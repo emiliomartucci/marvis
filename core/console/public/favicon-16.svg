@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" role="img" aria-label="MarvisX">
+
+  <rect width="100" height="100" rx="20" fill="#1B1917"></rect>
+  <rect x="12" y="26" width="76" height="48" rx="6" fill="#F2ECDF"></rect>
+  <rect x="22" y="36" width="56" height="28" rx="2" fill="#1C5C42"></rect>
+  <rect x="32" y="44" width="12" height="12" fill="#F6581C"></rect>
+  <rect x="56" y="44" width="12" height="12" fill="#F6581C"></rect>
+</svg>
