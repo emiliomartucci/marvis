@@ -1,0 +1,13 @@
+DROP INDEX IF EXISTS idx_cost_runs_agent;
+DROP INDEX IF EXISTS idx_agent_schedules_agent_id;
+DROP INDEX IF EXISTS idx_agent_runs_status;
+DROP INDEX IF EXISTS idx_agent_runs_agent_started;
+DROP INDEX IF EXISTS idx_agent_runs_agent_id;
+DROP INDEX IF EXISTS idx_agents_active;
+DROP INDEX IF EXISTS idx_agents_project_slug;
+DROP INDEX IF EXISTS idx_agents_user_id;
+DROP TABLE IF EXISTS agent_sync_state;
+DROP TABLE IF EXISTS agent_runs;
+DROP TABLE IF EXISTS agent_schedules;
+DROP TABLE IF EXISTS agents;
+DELETE FROM schema_versions WHERE version = 18;

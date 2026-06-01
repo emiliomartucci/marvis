@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 72" fill="none" role="img" aria-label="MarvisX">
+
+
+  <g transform="translate(8, 7) scale(0.437)">
+    <line x1="55" y1="4" x2="55" y2="14" stroke="currentColor" stroke-width="1.5"></line>
+    <circle cx="55" cy="4" r="3" fill="#F6581C"></circle>
+    <rect x="16" y="14" width="78" height="44" rx="6" fill="#F2ECDF" stroke="currentColor" stroke-width="1.5"></rect>
+    <rect x="26" y="22" width="58" height="20" rx="2" fill="#1C5C42"></rect>
+    <rect x="34" y="29" width="6" height="6" fill="#F6581C"></rect>
+    <rect x="70" y="29" width="6" height="6" fill="#F6581C"></rect>
+    <rect x="36" y="48" width="38" height="3" rx="1" fill="#F6581C"></rect>
+    <rect x="48" y="58" width="14" height="6" fill="currentColor"></rect>
+    <rect x="20" y="64" width="70" height="48" rx="4" fill="#F2ECDF" stroke="currentColor" stroke-width="1.5"></rect>
+    <circle cx="32" cy="76" r="2.5" fill="#2E9668"></circle>
+    <circle cx="42" cy="76" r="2.5" fill="#F6581C"></circle>
+    <rect x="32" y="112" width="12" height="10" rx="1" fill="#F2ECDF" stroke="currentColor" stroke-width="1.5"></rect>
+    <rect x="66" y="112" width="12" height="10" rx="1" fill="#F2ECDF" stroke="currentColor" stroke-width="1.5"></rect>
+    <rect x="28" y="122" width="20" height="4" rx="1" fill="currentColor"></rect>
+    <rect x="62" y="122" width="20" height="4" rx="1" fill="currentColor"></rect>
+  </g>
+
+  <text x="72" y="48" font-family="&#39;IBM Plex Sans Condensed&#39;, &#39;IBM Plex Sans&#39;, sans-serif" font-weight="700" font-size="34" letter-spacing="-0.5" fill="currentColor">marvis<tspan fill="#F6581C">x</tspan></text>
+
+  <text x="72" y="64" font-family="&#39;JetBrains Mono&#39;, monospace" font-weight="600" font-size="8" letter-spacing="3" fill="currentColor" opacity="0.55">CONSOLE · PIR</text>
+</svg>
