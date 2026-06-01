@@ -1,0 +1,35 @@
+name: Feedback / bug report
+description: Report a problem or share feedback. Pre-fillable from `marvis feedback`.
+title: "[feedback] "
+labels: ["source:cli"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the feedback. Running `marvis feedback` pre-fills this form
+        (including a PII-scrubbed `marvis doctor` report) and lets you review it
+        before submitting. No tokens or secrets are ever attached automatically.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Describe the problem or the feedback. What did you expect, what did you get?
+      placeholder: e.g. `marvis status` exits 1 with "db_ok:false" right after `marvis init`.
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command that triggered it
+      description: The exact `marvis` command you ran (optional).
+      placeholder: marvis status
+    validations:
+      required: false
+  - type: textarea
+    id: doctor
+    attributes:
+      label: marvis doctor output
+      description: Paste the output of `marvis doctor` (or let `marvis feedback` attach it).
+      render: text
+    validations:
+      required: false

@@ -1,0 +1,921 @@
+# v1.0.0 - 2026-05-27 - S1 F1.2: search use_cases extracted from router
+"""Search use_cases — pure domain logic, transport-agnostic (no ``fastapi``).
+
+Sibling of :mod:`core.api.use_cases.learnings` (the S1 "collapse runtime"
+TEMPLATE). One pure async function per operation; the HTTP router becomes a thin
+adapter that resolves identity into a :class:`CallerContext`, calls these
+functions, and maps :class:`ServiceError` -> ``HTTPException`` via
+``routers/_adapter.to_http``. The Python MCP surface (later) calls the SAME
+functions with ``CallerContext.local_single_user()``. One implementation, no fork.
+
+How the three TEMPLATE decisions land on the search domain:
+
+DECISION 1 — Visibility. N/A here. Search has NO ``project=`` visibility guard:
+    every query is scoped by ``workspace_id`` only (``ctx.workspace_id``), so this
+    module never resolves nor enforces ``get_visible_projects``.
+
+DECISION 2 — ``deep`` KG enrichment. N/A here. Search exposes no ``deep`` param;
+    the hybrid path already returns the KG-aware ``edge_path`` fields inline.
+
+DECISION 3 — Errors. The ``503`` raised by the *router itself* when the embedding
+    backend is unavailable ("Voyage AI not available") becomes a domain
+    :class:`ServiceUnavailableError` (``http_status = 503``). The ``RuntimeError``
+    surfaced by ``embedding_service.search_by_type`` is likewise wrapped into a
+    ``ServiceUnavailableError`` so the adapter need only translate ServiceError.
+
+Signature note (faithful deviation from the learnings template): these functions
+take ``(ctx, *typed_args)`` and DO NOT receive a request-scoped ``db``. Search and
+reindex never use the request connection pool — they open their own connections
+from ``settings.db_path`` / ``settings.vec0_path`` (``search_by_type`` documents
+why: per-connection serialization in aiosqlite). Keeping that property unchanged
+is the whole point of the reindex-route guard test (no read-only pool dependency).
+
+Service imports (embedding/Voyage client, KG hybrid_search, ``db._configure_connection``)
+are kept FUNCTION-LOCAL exactly as the original router did. ``hybrid_search`` and
+``embedding_service`` are services (fastapi-free) and could import at module top,
+but ``PROJECT_DIRS`` / ``_read_project_yaml`` live in ``routers.projects`` whose
+module imports ``fastapi``; importing them lazily keeps THIS module fastapi-free
+at import time (the property the import-linter contract + the smoke test assert).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+
+import aiosqlite
+
+from core.api.config import settings
+from core.api.models.search import SearchHit, SearchResponse
+from core.api.use_cases._context import CallerContext, require_role_ctx
+from core.api.use_cases._errors import ServiceError, ServiceUnavailableError
+
+logger = logging.getLogger(__name__)
+
+VALID_REINDEX_TYPES = {
+    "tasks",
+    "projects",
+    "files",
+    "handoffs",
+    "learnings",
+    "inbox_items",
+    "audits",
+    "all",
+}
+
+# Background task set (prevents GC of fire-and-forget reindex-all task).
+_bg_tasks: set[asyncio.Task] = set()
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_response(
+    grouped: dict[str, list[dict]],
+    q: str,
+    meta: dict[str, object] | None,
+) -> SearchResponse:
+    def to_hits(doc_type: str, items: list[dict]) -> list[SearchHit]:
+        return [
+            SearchHit(
+                doc_type=doc_type,  # type: ignore[arg-type]
+                doc_id=item["doc_id"],
+                title=item["title"],
+                project=item["project"],
+                score=item.get("score", 0.5),
+                salience=item.get("salience", 0.5),
+                path=item.get("path"),
+                status=item.get("status"),
+                # Phase 6.5 A extensions (None for legacy semantic-only path).
+                edge_path=item.get("edge_path"),
+                edge_path_summary=item.get("edge_path_summary"),
+                rrf_score=item.get("rrf_score"),
+            )
+            for item in items
+        ]
+
+    tasks = to_hits("task", grouped.get("task", []))
+    projects = to_hits("project", grouped.get("project", []))
+    files = to_hits("file", grouped.get("file", []))
+    handoffs = to_hits("handoff", grouped.get("handoff", []))
+    learnings = to_hits("learning", grouped.get("learning", []))
+    inbox_items = to_hits("inbox_item", grouped.get("inbox_item", []))
+    audits = to_hits("audit", grouped.get("audit", []))
+
+    suggested = None
+    if meta is not None:
+        maybe = meta.get("suggested_next_tool")
+        if isinstance(maybe, list) and maybe:
+            suggested = [str(x) for x in maybe]
+
+    return SearchResponse(
+        tasks=tasks,
+        projects=projects,
+        files=files,
+        handoffs=handoffs,
+        learnings=learnings,
+        inbox_items=inbox_items,
+        audits=audits,
+        total=len(tasks)
+        + len(projects)
+        + len(files)
+        + len(handoffs)
+        + len(learnings)
+        + len(inbox_items)
+        + len(audits),
+        query=q,
+        suggested_next_tool=suggested,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Use cases
+# ---------------------------------------------------------------------------
+
+
+async def search(
+    ctx: CallerContext,
+    *,
+    q: str,
+    hybrid: bool = True,
+    limit: int = 20,
+) -> SearchResponse:
+    """Hybrid (default) or semantic search across the KG and embedding index.
+
+    Phase 6.5 A: when ``hybrid=True`` the Voyage semantic retriever and the FTS5
+    KG retriever run in parallel and rankings are fused with weighted RRF; if
+    either retriever fails the other still returns results (graceful degradation).
+    When ``hybrid=False`` the endpoint returns the original semantic-only output
+    shape (no ``edge_path`` / ``rrf_score``).
+
+    Raises :class:`ServiceUnavailableError` (503) when the embedding backend is
+    unavailable on the semantic-only path, or when ``search_by_type`` reports a
+    backend ``RuntimeError`` (DECISION 3).
+    """
+    workspace_id = ctx.workspace_id or "ws_default"
+
+    if hybrid:
+        from core.api.services.kg.hybrid_search import hybrid_search as _hybrid_search
+
+        grouped, meta = await _hybrid_search(
+            q=q,
+            workspace_id=workspace_id,
+            db_path=settings.db_path,
+            vec0_path=settings.vec0_path,
+            limit=limit,
+        )
+        return _build_response(grouped, q, meta=meta)
+
+    # Legacy semantic-only branch (backward compat).
+    from core.api.services import embedding_service
+
+    if not embedding_service.is_available():
+        raise ServiceUnavailableError(
+            code="embedding_unavailable",
+            message="Voyage AI not available",
+        )
+
+    try:
+        grouped = await embedding_service.search_by_type(
+            query=q,
+            workspace_id=workspace_id,
+            db_path=settings.db_path,
+            vec0_path=settings.vec0_path,
+            top_k=5,
+        )
+    except RuntimeError as e:
+        raise ServiceUnavailableError(code="embedding_unavailable", message=str(e))
+
+    return _build_response(grouped, q, meta=None)
+
+
+async def trigger_reindex(
+    ctx: CallerContext,
+    *,
+    type: str = "all",
+) -> dict:
+    """Manual reindex (operator+). ``type=all`` returns immediately (background);
+    a specific type runs synchronously.
+
+    Raises :class:`ServiceUnavailableError` (503) when the embedding backend is
+    unavailable (DECISION 3).
+    """
+    require_role_ctx(ctx, "operator", "admin", "super_admin")
+
+    from core.api.services import embedding_service
+
+    if not embedding_service.is_available():
+        raise ServiceUnavailableError(
+            code="embedding_unavailable",
+            message="Voyage AI not available",
+        )
+
+    if type == "all":
+        task = asyncio.create_task(_reindex_all_bg(settings.db_path))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+        return {"status": "queued", "type": type}
+
+    # Specific type — synchronous (fast single-type operation)
+    workspace_id = ctx.workspace_id or "ws_default"
+    result = await _reindex_type(type, workspace_id)
+    return {"status": "ok", "type": type, **result}
+
+
+async def _reindex_type(doc_type: str, workspace_id: str) -> dict:
+    """Reindex a single document type. Returns stats dict."""
+    from core.api.db import _configure_connection, resolve_vec0_loadable
+
+    db = await aiosqlite.connect(settings.db_path)
+    await _configure_connection(db)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA busy_timeout=60000")
+
+    load_arg, vec_found = resolve_vec0_loadable()
+    if vec_found and load_arg is not None:
+        await db._execute(db._conn.enable_load_extension, True)
+        await db.execute("SELECT load_extension(?)", [load_arg])
+        await db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_documents USING vec0(
+                doc_id INTEGER PRIMARY KEY,
+                embedding float[512]
+            )
+        """)
+
+    try:
+        if doc_type == "handoffs":
+            return await _reindex_handoffs(workspace_id, db, db)
+        elif doc_type == "tasks":
+            return await _reindex_tasks(workspace_id, db, db)
+        elif doc_type == "projects":
+            return await _reindex_projects(workspace_id, db, db)
+        elif doc_type == "files":
+            return await _reindex_files(workspace_id, db, db)
+        elif doc_type == "learnings":
+            return await _reindex_learnings(workspace_id, db, db)
+        elif doc_type == "inbox_items":
+            return await _reindex_inbox_items(workspace_id, db, db)
+        elif doc_type == "audits":
+            return await _reindex_audits(workspace_id, db, db)
+        return {"indexed": 0}
+    finally:
+        await db.close()
+
+
+async def _reindex_all_bg(db_path: str) -> None:
+    """Background task: reindex all doc types.
+
+    Uses a SINGLE connection with vec extension loaded as both db and vec_db.
+    Two separate writers to the same DB cause 'database is locked' errors.
+    """
+    from core.api.db import _configure_connection, resolve_vec0_loadable
+
+    logger.info("Reindex all: starting background job")
+    try:
+        db = await aiosqlite.connect(db_path)
+        await _configure_connection(db)
+        db.row_factory = aiosqlite.Row
+        # Higher busy_timeout for background reindex — avoids blocking regular requests
+        await db.execute("PRAGMA busy_timeout=60000")
+        # Load vec extension on the same connection (cross-platform: .so/.dylib)
+        load_arg, vec_found = resolve_vec0_loadable()
+        if vec_found and load_arg is not None:
+            await db._execute(db._conn.enable_load_extension, True)
+            await db.execute("SELECT load_extension(?)", [load_arg])
+            await db.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_documents USING vec0(
+                    doc_id INTEGER PRIMARY KEY,
+                    embedding float[512]
+                )
+            """)
+
+        workspace_id = "ws_default"
+        # Pass same connection as both db and vec_db — single writer, no locking
+        for doc_type, fn in [
+            ("handoffs", _reindex_handoffs),
+            ("tasks", _reindex_tasks),
+            ("projects", _reindex_projects),
+            ("files", _reindex_files),
+            ("learnings", _reindex_learnings),
+            ("inbox_items", _reindex_inbox_items),
+            ("audits", _reindex_audits),
+        ]:
+            try:
+                result = await fn(workspace_id, db, db)
+                logger.info("Reindex %s: %s", doc_type, result)
+            except Exception:
+                logger.exception("Reindex %s failed", doc_type)
+
+        await db.close()
+        logger.info("Reindex all: background job complete")
+    except Exception:
+        logger.exception("Reindex all: background job failed")
+
+
+async def _reindex_tasks(
+    workspace_id: str, db: aiosqlite.Connection, vec_db: aiosqlite.Connection
+) -> dict:
+    """Batch-embed tasks to minimize Voyage API calls (free tier: 3 RPM).
+
+    Pattern: read → commit (release locks) → API call → write → commit.
+    Never hold DB locks during external API calls.
+    """
+    from core.api.services.embedding_service import embed_texts, serialize_f32, content_hash
+
+    # --- Read phase: gather tasks + filter unchanged ---
+    cur = await db.execute(
+        "SELECT id, title, project, status FROM tasks WHERE deleted_at IS NULL AND COALESCE(workspace_id, 'ws_default') = ?",
+        [workspace_id],
+    )
+    rows = await cur.fetchall()
+
+    to_embed: list[tuple] = []  # (row_dict, content, hash, file_path)
+    for row in rows:
+        content = f"{row['title']}\nStatus: {row['status']}\nProject: {row['project']}"
+        h = content_hash(content)
+        file_path = f"task:{row['id']}"
+        cur2 = await db.execute(
+            "SELECT content_hash FROM documents WHERE file_path = ?", [file_path]
+        )
+        existing = await cur2.fetchone()
+        if existing and existing["content_hash"] == h:
+            continue
+        # Materialize row data (aiosqlite.Row refs may not survive commit)
+        to_embed.append((dict(row), content, h, file_path))
+
+    # Release any implicit transaction from reads BEFORE calling Voyage API
+    await db.commit()
+
+    if not to_embed:
+        return {"indexed": 0, "skipped": len(rows), "total": len(rows)}
+
+    # --- Embed + write in small batches ---
+    indexed = 0
+    batch_size = 64
+    for i in range(0, len(to_embed), batch_size):
+        batch = to_embed[i : i + batch_size]
+        texts = [content for _, content, _, _ in batch]
+
+        # API phase: no DB lock held
+        embeddings = await embed_texts(texts, input_type="document")
+
+        # Write phase: quick burst of writes, then commit
+        for (row_d, content, h, file_path), embedding in zip(batch, embeddings):
+            await db.execute(
+                """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(file_path) DO UPDATE SET
+                     content_hash = excluded.content_hash,
+                     project = excluded.project,
+                     workspace_id = excluded.workspace_id,
+                     doc_type = excluded.doc_type,
+                     doc_title = excluded.doc_title""",
+                [
+                    file_path,
+                    row_d["project"] or "",
+                    workspace_id,
+                    "task",
+                    row_d["title"],
+                    h,
+                ],
+            )
+            cur3 = await db.execute(
+                "SELECT id FROM documents WHERE file_path = ?", [file_path]
+            )
+            doc_row = await cur3.fetchone()
+            doc_id = doc_row["id"]
+
+            await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
+            await vec_db.execute(
+                "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
+                [doc_id, serialize_f32(embedding)],
+            )
+            indexed += 1
+
+        await db.commit()
+        if db is not vec_db:
+            await vec_db.commit()
+
+        # Rate limit: 20s between batches respects Voyage 3 RPM free tier
+        if i + batch_size < len(to_embed):
+            await asyncio.sleep(20)
+
+    return {"indexed": indexed, "total": len(rows)}
+
+
+async def _reindex_projects(
+    workspace_id: str, db: aiosqlite.Connection, vec_db: aiosqlite.Connection
+) -> dict:
+    """Batch-embed projects from filesystem (project.yaml). No DB projects table."""
+    from core.api.routers.projects import PROJECT_DIRS, _read_project_yaml
+    from core.api.services.embedding_service import embed_texts, serialize_f32, content_hash
+
+    # Collect all projects
+    items: list[tuple[str, str, str]] = []  # (slug, name, content)
+    for base in PROJECT_DIRS:
+        if not base.exists():
+            continue
+        for project_dir in sorted(base.iterdir()):
+            if not project_dir.is_dir() or project_dir.is_symlink():
+                continue
+            yaml_data = _read_project_yaml(project_dir)
+            if not yaml_data:
+                continue
+            slug = yaml_data.get("project") or project_dir.name
+            name = yaml_data.get("description") or slug
+            description = yaml_data.get("description") or ""
+            content = f"{slug}\n{name}\n{description}"
+            items.append((slug, name, content))
+
+    # Filter unchanged
+    to_embed: list[tuple[str, str, str, str]] = []  # (slug, name, content, hash)
+    for slug, name, content in items:
+        h = content_hash(content)
+        file_path = f"project:{slug}"
+        cur = await db.execute(
+            "SELECT content_hash FROM documents WHERE file_path = ?", [file_path]
+        )
+        existing = await cur.fetchone()
+        if existing and existing["content_hash"] == h:
+            continue
+        to_embed.append((slug, name, content, h))
+
+    # Release implicit transaction from reads before API call
+    await db.commit()
+
+    if not to_embed:
+        return {"indexed": 0, "skipped": len(items), "total": len(items)}
+
+    # Batch embed all at once (projects are few, usually <50)
+    texts = [content for _, _, content, _ in to_embed]
+    embeddings = await embed_texts(texts, input_type="document")
+
+    indexed = 0
+    for (slug, name, content, h), embedding in zip(to_embed, embeddings):
+        file_path = f"project:{slug}"
+        await db.execute(
+            """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(file_path) DO UPDATE SET
+                 content_hash = excluded.content_hash,
+                 project = excluded.project,
+                 workspace_id = excluded.workspace_id,
+                 doc_type = excluded.doc_type,
+                 doc_title = excluded.doc_title""",
+            [file_path, slug, workspace_id, "project", name, h],
+        )
+        cur2 = await db.execute(
+            "SELECT id FROM documents WHERE file_path = ?", [file_path]
+        )
+        doc_row = await cur2.fetchone()
+        doc_id = doc_row["id"]
+
+        await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
+        await vec_db.execute(
+            "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
+            [doc_id, serialize_f32(embedding)],
+        )
+        indexed += 1
+
+    await db.commit()
+    if db is not vec_db:
+        await vec_db.commit()
+
+    return {"indexed": indexed, "total": len(items)}
+
+
+async def _reindex_files(
+    workspace_id: str, db: aiosqlite.Connection, vec_db: aiosqlite.Connection
+) -> dict:
+    """Batch-embed all docs/**/*.md from filesystem (audits, solutions, brainstorms, plans, etc.)."""
+    from core.api.routers.projects import PROJECT_DIRS
+    from core.api.services.embedding_service import embed_texts, serialize_f32, content_hash
+
+    # Recursive glob catches all doc subdirectories (audits, solutions, brainstorms, plans, etc.)
+    DOC_GLOBS = {
+        "file": ["docs/**/*.md"],
+    }
+    items: list[tuple[str, str, str, str]] = []  # (slug, file_path, title, content)
+    for base in PROJECT_DIRS:
+        if not base.exists():
+            continue
+        for project_dir in sorted(base.iterdir()):
+            if not project_dir.is_dir() or project_dir.is_symlink():
+                continue
+            slug = project_dir.name
+            for patterns in DOC_GLOBS.values():
+                for pattern in patterns:
+                    for f in sorted(project_dir.glob(pattern)):
+                        if f.is_symlink() or f.stat().st_size > 500_000:
+                            continue
+                        try:
+                            text = f.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            continue
+                        title = f.stem.replace("-", " ").strip()
+                        items.append((slug, str(f), title, text))
+
+    # Filter unchanged
+    to_embed: list[tuple[str, str, str, str, str]] = []
+    for slug, fpath, title, text in items:
+        h = content_hash(text)
+        cur = await db.execute(
+            "SELECT content_hash FROM documents WHERE file_path = ?", [fpath]
+        )
+        existing = await cur.fetchone()
+        if existing and existing["content_hash"] == h:
+            continue
+        to_embed.append((slug, fpath, title, text, h))
+
+    await db.commit()  # Release read locks before API call
+
+    if not to_embed:
+        return {"indexed": 0, "skipped": len(items), "total": len(items)}
+
+    # Batch embed
+    indexed = 0
+    batch_size = 64
+    for i in range(0, len(to_embed), batch_size):
+        batch = to_embed[i : i + batch_size]
+        texts = [text for _, _, _, text, _ in batch]
+        embeddings = await embed_texts(texts, input_type="document")
+
+        for (slug, fpath, title, text, h), embedding in zip(batch, embeddings):
+            await db.execute(
+                """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(file_path) DO UPDATE SET
+                     content_hash = excluded.content_hash,
+                     project = excluded.project,
+                     workspace_id = excluded.workspace_id,
+                     doc_type = excluded.doc_type,
+                     doc_title = excluded.doc_title""",
+                [fpath, slug, workspace_id, "file", title, h],
+            )
+            cur2 = await db.execute(
+                "SELECT id FROM documents WHERE file_path = ?", [fpath]
+            )
+            doc_row = await cur2.fetchone()
+            doc_id = doc_row["id"]
+
+            await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
+            await vec_db.execute(
+                "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
+                [doc_id, serialize_f32(embedding)],
+            )
+            indexed += 1
+
+        await db.commit()
+        if db is not vec_db:
+            await vec_db.commit()
+
+        if i + batch_size < len(to_embed):
+            await asyncio.sleep(20)
+
+    return {"indexed": indexed, "total": len(items)}
+
+
+async def _reindex_handoffs(
+    workspace_id: str, db: aiosqlite.Connection, vec_db: aiosqlite.Connection
+) -> dict:
+    """Batch-embed handoff files from filesystem (memory/handoff-*.md)."""
+    from core.api.routers.projects import PROJECT_DIRS
+    from core.api.services.embedding_service import embed_texts, serialize_f32, content_hash
+
+    # Scan all projects for handoffs
+    items: list[tuple[str, str, str, str]] = []  # (slug, file_path, title, content)
+    for base in PROJECT_DIRS:
+        if not base.exists():
+            continue
+        for project_dir in sorted(base.iterdir()):
+            if not project_dir.is_dir() or project_dir.is_symlink():
+                continue
+            slug = project_dir.name
+            memory_dir = project_dir / "memory"
+            if not memory_dir.is_dir():
+                continue
+            for f in sorted(memory_dir.glob("handoff-*.md")):
+                if f.is_symlink() or f.stat().st_size > 500_000:
+                    continue
+                try:
+                    text = f.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                title = f.stem.replace("-", " ").strip()
+                items.append((slug, str(f), title, text))
+
+    # Filter unchanged
+    to_embed: list[tuple[str, str, str, str, str]] = []
+    for slug, fpath, title, text in items:
+        h = content_hash(text)
+        cur = await db.execute(
+            "SELECT content_hash FROM documents WHERE file_path = ?", [fpath]
+        )
+        existing = await cur.fetchone()
+        if existing and existing["content_hash"] == h:
+            continue
+        to_embed.append((slug, fpath, title, text, h))
+
+    await db.commit()  # Release read locks before API call
+
+    if not to_embed:
+        return {"indexed": 0, "skipped": len(items), "total": len(items)}
+
+    # Batch embed
+    indexed = 0
+    batch_size = 64
+    for i in range(0, len(to_embed), batch_size):
+        batch = to_embed[i : i + batch_size]
+        texts = [text for _, _, _, text, _ in batch]
+        embeddings = await embed_texts(texts, input_type="document")
+
+        for (slug, fpath, title, text, h), embedding in zip(batch, embeddings):
+            await db.execute(
+                """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(file_path) DO UPDATE SET
+                     content_hash = excluded.content_hash,
+                     project = excluded.project,
+                     workspace_id = excluded.workspace_id,
+                     doc_type = excluded.doc_type,
+                     doc_title = excluded.doc_title""",
+                [fpath, slug, workspace_id, "handoff", title, h],
+            )
+            cur2 = await db.execute(
+                "SELECT id FROM documents WHERE file_path = ?", [fpath]
+            )
+            doc_row = await cur2.fetchone()
+            doc_id = doc_row["id"]
+
+            await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
+            await vec_db.execute(
+                "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
+                [doc_id, serialize_f32(embedding)],
+            )
+            indexed += 1
+
+        await db.commit()
+        if db is not vec_db:
+            await vec_db.commit()
+
+        if i + batch_size < len(to_embed):
+            await asyncio.sleep(20)
+
+    return {"indexed": indexed, "total": len(items)}
+
+
+async def _reindex_learnings(
+    workspace_id: str, db: aiosqlite.Connection, vec_db: aiosqlite.Connection
+) -> dict:
+    """Batch-embed learnings from DB (title + description + prevention)."""
+    from core.api.services.embedding_service import embed_texts, serialize_f32, content_hash
+
+    cur = await db.execute(
+        "SELECT id, title, description, prevention, category, severity, project "
+        "FROM learnings WHERE COALESCE(workspace_id, 'ws_default') = ?",
+        [workspace_id],
+    )
+    rows = await cur.fetchall()
+
+    to_embed: list[tuple] = []  # (row_dict, content, hash, file_path)
+    for row in rows:
+        content = "\n".join(
+            filter(
+                None,
+                [
+                    row["title"],
+                    row["description"],
+                    f"Prevention: {row['prevention']}" if row["prevention"] else None,
+                    f"Category: {row['category']}",
+                    f"Severity: {row['severity']}",
+                ],
+            )
+        )
+        h = content_hash(content)
+        file_path = f"learning:{row['id']}"
+        cur2 = await db.execute(
+            "SELECT content_hash FROM documents WHERE file_path = ?", [file_path]
+        )
+        existing = await cur2.fetchone()
+        if existing and existing["content_hash"] == h:
+            continue
+        to_embed.append((dict(row), content, h, file_path))
+
+    await db.commit()
+
+    if not to_embed:
+        return {"indexed": 0, "skipped": len(rows), "total": len(rows)}
+
+    indexed = 0
+    batch_size = 64
+    for i in range(0, len(to_embed), batch_size):
+        batch = to_embed[i : i + batch_size]
+        texts = [content for _, content, _, _ in batch]
+        embeddings = await embed_texts(texts, input_type="document")
+
+        for (row_d, content, h, file_path), embedding in zip(batch, embeddings):
+            await db.execute(
+                """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(file_path) DO UPDATE SET
+                     content_hash = excluded.content_hash,
+                     project = excluded.project,
+                     workspace_id = excluded.workspace_id,
+                     doc_type = excluded.doc_type,
+                     doc_title = excluded.doc_title""",
+                [
+                    file_path,
+                    row_d["project"] or "",
+                    workspace_id,
+                    "learning",
+                    row_d["title"],
+                    h,
+                ],
+            )
+            cur3 = await db.execute(
+                "SELECT id FROM documents WHERE file_path = ?", [file_path]
+            )
+            doc_row = await cur3.fetchone()
+            doc_id = doc_row["id"]
+
+            await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
+            await vec_db.execute(
+                "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
+                [doc_id, serialize_f32(embedding)],
+            )
+            indexed += 1
+
+        await db.commit()
+        if db is not vec_db:
+            await vec_db.commit()
+
+        if i + batch_size < len(to_embed):
+            await asyncio.sleep(20)
+
+    return {"indexed": indexed, "total": len(rows)}
+
+
+async def _reindex_inbox_items(
+    workspace_id: str, db: aiosqlite.Connection, vec_db: aiosqlite.Connection
+) -> dict:
+    """Batch-embed inbox items (title + snippet). Skips auto_ignored items."""
+    from core.api.services.embedding_service import embed_texts, serialize_f32, content_hash
+
+    cur = await db.execute(
+        "SELECT id, title, content, source, status "
+        "FROM inbox_items "
+        "WHERE COALESCE(workspace_id, 'ws_default') = ? AND status != 'auto_ignored'",
+        [workspace_id],
+    )
+    rows = await cur.fetchall()
+
+    to_embed: list[tuple] = []  # (row_dict, content, hash, file_path)
+    for row in rows:
+        # Build embeddable text from title + truncated content snippet
+        snippet = (row["content"] or "")[:500]
+        content = "\n".join(filter(None, [row["title"], snippet]))
+        if not content.strip():
+            continue
+        h = content_hash(content)
+        file_path = f"inbox_item:{row['id']}"
+        cur2 = await db.execute(
+            "SELECT content_hash FROM documents WHERE file_path = ?", [file_path]
+        )
+        existing = await cur2.fetchone()
+        if existing and existing["content_hash"] == h:
+            continue
+        to_embed.append((dict(row), content, h, file_path))
+
+    await db.commit()
+
+    if not to_embed:
+        return {"indexed": 0, "skipped": len(rows), "total": len(rows)}
+
+    indexed = 0
+    batch_size = 64
+    for i in range(0, len(to_embed), batch_size):
+        batch = to_embed[i : i + batch_size]
+        texts = [content for _, content, _, _ in batch]
+        embeddings = await embed_texts(texts, input_type="document")
+
+        for (row_d, content, h, file_path), embedding in zip(batch, embeddings):
+            await db.execute(
+                """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(file_path) DO UPDATE SET
+                     content_hash = excluded.content_hash,
+                     project = excluded.project,
+                     workspace_id = excluded.workspace_id,
+                     doc_type = excluded.doc_type,
+                     doc_title = excluded.doc_title""",
+                [file_path, "", workspace_id, "inbox_item", row_d["title"] or "", h],
+            )
+            cur3 = await db.execute(
+                "SELECT id FROM documents WHERE file_path = ?", [file_path]
+            )
+            doc_row = await cur3.fetchone()
+            doc_id = doc_row["id"]
+
+            await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
+            await vec_db.execute(
+                "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
+                [doc_id, serialize_f32(embedding)],
+            )
+            indexed += 1
+
+        await db.commit()
+        if db is not vec_db:
+            await vec_db.commit()
+
+        if i + batch_size < len(to_embed):
+            await asyncio.sleep(20)
+
+    return {"indexed": indexed, "total": len(rows)}
+
+
+async def _reindex_audits(
+    workspace_id: str, db: aiosqlite.Connection, vec_db: aiosqlite.Connection
+) -> dict:
+    """Batch-embed audit files from filesystem (docs/audits/*.md)."""
+    from core.api.routers.projects import PROJECT_DIRS
+    from core.api.services.embedding_service import embed_texts, serialize_f32, content_hash
+
+    items: list[tuple[str, str, str, str]] = []  # (slug, file_path, title, content)
+    for base in PROJECT_DIRS:
+        if not base.exists():
+            continue
+        for project_dir in sorted(base.iterdir()):
+            if not project_dir.is_dir() or project_dir.is_symlink():
+                continue
+            slug = project_dir.name
+            audits_dir = project_dir / "docs" / "audits"
+            if not audits_dir.is_dir():
+                continue
+            for f in sorted(audits_dir.glob("*.md")):
+                if f.is_symlink() or f.stat().st_size > 500_000:
+                    continue
+                try:
+                    text = f.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                title = f.stem.replace("-", " ").strip()
+                items.append((slug, str(f), title, text))
+
+    # Filter unchanged
+    to_embed: list[tuple[str, str, str, str, str]] = []
+    for slug, fpath, title, text in items:
+        h = content_hash(text)
+        cur = await db.execute(
+            "SELECT content_hash FROM documents WHERE file_path = ?", [fpath]
+        )
+        existing = await cur.fetchone()
+        if existing and existing["content_hash"] == h:
+            continue
+        to_embed.append((slug, fpath, title, text, h))
+
+    await db.commit()
+
+    if not to_embed:
+        return {"indexed": 0, "skipped": len(items), "total": len(items)}
+
+    indexed = 0
+    batch_size = 64
+    for i in range(0, len(to_embed), batch_size):
+        batch = to_embed[i : i + batch_size]
+        texts = [text for _, _, _, text, _ in batch]
+        embeddings = await embed_texts(texts, input_type="document")
+
+        for (slug, fpath, title, text, h), embedding in zip(batch, embeddings):
+            await db.execute(
+                """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(file_path) DO UPDATE SET
+                     content_hash = excluded.content_hash,
+                     project = excluded.project,
+                     workspace_id = excluded.workspace_id,
+                     doc_type = excluded.doc_type,
+                     doc_title = excluded.doc_title""",
+                [fpath, slug, workspace_id, "audit", title, h],
+            )
+            cur2 = await db.execute(
+                "SELECT id FROM documents WHERE file_path = ?", [fpath]
+            )
+            doc_row = await cur2.fetchone()
+            doc_id = doc_row["id"]
+
+            await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
+            await vec_db.execute(
+                "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
+                [doc_id, serialize_f32(embedding)],
+            )
+            indexed += 1
+
+        await db.commit()
+        if db is not vec_db:
+            await vec_db.commit()
+
+        if i + batch_size < len(to_embed):
+            await asyncio.sleep(20)
+
+    return {"indexed": indexed, "total": len(items)}

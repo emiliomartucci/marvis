@@ -1,0 +1,46 @@
+# OS
+.DS_Store
+
+# Environment
+.env
+.env.*
+!.env.example
+!**/.env.example
+!.env.*.example
+!**/.env.*.example
+
+# Binary files (not tracked)
+*.pdf
+*.PDF
+*.xlsx
+*.XLSX
+*.docx
+*.DOCX
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.zip
+
+# Python
+__pycache__/
+.import_linter_cache/
+
+# Node (mcp-pir local install — installed via npm install in deploy)
+node_modules/
+apps/docs/.next/
+apps/docs/.source/
+apps/docs/tsconfig.tsbuildinfo
+
+# Test
+test-results/
+pytest-of-*/
+docs/audits/kg-probe-*.json
+console.db
+console.db-shm
+console.db-wal
+console/.git.bak/
+
+.gemini/
+gha-creds-*.json
