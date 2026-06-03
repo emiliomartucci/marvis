@@ -1,0 +1,46 @@
+#!/usr/bin/env node
+import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+const CATEGORIES = [
+  "files", "dependencies", "devDependencies", "unlisted",
+  "unresolved", "exports", "types"
+];
+
+let raw;
+try {
+  raw = execSync("node_modules/.bin/knip --reporter json --cache", {
+    encoding: "utf8",
+    maxBuffer: 10 * 1024 * 1024,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+} catch (e) {
+  if (e.status === 2) { console.error("Knip crashed"); process.exit(2); }
+  raw = e.stdout || "";
+  if (!raw) { console.error("No output"); process.exit(2); }
+}
+
+const data = JSON.parse(raw);
+const issues = data.issues || [];
+const counts = {};
+
+for (const cat of CATEGORIES) {
+  if (cat === "files") {
+    counts.files = issues.reduce((acc, i) => acc + (i.files?.length ?? 0), 0);
+  } else {
+    counts[cat] = issues.reduce((acc, i) => acc + (i[cat]?.length ?? 0), 0);
+  }
+}
+
+const total = Object.values(counts).reduce((a, b) => a + b, 0);
+const knipPkg = JSON.parse(readFileSync("node_modules/knip/package.json", "utf8"));
+
+const baseline = {
+  schemaVersion: 1,
+  knipVersion: knipPkg.version,
+  generatedAt: new Date().toISOString(),
+  counts,
+  total,
+};
+
+process.stdout.write(JSON.stringify(baseline, null, 2) + "\n");

@@ -1,0 +1,53 @@
+{
+  "_version": "1.0.0",
+  "_description": "Centralized hook configuration. Read by _config.sh helpers.",
+  "branches": {
+    "protected": ["main", "master"],
+    "task_pattern": "^feat/task-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(/[a-z][a-z0-9-]*)?$"
+  },
+  "worktree": {
+    "whitelist_extensions": [".md", ".yaml", ".yml", ".json", ".jsonc"],
+    "whitelist_dirs": ["docs/", "memory/", "kb/", "research/", "data/",
+      ".claude/docs/", ".claude/agents/", ".claude/commands/",
+      ".claude/skills/", ".claude/rules/", ".claude/hooks/",
+      ".opencode/"],
+    "whitelist_files": ["project.yaml", ".gitignore", ".task", "tags.yaml", "programs.yaml"],
+    "whitelist_scripts": ["core/scripts/*.sh"],
+    "blocked_files": [
+      ".claude/settings.json",
+      ".claude/settings.local.json",
+      ".claude/hooks/config.json",
+      ".claude/hooks/_config.sh",
+      ".claude/hooks/quality-gate.sh",
+      ".claude/agents/session-check.md",
+      ".claude/agents/code-worker.md",
+      ".claude/rules/constitution.md",
+      ".opencode/OPENCODE.md",
+      ".opencode/opencode.json",
+      ".opencode/agents/session-check.md",
+      ".opencode/plugins/opencode-buddy.ts",
+      "core/scripts/safety_bridge.py",
+      "console/.knip-baseline.json",
+      "console/knip.json",
+      "console/eslint.config.mjs",
+      "console/eslint-suppressions.json"
+    ]
+  },
+  "bash_safety": {
+    "blocked_patterns": [
+      {"id": "force_push_main", "pattern": "git\\s+push.*(--force|-f).*(main|master)", "reason": "force push on main blocked"},
+      {"id": "gh_pr_create", "pattern": "gh\\s+pr\\s+create", "reason": "use submit_pr API instead"},
+      {"id": "cp_data_pir", "pattern": "cp\\s+.*\\s+/data/pir/", "reason": "deploy via PR merge, not direct cp"}
+    ]
+  },
+  "protected_files": [
+    ".claude/hooks/config.json",
+    ".claude/hooks/_config.sh",
+    ".claude/settings.json",
+    ".claude/rules/constitution.md"
+  ],
+  "db_protection": {
+    "db_patterns": ["console.db", "pir.db", "marvisx.db", "sessions.db", "/data/pir/.*\\.db"],
+    "write_keywords": ["UPDATE", "INSERT", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "VACUUM", "executescript"]
+  }
+}
