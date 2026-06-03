@@ -1,0 +1,1 @@
+"""Deterministic docs governance helpers."""
