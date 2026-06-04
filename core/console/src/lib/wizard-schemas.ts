@@ -82,7 +82,7 @@ export const SKIPPABLE_STEPS: ReadonlySet<StepId> = new Set([
   "first_project",
 ]);
 
-const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$/;
+const SLUG_PATTERN = /^[a-z0-9][a-z0-9&+_.-]{0,62}$/;
 
 export function slugify(name: string): string {
   return name
@@ -182,7 +182,7 @@ export function validateFirstProject(
   } else if (!SLUG_PATTERN.test(p.slug)) {
     errors.push({
       field: "slug",
-      message: "Slug must match ^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$",
+      message: "Slug must match ^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
     });
   }
   return errors;

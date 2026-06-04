@@ -18,7 +18,7 @@ from .state import (
     WelcomePayload,
 )
 
-SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$")
+SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$")
 
 
 class ValidationError(ValueError):
@@ -123,7 +123,7 @@ def validate_first_project(
         errors.append(
             ValidationError(
                 "slug",
-                "Slug must match ^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$",
+                "Slug must match ^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
             )
         )
     return errors

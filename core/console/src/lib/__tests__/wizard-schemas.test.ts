@@ -105,6 +105,12 @@ describe("validators", () => {
       validateFirstProject({ name: "x", slug: "ok-slug", type: "code" })
     ).toEqual([]);
   });
+
+  it("first_project accepts single-character slug", () => {
+    expect(validateFirstProject({ name: "x", slug: "a", type: "code" })).toEqual(
+      []
+    );
+  });
 });
 
 describe("slugify", () => {
