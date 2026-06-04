@@ -1,0 +1,296 @@
+name: E2E Install Cross-OS
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/e2e-macos.yml"
+      - "pyproject.toml"
+      - "core/cli/**"
+      - "core/api/**"
+      - "core/platform/**"
+      - "core/wizard/**"
+      - "core/telemetry/**"
+      - "core/scripts/install_hooks/**"
+      - "migrations/**"
+      - "docs/install/INSTALL-SKILL.md"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/e2e-macos.yml"
+      - "pyproject.toml"
+      - "core/cli/**"
+      - "core/api/**"
+      - "core/platform/**"
+      - "core/wizard/**"
+      - "core/telemetry/**"
+      - "core/scripts/install_hooks/**"
+      - "migrations/**"
+      - "docs/install/INSTALL-SKILL.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-install-cross-os-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Repo-aware matrix. The expensive macOS leg (10x GitHub-minutes) runs ONLY on
+  # the public mirror (emiliomartucci/marvisx-oss), where Actions are free; the
+  # private source repo keeps a cheap ubuntu+windows pre-merge gate. Same file on
+  # both repos — behavior is keyed on ${{ github.repository }} (only the PUBLIC
+  # name is ever referenced).
+  config:
+    name: resolve matrix (repo-aware)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      bash_os: ${{ steps.set.outputs.bash_os }}
+    steps:
+      - id: set
+        shell: bash
+        run: |
+          if [ "${{ github.repository }}" = "emiliomartucci/marvisx-oss" ]; then
+            # public mirror: full matrix — macOS is free here
+            echo 'bash_os=["ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            # private source: cheap pre-merge gate — no paid macOS
+            echo 'bash_os=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  # The OS-seam enforcement gate (Windows port Phase 2). OS-independent static AST
+  # analysis, so one OS suffices. Without this, the boundary is a local-only check
+  # and a future PR could silently reintroduce an `import pwd` / `os.chmod` that
+  # crashes a customer's Windows box. Runs on the PRIVATE source repo only (the
+  # pre-merge gate); skipped on the public mirror, whose test deps (tests/,
+  # requirements-test.txt) are intentionally not mirrored.
+  platform-boundary:
+    name: core/platform boundary (enforcement)
+    if: github.repository != 'emiliomartucci/marvisx-oss'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+      - name: Ensure uv-managed Python
+        run: uv python install 3.13
+      # uv run provisions the project deps in an ephemeral env; requirements-test.txt
+      # adds the test plugins conftest.py needs (pytest-asyncio etc.). The test
+      # parses core/cli + core/wizard from the checkout and imports marvis_doctor.
+      - name: Enforce core/platform OS-seam boundary
+        run: uv run --python 3.13 --with-requirements requirements-test.txt pytest -q tests/test_platform_boundary.py
+
+  install-smoke:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    needs: config
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      # macOS setup-python builds lack loadable sqlite extensions, so vec0 cannot
+      # load and `marvis doctor` (correctly) ERRORs on semantic_vec0 → false red.
+      # uv's python-build-standalone DOES support them — which is exactly what a
+      # real `uv tool install marvisx-cli` user gets. Force uv to use ONLY its
+      # managed Python so the smoke mirrors reality, not a capability this test
+      # had artificially pinned away by installing under the setup-python interp.
+      UV_PYTHON_PREFERENCE: only-managed
+    strategy:
+      fail-fast: false
+      matrix:
+        # Repo-aware (config job): ubuntu on both repos; macOS only on the public
+        # mirror (10x minutes, free there). macos-15-intel dropped — macos-latest
+        # (ARM) is the representative macOS; Intel was a paid duplicate.
+        os: ${{ fromJSON(needs.config.outputs.bash_os) }}
+        # Min + latest STABLE supported. NOT "3.x": it floats to bleeding-edge
+        # (3.14), for which onnxruntime has no macOS-x86_64 wheel yet -> false red.
+        # Matches pyproject requires-python ">=3.10,<3.14".
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          check-latest: true
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Ensure uv-managed Python (loadable-sqlite-extensions capable)
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Build wheel and sdist
+        run: uv build --wheel --sdist --out-dir dist
+
+      - name: Smoke installed artifacts from PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOOL_BIN="$HOME/.local/bin"
+          echo "$TOOL_BIN" >> "$GITHUB_PATH"
+          export PATH="$TOOL_BIN:$PATH"
+          unset PYTHONPATH
+
+          PYTHON_EXE="$(python -c 'import sys; print(sys.executable)')"
+          WHEEL="$(python - <<'PY'
+          from pathlib import Path
+          wheels = sorted(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected exactly one wheel, found {len(wheels)}")
+          print(wheels[0])
+          PY
+          )"
+          SDIST="$(python - <<'PY'
+          from pathlib import Path
+          sdists = sorted(Path("dist").glob("*.tar.gz"))
+          if len(sdists) != 1:
+              raise SystemExit(f"expected exactly one sdist, found {len(sdists)}")
+          print(sdists[0])
+          PY
+          )"
+
+          smoke_install() {
+            local artifact="$1"
+            local label="$2"
+            echo "== smoke: $label =="
+
+            # Install under uv's managed Python (UV_PYTHON_PREFERENCE=only-managed)
+            # for the matrix version — capable of loadable sqlite extensions, like
+            # a real user's install — NOT setup-python's interpreter ($PYTHON_EXE).
+            uv tool install --force --python "${{ matrix.python-version }}" "$artifact"
+            hash -r
+            command -v marvis
+
+            marvis --version
+            # Regression guard: --version must track the installed wheel, not a
+            # hardcoded constant (it once drifted to a stale release).
+            marvis --version | grep -qF "$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)" \
+              || { echo "ERROR: 'marvis --version' does not contain the pyproject version (stale/hardcoded)"; exit 1; }
+            marvis --help > "$RUNNER_TEMP/marvis-help-$label.txt"
+            grep -q "doctor" "$RUNNER_TEMP/marvis-help-$label.txt"
+            marvis doctor
+
+            local marvis_bin tool_python
+            marvis_bin="$(command -v marvis)"
+            tool_python="$(python - "$marvis_bin" <<'PY'
+          import pathlib
+          import sys
+          launcher = pathlib.Path(sys.argv[1])
+          first = launcher.read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+          if not first.startswith("#!"):
+              raise SystemExit(f"cannot resolve Python from launcher: {launcher}")
+          print(first[2:].strip())
+          PY
+          )"
+
+            (
+              cd "$RUNNER_TEMP"
+              "$tool_python" -c "import core.api"
+            )
+          }
+
+          smoke_install "$WHEEL" "wheel"
+          smoke_install "$SDIST" "sdist"
+
+  # Windows leg: the bash smoke above parses a Unix '#!' launcher shebang that
+  # does not exist on Windows '.exe' shims, so Windows needs its own pwsh smoke.
+  # This is the oracle the dev host (Linux) cannot be.
+  install-smoke-windows:
+    name: windows-latest / Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+      MARVIS_TELEMETRY: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Ensure uv-managed Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist
+
+      - name: Smoke (Windows, pwsh)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Install the wheel as a uv tool under the matrix Python. The .exe shim
+          # lands in %USERPROFILE%\.local\bin, which is NOT on PATH by default.
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          uv tool install --force --python ${{ matrix.python-version }} $wheel
+          if ($LASTEXITCODE -ne 0) { Write-Error "tool install failed"; exit 1 }
+          $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
+
+          # pwsh does NOT auto-fail on a native non-zero exit -> assert $LASTEXITCODE.
+          marvis --version; if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (marvis --help | Select-String "doctor")) { Write-Error "doctor missing from --help"; exit 1 }
+
+          # Isolate EVERY write into the runner temp (false-green guard: init must
+          # not touch C:\data or the real profile) and exercise env precedence.
+          $root = Join-Path $env:RUNNER_TEMP "marvis"
+          $env:MARVIS_VAULT_DIR     = $root
+          $env:MARVIS_DB_PATH       = (Join-Path $root "console.db")
+          $env:MARVIS_PROJECTS_ROOT = (Join-Path $root "projects")
+
+          marvis doctor;       if ($LASTEXITCODE -ne 0) { exit 1 }
+          marvis init --accept-bsl --no-interactive --yes --vault-dir $root; if ($LASTEXITCODE -ne 0) { exit 1 }
+          marvis status;       if ($LASTEXITCODE -ne 0) { exit 1 }
+          marvis mcp status;   if ($LASTEXITCODE -ne 0) { exit 1 }
+          marvis project list; if ($LASTEXITCODE -ne 0) { exit 1 }   # the 'No module named pwd' crash - now green
+
+          # Phase 3: schtasks scheduler backend round-trip against the REAL Task Scheduler.
+          marvis brain schedule --enable; if ($LASTEXITCODE -ne 0) { exit 1 }
+          $sched = marvis brain schedule --status --json | ConvertFrom-Json
+          if ($sched.backend -ne "schtasks") { Write-Error "expected schtasks backend, got $($sched.backend)"; exit 1 }
+          if (-not $sched.enabled) { Write-Error "brain schedule not enabled after --enable"; exit 1 }
+          marvis brain schedule --disable; if ($LASTEXITCODE -ne 0) { exit 1 }
+          $sched2 = marvis brain schedule --status --json | ConvertFrom-Json
+          if ($sched2.enabled) { Write-Error "brain schedule still enabled after --disable"; exit 1 }
+
+          # False-green guard: nothing leaked to the legacy /data root.
+          if (Test-Path "C:\data") { Write-Error "writes leaked under C:\data"; exit 1 }
+
+          # Default-resolution assertion (NO env override): the resolved DB must
+          # land under %LOCALAPPDATA%\marvisx, never C:\data nor a bare relative name.
+          Remove-Item Env:\MARVIS_DB_PATH, Env:\MARVIS_PROJECTS_ROOT, Env:\MARVIS_VAULT_DIR
+          $doc = marvis doctor --json | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $rp = $doc | Where-Object { $_.name -eq "resolved_paths" }
+          if (-not $rp) { Write-Error "resolved_paths check missing from doctor --json"; exit 1 }
+          if ($rp.detail -notmatch "AppData\\Local\\marvisx") { Write-Error "default DB not under %LOCALAPPDATA%\marvisx: $($rp.detail)"; exit 1 }
+          if ($rp.detail -match "C:\\data") { Write-Error "default resolved under C:\data: $($rp.detail)"; exit 1 }
