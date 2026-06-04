@@ -1,0 +1,23 @@
+-- v1.0.0 - 2026-04-11 - Add completion_mode to tasks for non-PR task lifecycle
+--
+-- Problem: validate_and_transition_task blocks status=completed for code/system
+-- projects unless a merged PR exists. But research/brainstorm/plan/verify/diagnose
+-- tasks never produce a PR — they produce handoffs, solutions, or nothing tangible.
+-- Result: 32+ marvisx tasks stuck in_progress forever, inflating REM backlog and
+-- driving success_rate to 0.20 (REM sees stale tasks as still-open, proposes
+-- duplicates that get rejected, cycle repeats).
+--
+-- Fix strategy:
+--   1) Add tasks.completion_mode TEXT with values {pr, doc, none}:
+--      - pr    (default, backward compat): requires merged PR to complete
+--      - doc   (research/brainstorm/plan): requires only transition trigger — app
+--              layer can check handoff/solution existence if needed later
+--      - none  (verify/diagnose): free transition, no backend check
+--   2) validate_and_transition_task reads completion_mode and applies guard
+--      only when mode='pr'.
+--   3) MCP create_task and REM SOUL.md pass completion_mode explicitly.
+--
+-- ALTER TABLE lives in Python post-hook _add_task_completion_mode in api/db.py
+-- for idempotency (safe on re-run via _column_exists check).
+
+INSERT OR IGNORE INTO schema_versions (version) VALUES (63);
