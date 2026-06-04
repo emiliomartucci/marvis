@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="48" viewBox="0 0 96 48" fill="none">
+
+  <text x="4" y="36" class="mx bone">m</text>
+  <circle cx="46" cy="24" r="2" class="orange"></circle>
+  <rect x="48" y="22.75" width="8" height="2.5" class="orange"></rect>
+  <circle cx="56" cy="24" r="2" class="orange"></circle>
+  <text x="60" y="36" class="mx orange">x</text>
+</svg>
