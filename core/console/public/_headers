@@ -1,0 +1,5 @@
+/*
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: same-origin
+  Content-Security-Policy: default-src 'self'; connect-src 'self' https://api.justaskmarvis.com wss://api.justaskmarvis.com https://term.justaskmarvis.com:8443 wss://term.justaskmarvis.com:8443; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://api.justaskmarvis.com blob:; frame-src 'self' https://api.justaskmarvis.com blob:
