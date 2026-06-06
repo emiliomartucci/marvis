@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "knipVersion": "6.4.1",
+  "generatedAt": "2026-05-17T16:48:35.505Z",
+  "counts": {
+    "files": 8,
+    "dependencies": 0,
+    "devDependencies": 2,
+    "unlisted": 0,
+    "unresolved": 1,
+    "exports": 67,
+    "types": 60
+  },
+  "total": 138
+}

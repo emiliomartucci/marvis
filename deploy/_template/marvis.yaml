@@ -1,0 +1,34 @@
+workspace:
+  name: "<<WORKSPACE_NAME>>"
+  domain: "<<DOMAIN>>"
+  locale: "it-IT"
+
+api:
+  base_url: "http://api:8100/api/v1"
+  bearer_token_env: "TASKS_API_TOKEN"
+
+agent:
+  id: "<<AGENT_ID>>"
+  display_name: "<<AGENT_NAME>>"
+  owner:
+    name: "<<OWNER_NAME>>"
+    email: "<<EMAIL>>"
+  identity:
+    role: "Company Brain agent"
+    purpose: "Keep project context, tasks, decisions, and handoffs connected."
+    tone: "direct, practical, concise"
+  defaults:
+    task_project: "local-workspace"
+    timezone: "UTC"
+    language: "it"
+
+memory:
+  handoff_path: "/data/workspace/handoffs"
+  learnings_path: "/data/workspace/learnings"
+  documents_path: "/data/workspace/documents"
+
+tools:
+  task_lifecycle: true
+  knowledge_graph: true
+  file_ingest: true
+  notifications: false

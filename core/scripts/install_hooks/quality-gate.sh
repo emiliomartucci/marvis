@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# v1.3.0 - 2026-04-22 - Phase 7.x hygiene: CWD-aware + consolidated git diff + fail-closed
+# v1.2.0 - 2026-04-22 - Phase 7.2: add MCP smoke test (prevents Zod crash regression, learning f2663d51)
+# v1.1.0 - 2026-04-17 - Wire migration version check (migration 082/083 P1)
+# Thin wrapper around core/scripts/safety_bridge.py + migration-version gate
+
+set -euo pipefail
+
+source "$(dirname "$0")/_config.sh"
+
+INPUT=$(cat)
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$HOOK_DIR/safety_bridge.py" ]; then
+  # Self-contained install: `marvis hooks install` ships safety_bridge.py here.
+  BRIDGE="$HOOK_DIR/safety_bridge.py"
+else
+  # Source-checkout fallback: hooks live in .claude/hooks, bridge in core/scripts.
+  BRIDGE="$(cd "$HOOK_DIR/../.." && pwd)/core/scripts/safety_bridge.py"
+fi
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+if ! OUTPUT=$(printf '%s' "$INPUT" | python3 "$BRIDGE" hook --rule quality-gate); then
+  deny "Safety bridge failure (quality-gate) - blocked fail-closed."
+fi
+
+[ -n "$OUTPUT" ] && printf '%s\n' "$OUTPUT"
+
+# CWD extraction from PreToolUse payload (Phase 7.x hygiene fix).
+# Previously we used REPO_ROOT fisso = workspace main → worktree commits were
+# blocked when main had unrelated staged files. Now we honour payload.cwd after
+# realpath + allow-list validation (prevents fake-repo bypass, security MEDIUM).
+CWD_RESOLVED=$(printf '%s' "$INPUT" | REPO_ROOT="$REPO_ROOT" python3 -c "
+import sys, json, os
+try:
+    d = json.load(sys.stdin)
+    cwd_raw = d.get('cwd') or os.environ.get('REPO_ROOT', '')
+    if not cwd_raw:
+        sys.exit(0)
+    cwd = os.path.realpath(cwd_raw)
+    # Allow-list = REPO_ROOT (where \$CLAUDE_PROJECT_DIR points) + any extra
+    # worktree dirs declared in MARVIS_WORKTREE_DIRS (os.pathsep list). De-hardcoded
+    # (S2 F2): no internal path baked into the shipped hook. On the Marvis server,
+    # the worktree dir is injected via the .claude/settings.json env block (so
+    # existing worktree commits stay allowed); OSS users (env unset) get REPO_ROOT
+    # only — they work in the repo, not external worktrees.
+    allowed = tuple(
+        os.path.realpath(p)
+        for p in [
+            os.environ.get('REPO_ROOT') or os.getcwd(),
+            *os.environ.get('MARVIS_WORKTREE_DIRS', '').split(os.pathsep),
+        ]
+        if p
+    )
+    if not any(cwd == a or cwd.startswith(a + os.sep) for a in allowed):
+        sys.exit(0)
+    print(cwd)
+except Exception:
+    pass
+" 2>/dev/null || true)
+
+if [ -z "$CWD_RESOLVED" ]; then
+  CWD_RESOLVED="$REPO_ROOT"
+fi
+
+# Consolidated git diff --cached call (julik P1). Previously migration check
+# and MCP check ran two separate subprocess.run invocations → race window +
+# double cost. Now one call, shared between both checks.
+# Fail-closed philosophy: only run if `git commit` is the actual command; a git
+# error inside an allow-listed worktree leaves STAGED_FILES empty (subsequent
+# checks no-op) rather than silently skipping with misleading green.
+STAGED_FILES=""
+CMD_KIND=$(printf '%s' "$INPUT" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    cmd = d.get('tool_input', {}).get('command', '') or ''
+    if 'git' in cmd and 'commit' in cmd:
+        print('commit')
+except Exception:
+    pass
+" 2>/dev/null || true)
+
+if [ "$CMD_KIND" = "commit" ] && [ -d "$CWD_RESOLVED/.git" -o -f "$CWD_RESOLVED/.git" ]; then
+  if ! STAGED_FILES=$(cd "$CWD_RESOLVED" && git diff --cached --name-only 2>/dev/null); then
+    echo "Quality gate: git diff --cached failed in $CWD_RESOLVED" >&2
+    STAGED_FILES=""
+  fi
+fi
+
+# Migration version gate: run when staging SQL migration files
+STAGED_MIGRATIONS=$(printf '%s' "$STAGED_FILES" | python3 -c "
+import sys
+staged = [line for line in sys.stdin.read().splitlines() if line]
+migrations = [f for f in staged if f.startswith('migrations/') and f.endswith('.sql')]
+if migrations:
+    print(' '.join(migrations))
+" 2>/dev/null || true)
+
+if [[ -n "$STAGED_MIGRATIONS" ]]; then
+  MIG_CHECK="$REPO_ROOT/core/scripts/check-migration-version.sh"
+  if [[ -x "$MIG_CHECK" ]]; then
+    if ! (cd "$CWD_RESOLVED" && bash "$MIG_CHECK" 2>&1); then
+      deny "Migration version gate failed. Local migration version must be > production. See core/scripts/check-migration-version.sh output above."
+    fi
+  fi
+fi
+
+# MCP smoke test (S2 F2) — learning f2663d51: a schema/registration crash makes
+# tools/list return fewer tools than baseline silently; all MCP clients then see
+# a degraded tool set. We catch it BEFORE the commit lands. S1 moved the server
+# from Node (mcp-pir/index.mjs) to Python (core/api/mcp/), so we trigger on staged
+# files under core/api/mcp/ and round-trip the Python server in-process.
+#
+# MARVIS_MCP_MIN_TOOLS = baseline assertion (default 61, the S1 OSS baseline).
+# NOT hardcoded to 91 — the OSS server ships fewer tools by design.
+#
+# GRACEFUL SKIP: if the `mcp` SDK (or any optional dependency) isn't importable
+# in the hook's environment, the smoke SKIPS (treated as pass). It MUST NEVER
+# fail-closed on a missing dependency — that would block every commit on a host
+# that simply lacks the MCP runtime (this hook also fires on the Marvis server,
+# where `mcp` is not installed). It runs the real check only in Docker/CI where
+# the dependency exists (never a host build — learning 3ffb65ef).
+STAGED_MCP=$(printf '%s' "$STAGED_FILES" | python3 -c "
+import sys
+staged = [line for line in sys.stdin.read().splitlines() if line]
+mcp_files = [f for f in staged if f.startswith('core/api/mcp/') and f.endswith('.py')]
+if mcp_files:
+    print(' '.join(mcp_files))
+" 2>/dev/null || true)
+
+if [[ -n "$STAGED_MCP" ]]; then
+  MIN_TOOLS="${MARVIS_MCP_MIN_TOOLS:-61}"
+  # One in-process round-trip: import the server module + list_tools(). Emits
+  # exactly one token on stdout: SKIP (deps missing → pass), an integer (tool
+  # count), or FAIL:<reason> (genuine server breakage → block).
+  SMOKE=$(cd "$CWD_RESOLVED" && MARVIS_OSS_LOCAL=1 python3 -c "
+import sys, asyncio
+try:
+    import mcp  # the FastMCP SDK — optional dependency
+except ImportError:
+    print('SKIP'); sys.exit(0)
+try:
+    from core.api.mcp.server import mcp as server
+except ImportError as exc:
+    # A missing optional dependency pulled in by the server (NOT the server's own
+    # code being broken) must also skip, never block. The SDK is already present
+    # here, so a remaining ImportError is a transitive optional dep → skip.
+    print('SKIP'); sys.exit(0)
+except Exception as exc:  # syntax/registration error inside the server module
+    print('FAIL:' + repr(exc)[:300]); sys.exit(0)
+try:
+    tools = asyncio.run(server.list_tools())
+    print(len(tools))
+except Exception as exc:
+    print('FAIL:' + repr(exc)[:300])
+" 2>/dev/null || echo SKIP)
+
+  case "$SMOKE" in
+    SKIP|"")
+      : ;;  # deps unavailable → smoke skipped, allow.
+    FAIL:*)
+      deny "MCP smoke test: 'import core.api.mcp.server' failed → ${SMOKE#FAIL:}. The MCP server module is broken; fix before commit (see learning f2663d51)." ;;
+    *)
+      if [[ "$SMOKE" =~ ^[0-9]+$ ]] && [[ "$SMOKE" -lt "$MIN_TOOLS" ]]; then
+        deny "MCP smoke test: tools/list returned $SMOKE tools (expected >= $MIN_TOOLS, the S1 OSS baseline). Likely a tool registration crash — see learning f2663d51."
+      fi ;;
+  esac
+fi
+
+exit 0
