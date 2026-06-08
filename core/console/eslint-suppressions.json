@@ -1,0 +1,291 @@
+{
+  "src/app/(app)/settings/activity/page.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/app/(app)/settings/general/page.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/app/(app)/settings/teams/page.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 2
+    }
+  },
+  "src/app/(app)/settings/users/page.tsx": {
+    "react/no-unescaped-entities": {
+      "count": 1
+    },
+    "sonarjs/no-dead-store": {
+      "count": 1
+    },
+    "sonarjs/no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/components/SessionSidebar.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 2
+    },
+    "sonarjs/no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/components/Terminal.tsx": {
+    "sonarjs/no-invariant-returns": {
+      "count": 1
+    },
+    "sonarjs/slow-regex": {
+      "count": 1
+    }
+  },
+  "src/components/finder/FileListItem.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/components/finder/FileViewer.tsx": {
+    "sonarjs/cognitive-complexity": {
+      "count": 1
+    },
+    "sonarjs/no-nested-conditional": {
+      "count": 4
+    }
+  },
+  "src/components/finder/UploadModal.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    },
+    "sonarjs/no-nested-functions": {
+      "count": 1
+    }
+  },
+  "src/components/finder/viewers/CodeEditor.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 3
+    }
+  },
+  "src/components/inbox/ActionViewIcon.tsx": {
+    "sonarjs/no-nested-template-literals": {
+      "count": 1
+    }
+  },
+  "src/components/inbox/ActionViewModal.tsx": {
+    "sonarjs/cognitive-complexity": {
+      "count": 1
+    },
+    "sonarjs/no-nested-conditional": {
+      "count": 4
+    },
+    "sonarjs/no-nested-functions": {
+      "count": 1
+    }
+  },
+  "src/components/monitoring/DiskTreemap.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/components/monitoring/HealthBar.tsx": {
+    "sonarjs/cognitive-complexity": {
+      "count": 1
+    }
+  },
+  "src/components/monitoring/charts/TimeframeSelector.tsx": {
+    "sonarjs/use-type-alias": {
+      "count": 1
+    }
+  },
+  "src/components/monitoring/sections/DockerSection.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/components/monitoring/sections/SecuritySection.tsx": {
+    "sonarjs/cognitive-complexity": {
+      "count": 1
+    },
+    "sonarjs/no-nested-conditional": {
+      "count": 3
+    }
+  },
+  "src/components/newsletter/ArchiveTab.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 2
+    }
+  },
+  "src/components/newsletter/ComposeTab.tsx": {
+    "sonarjs/slow-regex": {
+      "count": 1
+    }
+  },
+  "src/components/newsletter/RecipientsTab.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/components/notifications/NotificationItem.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 2
+    }
+  },
+  "src/components/projects/BillingTab.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 2
+    }
+  },
+  "src/components/projects/CommentThread.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/components/projects/CostsTab.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/components/projects/DocsTab.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 2
+    }
+  },
+  "src/components/projects/GitGraph.tsx": {
+    "sonarjs/cognitive-complexity": {
+      "count": 1
+    },
+    "sonarjs/no-nested-conditional": {
+      "count": 8
+    },
+    "sonarjs/single-char-in-character-classes": {
+      "count": 1
+    },
+    "sonarjs/unused-import": {
+      "count": 2
+    }
+  },
+  "src/components/projects/HandoffsTab.tsx": {
+    "sonarjs/unused-import": {
+      "count": 1
+    }
+  },
+  "src/components/projects/KanbanBoard.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/components/projects/OverviewTab.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    },
+    "sonarjs/unused-import": {
+      "count": 6
+    }
+  },
+  "src/components/projects/RaciTab.tsx": {
+    "sonarjs/no-dead-store": {
+      "count": 1
+    },
+    "sonarjs/no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/components/projects/TaskDetailModal.tsx": {
+    "sonarjs/regex-complexity": {
+      "count": 1
+    },
+    "sonarjs/slow-regex": {
+      "count": 1
+    },
+    "sonarjs/void-use": {
+      "count": 1
+    }
+  },
+  "src/components/settings/ActivityLogFilters.tsx": {
+    "sonarjs/unused-import": {
+      "count": 1
+    }
+  },
+  "src/components/settings/InviteUserModal.tsx": {
+    "sonarjs/slow-regex": {
+      "count": 1
+    }
+  },
+  "src/components/sources/SourceCard.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 2
+    }
+  },
+  "src/components/sources/SourcesDashboard.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/components/triage/CIChecksList.tsx": {
+    "sonarjs/cognitive-complexity": {
+      "count": 1
+    },
+    "sonarjs/no-nested-conditional": {
+      "count": 2
+    }
+  },
+  "src/components/triage/ScoreInput.tsx": {
+    "sonarjs/no-nested-conditional": {
+      "count": 1
+    }
+  },
+  "src/components/triage/TriageKanban.tsx": {
+    "sonarjs/duplicates-in-character-class": {
+      "count": 3
+    },
+    "sonarjs/no-dead-store": {
+      "count": 1
+    },
+    "sonarjs/no-nested-conditional": {
+      "count": 2
+    },
+    "sonarjs/no-nested-template-literals": {
+      "count": 2
+    },
+    "sonarjs/no-unused-vars": {
+      "count": 1
+    },
+    "sonarjs/slow-regex": {
+      "count": 3
+    },
+    "sonarjs/unused-import": {
+      "count": 1
+    }
+  },
+  "src/hooks/useActionView.ts": {
+    "sonarjs/void-use": {
+      "count": 1
+    }
+  },
+  "src/hooks/useNotifications.ts": {
+    "sonarjs/no-nested-functions": {
+      "count": 3
+    }
+  },
+  "src/lib/api.ts": {
+    "sonarjs/no-nested-template-literals": {
+      "count": 9
+    }
+  },
+  "src/lib/gitGraphLayout.ts": {
+    "sonarjs/cognitive-complexity": {
+      "count": 1
+    }
+  },
+  "src/lib/terminalDiagnostics.ts": {
+    "sonarjs/pseudo-random": {
+      "count": 1
+    }
+  },
+  "src/lib/ws.ts": {
+    "sonarjs/pseudo-random": {
+      "count": 1
+    }
+  }
+}

@@ -1,0 +1,47 @@
+THIRD-PARTY LICENSES
+====================
+
+MarvisX is distributed under the Business Source License 1.1 (see LICENSE).
+It bundles or depends on third-party components under their own licenses.
+This file records the notices required for redistribution.
+
+Most dependencies are under MIT, Apache-2.0, or BSD licenses. The components
+below carry redistribution-notice obligations and are listed explicitly.
+
+-----------------------------------------------------------------------------
+MPL-2.0 (Mozilla Public License 2.0) — file-level weak copyleft
+-----------------------------------------------------------------------------
+
+These components are redistributed unmodified. Their source is available from
+the upstream URLs below. If any of these files are modified, the modified files
+must be released under MPL-2.0.
+
+  - pywebpush
+      Copyright Mozilla and contributors.
+      Source: https://github.com/web-push-libs/pywebpush
+      License: https://www.mozilla.org/en-US/MPL/2.0/
+
+  - py-vapid
+      Copyright Mozilla and contributors.
+      Source: https://github.com/web-push-libs/vapid
+      License: https://www.mozilla.org/en-US/MPL/2.0/
+
+  - dompurify
+      Copyright Dr.-Ing. Mario Heiderich, Cure53 and contributors.
+      Source: https://github.com/cure53/DOMPurify
+      Dual-licensed Apache-2.0 OR MPL-2.0; for this distribution the licensee
+      elects: Apache License, Version 2.0.
+
+-----------------------------------------------------------------------------
+GPLv2 with linking exception
+-----------------------------------------------------------------------------
+
+  - pygit2
+      Licensed under GPLv2 with a linking exception (GCC libgcc model), which
+      permits linking from software under any license without propagating GPL.
+      Source: https://github.com/libgit2/pygit2
+
+-----------------------------------------------------------------------------
+
+Full dependency license inventory: see docs/audits/2026-05-19-license-audit-deps.md
+in the canonical repository.
