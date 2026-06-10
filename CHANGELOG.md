@@ -6,6 +6,19 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+_(nothing yet)_
+
+## [v0.3.8] - 2026-06-10
+
+The "measured memory" release: we benchmarked our own retrieval against a
+plain-files agent across 314 judged runs — and shipped the fixes the data
+demanded. With the engine flags on, Marvis now wins the largest category
+outright (facts that changed over time: it returns the CURRENT value, with the
+evidence span inline) and never invents when it doesn't know. A default install
+still behaves like v0.3.7 — every engine feature below is opt-in behind a flag.
+Also in this release: install completeness in `marvis doctor`, a human `marvis
+task` surface, and the Brain on your Claude Code subscription with zero API key.
+
 ### Added
 - **Evidence spans in search results**, behind `MARVIS_SEARCH_SPANS` (requires `MARVIS_CHUNKING` for the write side): the semantic lane max-pools chunk-level matches into the document ranking and each file-backed hit carries the winning chunk's text expanded to line boundaries ±12 lines (`span_text` / `span_path` / `span_line_start` / `span_line_end`), so an agent can answer FROM the search result without a follow-up file read. Additive fields, `null` when the flag is off or the hit is row-backed; fail-soft when the source file moved. Chunking now also runs on the generic document upsert and the reindex paths (previously a single write path), keeping the chunk sidecar fresh.
 - **Orchestration-ready MCP tools.** New `project_impact(slug)` — the project-level blast radius ("what blocks if I pause/close this project"), distinct from the code graph. The graph tool descriptions are rewritten for an agent acting as a cross-project orchestrator (dropped the `[Power-user]` gating and the "use get_project instead" steering), the MCP server ships an `instructions` decision tree (task-type → tool), and `session_brief` suggests `project_impact` on cross-project work. The cold-start core is marked `alwaysLoad` so tool-search clients defer the rest of the ~70-tool surface.
@@ -17,6 +30,7 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 - **Run the Brain on your Claude Code subscription — no API key** (`BRAIN_LLM_PROVIDER=claude_cli`). A new Brain LLM backend that calls `claude -p` (headless) as a subprocess instead of an HTTP gateway, so `marvis brain run` produces polished narrative with zero API key. Default stays `gateway` (unchanged). Pure generation (no tools), fail-soft: any error/timeout degrades transparently to the deterministic baseline.
 
 ### Fixed
+- **`marvis doctor --json` is an ARRAY again** (kept the documented contract): a beta briefly wrapped the check list in an object, breaking every consumer that iterates it — caught by the Windows E2E probe. The onboarding-completion block now rides as one additive array element (`name: "onboarding_completion"`, full payload under `summary`); a parity test pins the response contract.
 - **Evidence spans were always `null` for MCP/HTTP consumers** (`0.3.8b6` regression, caught by an external acceptance run): the search engine attached `span_text`/`span_path`/`span_line_*` to its hits, but the response builder dropped them when constructing the API model — with the flags on and chunks populated, every consumer saw `null` spans. The fields are now propagated, and a parity test pins the response contract so a model field can no longer ship half-wired.
 - **Full-text search lost document bodies on every write** (behind `MARVIS_FTS_BODIES`, default off): the `documents_fts` sync triggers stored the file *path* instead of the body, so any document written or updated after the one-time migration backfill was invisible to keyword search on its content — keyword ranking systematically favoured OLD document versions. With the flag on, every document write now refreshes the full-text row with the real title+body in the same transaction; `core/scripts/backfill_documents_fts.py` repairs historical rows (idempotent, batched).
 - `create_learning` no longer fails with `table learnings has no column named valid_from` on a brain upgraded from `<=0.3.7`: pending migrations now apply on every entry point (CLI / MCP / brain, not just `marvis init`), and `valid_from` is written only under the temporal flag. The migration-016 admin seed also no longer aborts a fresh-DB boot when no admin password is configured — single-user installs skip the seed instead of crashing. Closes #12.
@@ -27,9 +41,9 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 ### Known limitations
 - `project_impact` and project-level graph reasoning need a **populated** Knowledge Graph. On a fresh install the graph is empty — `marvis project import` registers a project but does not index its topology (`import != index`), so `project_impact` returns "node not found" until you run `marvis project index <slug>` and cross-project dependency edges exist. The orchestration benefit is real once the graph is populated; out of the box it is not there yet. Auto-populating the graph on import (or degrading `project_impact` to the brief's file view) is a planned follow-up.
 
-_Pre-released for testing as `0.3.8bN`. Install with `pip install "marvisx-cli==0.3.8b7"` (or `uv tool install "marvisx-cli==0.3.8b7"`)._
+_Iterated through betas `0.3.8b1`-`0.3.8b7` (packaging validated on a fresh-install cross-OS matrix; retrieval validated by a 314-cell blind-judged benchmark). Install: `pip install marvisx-cli` (or `uv tool install marvisx-cli`)._
 
-_Note: `0.3.8b2` was **yanked** — a stale wheel built before the migration-016 fix reached PyPI (which is write-once) and crashed a fresh-DB boot. Use `0.3.8b7`._
+_Note: `0.3.8b2` was **yanked** — a stale wheel built before the migration-016 fix reached PyPI (which is write-once) and crashed a fresh-DB boot. Use `0.3.8`._
 
 ## [v0.3.7] - 2026-06-04
 
