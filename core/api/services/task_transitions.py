@@ -1,0 +1,146 @@
+# v1.5.0 - 2026-04-12 - Add WIP limit check on approved -> in_progress transition
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+import aiosqlite
+
+from core.api.config import settings
+from core.api.models import VALID_TRANSITIONS
+
+logger = logging.getLogger(__name__)
+
+
+async def validate_and_transition_task(
+    db: aiosqlite.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    trigger: str = "manual",
+    auto_commit: bool = True,
+) -> None:
+    """Validate and apply a task status transition.
+
+    Used by both tasks.py PATCH and pr_service.py auto-transitions.
+    Raises ValueError if the transition is not allowed.
+    No-op if already in the target status.
+
+    The code/system "require merged PR" guard only fires when the task has
+    completion_mode='pr' (the default, backward-compatible). Research tasks
+    created with completion_mode='doc' or 'none' transition freely and are
+    expected to be closed by the agent/human once the doc/handoff exists.
+    """
+    cursor = await db.execute(
+        "SELECT id, status, completion_mode FROM tasks WHERE id = ? AND deleted_at IS NULL",
+        (task_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        raise ValueError(f"Task not found: {task_id}")
+
+    current = row["status"]
+    # completion_mode may be None on rows predating migration 063; treat as "pr" (strict default).
+    try:
+        completion_mode = row["completion_mode"] or "pr"
+    except (IndexError, KeyError):
+        completion_mode = "pr"
+
+    if current == new_status:
+        logger.debug("Task %s already in status %s (trigger=%s), no-op", task_id, new_status, trigger)
+        return
+
+    allowed = VALID_TRANSITIONS.get(current, set())
+    if new_status not in allowed:
+        raise ValueError(
+            f"Invalid transition: {current} → {new_status} "
+            f"(allowed: {sorted(allowed)}, trigger={trigger})"
+        )
+
+    # WIP guard: limit concurrent in_progress tasks per project.
+    # doc/none completion_mode tasks count as 0.5 WIP slots.
+    if new_status == "in_progress" and current == "approved":
+        proj_cursor = await db.execute(
+            "SELECT project FROM tasks WHERE id = ?", (task_id,)
+        )
+        proj_row = await proj_cursor.fetchone()
+        if proj_row and proj_row["project"]:
+            project_slug = proj_row["project"]
+            wip_cursor = await db.execute(
+                "SELECT completion_mode FROM tasks "
+                "WHERE project = ? AND status = 'in_progress' "
+                "AND deleted_at IS NULL AND id != ?",
+                (project_slug, task_id),
+            )
+            wip_rows = await wip_cursor.fetchall()
+            wip_count = 0.0
+            for wip_row in wip_rows:
+                try:
+                    cm = wip_row["completion_mode"] or "pr"
+                except (IndexError, KeyError):
+                    cm = "pr"
+                wip_count += 0.5 if cm in ("doc", "none") else 1.0
+            if wip_count >= settings.wip_max_in_progress:
+                raise ValueError(
+                    f"WIP limit reached: project '{project_slug}' already has "
+                    f"{wip_count} in_progress tasks (limit: {settings.wip_max_in_progress}). "
+                    f"Complete or fail existing tasks before starting new ones."
+                )
+
+    # Guard: block completed transition while a PR is still open.
+    # Applies to tasks that actually have a PR lifecycle. Research/doc/none
+    # tasks shouldn't have an open PR, but we keep the check defensive so a
+    # stray draft PR attached to a research task still blocks completion.
+    # Skipped for pr_merge trigger (PR is already set to 'merged' before this).
+    if new_status == "completed" and trigger != "pr_merge":
+        pr_cursor = await db.execute(
+            "SELECT id FROM pull_requests"
+            " WHERE task_id = ? AND status IN ('draft', 'open', 'merging') LIMIT 1",
+            (task_id,),
+        )
+        if await pr_cursor.fetchone():
+            raise ValueError(
+                f"Cannot transition task {task_id} to completed: PR is still open (trigger={trigger})"
+            )
+
+    # Guard: merged-PR requirement applies ONLY to completion_mode='pr'.
+    # Research/plan/verify tasks (doc|none) bypass this guard and transition
+    # freely, because they don't produce a PR as their deliverable.
+    # Anti-zombie: pr_merge (direct), closed_by_sibling_pr (task A: PR body
+    # parser auto-closes tasks bundled in PR body), handoff_written (task B:
+    # post-index handoff marks preparation tasks done).
+    if (
+        new_status == "completed"
+        and trigger not in ("pr_merge", "closed_by_sibling_pr", "handoff_written")
+        and completion_mode == "pr"
+    ):
+        from core.api.routers.projects import _find_git_path
+        # Get project slug for this task
+        proj_cursor = await db.execute(
+            "SELECT project FROM tasks WHERE id = ?", (task_id,)
+        )
+        proj_row = await proj_cursor.fetchone()
+        if proj_row and _find_git_path(proj_row["project"]):
+            # Project has git repo — require merged PR
+            merged_cursor = await db.execute(
+                "SELECT id FROM pull_requests WHERE task_id = ? AND status = 'merged' LIMIT 1",
+                (task_id,),
+            )
+            if not await merged_cursor.fetchone():
+                raise ValueError(
+                    f"Code/system projects with completion_mode='pr' require a merged PR. "
+                    f"Use the PR workflow, set trigger='pr_merge', or create the task with "
+                    f"completion_mode='doc' (research/plan) or 'none' (verify/diagnose)."
+                )
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+        (new_status, now, task_id),
+    )
+    if auto_commit:
+        await db.commit()
+    logger.info(
+        "Task %s: %s → %s (trigger=%s, completion_mode=%s)",
+        task_id, current, new_status, trigger, completion_mode,
+    )
