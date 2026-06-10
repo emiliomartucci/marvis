@@ -1,0 +1,3 @@
+DROP INDEX IF EXISTS idx_graph_edges_source_active_target;
+DROP INDEX IF EXISTS idx_graph_edges_target_active_source;
+DROP INDEX IF EXISTS idx_graph_nodes_project_lastseen_active;

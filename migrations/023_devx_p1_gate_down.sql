@@ -1,0 +1,3 @@
+-- Note: ALTER TABLE DROP COLUMN requires SQLite >= 3.35
+-- If needed, recreate table without p1_gate_notified_at and p1_gate_blocked_by
+-- This migration adds nullable columns so rollback is safe to skip in production
