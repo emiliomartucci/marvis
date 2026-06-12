@@ -1,0 +1,85 @@
+#!/usr/bin/env node
+import { execSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+
+function readBaseline() {
+  try {
+    return JSON.parse(readFileSync('.eslint-baseline.json', 'utf8'))
+  } catch (error) {
+    console.error('Failed to read .eslint-baseline.json:', error.message)
+    console.error('Run: npm run lint:baseline')
+    process.exit(2)
+  }
+}
+
+function runEslint() {
+  try {
+    return execSync('node_modules/.bin/eslint . --format json', {
+      encoding: 'utf8',
+      maxBuffer: 20 * 1024 * 1024,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+  } catch (error) {
+    const output = error.stdout || ''
+    if (!output) {
+      console.error('ESLint produced no JSON output:', error.stderr || error.message)
+      process.exit(2)
+    }
+    return output
+  }
+}
+
+function summarize(results) {
+  const summary = {
+    totals: { errors: 0, warnings: 0 },
+    rules: {},
+  }
+
+  for (const file of results) {
+    summary.totals.errors += file.errorCount ?? 0
+    summary.totals.warnings += file.warningCount ?? 0
+
+    for (const message of file.messages ?? []) {
+      const ruleId = message.ruleId || '<unknown>'
+      if (!summary.rules[ruleId]) {
+        summary.rules[ruleId] = { errors: 0, warnings: 0 }
+      }
+      if (message.severity === 2) {
+        summary.rules[ruleId].errors += 1
+      } else if (message.severity === 1) {
+        summary.rules[ruleId].warnings += 1
+      }
+    }
+  }
+
+  return summary
+}
+
+const baseline = readBaseline()
+const current = summarize(JSON.parse(runEslint()))
+const regressions = []
+
+for (const [ruleId, counts] of Object.entries(current.rules)) {
+  const baselineCounts = baseline.rules?.[ruleId] || { errors: 0, warnings: 0 }
+  const errorDelta = counts.errors - baselineCounts.errors
+  const warningDelta = counts.warnings - baselineCounts.warnings
+  if (errorDelta > 0 || warningDelta > 0) {
+    regressions.push({ ruleId, errorDelta, warningDelta })
+  }
+}
+
+if (regressions.length > 0) {
+  console.error('ESLint baseline regression detected\n')
+  for (const item of regressions) {
+    const parts = []
+    if (item.errorDelta > 0) parts.push(`errors +${item.errorDelta}`)
+    if (item.warningDelta > 0) parts.push(`warnings +${item.warningDelta}`)
+    console.error(`  ${item.ruleId}: ${parts.join(', ')}`)
+  }
+  console.error('\nFix the new ESLint findings or intentionally refresh the baseline with justification.')
+  process.exit(1)
+}
+
+console.log('ESLint OK -- no regressions')
+console.log(`  Errors: ${current.totals.errors} (baseline: ${baseline.totals?.errors ?? 0})`)
+console.log(`  Warnings: ${current.totals.warnings} (baseline: ${baseline.totals?.warnings ?? 0})`)

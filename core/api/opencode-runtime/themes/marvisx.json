@@ -1,0 +1,231 @@
+{
+  "$schema": "https://opencode.ai/theme.json",
+  "defs": {
+    "mx_dark_base": "#0b1520",
+    "mx_dark_panel": "#0f1b29",
+    "mx_dark_element": "#162434",
+    "mx_dark_border": "#23384f",
+    "mx_dark_border_active": "#3e7eff",
+    "mx_dark_text": "#edf4ff",
+    "mx_dark_text_muted": "#94a8c2",
+    "mx_dark_accent": "#3e7eff",
+    "mx_dark_secondary": "#62b0ff",
+    "mx_dark_success": "#31c48d",
+    "mx_dark_warning": "#f5b942",
+    "mx_dark_error": "#ff6b6b",
+    "mx_light_base": "#f4f8fd",
+    "mx_light_panel": "#ffffff",
+    "mx_light_element": "#e9f0f8",
+    "mx_light_border": "#c4d4e6",
+    "mx_light_border_active": "#2563eb",
+    "mx_light_text": "#072543",
+    "mx_light_text_muted": "#5d728a",
+    "mx_light_accent": "#2563eb",
+    "mx_light_secondary": "#3e7eff",
+    "mx_light_success": "#0f9f6e",
+    "mx_light_warning": "#c98512",
+    "mx_light_error": "#d64545"
+  },
+  "theme": {
+    "primary": {
+      "dark": "mx_dark_accent",
+      "light": "mx_light_accent"
+    },
+    "secondary": {
+      "dark": "mx_dark_secondary",
+      "light": "mx_light_secondary"
+    },
+    "accent": {
+      "dark": "mx_dark_accent",
+      "light": "mx_light_accent"
+    },
+    "error": {
+      "dark": "mx_dark_error",
+      "light": "mx_light_error"
+    },
+    "warning": {
+      "dark": "mx_dark_warning",
+      "light": "mx_light_warning"
+    },
+    "success": {
+      "dark": "mx_dark_success",
+      "light": "mx_light_success"
+    },
+    "info": {
+      "dark": "mx_dark_secondary",
+      "light": "mx_light_secondary"
+    },
+    "text": {
+      "dark": "mx_dark_text",
+      "light": "mx_light_text"
+    },
+    "textMuted": {
+      "dark": "mx_dark_text_muted",
+      "light": "mx_light_text_muted"
+    },
+    "background": {
+      "dark": "mx_dark_base",
+      "light": "mx_light_base"
+    },
+    "backgroundPanel": {
+      "dark": "mx_dark_panel",
+      "light": "mx_light_panel"
+    },
+    "backgroundElement": {
+      "dark": "mx_dark_element",
+      "light": "mx_light_element"
+    },
+    "border": {
+      "dark": "mx_dark_border",
+      "light": "mx_light_border"
+    },
+    "borderActive": {
+      "dark": "mx_dark_border_active",
+      "light": "mx_light_border_active"
+    },
+    "borderSubtle": {
+      "dark": "mx_dark_border",
+      "light": "mx_light_border"
+    },
+    "diffAdded": {
+      "dark": "mx_dark_success",
+      "light": "mx_light_success"
+    },
+    "diffRemoved": {
+      "dark": "mx_dark_error",
+      "light": "mx_light_error"
+    },
+    "diffContext": {
+      "dark": "mx_dark_text_muted",
+      "light": "mx_light_text_muted"
+    },
+    "diffHunkHeader": {
+      "dark": "mx_dark_secondary",
+      "light": "mx_light_secondary"
+    },
+    "diffHighlightAdded": {
+      "dark": "mx_dark_success",
+      "light": "mx_light_success"
+    },
+    "diffHighlightRemoved": {
+      "dark": "mx_dark_error",
+      "light": "mx_light_error"
+    },
+    "diffAddedBg": {
+      "dark": "#10261d",
+      "light": "#ddf7ec"
+    },
+    "diffRemovedBg": {
+      "dark": "#2a1418",
+      "light": "#fde7e7"
+    },
+    "diffContextBg": {
+      "dark": "mx_dark_panel",
+      "light": "mx_light_panel"
+    },
+    "diffLineNumber": {
+      "dark": "mx_dark_text_muted",
+      "light": "mx_light_text_muted"
+    },
+    "diffAddedLineNumberBg": {
+      "dark": "#10261d",
+      "light": "#ddf7ec"
+    },
+    "diffRemovedLineNumberBg": {
+      "dark": "#2a1418",
+      "light": "#fde7e7"
+    },
+    "markdownText": {
+      "dark": "mx_dark_text",
+      "light": "mx_light_text"
+    },
+    "markdownHeading": {
+      "dark": "mx_dark_secondary",
+      "light": "mx_light_secondary"
+    },
+    "markdownLink": {
+      "dark": "mx_dark_accent",
+      "light": "mx_light_accent"
+    },
+    "markdownLinkText": {
+      "dark": "mx_dark_secondary",
+      "light": "mx_light_secondary"
+    },
+    "markdownCode": {
+      "dark": "#8bd8ff",
+      "light": "#0b5bd3"
+    },
+    "markdownBlockQuote": {
+      "dark": "mx_dark_text_muted",
+      "light": "mx_light_text_muted"
+    },
+    "markdownEmph": {
+      "dark": "#ffbf66",
+      "light": "#b56d00"
+    },
+    "markdownStrong": {
+      "dark": "#fff1a3",
+      "light": "#7b5b00"
+    },
+    "markdownHorizontalRule": {
+      "dark": "mx_dark_border",
+      "light": "mx_light_border"
+    },
+    "markdownListItem": {
+      "dark": "mx_dark_secondary",
+      "light": "mx_light_secondary"
+    },
+    "markdownListEnumeration": {
+      "dark": "mx_dark_accent",
+      "light": "mx_light_accent"
+    },
+    "markdownImage": {
+      "dark": "mx_dark_secondary",
+      "light": "mx_light_secondary"
+    },
+    "markdownImageText": {
+      "dark": "mx_dark_text_muted",
+      "light": "mx_light_text_muted"
+    },
+    "markdownCodeBlock": {
+      "dark": "mx_dark_text",
+      "light": "mx_light_text"
+    },
+    "syntaxComment": {
+      "dark": "mx_dark_text_muted",
+      "light": "mx_light_text_muted"
+    },
+    "syntaxKeyword": {
+      "dark": "#8db6ff",
+      "light": "#2750c6"
+    },
+    "syntaxFunction": {
+      "dark": "#79d4ff",
+      "light": "#0068b5"
+    },
+    "syntaxVariable": {
+      "dark": "#d6e8ff",
+      "light": "#16395f"
+    },
+    "syntaxString": {
+      "dark": "#7fe3b4",
+      "light": "#0f8a5f"
+    },
+    "syntaxNumber": {
+      "dark": "#ffb26b",
+      "light": "#b86500"
+    },
+    "syntaxType": {
+      "dark": "#b8c8ff",
+      "light": "#3b57c4"
+    },
+    "syntaxOperator": {
+      "dark": "mx_dark_accent",
+      "light": "mx_light_accent"
+    },
+    "syntaxPunctuation": {
+      "dark": "mx_dark_text",
+      "light": "mx_light_text"
+    }
+  }
+}

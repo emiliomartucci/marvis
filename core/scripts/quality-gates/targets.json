@@ -1,0 +1,15 @@
+{
+  "_comment": "Per-deployment rollout manifest. Populate `targets` with your own project slugs and repo paths. Override the file location with the QUALITY_GATES_TARGETS_FILE env var. Schema example below.",
+  "_example": {
+    "my-project": {
+      "mode": "standard-root",
+      "repo_path": "/path/to/repos/my-project"
+    },
+    "my-subdir-project": {
+      "mode": "subdir-root",
+      "repo_path": "/path/to/repos/my-subdir-project",
+      "subdir": "src"
+    }
+  },
+  "targets": {}
+}
