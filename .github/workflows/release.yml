@@ -1,0 +1,191 @@
+name: PyPI Publish (trusted publishing)
+
+# Publishes `marvisx-cli` to PyPI on a version tag (`v*`).
+#
+# Trusted publishing (OIDC): GitHub Actions presents a short-lived OIDC token,
+# PyPI exchanges it for an upload token. There is NO username/password and NO
+# long-lived API token in the repo or in secrets — `permissions: id-token:
+# write` is the entire auth story. The `pypi` GitHub Environment gates the real
+# upload behind a required reviewer (configure in repo Settings → Environments).
+#
+# Two jobs:
+#   build — build sdist + wheel, then GATE the wheel for completeness
+#           (learning 9e527cfa: the wheel once shipped 0 data-files while all
+#           unit-tests stayed green because conftest put the repo on sys.path).
+#   pypi  — real publish, only after the build gate passes + a human approves
+#           the `pypi` environment. (A TestPyPI dry-run job was intentionally
+#           dropped: the wheel is already validated by the E2E + build gate, and
+#           TestPyPI needed a separate trusted publisher to be configured.)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build + verify wheel completeness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Console static export in Docker
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD:/repo" \
+            -w /repo/core/console \
+            -e NEXT_PUBLIC_API_URL="" \
+            -e NEXT_PUBLIC_LOCAL_MODE=1 \
+            -e NEXT_TELEMETRY_DISABLED=1 \
+            node:22-bookworm \
+            bash -lc 'npm ci && npm run build'
+
+          test -f core/console/out/index.html
+          test -d core/console/out/_next
+          rm -rf core/api/console_dist
+          mkdir -p core/api/console_dist
+          cp -a core/console/out/. core/api/console_dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --quiet --upgrade build
+          python -m build --sdist --wheel --outdir dist/
+          ls -l dist/
+
+      # -------------------------------------------------------------------
+      # DECISIVE GATE — fail the build if the wheel is missing data-files.
+      # We inspect the wheel ARCHIVE directly (no install needed): the wheel
+      # is just a zip, so we list its members and assert each required data
+      # extension is present. An empty match for any extension → exit 1.
+      # -------------------------------------------------------------------
+      - name: Gate — wheel must ship migrations / hooks data-files
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls dist/*.whl)"
+          echo "Inspecting $WHEEL"
+          # One archive member per line, names ONLY. `python -m zipfile -l`
+          # prints "<name>  <date>  <size>", so a $-anchored grep (e.g. \.sql$)
+          # would match the trailing size, never the name → false 0-count.
+          # NOTE: every check greps a FILE, never `echo "$MEMBERS" | grep -q`.
+          # Under `set -o pipefail`, grep -q exits on the first match and the
+          # still-writing echo gets SIGPIPE (141) → the pipeline "fails" and
+          # the gate reports a file as MISSING while it is in the archive.
+          # That race rejected v0.3.9b3 twice and intermittently hit earlier
+          # cuts (the "unreproducible" b1 failure). Same fix as
+          # mirror_filter.sh's capture-and-test note.
+          python -c "import sys, zipfile; print(chr(10).join(zipfile.ZipFile(sys.argv[1]).namelist()))" "$WHEEL" > /tmp/wheel-members.txt
+          cat /tmp/wheel-members.txt
+
+          fail=0
+          for ext in sql sh; do
+            count="$(grep -Ec "\.${ext}$" /tmp/wheel-members.txt || true)"
+            if [ "$count" -eq 0 ]; then
+              echo "::error::wheel ships ZERO *.${ext} files — data-files missing (learning 9e527cfa)"
+              fail=1
+            else
+              echo "OK: wheel ships ${count} *.${ext} file(s)"
+            fi
+          done
+
+          # safety_bridge.py must be co-located with the hook scripts.
+          if ! grep -Eq "install_hooks/safety_bridge\.py$" /tmp/wheel-members.txt; then
+            echo "::error::wheel is missing core/scripts/install_hooks/safety_bridge.py"
+            fail=1
+          else
+            echo "OK: wheel ships safety_bridge.py"
+          fi
+
+          if ! grep -Eq "^core/api/console_dist/index\.html$" /tmp/wheel-members.txt; then
+            echo "::error::wheel is missing core/api/console_dist/index.html"
+            fail=1
+          else
+            echo "OK: wheel ships Console index.html"
+          fi
+
+          if ! grep -Eq "^core/api/console_dist/_next/" /tmp/wheel-members.txt; then
+            echo "::error::wheel is missing core/api/console_dist/_next assets"
+            fail=1
+          else
+            echo "OK: wheel ships Console _next assets"
+          fi
+
+          # The runtime needs >= 50 migrations on a clean install.
+          sql_count="$(grep -Ec "\.sql$" /tmp/wheel-members.txt || true)"
+          if [ "$sql_count" -lt 50 ]; then
+            echo "::error::wheel ships only ${sql_count} *.sql migrations (expected >= 50)"
+            fail=1
+          else
+            echo "OK: wheel ships ${sql_count} *.sql migrations"
+          fi
+
+          [ "$fail" -eq 0 ] || { echo "Wheel completeness gate FAILED"; exit 1; }
+
+      # -------------------------------------------------------------------
+      # Clean-machine smoke: install the wheel into a venv OUTSIDE the repo
+      # (so the repo is NOT on sys.path — the exact blind spot unit-tests
+      # have via conftest) and assert the package can resolve its data-files
+      # through importlib.resources, then run `marvis --version`.
+      # -------------------------------------------------------------------
+      - name: Gate — install wheel outside repo + resolve data-files
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls "$PWD"/dist/*.whl)"
+          WORK="$(mktemp -d)"
+          cd "$WORK"   # leave the repo dir so source is not importable
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --quiet "$WHEEL"
+          marvis --version || marvis --help
+          python - <<'PY'
+          import importlib.resources as res
+          checks = {
+              "migrations": ".sql",
+              "core.scripts.install_hooks": ".sh",
+          }
+          for pkg, ext in checks.items():
+              files = [f.name for f in res.files(pkg).iterdir() if f.is_file()]
+              n = sum(1 for name in files if name.endswith(ext))
+              assert n > 0, f"{pkg}: no *{ext} files resolvable from installed wheel"
+              print(f"OK installed wheel: {pkg} -> {n} *{ext} file(s)")
+          # safety_bridge must be co-located + importable as data
+          hooks = [f.name for f in res.files("core.scripts.install_hooks").iterdir()]
+          assert "safety_bridge.py" in hooks, "safety_bridge.py missing from installed wheel"
+          print("OK installed wheel: safety_bridge.py present")
+          console_dist = res.files("core.api").joinpath("console_dist")
+          assert console_dist.joinpath("index.html").is_file(), "Console index.html missing from installed wheel"
+          assert console_dist.joinpath("_next").is_dir(), "Console _next dir missing from installed wheel"
+          print("OK installed wheel: Console assets present")
+          PY
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi  # required-reviewer gate → human approval before token
+    permissions:
+      id-token: write  # OIDC — trusted publishing, no token
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

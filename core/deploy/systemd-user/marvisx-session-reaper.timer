@@ -1,0 +1,12 @@
+# v1.0.0 - 2026-06-12 - task 1e800849 - reaper schedule (USER unit)
+[Unit]
+Description=Run the MarvisX session reaper every 30 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
