@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 110 130" fill="none" role="img" aria-label="MarvisX Terminal Bot">
+
+  <g id="marvisx-bot">
+
+    <line x1="55" y1="4" x2="55" y2="14" stroke="#1C5C42" stroke-width="1.5"></line>
+    <circle cx="55" cy="4" r="3" fill="#F6581C"></circle>
+
+    <rect x="16" y="14" width="78" height="44" rx="6" fill="#F2ECDF" stroke="#1C5C42" stroke-width="1.5"></rect>
+    <circle cx="22" cy="20" r="1.2" fill="#1C5C42" opacity="0.7"></circle>
+    <circle cx="88" cy="20" r="1.2" fill="#1C5C42" opacity="0.7"></circle>
+    <circle cx="22" cy="52" r="1.2" fill="#1C5C42" opacity="0.7"></circle>
+    <circle cx="88" cy="52" r="1.2" fill="#1C5C42" opacity="0.7"></circle>
+
+    <rect x="26" y="22" width="58" height="20" rx="2" fill="#1C5C42"></rect>
+    <rect x="34" y="29" width="6" height="6" fill="#F6581C"></rect>
+    <rect x="70" y="29" width="6" height="6" fill="#F6581C"></rect>
+
+    <rect x="36" y="48" width="38" height="3" rx="1" fill="#F6581C"></rect>
+
+    <rect x="48" y="58" width="14" height="6" fill="#1C5C42"></rect>
+
+    <rect x="20" y="64" width="70" height="48" rx="4" fill="#F2ECDF" stroke="#1C5C42" stroke-width="1.5"></rect>
+
+    <circle cx="32" cy="76" r="2.5" fill="#2E9668"></circle>
+    <circle cx="42" cy="76" r="2.5" fill="#F6581C"></circle>
+    <circle cx="52" cy="76" r="2.5" fill="#1C5C42" opacity="0.25"></circle>
+
+    <circle cx="76" cy="84" r="6" fill="#F2ECDF" stroke="#1C5C42" stroke-width="1.5"></circle>
+    <line x1="76" y1="80" x2="76" y2="84" stroke="#F6581C" stroke-width="1.5"></line>
+
+    <text x="55" y="105" text-anchor="middle" font-family="&#39;JetBrains Mono&#39;, monospace" font-weight="600" font-size="7" letter-spacing="1.5" fill="#1C5C42">MX—01</text>
+
+    <rect x="10" y="68" width="10" height="4" fill="#F2ECDF" stroke="#1C5C42" stroke-width="1.5"></rect>
+    <rect x="90" y="68" width="10" height="4" fill="#F2ECDF" stroke="#1C5C42" stroke-width="1.5"></rect>
+    <circle cx="8" cy="70" r="3" fill="#F6581C"></circle>
+    <circle cx="102" cy="70" r="3" fill="#F6581C"></circle>
+
+    <rect x="32" y="112" width="12" height="10" rx="1" fill="#F2ECDF" stroke="#1C5C42" stroke-width="1.5"></rect>
+    <rect x="66" y="112" width="12" height="10" rx="1" fill="#F2ECDF" stroke="#1C5C42" stroke-width="1.5"></rect>
+    <rect x="28" y="122" width="20" height="4" rx="1" fill="#1C5C42"></rect>
+    <rect x="62" y="122" width="20" height="4" rx="1" fill="#1C5C42"></rect>
+  </g>
+</svg>
