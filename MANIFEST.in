@@ -1,0 +1,15 @@
+# Source-distribution manifest.
+#
+# `python -m build --sdist --wheel` builds the wheel FROM the sdist, so any
+# runtime data-file missing from the sdist is also missing from that wheel —
+# even though a DIRECT wheel build (uv build / pip wheel) would include it via
+# [tool.setuptools.package-data]. uv infers sdist contents from the git file
+# list; plain setuptools needs them spelled out here. Keep these globs in sync
+# with [tool.setuptools.package-data] in pyproject.toml (learning 9e527cfa).
+recursive-include migrations *.sql
+recursive-include core/scripts/install_hooks *.sh *.json *.py
+recursive-include core/api/templates *.md *.j2
+recursive-include core/api/mcp/tools/workflow_playbooks *.md
+recursive-include core/cli/guides *.md
+recursive-include core/api/console_dist *
+recursive-include projects/_template *
