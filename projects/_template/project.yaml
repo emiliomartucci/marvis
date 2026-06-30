@@ -1,0 +1,46 @@
+# Project Metadata Schema v1.0
+# =============================
+# Source of truth for structured project metadata.
+# Your agent reads this at session start; the API parses it for the Console.
+#
+# REQUIRED fields: project, lifecycle, language, type
+# OPTIONAL fields: everything else (omit if not applicable)
+#
+# See `marvis guide` for how projects, tasks, and the graph fit together.
+
+# === Identity ===
+project: project-slug             # REQUIRED. Must match .task file content
+program: null                     # Program from programs.yaml (null if standalone)
+scope: personal                   # personal | work
+description: ""                   # 1-2 sentences, what the project does
+type: work                        # REQUIRED. work | code | system
+repo_path: null                   # Absolute path to git repo (Code/System only, null for Work)
+
+# === Lifecycle ===
+# State machine: idea -> planning -> active -> maintenance -> archived
+# Valid transitions:
+#   idea       -> planning, archived
+#   planning   -> active, archived
+#   active     -> maintenance, archived
+#   maintenance -> active, archived
+#   archived   -> active (reactivation)
+lifecycle: idea                   # REQUIRED. idea | planning | active | maintenance | archived
+phase: ""                         # Free-text current phase detail (e.g. "sprint 3", "MVP live")
+
+# === Tech ===
+language: null                    # REQUIRED. python | typescript | javascript | ruby | go | none
+stack: []                         # Frameworks/tools list (e.g. [fastapi, nextjs, sqlite])
+test: false                       # Has tests?
+test_command: null                # Command to run tests (e.g. "pytest", "npm test")
+
+# === Environment & Deploy ===
+env_file: null                    # Path to .env.example (null if no env vars)
+deploy:                           # Omit entire block if no deploy
+  hosting: null                   # cloudflare-pages | vercel | netlify | hetzner | none
+  url: null                       # Production URL
+  api_url: null                   # API URL (if separate from frontend)
+  git_connected: false            # Auto-deploy on push?
+
+# === Session Tracking ===
+last_session: 0                   # Incremented by Claude at session end
+last_work: null                   # ISO date (YYYY-MM-DD), updated by Claude at session end

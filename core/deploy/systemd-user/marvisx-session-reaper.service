@@ -1,0 +1,28 @@
+# v1.0.0 - 2026-06-12 - task 1e800849 - orphan agent-worker reaper (USER unit)
+#
+# Install (as the openclaw user, NOT root):
+#   mkdir -p ~/.config/systemd/user
+#   cp core/deploy/systemd-user/marvisx-session-reaper.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now marvisx-session-reaper.timer
+#
+# DRY-RUN BY DEFAULT: as shipped, ExecStart runs WITHOUT --apply, so the timer
+# only LOGS would-be kills (to ~/.local/state/marvisx/session-reaper.log). Review
+# a few cycles, then enable real reaping with an explicit override:
+#   systemctl --user edit marvisx-session-reaper.service
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/bin/python3 /data/pir/core/scripts/session_reaper.py --apply
+[Unit]
+Description=MarvisX orphan agent-worker reaper (dry-run)
+# Rationale and rollout history: task 1e800849 in the operator console.
+After=default.target
+
+[Service]
+Type=oneshot
+# Reap is intentionally dry-run here. Append --apply via a drop-in to enable kills.
+ExecStart=/usr/bin/python3 /data/pir/core/scripts/session_reaper.py
+Nice=10
+IOSchedulingClass=idle
+# Never let the reaper itself become a heavy/long process.
+TimeoutStartSec=120
