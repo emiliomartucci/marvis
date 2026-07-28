@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  surface-registry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: Surface registry gate (fail-closed)
+        run: python scripts/validate_surfaces.py
+      - name: Validator unit tests (green on good, red on tampered)
+        run: python -m unittest discover -s scripts -p "test_*.py" -v

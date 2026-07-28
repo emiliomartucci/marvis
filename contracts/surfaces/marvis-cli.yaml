@@ -1,0 +1,25 @@
+# Surface manifest — public marvis-cli product (CLI + local MCP + runtime).
+# Consumed by scripts/validate_surfaces.py in CI. Same registry pattern as
+# marvisx:contracts/surfaces/terminal-console.yaml and
+# marvisx-cloud:contracts/surfaces/cloud-edge.yaml (U1 portfolio, separation
+# goal 2026-07-24).
+surface_id: marvis-cli
+owner_project: marvis
+owner_repo: emiliomartucci/marvis
+contract_version: 1
+description: >-
+  Public OSS/open-core product: CLI, local MCP server and local runtime,
+  shipped as a Python wheel.
+
+artifact_kind: python-wheel
+# Compatibility distribution name during migration (plan naming registry); a
+# public rename is a separately planned decision. Cross-checked against
+# pyproject.toml by the validator.
+distribution_name: marvisx-cli
+
+deploy:
+  tool: github-release
+  workflow: .github/workflows/release.yml
+  trigger: v* tag, human-gated pypi environment
+rollback:
+  strategy: pip-version-pin

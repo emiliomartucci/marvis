@@ -1,0 +1,26 @@
+# Surface manifest — future desktop/local GUI owned by marvis (U7/U8). STUB,
+# fail-closed: declared so the registry can tell this surface apart from the
+# CLI wheel and from foreign product GUIs, but NOT deployable. Flipping
+# deployable requires proof for every prerequisite below. No desktop framework
+# is named here — that choice belongs to a separate ADR (plan KTD4).
+surface_id: desktop-ui
+owner_project: marvis
+owner_repo: emiliomartucci/marvis
+contract_version: 1
+description: >-
+  Desktop/local GUI for the marvis product. Owned by marvis; never built from
+  or served by marvisx UI bundles (KTD10), never a Cloud or terminal surface.
+
+deployable: false
+
+# U7/U8 gate — each key must map to non-empty evidence before deployable may
+# become true. The validator enforces this shape.
+prerequisites:
+  local_gui_characterization: null
+  desktop_host_contract: null
+  shell_adr_decision: null
+
+forbidden_sources:
+  - marvisx:core/console
+forbidden_targets:
+  - console.justaskmarvis.com/terminal/
