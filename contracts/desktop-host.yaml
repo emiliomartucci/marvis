@@ -1,0 +1,72 @@
+# Contract between a desktop shell and the local Marvis runtime.
+# U8 of the surface-separation plan (marvisx:docs/goals/2026-07-24-separate-surfaces.md).
+#
+# Purpose: let a future desktop plan choose a shell technology WITHOUT
+# reopening ownership, API surface or data lifecycle (KTD4). No technology is
+# named or implied here — see docs/decisions/desktop-shell-selection.md.
+#
+# Anchored to the real launcher: scripts/validate_desktop_host.py checks the
+# endpoint and every capability against core/cli/marvis_console.py, so this
+# cannot drift into prose that describes a product that no longer exists.
+schema_version: 1
+surface_id: desktop-ui
+owner_project: marvis
+
+# How a shell reaches the product. Loopback only: the local runtime is
+# single-user and never binds a public interface.
+endpoint:
+  host: 127.0.0.1
+  port: 8100
+  ui_path: /ui/
+  scheme: http
+
+# What a shell is allowed to do, and the CLI command that already does it.
+# The launcher stays the compatibility path: a shell drives these, it does not
+# reimplement them. Every entry must resolve to a registered command.
+capabilities:
+  open_gui:
+    command: console
+    description: Verify the packaged GUI, ensure the runtime answers, open the UI.
+  stop_runtime:
+    command: console
+    option: --stop
+    description: Stop the runtime this product started (pidfile under the vault dir).
+  autostart_enable:
+    command: autostart enable
+    description: Opt in to starting the runtime at login, via the OS mechanism.
+  autostart_disable:
+    command: autostart disable
+    description: Opt out of autostart.
+  autostart_status:
+    command: autostart status
+    description: Report whether autostart is registered.
+
+# What a shell must never do. These are ownership rules, not preferences:
+# breaking them moves product logic into the shell, which is exactly what a
+# later technology change would then have to renegotiate.
+forbidden:
+  direct_database_access: The runtime owns the database; a shell reads it through the API only.
+  bypass_local_api: Every product action goes through the local API, so permissions stay in one place.
+  embed_cloud_identity: WorkOS is Cloud-only (KTD6); the local product does not carry Cloud sessions.
+  ship_foreign_surfaces: The shell serves the local perimeter only (apps/desktop-ui/surfaces.yaml).
+  bind_public_interface: Loopback only; a desktop shell never exposes the runtime to the network.
+
+# Where authority lives. A shell asks; the runtime decides.
+permissions:
+  owner: local-runtime
+  rationale: >-
+    Permission checks live behind the API so CLI, MCP and any shell get the
+    same answer. A shell that decides for itself would create a second policy
+    that drifts from the first.
+
+# What a desktop package must satisfy, whatever technology is chosen later.
+packaging:
+  - Ships the local GUI export produced from apps/desktop-ui, nothing else.
+  - Starts the runtime through the documented capabilities, not by spawning
+    private commands.
+  - Degrades to the existing browser launcher when the shell is unavailable.
+  - Carries no credential, token or Cloud configuration at build time.
+
+# The choice of shell technology is deliberately NOT made here.
+shell_selection: open
+shell_selection_record: docs/decisions/desktop-shell-selection.md
