@@ -18,14 +18,14 @@ from validate_local_surfaces import (  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = "apps/desktop-ui/surfaces.yaml"
-APP_SHELL = "core/console/src/components/AppShell.tsx"
+APP_SHELL = "apps/desktop-ui/src/components/AppShell.tsx"
 
 
 class PerimeterCase(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="perimeter-"))
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
-        for rel in ("apps", "core/console/src"):
+        for rel in ("apps",):
             shutil.copytree(REPO_ROOT / rel, self.dir / rel)
 
     def rewrite(self, rel: str, old: str, new: str) -> None:
@@ -84,19 +84,20 @@ class TestPerimeterGate(PerimeterCase):
         self.assertTrue(any("no owned_routes" in e for e in errors), errors)
 
 
-class TestMeasuredGap(unittest.TestCase):
-    """The reason U7 needs a move, measured rather than asserted."""
+class TestPerimeterIsClosed(unittest.TestCase):
+    """The same measurement that justified the move, now proving it landed.
 
-    def test_shared_export_still_carries_foreign_routes(self) -> None:
-        strangers = foreign_routes(REPO_ROOT)
-        # Navigation hides them, the artifact ships them: direct URLs resolve.
-        self.assertGreater(len(strangers), 0)
-        self.assertIn("/terminal/", strangers)
+    Before the move these two asserted the opposite: 24 foreign routes lived in
+    the shared app, /terminal/ among them. They are the before/after evidence.
+    """
 
-    def test_forbidden_classes_are_present_in_todays_export(self) -> None:
+    def test_owned_source_carries_no_foreign_route(self) -> None:
+        self.assertEqual(foreign_routes(REPO_ROOT), [])
+
+    def test_forbidden_classes_are_absent_from_the_owned_source(self) -> None:
         strangers = set(foreign_routes(REPO_ROOT))
         for route in ("/terminal/", "/settings/users/", "/monitoring/"):
-            self.assertIn(route, strangers, f"{route} expected in the pre-move export")
+            self.assertNotIn(route, strangers, f"{route} must not live in the local product")
 
 
 if __name__ == "__main__":

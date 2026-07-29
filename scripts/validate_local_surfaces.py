@@ -15,9 +15,12 @@ from pathlib import Path
 
 import yaml
 
-MANIFEST = Path("apps/desktop-ui/surfaces.yaml")
-APP_SHELL = Path("core/console/src/components/AppShell.tsx")
-ROUTES_GLOB = "core/console/src/app/**/page.tsx"
+DESKTOP_UI = Path("apps/desktop-ui")
+MANIFEST = DESKTOP_UI / "surfaces.yaml"
+APP_SHELL = DESKTOP_UI / "src/components/AppShell.tsx"
+ROUTES_GLOB = "apps/desktop-ui/src/app/**/page.tsx"
+# Entry point and auth pages: shell, not product surfaces.
+SHELL_ROUTES = {"/", "/login/", "/login/sso-callback/", "/welcome/"}
 
 
 def local_nav_routes(source: str) -> list[str]:
@@ -35,7 +38,7 @@ def exported_routes(root: Path) -> set[str]:
     """Every route the shared Next app exports, as URL paths."""
     routes = set()
     for page in root.glob(ROUTES_GLOB):
-        rel = page.relative_to(root / "core/console/src/app").parent
+        rel = page.relative_to(root / DESKTOP_UI / "src/app").parent
         parts = [p for p in rel.parts if not (p.startswith("(") and p.endswith(")"))]
         routes.add("/" + "".join(f"{p}/" for p in parts))
     return routes
@@ -70,6 +73,11 @@ def validate(root: Path) -> list[str]:
         if route not in exported:
             errors.append(f"{route}: declared as owned but no page exports it")
 
+    # The source is now the perimeter: a foreign route here is a defect, not a
+    # known gap. Until slice 4 this was reported; it is enforced from here on.
+    for route in sorted(exported - set(declared) - SHELL_ROUTES):
+        errors.append(f"{route}: present in the local source but outside the perimeter")
+
     return errors
 
 
@@ -77,9 +85,7 @@ def foreign_routes(root: Path) -> list[str]:
     """Exported routes outside the local perimeter — the gap the move closes."""
     manifest = yaml.safe_load((root / MANIFEST).read_text(encoding="utf-8"))
     declared = set(manifest.get("owned_routes") or [])
-    # The entry point and auth pages are shell, not product surfaces.
-    shell = {"/", "/login/", "/login/sso-callback/", "/welcome/"}
-    return sorted(exported_routes(root) - declared - shell)
+    return sorted(exported_routes(root) - declared - SHELL_ROUTES)
 
 
 def main() -> int:
@@ -91,18 +97,10 @@ def main() -> int:
             print(f"  - {error}", file=sys.stderr)
         return 1
 
-    strangers = foreign_routes(root)
     print(
-        "local surface perimeter valid: declaration matches LOCAL_NAV and every "
-        "owned route exists"
+        "local surface perimeter valid: the owned source carries the declared "
+        "routes and nothing else"
     )
-    if strangers:
-        # Reported, not failed: this is the known pre-move state the manifest
-        # records. It becomes a failure once the move is done.
-        print(
-            f"note: the shared export still carries {len(strangers)} routes outside "
-            "the local perimeter (U7 move closes this)"
-        )
     return 0
 
 

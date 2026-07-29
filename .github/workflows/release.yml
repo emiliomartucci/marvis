@@ -32,34 +32,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prune the build tree to the local perimeter
-        # The wheel must carry only what the local product owns. Without this
-        # the export is the whole app: terminal, hosted administration and
-        # SaaS routes ship inside the local release and answer direct URLs.
-        # The script refuses to run if apps/desktop-ui/surfaces.yaml and the
-        # source have drifted, so a stale perimeter cannot produce an artifact.
+      - name: Verify the local GUI perimeter
+        # The source IS the perimeter since the U7 move, so this only has to
+        # confirm nothing foreign crept in — no pruning step to trust.
         run: |
           set -euo pipefail
           python -m pip install --quiet pyyaml
-          python scripts/build_local_gui.py build/local-gui
+          python scripts/validate_local_surfaces.py
 
-      - name: Build Console static export in Docker
+      - name: Build the local GUI static export in Docker
         run: |
           set -euo pipefail
           docker run --rm \
             -v "$PWD:/repo" \
-            -w /repo/build/local-gui \
+            -w /repo/apps/desktop-ui \
             -e NEXT_PUBLIC_API_URL="" \
             -e NEXT_PUBLIC_LOCAL_MODE=1 \
             -e NEXT_TELEMETRY_DISABLED=1 \
             node:22-bookworm \
             bash -lc 'npm ci && npm run build'
 
-          test -f build/local-gui/out/index.html
-          test -d build/local-gui/out/_next
+          test -f apps/desktop-ui/out/index.html
+          test -d apps/desktop-ui/out/_next
           rm -rf core/api/console_dist
           mkdir -p core/api/console_dist
-          cp -a build/local-gui/out/. core/api/console_dist/
+          cp -a apps/desktop-ui/out/. core/api/console_dist/
 
       - name: Fail if a foreign surface reached the local artifact
         # Proving the export, not the intent: a route outside the perimeter in
