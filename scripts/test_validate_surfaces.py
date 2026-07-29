@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import sys
 import tempfile
@@ -153,8 +154,16 @@ class TestValidator(FixtureCase):
         errors = validate(self.dir)
         self.assertTrue(any("is not accepted" in e for e in errors), errors)
 
-    def test_desktop_shell_allowed_once_the_adr_is_accepted(self) -> None:
+    def test_desktop_shell_allowed_once_the_adr_is_accepted_and_something_packages_it(self) -> None:
         self.rewrite(DESKTOP, "desktop_shell:\n  deployable: false", "desktop_shell:\n  deployable: true")
+        self.rewrite(
+            DESKTOP,
+            "  decision_record: docs/decisions/desktop-shell-selection.md",
+            "  decision_record: docs/decisions/desktop-shell-selection.md\n"
+            "  packaged_as:\n"
+            "    built_by: apps/desktop-ui\n"
+            "    artifact: a desktop application bundle",
+        )
         self.rewrite("docs/decisions/desktop-shell-selection.md", "status: open", "status: accepted")
         self.assertEqual(validate(self.dir), [])
 
@@ -207,6 +216,39 @@ class TestValidator(FixtureCase):
         errors = validate(self.dir)
         self.assertTrue(any("does not ship console_dist" in e for e in errors), errors)
 
+    def test_red_broadened_shipping_paths(self) -> None:
+        # `built_from: apps` and `bundled_at: console_dist` both matched the
+        # workflow and the package data while naming neither the source nor the
+        # bundle.
+        self.rewrite(DESKTOP, "built_from: apps/desktop-ui", "built_from: apps")
+        self.rewrite(DESKTOP, "bundled_at: core/api/console_dist", "bundled_at: console_dist")
+        errors = validate(self.dir)
+        self.assertTrue(any("built_from must be apps/desktop-ui" in e for e in errors), errors)
+        self.assertTrue(any("bundled_at must be core/api/console_dist" in e for e in errors), errors)
+
+    def test_red_package_data_under_the_wrong_package(self) -> None:
+        self.rewrite("pyproject.toml", '"core.api" = ["console_dist/**/*"]', '"projects" = ["console_dist/**/*"]')
+        errors = validate(self.dir)
+        self.assertTrue(any("does not ship console_dist" in e for e in errors), errors)
+
+    def test_red_decision_record_pointing_at_another_adr(self) -> None:
+        # The manifest would otherwise pick whichever accepted ADR exists and
+        # authorise itself with it.
+        other = self.dir / "docs/decisions/something-else.md"
+        other.write_text("---\nstatus: accepted\n---\n\n# Other\n", encoding="utf-8")
+        self.rewrite(DESKTOP, "decision_record: docs/decisions/desktop-shell-selection.md", "decision_record: docs/decisions/something-else.md")
+        self.rewrite(DESKTOP, "desktop_shell:\n  deployable: false", "desktop_shell:\n  deployable: true")
+        errors = validate(self.dir)
+        self.assertTrue(any("decision_record must be" in e for e in errors), errors)
+
+    def test_red_shell_deployable_without_any_packaging(self) -> None:
+        # An accepted ADR decides WHICH shell, not that one exists. Nothing
+        # packages a desktop application today.
+        self.rewrite(DESKTOP, "desktop_shell:\n  deployable: false", "desktop_shell:\n  deployable: true")
+        self.rewrite("docs/decisions/desktop-shell-selection.md", "status: open", "status: accepted")
+        errors = validate(self.dir)
+        self.assertTrue(any("requires a packaged_as block" in e for e in errors), errors)
+
     def test_red_tampered_engine_pin(self) -> None:
         self.rewrite(
             "contracts/engine-pin.yaml",
@@ -229,6 +271,13 @@ class TestReleasePathRunsTheGate(unittest.TestCase):
     def commands(self, root: Path) -> list[str]:
         return release_run_commands(root)
 
+    @staticmethod
+    def invokes(commands: list[str], script: str) -> bool:
+        """The script must be what the line runs, not something it mentions."""
+        return any(
+            re.match(rf"^(python3?|py)\s+{re.escape(script)}(\s|$)", line) for line in commands
+        )
+
     def test_release_workflow_runs_every_registry_gate(self) -> None:
         commands = self.commands(REPO_ROOT)
         for gate in (
@@ -236,9 +285,26 @@ class TestReleasePathRunsTheGate(unittest.TestCase):
             "scripts/validate_local_surfaces.py",
             "scripts/validate_desktop_host.py",
         ):
-            self.assertTrue(
-                any(gate in line for line in commands), f"{gate} does not run on the tag path"
-            )
+            self.assertTrue(self.invokes(commands, gate), f"{gate} does not run on the tag path")
+
+    def test_a_mentioned_gate_is_not_an_invoked_gate(self) -> None:
+        workspace = Path(tempfile.mkdtemp(prefix="release-"))
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        target = workspace / RELEASE
+        target.parent.mkdir(parents=True)
+        text = (REPO_ROOT / RELEASE).read_text(encoding="utf-8")
+        target.write_text(
+            text.replace(
+                "          python scripts/validate_surfaces.py",
+                "          echo python scripts/validate_surfaces.py",
+            ),
+            encoding="utf-8",
+        )
+        commands = self.commands(workspace)
+        self.assertFalse(
+            self.invokes(commands, "scripts/validate_surfaces.py"),
+            "a script merely echoed is not a gate",
+        )
 
     def test_release_workflow_gates_before_it_builds(self) -> None:
         commands = self.commands(REPO_ROOT)

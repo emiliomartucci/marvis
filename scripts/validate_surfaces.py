@@ -48,6 +48,17 @@ REQUIRED_DESKTOP_PREREQUISITES = {
     "perimeter_gate": "scripts/validate_local_surfaces.py",
 }
 DESKTOP_HOST_CONTRACT = Path("contracts/desktop-host.yaml")
+# Where the local GUI is built and bundled. Pinned for the same reason the
+# prerequisite paths are: a substring check let the manifest shorten the claim —
+# `built_from: apps` and `bundled_at: console_dist` both matched the workflow
+# and the package data while naming neither the source nor the bundle.
+EXPECTED_SHIPS_AS = {
+    "built_from": "apps/desktop-ui",
+    "bundled_at": "core/api/console_dist",
+}
+# The one record that can authorise a desktop shell. Without pinning it, the
+# manifest picks whichever accepted ADR happens to exist and authorises itself.
+SHELL_DECISION_RECORD = "docs/decisions/desktop-shell-selection.md"
 # What a shipping local GUI must be true of, read from the files that do the
 # shipping. `deployable: true` is a claim about the release, so it is checked
 # against the release.
@@ -122,9 +133,12 @@ def desktop_shell_errors(root: Path, desktop: dict) -> list[str]:
 
     errors: list[str] = []
     record = shell.get("decision_record")
-    if not isinstance(record, str) or not (root / record).is_file():
-        errors.append("desktop-ui: desktop_shell.decision_record must name an existing ADR")
-        return errors
+    if record != SHELL_DECISION_RECORD:
+        return errors + [
+            f"desktop-ui: desktop_shell.decision_record must be {SHELL_DECISION_RECORD}, not {record!r}"
+        ]
+    if not (root / record).is_file():
+        return errors + [f"desktop-ui: {record} does not exist in the tree"]
 
     deployable = shell.get("deployable")
     # A malformed truthy value such as the string "true" is not `is True`, so the
@@ -132,10 +146,50 @@ def desktop_shell_errors(root: Path, desktop: dict) -> list[str]:
     if not isinstance(deployable, bool):
         return errors + ["desktop-ui: desktop_shell.deployable must be a boolean"]
 
-    if deployable and adr_status(root / record) != "accepted":
+    if not deployable:
+        return errors
+
+    if adr_status(root / record) != "accepted":
         errors.append(
             f"desktop-ui: desktop_shell.deployable=true while {record} is not accepted — "
             "no shell technology has been chosen"
+        )
+
+    # An accepted ADR decides WHICH shell, not that one exists. The flag is a
+    # claim about a shipped artifact, so it is checked against one — the same
+    # way the outer deployable flag is checked against its shipping path.
+    # Nothing packages a desktop application today: the release builds a static
+    # export and puts it in the wheel.
+    errors.extend(shell_packaging_errors(root, shell))
+    return errors
+
+
+def shell_packaging_errors(root: Path, shell: dict) -> list[str]:
+    """A deployable shell must name what builds it and what that produces."""
+    packaged = shell.get("packaged_as")
+    if not isinstance(packaged, dict):
+        return [
+            "desktop-ui: desktop_shell.deployable=true requires a packaged_as block "
+            "naming built_by and artifact — no desktop application is packaged today"
+        ]
+
+    errors: list[str] = []
+    built_by = str(packaged.get("built_by") or "").strip()
+    artifact = str(packaged.get("artifact") or "").strip()
+    if not built_by or not (root / built_by).exists():
+        errors.append(
+            f"desktop-ui: desktop_shell.packaged_as.built_by {built_by!r} does not exist in the tree"
+        )
+    if not artifact:
+        errors.append("desktop-ui: desktop_shell.packaged_as.artifact must name what is produced")
+
+    try:
+        commands = release_run_commands(root)
+    except OSError as exc:
+        return errors + [f"cannot read {RELEASE_WORKFLOW}: {exc}"]
+    if built_by and not any(built_by in line for line in commands):
+        errors.append(
+            f"desktop-ui: desktop_shell.deployable=true but {RELEASE_WORKFLOW} never runs {built_by}"
         )
     return errors
 
@@ -169,10 +223,12 @@ def shipping_claim_errors(root: Path, desktop: dict) -> list[str]:
 
     built_from = str(ships.get("built_from") or "").strip()
     bundled_at = str(ships.get("bundled_at") or "").strip()
-    if not built_from or not (root / built_from).is_dir():
+    for field, expected in EXPECTED_SHIPS_AS.items():
+        declared = str(ships.get(field) or "").strip()
+        if declared != expected:
+            errors.append(f"desktop-ui: ships_as.{field} must be {expected}, not {declared!r}")
+    if built_from and not (root / built_from).is_dir():
         errors.append(f"desktop-ui: ships_as.built_from {built_from!r} is not a directory in the tree")
-    if not bundled_at:
-        errors.append("desktop-ui: ships_as.bundled_at must name the bundled location")
 
     served_at = str(ships.get("served_at") or "").strip()
     # The route is fixed by the desktop host contract, which the launcher is
@@ -216,14 +272,18 @@ def shipping_claim_errors(root: Path, desktop: dict) -> list[str]:
     package_data = (
         pyproject.get("tool", {}).get("setuptools", {}).get("package-data", {})
     )
-    shipped_globs = [glob for globs in package_data.values() for glob in globs]
-    bundled_package_data = bundled_at.rsplit("/", 1)[-1] if bundled_at else ""
-    if bundled_package_data and not any(
-        glob.startswith(f"{bundled_package_data}/") for glob in shipped_globs
-    ):
-        errors.append(
-            f"desktop-ui: deployable=true but {PYPROJECT} does not ship {bundled_package_data}"
-        )
+    # Derived from the bundle path rather than matched loosely: core/api/console_dist
+    # means the `core.api` package must ship globs under `console_dist/`. Scanning
+    # every package's globs would accept the right glob under the wrong package.
+    if bundled_at and "/" in bundled_at:
+        package, _, directory = bundled_at.rpartition("/")
+        package = package.replace("/", ".")
+        globs = package_data.get(package) or []
+        if not any(str(glob).startswith(f"{directory}/") for glob in globs):
+            errors.append(
+                f"desktop-ui: deployable=true but {PYPROJECT} package-data for {package!r} "
+                f"does not ship {directory}"
+            )
     return errors
 
 
