@@ -1,0 +1,45 @@
+# Ownership perimeter of the local/desktop GUI owned by marvis.
+# U7 of the surface-separation plan (marvisx:docs/goals/2026-07-24-separate-surfaces.md).
+#
+# Why this file exists: the local/Cloud split is currently a RUNTIME flag
+# (NEXT_PUBLIC_LOCAL_MODE) inside one shared Next export. The local product
+# navigates five surfaces, but the exported bundle carries every page in the
+# app — terminal, hosted administration and SaaS included. Navigation hides
+# them; the artifact still ships them. That is KTD10 violated by construction,
+# and the same shape as the 2026-07-23 terminal incident: one artifact serving
+# several products.
+#
+# This declares the perimeter the next slice will carry into a marvis-owned
+# directory. scripts/validate_local_surfaces.py checks it against the real
+# source, so the declaration cannot drift from the code.
+schema_version: 1
+surface_id: desktop-ui
+owner_project: marvis
+
+# Routes the local product owns. Kept in step with LOCAL_NAV in
+# core/console/src/components/AppShell.tsx — the gate fails on any drift,
+# in either direction.
+owned_routes:
+  - /diario/
+  - /todos/
+  - /tasks/
+  - /projects/
+  - /universe/
+
+# Route classes this product must never ship, with the rule each one protects.
+# The gate rejects any of these appearing in owned_routes.
+forbidden_routes:
+  /terminal/: personal terminal Console, owned by marvisx (plan R1/R4)
+  /newsletter/: SaaS-only surface, not part of the public local product
+  /automations/: SaaS-only surface, not part of the public local product
+  /reddit/: SaaS-only surface, not part of the public local product
+  /settings/users/: hosted multi-user administration, not local single-user
+  /settings/teams/: hosted multi-user administration, not local single-user
+  /settings/tokens/: hosted agent-token administration
+  /settings/workspace/: hosted workspace administration
+  /monitoring/: hosted fleet monitoring
+
+# Known gap, measured not assumed: the shared export currently contains routes
+# outside owned_routes. tests/desktop_ui/ records the current count so the move
+# in the next slice has a before/after number instead of an impression.
+current_state: shared-export-carries-foreign-routes
