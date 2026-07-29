@@ -20,7 +20,6 @@ class MockResizeObserver {
 
 // Forza matchMedia (prefers-reduced-motion = false).
 function setupMocks() {
-  // @ts-expect-error jsdom stub
   globalThis.ResizeObserver = MockResizeObserver;
   Object.defineProperty(window, "matchMedia", {
     writable: true,

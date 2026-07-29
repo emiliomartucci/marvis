@@ -1,9 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { SESSION_COUNT_CHANGED_EVENT } from "@/lib/sessionEvents";
+import { fireEvent, render, screen } from "@testing-library/react";
 
 let mockedPathname = "/projects/";
-let mockedDesignV2 = false;
 let fetchMock: ReturnType<typeof vi.fn>;
 
 function mockVersionResponse(version: {
@@ -32,7 +30,6 @@ vi.mock("next/navigation", () => ({
 
 vi.mock("@/lib/api", () => ({
   getPrograms: vi.fn(async () => []),
-  listSessions: vi.fn(async () => []),
   listTodosLocal: vi.fn(async () => []),
   createTodoLocal: vi.fn(async () => ({
     id: "todo-1",
@@ -55,18 +52,12 @@ vi.mock("@/lib/api", () => ({
   })),
 }));
 
-vi.mock("@/lib/useDesignV2", () => ({
-  useDesignV2: () => mockedDesignV2,
-}));
-
 import AppShell from "../AppShell";
-import { createTodoLocal, listSessions, listTodosLocal } from "@/lib/api";
+import { createTodoLocal, listTodosLocal } from "@/lib/api";
 
 describe("AppShell", () => {
   beforeEach(() => {
     mockedPathname = "/projects/";
-    mockedDesignV2 = false;
-    delete process.env.NEXT_PUBLIC_LOCAL_MODE;
     localStorage.clear();
     vi.clearAllMocks();
     vi.mocked(listTodosLocal).mockResolvedValue([]);
@@ -79,29 +70,6 @@ describe("AppShell", () => {
     });
   });
 
-  it("renders top bar with package navigation", () => {
-    render(
-      <AppShell>
-        <div>Content</div>
-      </AppShell>
-    );
-    expect(screen.getByText("Terminal")).toBeInTheDocument();
-    expect(screen.getByText("Projects")).toBeInTheDocument();
-    expect(screen.getByText("Logout")).toBeInTheDocument();
-  });
-
-  it("exposes Inbox RSS and Ingester menu entries", () => {
-    render(
-      <AppShell>
-        <div>Content</div>
-      </AppShell>
-    );
-
-    expect(screen.getByRole("menu", { name: "Inbox navigation" })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: "RSS" })).toHaveAttribute("href", "/inbox");
-    expect(screen.getByRole("menuitem", { name: "Ingester" })).toHaveAttribute("href", "/inbox/triage/files");
-  });
-
   it("renders children in content area", () => {
     render(
       <AppShell>
@@ -111,27 +79,19 @@ describe("AppShell", () => {
     expect(screen.getByText("Test Content")).toBeInTheDocument();
   });
 
-  it("renders sidebar slot when provided", () => {
-    render(
-      <AppShell sidebar={<div>Sidebar Content</div>}>
-        <div>Main</div>
-      </AppShell>
-    );
-    expect(screen.getByText("Sidebar Content")).toBeInTheDocument();
-  });
-
+  // The `sidebar` slot was hosted-only: LocalAppShellContent accepted the prop
+  // and never rendered it, so the old test passed against the hosted branch and
+  // said nothing about this product. The prop is gone with that branch.
   it("has app-shell testid", () => {
     const { container } = render(
-      <AppShell sidebar={<div>Side</div>}>
+      <AppShell>
         <div>Main</div>
       </AppShell>
     );
-    const shell = container.querySelector("[data-testid='app-shell']");
-    expect(shell).toBeInTheDocument();
+    expect(container.querySelector("[data-testid='app-shell']")).toBeInTheDocument();
   });
 
-  it("renders the local-mode sidebar and hides the auth cluster when the flag is on", async () => {
-    process.env.NEXT_PUBLIC_LOCAL_MODE = "1";
+  it("renders the local sidebar without an auth cluster", async () => {
     mockedPathname = "/todos/";
     localStorage.setItem("marvis:locale", "it");
 
@@ -153,8 +113,29 @@ describe("AppShell", () => {
     expect(await screen.findByText("v0.3.8")).toBeInTheDocument();
   });
 
+  // The shell used to branch on NEXT_PUBLIC_LOCAL_MODE and, in the other branch,
+  // navigate to Terminal / Triage / Brain / Inbox / Monitoring / Finder. The
+  // flag hid that top bar; the bundle carried it anyway. There is one shell now,
+  // and it must not reach any surface this product does not ship.
+  it("navigates only to routes this product ships", () => {
+    const { container } = render(
+      <AppShell>
+        <div>Content</div>
+      </AppShell>
+    );
+
+    const shipped = new Set(["/diario", "/todos", "/tasks", "/projects", "/universe", "/settings/llm"]);
+    const targets = Array.from(container.querySelectorAll("a[href^='/']"))
+      .map((a) => (a.getAttribute("href") ?? "").replace(/\/$/, ""))
+      .filter((href) => href !== "");
+
+    expect(targets.length).toBeGreaterThan(0);
+    for (const href of targets) {
+      expect(shipped).toContain(href);
+    }
+  });
+
   it("wires local quick-capture to the todos endpoint", async () => {
-    process.env.NEXT_PUBLIC_LOCAL_MODE = "1";
     localStorage.setItem("marvis:locale", "it");
 
     render(
@@ -171,8 +152,7 @@ describe("AppShell", () => {
     expect(vi.mocked(createTodoLocal)).toHaveBeenCalledWith({ text: "Rivedere il piano" });
   });
 
-  it("shows the open todos badge in local mode", async () => {
-    process.env.NEXT_PUBLIC_LOCAL_MODE = "1";
+  it("shows the open todos badge", async () => {
     localStorage.setItem("marvis:locale", "it");
     vi.mocked(listTodosLocal).mockResolvedValue([
       {
@@ -206,7 +186,6 @@ describe("AppShell", () => {
   });
 
   it("renders an update hint in the local status bar and copies the pip command", async () => {
-    process.env.NEXT_PUBLIC_LOCAL_MODE = "1";
     localStorage.setItem("marvis:locale", "it");
     mockVersionResponse({
       installed: "0.3.7",
@@ -229,29 +208,5 @@ describe("AppShell", () => {
 
     expect(writeText).toHaveBeenCalledWith("pip install -U marvisx-cli");
     expect(await screen.findByText("Comando copiato")).toBeInTheDocument();
-  });
-
-  it("updates terminal session count from TerminalPanel count events without refetching on sessions_changed", async () => {
-    mockedPathname = "/terminal/";
-    mockedDesignV2 = true;
-
-    render(
-      <AppShell>
-        <div>Main</div>
-      </AppShell>
-    );
-
-    expect(await screen.findByText("Sessioni")).toBeInTheDocument();
-    const initialFetches = vi.mocked(listSessions).mock.calls.length;
-
-    act(() => {
-      window.dispatchEvent(new CustomEvent(SESSION_COUNT_CHANGED_EVENT, { detail: { count: 12 } }));
-    });
-    expect(await screen.findByText("12")).toBeInTheDocument();
-
-    act(() => {
-      window.dispatchEvent(new CustomEvent("marvisx:sessions_changed"));
-    });
-    expect(vi.mocked(listSessions).mock.calls.length).toBe(initialFetches);
   });
 });

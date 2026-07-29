@@ -71,7 +71,7 @@ function SSOCallbackContent() {
         await completeSSOCallback(code!, stateParam!);
         setState("success");
         sessionStorage.removeItem("sso_login_email");
-        router.push("/terminal/");
+        router.push("/diario/");
       } catch (err) {
         const msg = err instanceof Error ? err.message : "SSO authentication failed";
         setError(ERROR_MESSAGES[msg] || msg);

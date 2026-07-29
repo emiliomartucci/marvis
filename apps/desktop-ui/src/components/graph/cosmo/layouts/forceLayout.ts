@@ -57,7 +57,10 @@ export function forceLayout(
   projects: readonly Project[],
   viewport: { w: number; h: number },
   edges: readonly Edge[] = [],
-  iterations = COSMO_FORCE_PARAMS.iterations,
+  // Typed explicitly: COSMO_FORCE_PARAMS is `as const`, so inferring from
+  // the default narrowed this to the literal 400 and rejected every other
+  // iteration count callers pass.
+  iterations: number = COSMO_FORCE_PARAMS.iterations,
 ): PlacedNode[] {
   const radii = computeProjectRadii(projects);
   const nodes: CosmoForceNode[] = projects.map((p) => ({

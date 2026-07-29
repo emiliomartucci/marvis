@@ -1,29 +1,16 @@
 "use client";
 
-import { usePathname } from "next/navigation";
 import AppShell from "@/components/AppShell";
-import TerminalPanel from "@/components/TerminalPanel";
 
+// The terminal Console belongs to marvisx (plan R1/R4). This layout used to
+// mount TerminalPanel on every page so its session state survived route
+// switches — which meant terminal code was bundled into the local artifact
+// even after the terminal route was pruned: a perimeter that held for pages
+// but not for the emitted JavaScript. The local product does not ship it.
 export default function AppLayout({ children }: { children: React.ReactNode }) {
-  const pathname = usePathname();
-  const panelVisible = pathname.startsWith("/terminal");
-
   return (
     <AppShell>
-      {/* Keep TerminalPanel mounted so open/active session state survives route switches,
-          but pass panelVisible=false so it can suspend expensive runtime work off-route. */}
-      <div
-        style={{ display: panelVisible ? "flex" : "none" }}
-        className="flex-1 min-h-0"
-      >
-        <TerminalPanel panelVisible={panelVisible} />
-      </div>
-      <div
-        style={{ display: panelVisible ? "none" : "flex" }}
-        className="flex-1 min-h-0 flex-col"
-      >
-        {children}
-      </div>
+      <div className="flex-1 min-h-0 flex flex-col">{children}</div>
     </AppShell>
   );
 }

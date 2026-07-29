@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
@@ -801,12 +800,9 @@ export function TaskDetailDrawer({
                   <span className="text-pir-text-muted">{pr.diff.stats.files_changed} files</span>
                 </div>
               )}
-              <Link
-                href={`/graph/pr-impact?prId=${encodeURIComponent(pr?.id ?? task.id)}`}
-                className="inline-flex h-8 items-center rounded border border-pir px-3 text-caption text-pir-text-secondary hover:border-pir-accent hover:text-pir-text-primary"
-              >
-                {t.drawer.diffLink}
-              </Link>
+              {/* The diff button opened /graph/pr-impact, the hosted Knowledge
+                  Graph surface. This product does not ship it, so the button
+                  led out of the application. The PR stats above stay. */}
             </div>
           </section>
         )}

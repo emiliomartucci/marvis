@@ -11,6 +11,14 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn() }),
 }));
 
+// These cases describe the v1 sidebar (search placeholder, active-row marker,
+// active/total badge). The design flag defaults to v2, so without this mock they
+// rendered v2 and asserted against markup that is not there — four failures the
+// tree carried because no CI job ran this suite.
+vi.mock("@/lib/useDesignV2", () => ({
+  useDesignV2: () => false,
+}));
+
 import { getPrograms } from "@/lib/api";
 import ProjectsSidebar from "../ProjectsSidebar";
 
@@ -24,8 +32,15 @@ const mockPrograms = [
         name: "MarvisX",
         program: "marvis",
         language: "python",
+        lifecycle: null,
+        phase: null,
+        scope: null,
+        description: null,
+        type: null,
+        repo_path: null,
+        metadata_path: null,
         status: "active" as const,
-        task_counts: { pending: 2, approved: 1, in_progress: 1, completed: 8, rejected: 0, failed: 0 },
+        task_counts: { pending: 2, approved: 1, in_progress: 1, review: 0, completed: 8, rejected: 0, failed: 0 },
         last_handoff: "2026-02-25",
         last_status_update: null,
         on_server: true,
@@ -42,8 +57,15 @@ const mockPrograms = [
         name: "emilio",
         program: "personal",
         language: null,
+        lifecycle: null,
+        phase: null,
+        scope: null,
+        description: null,
+        type: null,
+        repo_path: null,
+        metadata_path: null,
         status: "active" as const,
-        task_counts: { pending: 0, approved: 0, in_progress: 0, completed: 0, rejected: 0, failed: 0 },
+        task_counts: { pending: 0, approved: 0, in_progress: 0, review: 0, completed: 0, rejected: 0, failed: 0 },
         last_handoff: null,
         last_status_update: null,
         on_server: true,
