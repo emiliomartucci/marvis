@@ -1,24 +1,49 @@
-# Surface manifest — future desktop/local GUI owned by marvis (U7/U8). STUB,
-# fail-closed: declared so the registry can tell this surface apart from the
-# CLI wheel and from foreign product GUIs, but NOT deployable. Flipping
-# deployable requires proof for every prerequisite below. No desktop framework
-# is named here — that choice belongs to a separate ADR (plan KTD4).
+# Surface manifest — the local GUI owned by marvis (U7/U8).
+#
+# This manifest used to declare deployable: false and describe a desktop shell
+# that does not exist, while the local GUI has been shipping for months:
+# release.yml builds apps/desktop-ui, copies the export into
+# core/api/console_dist/, pyproject.toml ships that directory in the wheel, and
+# core/api/ui_static.py serves it at /ui/. The registry reported green over a
+# real, unregistered surface — the artifact-mismatch class it exists to prevent.
+#
+# The shell technology choice is a separate question and is still open
+# (docs/decisions/desktop-shell-selection.md). Packaging the GUI into a desktop
+# app is gated below, on its own flag; the browser launcher is the shipping path
+# today.
 surface_id: desktop-ui
 owner_project: marvis
 owner_repo: emiliomartucci/marvis
-contract_version: 1
+contract_version: 2
 description: >-
-  Desktop/local GUI for the marvis product. Owned by marvis; never built from
-  or served by marvisx UI bundles (KTD10), never a Cloud or terminal surface.
+  Local GUI for the marvis product: built from apps/desktop-ui, shipped inside
+  the wheel and served by the local runtime at /ui/. Owned by marvis; never
+  built from or served by marvisx UI bundles (KTD10), never a Cloud or terminal
+  surface.
 
-deployable: false
+# The GUI ships today. scripts/validate_surfaces.py checks this claim against
+# the release workflow and the wheel packaging, so it cannot become a wish.
+deployable: true
 
-# U7/U8 gate — each key must map to non-empty evidence before deployable may
-# become true. The validator enforces this shape.
+ships_as:
+  built_from: apps/desktop-ui
+  bundled_at: core/api/console_dist
+  served_at: /ui/
+
+# Each key must name a file that exists. The set is fixed in the validator, not
+# read from here: a gate that lets the audited file choose what it is audited
+# against certifies whatever it was handed.
 prerequisites:
-  local_gui_characterization: null
-  desktop_host_contract: null
-  shell_adr_decision: null
+  local_gui_characterization: core/cli/tests/test_marvis_console_characterization.py
+  desktop_host_contract: contracts/desktop-host.yaml
+  perimeter_gate: scripts/validate_local_surfaces.py
+
+# Packaging the GUI as an installed desktop application. Distinct from shipping
+# the GUI itself: it needs a shell technology, and that decision is open. The
+# validator refuses to flip this while the ADR is not accepted.
+desktop_shell:
+  deployable: false
+  decision_record: docs/decisions/desktop-shell-selection.md
 
 forbidden_sources:
   - marvisx:core/console
