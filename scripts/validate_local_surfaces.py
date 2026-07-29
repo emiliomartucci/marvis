@@ -41,9 +41,16 @@ ROUTE_FILES = {"page.tsx", "layout.tsx", "template.tsx", "error.tsx", "not-found
 TOOLCHAIN_MODULES = {SRC / "test/setup.ts"}
 
 IMPORT_RE = re.compile(r"""(?:from\s+|import\s*\(\s*)["']([^"']+)["']""")
-LINK_RE = re.compile(r"""(?:href=|router\.(?:push|replace)\(\s*)["'](/[^"']*)["']""")
+# Anything that puts the user on a route: a plain href, a braced one, a template
+# literal, a router call. The first version required a quote immediately after
+# `href=`, so `href={`/admin/?id=${id}`}` was invisible to it and only got
+# reported if /admin/ happened to sit in forbidden_routes — a finite list, so
+# every other undeclared route shipped silently.
+LINK_RE = re.compile(
+    r"""(?:href=\{?\s*|router\.(?:push|replace)\(\s*)["'`](/[^"'`?#$\s]*)""",
+)
 # Nav tables declare their targets as object fields, not JSX attributes.
-NAV_FIELD_RE = re.compile(r"""\bhref:\s*["'](/[^"']*)["']""")
+NAV_FIELD_RE = re.compile(r"""\bhref:\s*["'`](/[^"'`?#$\s]*)""")
 # A route reached by building the URL: `/finder/?path=` + something, or
 # `${origin}/graph/?id=...`. The first version of this gate read only href
 # attributes and missed both. The leading `}` matters: the share link that got
@@ -139,9 +146,23 @@ def strip_comments(source: str) -> str:
 
 
 def navigation_targets(module: Path) -> set[str]:
-    """Internal routes this module sends the user to, declared as links."""
-    source = module.read_text(encoding="utf-8")
-    return set(LINK_RE.findall(source)) | set(NAV_FIELD_RE.findall(source))
+    """Internal routes this module sends the user to, declared as links.
+
+    Every hit is compared against the declared perimeter, not against a list of
+    known-bad routes: a route nobody thought to forbid is still a route this
+    product does not ship.
+    """
+    source = strip_comments(module.read_text(encoding="utf-8"))
+    targets = set(LINK_RE.findall(source)) | set(NAV_FIELD_RE.findall(source))
+    normalised = set()
+    for target in targets:
+        if target.startswith(NON_ROUTE_PREFIXES):
+            continue
+        # A trailing filename is an asset request, not a navigation.
+        if "." in target.rsplit("/", 1)[-1]:
+            continue
+        normalised.add(target if target.endswith("/") else f"{target}/")
+    return normalised
 
 
 def forbidden_literals(module: Path, forbidden: set[str]) -> set[str]:
@@ -166,6 +187,10 @@ def forbidden_literals(module: Path, forbidden: set[str]) -> set[str]:
 
 
 def validate(root: Path) -> list[str]:
+    # Resolved once, here: the import walker turns relative imports into
+    # absolute paths while `@/` ones stay as given, so a relative root mixed
+    # the two forms and `relative_to` raised instead of reporting findings.
+    root = root.resolve()
     errors: list[str] = []
     manifest = yaml.safe_load((root / MANIFEST).read_text(encoding="utf-8"))
 
@@ -233,6 +258,7 @@ def validate(root: Path) -> list[str]:
 
 def declared_routes(root: Path) -> set[str]:
     """Everything the local product owns: navigated, reachable, and shell."""
+    root = root.resolve()
     manifest = yaml.safe_load((root / MANIFEST).read_text(encoding="utf-8"))
     return (
         set(manifest.get("owned_routes") or [])
@@ -243,11 +269,12 @@ def declared_routes(root: Path) -> set[str]:
 
 def foreign_routes(root: Path) -> list[str]:
     """Exported routes outside the local perimeter."""
+    root = root.resolve()
     return sorted(exported_routes(root) - declared_routes(root))
 
 
 def main() -> int:
-    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
+    root = (Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()).resolve()
     errors = validate(root)
     if errors:
         print("local surface perimeter INVALID:", file=sys.stderr)

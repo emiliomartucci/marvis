@@ -38,7 +38,7 @@ function parseLens(
 export function GraphLensShell({
   lenses = GRAPH_LENSES,
   defaultLens = "cosmo",
-  basePath = "/graph",
+  basePath = "/universe",
 }: {
   readonly lenses?: readonly LensOption[];
   readonly defaultLens?: LensId;
@@ -73,7 +73,7 @@ function GraphShellContent({
       )}
 
       {lens === "cosmo" && <CosmoGraphPage />}
-      {lens === "codex" && <CodexLens />}
+      {lens === "codex" && <CodexLens basePath={basePath} />}
     </div>
   );
 }

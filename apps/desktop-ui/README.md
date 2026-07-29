@@ -26,19 +26,6 @@ NEXT_PUBLIC_LOCAL_MODE=1 NEXT_PUBLIC_API_URL="" npm run build
 The static export lands in `out/`. The release workflow copies it into
 `core/api/console_dist/`, which is what the wheel carries.
 
-## API types codegen
-
-Zod schemas and TS types for graph endpoints are generated from the backend
-Pydantic models:
-
-```bash
-npm run gen:types
-```
-
-Regenerate whenever the graph endpoint response shapes change, and commit the
-generated file — it is the source of truth for frontend types. Always import
-from `@/lib/graphTypes`, never from `@/generated/api` directly.
-
 ## Receiving a desktop shell
 
 `contracts/desktop-host.yaml` (repository root) defines what a desktop shell may

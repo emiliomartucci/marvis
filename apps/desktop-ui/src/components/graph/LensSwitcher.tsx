@@ -25,7 +25,7 @@ export function LensSwitcher({
   active,
   className,
   lenses = GRAPH_LENSES,
-  basePath = "/graph",
+  basePath = "/universe",
 }: {
   active: LensId;
   className?: string;

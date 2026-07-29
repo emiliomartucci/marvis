@@ -16,8 +16,7 @@
     "test:e2e:ui": "playwright test --ui",
     "knip": "knip --cache",
     "knip:check": "node scripts/knip-check.mjs",
-    "knip:baseline": "node scripts/knip-count.mjs > .knip-baseline.json",
-    "gen:types": "node scripts/gen-types.mjs"
+    "knip:baseline": "node scripts/knip-count.mjs > .knip-baseline.json"
   },
   "dependencies": {
     "@codemirror/lang-javascript": "^6.2.4",

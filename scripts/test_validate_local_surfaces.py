@@ -120,6 +120,42 @@ class TestPerimeterGate(PerimeterCase):
         errors = validate(self.dir)
         self.assertTrue(any("/monitoring/" in e and "does not ship" in e for e in errors), errors)
 
+    def test_red_braced_template_link_to_an_undeclared_route(self) -> None:
+        # The check used to filter every assembled URL through forbidden_routes,
+        # a finite list. A route nobody thought to forbid — /admin/ here — is
+        # still a route this product does not ship.
+        self.rewrite(
+            "apps/desktop-ui/src/components/tasks/TaskSurface.tsx",
+            "const VIEW_STORAGE_KEY",
+            "const ADMIN = <a href={`/admin/?id=${1}`}>x</a>;\nconst VIEW_STORAGE_KEY",
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("/admin/" in e and "does not ship" in e for e in errors), errors)
+
+    def test_red_router_push_with_a_template_literal(self) -> None:
+        # How the Codex lens navigated to /graph: a backtick, not a quote, so
+        # the quote-anchored pattern walked past it.
+        self.rewrite(
+            "apps/desktop-ui/src/components/tasks/TaskSurface.tsx",
+            "const VIEW_STORAGE_KEY",
+            "const go = () => router.push(`/reports?x=${1}`);\nconst VIEW_STORAGE_KEY",
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("/reports/" in e and "does not ship" in e for e in errors), errors)
+
+    def test_a_relative_root_reports_findings_instead_of_raising(self) -> None:
+        # `validate_local_surfaces.py .` used to raise ValueError: relative
+        # imports resolved to absolute paths while `@/` ones stayed relative,
+        # and relative_to could not reconcile the two. A crash is not a verdict.
+        import os
+
+        previous = Path.cwd()
+        os.chdir(self.dir)
+        try:
+            self.assertEqual(validate(Path(".")), [])
+        finally:
+            os.chdir(previous)
+
     def test_red_url_assembled_from_a_forbidden_route(self) -> None:
         # The href-only check passed this: the universe surface built
         # `/finder/?path=` + a project path, and the finder is hosted-only.
