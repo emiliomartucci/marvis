@@ -32,13 +32,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify the local GUI perimeter
-        # The source IS the perimeter since the U7 move, so this only has to
-        # confirm nothing foreign crept in — no pruning step to trust.
+      - name: Verify the surface registry and the local GUI perimeter
+        # A `v*` tag starts this workflow directly, and the CI workflow that
+        # carries the registry gate only runs on pull requests and pushes to
+        # main. Without this step a tagged commit reached the human-gated
+        # publish job with an unvalidated registry — the one path that skipped
+        # the gate was the one that ships.
+        #
+        # The perimeter check that follows only has to confirm nothing foreign
+        # crept in: the source IS the perimeter since the U7 move.
         run: |
           set -euo pipefail
           python -m pip install --quiet pyyaml
+          python scripts/validate_surfaces.py
           python scripts/validate_local_surfaces.py
+          python scripts/validate_desktop_host.py
 
       - name: Build the local GUI static export in Docker
         run: |
