@@ -32,23 +32,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prune the build tree to the local perimeter
+        # The wheel must carry only what the local product owns. Without this
+        # the export is the whole app: terminal, hosted administration and
+        # SaaS routes ship inside the local release and answer direct URLs.
+        # The script refuses to run if apps/desktop-ui/surfaces.yaml and the
+        # source have drifted, so a stale perimeter cannot produce an artifact.
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pyyaml
+          python scripts/build_local_gui.py build/local-gui
+
       - name: Build Console static export in Docker
         run: |
           set -euo pipefail
           docker run --rm \
             -v "$PWD:/repo" \
-            -w /repo/core/console \
+            -w /repo/build/local-gui \
             -e NEXT_PUBLIC_API_URL="" \
             -e NEXT_PUBLIC_LOCAL_MODE=1 \
             -e NEXT_TELEMETRY_DISABLED=1 \
             node:22-bookworm \
             bash -lc 'npm ci && npm run build'
 
-          test -f core/console/out/index.html
-          test -d core/console/out/_next
+          test -f build/local-gui/out/index.html
+          test -d build/local-gui/out/_next
           rm -rf core/api/console_dist
           mkdir -p core/api/console_dist
-          cp -a core/console/out/. core/api/console_dist/
+          cp -a build/local-gui/out/. core/api/console_dist/
+
+      - name: Fail if a foreign surface reached the local artifact
+        # Proving the export, not the intent: a route outside the perimeter in
+        # the shipped bundle is the 2026-07-23 incident shape (one artifact
+        # serving several products).
+        run: |
+          set -euo pipefail
+          for route in terminal settings monitoring brain graph inbox triage finder; do
+            if find core/api/console_dist -path "*/$route/*" -name "*.html" | grep -q .; then
+              echo "::error::/$route/ is not owned by the local product but reached the artifact"
+              exit 1
+            fi
+          done
+          echo "artifact carries the local perimeter only"
 
       - name: Set up Python
         uses: actions/setup-python@v5
