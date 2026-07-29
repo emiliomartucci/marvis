@@ -106,7 +106,10 @@ export default function LoginPage() {
 
     try {
       await login(email.trim(), password);
-      router.push("/terminal/");
+      // Landing after login must be a route this product ships: /terminal/
+      // belongs to marvisx and is not in the local perimeter, so a successful
+      // login used to leave the user on a page that does not exist.
+      router.push("/diario/");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {

@@ -86,6 +86,126 @@ class TestPerimeterGate(PerimeterCase):
         errors = validate(self.dir)
         self.assertTrue(any("no owned_routes" in e for e in errors), errors)
 
+    def test_red_shipped_code_links_to_a_route_the_product_lacks(self) -> None:
+        # The defect this check exists for: the shell linked to /terminal/ and
+        # /settings/users/ while every page-level check stayed green.
+        self.rewrite(
+            APP_SHELL,
+            'href="/settings/llm/"',
+            'href="/settings/users/"',
+        )
+        errors = validate(self.dir)
+        self.assertTrue(
+            any("/settings/users/" in e and "does not ship" in e for e in errors), errors
+        )
+
+    def test_red_shipped_code_navigates_to_a_route_the_product_lacks(self) -> None:
+        self.rewrite(
+            "apps/desktop-ui/src/app/(app)/page.tsx",
+            'router.replace("/diario/");',
+            'router.replace("/triage/");',
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("/triage/" in e and "does not ship" in e for e in errors), errors)
+
+    def test_red_nav_table_pointing_outside_the_perimeter(self) -> None:
+        # Nav tables declare targets as object fields; the first version of this
+        # gate only read JSX href attributes and missed a whole hosted top bar.
+        self.rewrite(
+            APP_SHELL,
+            'const LOCAL_NAV: LocalNavItem[] = [',
+            'const PACKAGES = [{ href: "/monitoring/" }];\n'
+            'const LOCAL_NAV: LocalNavItem[] = [',
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("/monitoring/" in e and "does not ship" in e for e in errors), errors)
+
+    def test_red_braced_template_link_to_an_undeclared_route(self) -> None:
+        # The check used to filter every assembled URL through forbidden_routes,
+        # a finite list. A route nobody thought to forbid — /admin/ here — is
+        # still a route this product does not ship.
+        self.rewrite(
+            "apps/desktop-ui/src/components/tasks/TaskSurface.tsx",
+            "const VIEW_STORAGE_KEY",
+            "const ADMIN = <a href={`/admin/?id=${1}`}>x</a>;\nconst VIEW_STORAGE_KEY",
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("/admin/" in e and "does not ship" in e for e in errors), errors)
+
+    def test_red_router_push_with_a_template_literal(self) -> None:
+        # How the Codex lens navigated to /graph: a backtick, not a quote, so
+        # the quote-anchored pattern walked past it.
+        self.rewrite(
+            "apps/desktop-ui/src/components/tasks/TaskSurface.tsx",
+            "const VIEW_STORAGE_KEY",
+            "const go = () => router.push(`/reports?x=${1}`);\nconst VIEW_STORAGE_KEY",
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("/reports/" in e and "does not ship" in e for e in errors), errors)
+
+    def test_a_relative_root_reports_findings_instead_of_raising(self) -> None:
+        # `validate_local_surfaces.py .` used to raise ValueError: relative
+        # imports resolved to absolute paths while `@/` ones stayed relative,
+        # and relative_to could not reconcile the two. A crash is not a verdict.
+        import os
+
+        previous = Path.cwd()
+        os.chdir(self.dir)
+        try:
+            self.assertEqual(validate(Path(".")), [])
+        finally:
+            os.chdir(previous)
+
+    def test_red_url_assembled_from_a_forbidden_route(self) -> None:
+        # The href-only check passed this: the universe surface built
+        # `/finder/?path=` + a project path, and the finder is hosted-only.
+        self.rewrite(
+            "apps/desktop-ui/src/components/tasks/TaskSurface.tsx",
+            "const VIEW_STORAGE_KEY",
+            'const OPEN_IN_FINDER = `/finder/?path=${"x"}`;\nconst VIEW_STORAGE_KEY',
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("/finder/" in e and "builds a URL" in e for e in errors), errors)
+
+    def test_red_share_url_built_from_an_interpolated_origin(self) -> None:
+        # How the graph share button got through: the path was glued to the end
+        # of `${origin}`, so it never started right after a quote.
+        self.rewrite(
+            "apps/desktop-ui/src/components/tasks/TaskSurface.tsx",
+            "const VIEW_STORAGE_KEY",
+            "const SHARE = `${window.location.origin}/graph/?id=x`;\nconst VIEW_STORAGE_KEY",
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("/graph/" in e and "builds a URL" in e for e in errors), errors)
+
+    def test_server_call_on_an_api_base_is_not_a_navigation(self) -> None:
+        # `${API_BASE_URL}/terminal/upload` is a request, not a link: only the
+        # interpolated base separates it from the share URL above.
+        self.rewrite(
+            "apps/desktop-ui/src/components/tasks/TaskSurface.tsx",
+            "const VIEW_STORAGE_KEY",
+            "const UPLOAD = `${API_BASE_URL}/terminal/upload`;\nconst VIEW_STORAGE_KEY",
+        )
+        self.assertEqual(validate(self.dir), [])
+
+    def test_prose_about_a_forbidden_route_is_not_a_link(self) -> None:
+        # The check must read code, not comments: three of its first four hits
+        # were sentences describing `/graph/cosmo`.
+        self.rewrite(
+            "apps/desktop-ui/src/components/tasks/TaskSurface.tsx",
+            "const VIEW_STORAGE_KEY",
+            '// The hosted build reaches `/graph/pr-impact` from here.\nconst VIEW_STORAGE_KEY',
+        )
+        self.assertEqual(validate(self.dir), [])
+
+    def test_red_module_no_route_can_reach(self) -> None:
+        # How the terminal, hosted administration and SaaS components travelled
+        # into this repository: nothing imported them, nothing flagged them.
+        orphan = self.dir / "apps/desktop-ui/src/components/OrphanPanel.tsx"
+        orphan.write_text("export default function OrphanPanel() { return null; }\n", encoding="utf-8")
+        errors = validate(self.dir)
+        self.assertTrue(any("OrphanPanel.tsx" in e and "no route reaches" in e for e in errors), errors)
+
 
 class TestPerimeterIsClosed(unittest.TestCase):
     """The same measurement that justified the move, now proving it landed.

@@ -57,11 +57,11 @@ describe("useCosmoData", () => {
   });
 
   it("cleanup aborta la request in-flight (unmount)", async () => {
-    let resolveFn: ((v: unknown) => void) | null = null;
+    const pending: { resolve: ((v: unknown) => void) | null } = { resolve: null };
     getGraphCosmoMock.mockImplementation(
       (opts?: { signal?: AbortSignal }) =>
         new Promise((resolve, reject) => {
-          resolveFn = resolve;
+          pending.resolve = resolve;
           opts?.signal?.addEventListener("abort", () =>
             reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
           );
@@ -71,7 +71,7 @@ describe("useCosmoData", () => {
     expect(result.current.loading).toBe(true);
     unmount();
     // Resolve dopo unmount non deve crashare.
-    resolveFn?.({ projects: [], edges: [] });
+    pending.resolve?.({ projects: [], edges: [] });
     await new Promise((r) => setTimeout(r, 5));
     // State snapshot prima del unmount e' loading:true — sufficiente per verificare no-leak.
     expect(true).toBe(true);

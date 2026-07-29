@@ -1059,18 +1059,6 @@ function radiusForItemImportance(importance: number, satRadius: number): number 
   return baseR * factor;
 }
 
-/** Costruisce un finder URL "open in finder" per `path` relativo al project.
- * Highlight del file dentro la directory parent. Filter XSS-safe. */
-function makeFinderHref(slug: string, relativePath: string): string {
-  const cleaned = relativePath.replace(/^\/+/, "");
-  const rel = `projects/${encodeURIComponent(slug)}/${cleaned}`;
-  const idx = rel.lastIndexOf("/");
-  if (idx <= 0) return `/finder/?path=${encodeURIComponent(rel)}`;
-  const parent = rel.slice(0, idx);
-  const name = rel.slice(idx + 1);
-  return `/finder/?path=${encodeURIComponent(parent)}&highlight=${encodeURIComponent(name)}`;
-}
-
 /** Tooltip multi-line per un SatelliteItem. */
 function itemTooltip(item: SatelliteItem): string {
   const cite = item.importance === 1 ? "cite" : "cites";
@@ -1120,7 +1108,7 @@ function computeDotGeometry(
   return { fx, fy, dotR, fillColor, opacity };
 }
 
-/** Render singolo file-dot (eventualmente avvolto in <a> finder se DEEP+path). */
+/** Render singolo file-dot. */
 function renderSingleDot(
   fi: number,
   dotCount: number,
@@ -1128,8 +1116,6 @@ function renderSingleDot(
   zoom: number,
   item: SatelliteItem | null,
   satLatestAt: string | null,
-  isClickable: boolean,
-  projectSlug: string,
 ): ReactNode {
   const { fx, fy, dotR, fillColor, opacity } = computeDotGeometry(
     fi,
@@ -1142,22 +1128,8 @@ function renderSingleDot(
   const dotKey = item ? item.id : `dot-${fi}`;
   const tooltipNode = item ? <title>{itemTooltip(item)}</title> : null;
 
-  if (item && isClickable && item.path) {
-    return (
-      <a
-        key={dotKey}
-        href={makeFinderHref(projectSlug, item.path)}
-        target="_blank"
-        rel="noopener noreferrer"
-        onClick={(e) => e.stopPropagation()}
-        style={{ cursor: "pointer" }}
-      >
-        <circle cx={fx} cy={fy} r={dotR} fill={fillColor} opacity={opacity}>
-          {tooltipNode}
-        </circle>
-      </a>
-    );
-  }
+  // The dots used to link to /finder/, a hosted surface this product does not
+  // ship: every click landed on a route that is not in the export.
   return (
     <circle key={dotKey} cx={fx} cy={fy} r={dotR} fill={fillColor} opacity={opacity}>
       {tooltipNode}
@@ -1180,11 +1152,7 @@ function renderSingleDot(
  *
  * Porta evolutiva da reference-graph-v1-cosmo.html righe 1090-1119.
  */
-function renderFileDots(
-  sat: SatelliteNodeProps["sat"],
-  zoom: number,
-  projectSlug: string,
-): ReactNode {
+function renderFileDots(sat: SatelliteNodeProps["sat"], zoom: number): ReactNode {
   const satRadius = sat.r;
   const effR = satRadius * zoom;
   const totalCount = sat.count;
@@ -1236,7 +1204,6 @@ function renderFileDots(
   // o quando arc-label non e' renderizzata per spazio insufficiente).
   const showCountBadge = totalCount > 0 && effR >= LOD_MID_THRESHOLD;
   const countBadgeText = hidden > 0 ? `+${hidden}` : `${totalCount}`;
-  const isClickable = effR >= LOD_DEEP_THRESHOLD;
 
   const dots: ReactNode[] = [];
   for (let fi = 0; fi < dotCount; fi++) {
@@ -1249,8 +1216,6 @@ function renderFileDots(
         zoom,
         item,
         sat.latest_at,
-        isClickable,
-        projectSlug,
       ),
     );
   }
@@ -1488,7 +1453,7 @@ function SatelliteNodeImpl({
           {sat.fibValue}
         </text>
       )}
-      {showFiles && renderFileDots(sat, zoom, projectSlug)}
+      {showFiles && renderFileDots(sat, zoom)}
     </g>
   );
 }

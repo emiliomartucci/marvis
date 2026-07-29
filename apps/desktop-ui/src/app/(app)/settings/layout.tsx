@@ -1,18 +1,10 @@
-import SettingsSidebar from "@/components/settings/SettingsSidebar";
-import { WorkspaceProvider } from "@/lib/workspace";
 import type { ReactNode } from "react";
 
+// The local product ships exactly one settings page: the LLM key
+// (apps/desktop-ui/surfaces.yaml, reachable_routes). The shared layout rendered
+// SettingsSidebar, whose eight entries point at hosted administration surfaces
+// this product does not ship — seven dead links around one working page. Local
+// settings are a plain container until a second local settings page exists.
 export default function SettingsLayout({ children }: { children: ReactNode }) {
-  return (
-    <WorkspaceProvider>
-      <div className="flex flex-1 min-h-0 h-full">
-        <aside className="hidden md:flex w-[240px] shrink-0 flex-col bg-pir-surface-0 border-r border-pir overflow-y-auto">
-          <SettingsSidebar />
-        </aside>
-        <div className="flex-1 overflow-y-auto">
-          {children}
-        </div>
-      </div>
-    </WorkspaceProvider>
-  );
+  return <div className="flex-1 overflow-y-auto">{children}</div>;
 }

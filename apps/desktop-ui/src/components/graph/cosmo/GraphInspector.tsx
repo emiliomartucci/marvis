@@ -51,18 +51,6 @@ function safeHref(raw: string): string {
   return /^[/?#]|^https?:/.test(raw) ? raw : "#";
 }
 
-function finderUrl(slug: string, relativePath: string): string {
-  const cleaned = relativePath.replace(/^\/+/, "");
-  const rel = `projects/${encodeURIComponent(slug)}/${cleaned}`;
-  const idx = rel.lastIndexOf("/");
-  if (idx <= 0) return safeHref(`/finder/?path=${encodeURIComponent(rel)}`);
-  const parent = rel.slice(0, idx);
-  const name = rel.slice(idx + 1);
-  return safeHref(
-    `/finder/?path=${encodeURIComponent(parent)}&highlight=${encodeURIComponent(name)}`,
-  );
-}
-
 function downloadUrl(slug: string, relativePath: string): string {
   const cleaned = relativePath.replace(/^\/+/, "");
   return safeHref(
@@ -693,7 +681,6 @@ function ProjectInspector({ slug, onClose }: ProjectInspectorProps) {
               onHover={setHoveredKey}
               copyFlash={copyRow === key}
               onCopy={() => copyPathRow(key, d.filename)}
-              finderHref={finderUrl(slug, d.filename)}
               downloadHref={downloadUrl(slug, d.filename)}
             >
               <span style={styles.rowPrimary}>
@@ -728,7 +715,6 @@ function ProjectInspector({ slug, onClose }: ProjectInspectorProps) {
               onHover={setHoveredKey}
               copyFlash={copyRow === key}
               onCopy={() => copyPathRow(key, h.filename)}
-              finderHref={finderUrl(slug, h.filename)}
               downloadHref={downloadUrl(slug, h.filename)}
             >
               <span style={styles.rowPrimary}>{name}</span>
@@ -823,18 +809,11 @@ function ProjectInspector({ slug, onClose }: ProjectInspectorProps) {
         </ListSection>
       )}
 
+      {/* The share button copied `<origin>/graph/?id=...`, a link into the
+          hosted Knowledge Graph console. Pasted from this product it pointed at
+          a route the local server does not serve. Copying the node id, which
+          any surface can resolve, stays. */}
       <div style={styles.actionsRow}>
-        <button
-          type="button"
-          style={copyFlash === "url" ? styles.actionBtnActive : styles.actionBtn}
-          onClick={() => {
-            const origin = typeof window === "undefined" ? "" : window.location.origin;
-            copyFlashTimed("url", `${origin}/graph/?id=project:artifact:${encodeURIComponent(slug)}`);
-          }}
-          title="Copy share URL"
-        >
-          {copyFlash === "url" ? "✓ copied" : "share"}
-        </button>
         <button
           type="button"
           style={copyFlash === "id" ? styles.actionBtnActive : styles.actionBtn}
@@ -1105,7 +1084,6 @@ function DirInspector({ slug, kind, dirName, onClose }: DirInspectorProps) {
               onHover={setHoveredKey}
               copyFlash={copyRow === it.id}
               onCopy={() => copyPathRow(it.id, it.copyValue)}
-              finderHref={it.path ? finderUrl(slug, it.path) : null}
               downloadHref={it.path ? downloadUrl(slug, it.path) : null}
             >
               <span style={styles.rowPrimary}>

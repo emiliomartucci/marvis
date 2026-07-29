@@ -1,30 +1,40 @@
 # Ownership perimeter of the local/desktop GUI owned by marvis.
 # U7 of the surface-separation plan (marvisx:docs/goals/2026-07-24-separate-surfaces.md).
 #
-# Why this file exists: the local/Cloud split is currently a RUNTIME flag
+# Why this file exists: the local/Cloud split used to be a RUNTIME flag
 # (NEXT_PUBLIC_LOCAL_MODE) inside one shared Next export. The local product
-# navigates five surfaces, but the exported bundle carries every page in the
-# app — terminal, hosted administration and SaaS included. Navigation hides
-# them; the artifact still ships them. That is KTD10 violated by construction,
-# and the same shape as the 2026-07-23 terminal incident: one artifact serving
-# several products.
+# navigated five surfaces while the bundle carried every page in the app —
+# terminal, hosted administration and SaaS included. Navigation hid them; the
+# artifact shipped them. That is KTD10 violated by construction, and the same
+# shape as the 2026-07-23 terminal incident: one artifact serving several
+# products.
 #
-# This declares the perimeter the next slice will carry into a marvis-owned
-# directory. scripts/validate_local_surfaces.py checks it against the real
-# source, so the declaration cannot drift from the code.
+# scripts/validate_local_surfaces.py checks this declaration against the real
+# source — pages, links, and the import closure that decides what the bundler
+# emits — so it cannot drift from the code.
 schema_version: 1
 surface_id: desktop-ui
 owner_project: marvis
 
 # Routes the local product owns. Kept in step with LOCAL_NAV in
-# core/console/src/components/AppShell.tsx — the gate fails on any drift,
-# in either direction.
+# src/components/AppShell.tsx — the gate fails on any drift, in either
+# direction.
 owned_routes:
   - /diario/
   - /todos/
   - /tasks/
   - /projects/
   - /universe/
+
+# Owned too, but reached from a flow rather than from the navigation bar. They
+# must ship: pruning them leaves the UI pointing at pages that do not exist.
+# Every entry records the flow that needs it, so this cannot become a backdoor
+# for surfaces nobody navigates to.
+reachable_routes:
+  /settings/llm/: >-
+    Recovery path for the missing-LLM-key banner in AppShell. Configuring the
+    local model key is part of the local product; without this page the banner
+    tells the user to go somewhere that is not shipped.
 
 # Route classes this product must never ship, with the rule each one protects.
 # The gate rejects any of these appearing in owned_routes.
@@ -37,9 +47,16 @@ forbidden_routes:
   /settings/teams/: hosted multi-user administration, not local single-user
   /settings/tokens/: hosted agent-token administration
   /settings/workspace/: hosted workspace administration
+  /settings/activity/: hosted activity log
+  /settings/general/: hosted workspace settings
   /monitoring/: hosted fleet monitoring
+  /finder/: hosted file browser surface
+  /brain/: hosted Brain reflection surface
+  /inbox/: hosted inbox surface
+  /triage/: hosted PR triage surface
+  /graph/: hosted Knowledge Graph surface
 
-# Known gap, measured not assumed: the shared export currently contains routes
-# outside owned_routes. tests/desktop_ui/ records the current count so the move
-# in the next slice has a before/after number instead of an impression.
-current_state: shared-export-carries-foreign-routes
+# Closed and enforced: the export carries the declared routes only, no shipped
+# module links outside them, and no module sits in the tree that a route
+# cannot reach. Measured, not assumed — see scripts/test_validate_local_surfaces.py.
+current_state: perimeter-enforced-on-shipped-code

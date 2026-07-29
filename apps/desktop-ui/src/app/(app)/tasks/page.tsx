@@ -1,21 +1,10 @@
 "use client";
 
-import { useEffect } from "react";
-import { useRouter } from "next/navigation";
 import TaskSurface from "@/components/tasks/TaskSurface";
 
-function isLocalMode(): boolean {
-  const value = process.env.NEXT_PUBLIC_LOCAL_MODE;
-  return value === "1" || value === "true";
-}
-
+// The shared page redirected to /triage/ outside local mode. This product is
+// the local one and does not ship /triage/, so the branch could only ever send
+// the user to a missing page.
 export default function TasksPage() {
-  const router = useRouter();
-
-  useEffect(() => {
-    if (!isLocalMode()) router.replace("/triage/");
-  }, [router]);
-
-  if (!isLocalMode()) return null;
   return <TaskSurface />;
 }

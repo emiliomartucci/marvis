@@ -36,7 +36,10 @@ import type {
 
 const DEFAULT_PROJECT = "marvisx";
 
-export function CodexLens() {
+// The lens rebuilds its own URL on every filter change. It used to hardcode
+// "/graph", the hosted Knowledge Graph console, so inside /universe/ any filter
+// click navigated to a route this product does not ship.
+export function CodexLens({ basePath = "/universe" }: { readonly basePath?: string }) {
   const router = useRouter();
   const params = useSearchParams();
   const prId = useMemo(() => {
@@ -205,9 +208,9 @@ export function CodexLens() {
       const sp = new URLSearchParams(params?.toString() ?? "");
       sp.set("lens", "codex");
       mut(sp);
-      router.push(`/graph?${sp.toString()}`);
+      router.push(`${basePath}?${sp.toString()}`);
     },
-    [router, params]
+    [router, params, basePath]
   );
 
   const onSelectPr = useCallback(

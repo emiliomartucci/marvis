@@ -23,6 +23,27 @@ jobs:
       - name: Validator unit tests (green on good, red on tampered)
         run: python -m unittest discover -s scripts -p "test_*.py" -v
 
+  # The GUI the public product ships had no job running its tests. The tree
+  # arrived from the shared console with 17 failing tests and a suite that did
+  # not compile, and nothing said so.
+  desktop-ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop-ui/package-lock.json
+      - run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit -p tsconfig.json
+      - name: Unit tests
+        run: npx vitest run
+
   console-launcher:
     runs-on: ubuntu-latest
     steps:
