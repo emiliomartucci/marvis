@@ -18,3 +18,16 @@ jobs:
         run: python scripts/validate_surfaces.py
       - name: Validator unit tests (green on good, red on tampered)
         run: python -m unittest discover -s scripts -p "test_*.py" -v
+
+  console-launcher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Only what the launcher module imports: these tests characterize the
+      # CLI entry point, they do not boot the API.
+      - run: pip install typer rich pytest
+      - name: Console launcher characterization (U7 pre-move baseline)
+        run: python -m pytest core/cli/tests -q
