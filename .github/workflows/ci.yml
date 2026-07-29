@@ -16,6 +16,8 @@ jobs:
       - run: pip install pyyaml
       - name: Surface registry gate (fail-closed)
         run: python scripts/validate_surfaces.py
+      - name: Local GUI perimeter gate (declaration vs source)
+        run: python scripts/validate_local_surfaces.py
       - name: Validator unit tests (green on good, red on tampered)
         run: python -m unittest discover -s scripts -p "test_*.py" -v
 
