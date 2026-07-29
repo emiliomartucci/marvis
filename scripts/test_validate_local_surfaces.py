@@ -25,8 +25,11 @@ class PerimeterCase(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="perimeter-"))
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        # Skip build output: a local `npm ci` leaves ~1 GB under apps/, and
+        # copying it turns a sub-second suite into minutes.
+        ignore = shutil.ignore_patterns("node_modules", ".next", "out")
         for rel in ("apps",):
-            shutil.copytree(REPO_ROOT / rel, self.dir / rel)
+            shutil.copytree(REPO_ROOT / rel, self.dir / rel, ignore=ignore)
 
     def rewrite(self, rel: str, old: str, new: str) -> None:
         path = self.dir / rel

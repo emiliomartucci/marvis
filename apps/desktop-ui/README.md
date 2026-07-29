@@ -1,22 +1,51 @@
-# MarvisX Console
-Mission Control Portal for MarvisX Team
+# Local GUI — owned by `marvis`
+
+The graphical interface of the local Marvis product. This directory is its
+source of truth: the wheel ships an export built from here, the local API
+serves it, and `marvis console` opens it.
+
+## Perimeter
+
+`surfaces.yaml` declares the routes this product owns. It is not documentation:
+`scripts/validate_local_surfaces.py` reads the navigation table out of
+`src/components/AppShell.tsx` and fails CI when the declaration and the code
+disagree, or when a route outside the perimeter appears here.
+
+Surfaces belonging to other products — the personal terminal Console, hosted
+multi-user administration, SaaS-only pages — are not part of this source and
+must not return. Before the U7 move they travelled inside the local release and
+answered a direct URL even though navigation hid them.
+
+## Build
+
+```bash
+npm ci
+NEXT_PUBLIC_LOCAL_MODE=1 NEXT_PUBLIC_API_URL="" npm run build
+```
+
+The static export lands in `out/`. The release workflow copies it into
+`core/api/console_dist/`, which is what the wheel carries.
 
 ## API types codegen
 
-Zod schemas and TS types for `/api/v1/graph/*` endpoints are generated from the backend Pydantic models:
+Zod schemas and TS types for graph endpoints are generated from the backend
+Pydantic models:
 
 ```bash
 npm run gen:types
 ```
 
-Regenerate whenever `api/models/graph_ux.py` or graph endpoint response shapes change.
-Commit `console/src/generated/api.ts` — it is the source of truth for frontend types.
+Regenerate whenever the graph endpoint response shapes change, and commit the
+generated file — it is the source of truth for frontend types. Always import
+from `@/lib/graphTypes`, never from `@/generated/api` directly.
 
-**How it works:** the script imports Pydantic models directly via Python (bypassing the broken
-`/openapi.json` live endpoint) and runs `openapi-zod-client` with the schemas-only template.
-Output is post-processed to add `Schema` suffix + `z.infer<>` type exports.
+## Receiving a desktop shell
 
-**Not impacted:** MCP tools (`mcp-pir/index.mjs`) — keep manual Zod schemas there.
+`contracts/desktop-host.yaml` (repository root) defines what a desktop shell may
+ask of the local runtime: the loopback endpoint, the capabilities it may drive,
+what it must never do, and where permissions live. **No shell technology has
+been chosen** — `docs/decisions/desktop-shell-selection.md` records the open
+decision and the criteria it must answer.
 
-**Import surface:** always import from `@/lib/graphTypes` (re-exports from generated + keeps
-custom types like `GraphKgNode`, `NodeId`, `OrphanNode`). Never import from `@/generated/api` directly.
+The browser launcher stays the compatibility path: a shell drives the documented
+capabilities, it does not reimplement them.
