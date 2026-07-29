@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from validate_surfaces import validate  # noqa: E402
+from validate_surfaces import release_run_commands, validate  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DESKTOP = "contracts/surfaces/desktop-ui.yaml"
@@ -127,7 +127,13 @@ class TestValidator(FixtureCase):
     def test_red_prerequisite_pointing_at_nothing(self) -> None:
         self.rewrite(DESKTOP, "desktop_host_contract: contracts/desktop-host.yaml", "desktop_host_contract: contracts/imaginary.yaml")
         errors = validate(self.dir)
-        self.assertTrue(any("does not exist in the tree" in e for e in errors), errors)
+        self.assertTrue(any("must name contracts/desktop-host.yaml" in e for e in errors), errors)
+
+    def test_red_evidence_deleted_from_the_tree(self) -> None:
+        # The manifest still names the right artifact; the artifact is gone.
+        (self.dir / "contracts/desktop-host.yaml").unlink()
+        errors = validate(self.dir)
+        self.assertTrue(any("is not a file in the tree" in e for e in errors), errors)
 
     def test_red_shipping_claim_the_release_does_not_honour(self) -> None:
         # `deployable: true` is a claim about the release, so it is read against
@@ -152,6 +158,55 @@ class TestValidator(FixtureCase):
         self.rewrite("docs/decisions/desktop-shell-selection.md", "status: open", "status: accepted")
         self.assertEqual(validate(self.dir), [])
 
+    def test_red_prerequisite_pointing_at_an_unrelated_file(self) -> None:
+        # Checking only that the path exists let any file stand in for the proof
+        # it was supposed to name.
+        self.rewrite(DESKTOP, "desktop_host_contract: contracts/desktop-host.yaml", "desktop_host_contract: pyproject.toml")
+        errors = validate(self.dir)
+        self.assertTrue(any("must name contracts/desktop-host.yaml" in e for e in errors), errors)
+
+    def test_red_prerequisite_pointing_at_a_directory(self) -> None:
+        self.rewrite(DESKTOP, "perimeter_gate: scripts/validate_local_surfaces.py", "perimeter_gate: .")
+        errors = validate(self.dir)
+        self.assertTrue(any("must name scripts/validate_local_surfaces.py" in e for e in errors), errors)
+
+    def test_red_served_at_drifting_from_the_host_contract(self) -> None:
+        # The route is fixed by the desktop host contract; the shipping claim
+        # could name any path and stay green.
+        self.rewrite(DESKTOP, "served_at: /ui/", "served_at: /wrong/")
+        errors = validate(self.dir)
+        self.assertTrue(any("served_at" in e and "ui_path" in e for e in errors), errors)
+
+    def test_red_non_boolean_desktop_shell_flag(self) -> None:
+        # `"true"` is not `is True`, so the identity check read a malformed
+        # truthy value as undeployable and skipped the ADR gate.
+        self.rewrite(DESKTOP, "desktop_shell:\n  deployable: false", 'desktop_shell:\n  deployable: "true"')
+        errors = validate(self.dir)
+        self.assertTrue(any("must be a boolean" in e for e in errors), errors)
+
+    def test_red_adr_accepted_only_inside_the_body(self) -> None:
+        # A whole-document search matched an example in the prose and read an
+        # open ADR as decided.
+        self.rewrite(DESKTOP, "desktop_shell:\n  deployable: false", "desktop_shell:\n  deployable: true")
+        self.rewrite(
+            "docs/decisions/desktop-shell-selection.md",
+            "## Status",
+            "## Status\n\nA later ADR will read:\n\n```yaml\nstatus: accepted\n```\n",
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("is not accepted" in e for e in errors), errors)
+
+    def test_red_package_data_entry_commented_out(self) -> None:
+        # Commenting the entry is how a setuptools setting is usually disabled;
+        # the raw-text check still found the string and stayed green.
+        self.rewrite(
+            "pyproject.toml",
+            '"core.api" = ["console_dist/**/*"]',
+            '# "core.api" = ["console_dist/**/*"]',
+        )
+        errors = validate(self.dir)
+        self.assertTrue(any("does not ship console_dist" in e for e in errors), errors)
+
     def test_red_tampered_engine_pin(self) -> None:
         self.rewrite(
             "contracts/engine-pin.yaml",
@@ -166,24 +221,48 @@ class TestReleasePathRunsTheGate(unittest.TestCase):
     """A `v*` tag starts release.yml directly and skips the CI workflow.
 
     The registry gate has to run on the path that ships, not only on the path
-    that reviews.
+    that reviews. Read from the parsed workflow: a commented-out
+    `# python scripts/validate_surfaces.py` still contains the script name, so a
+    text search reported a gate that no longer executes.
     """
 
+    def commands(self, root: Path) -> list[str]:
+        return release_run_commands(root)
+
     def test_release_workflow_runs_every_registry_gate(self) -> None:
-        workflow = (REPO_ROOT / RELEASE).read_text(encoding="utf-8")
+        commands = self.commands(REPO_ROOT)
         for gate in (
             "scripts/validate_surfaces.py",
             "scripts/validate_local_surfaces.py",
             "scripts/validate_desktop_host.py",
         ):
-            self.assertIn(gate, workflow, f"{gate} does not run on the tag path")
+            self.assertTrue(
+                any(gate in line for line in commands), f"{gate} does not run on the tag path"
+            )
 
     def test_release_workflow_gates_before_it_builds(self) -> None:
-        workflow = (REPO_ROOT / RELEASE).read_text(encoding="utf-8")
-        self.assertLess(
-            workflow.index("scripts/validate_surfaces.py"),
-            workflow.index("Build the local GUI static export"),
-            "the registry gate must run before anything is built",
+        commands = self.commands(REPO_ROOT)
+        gate = next(i for i, l in enumerate(commands) if "scripts/validate_surfaces.py" in l)
+        build = next(i for i, l in enumerate(commands) if "npm run build" in l)
+        self.assertLess(gate, build, "the registry gate must run before anything is built")
+
+    def test_a_commented_out_gate_is_not_a_gate(self) -> None:
+        workspace = Path(tempfile.mkdtemp(prefix="release-"))
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        target = workspace / RELEASE
+        target.parent.mkdir(parents=True)
+        text = (REPO_ROOT / RELEASE).read_text(encoding="utf-8")
+        target.write_text(
+            text.replace(
+                "          python scripts/validate_surfaces.py",
+                "          # python scripts/validate_surfaces.py",
+            ),
+            encoding="utf-8",
+        )
+        commands = self.commands(workspace)
+        self.assertFalse(
+            any("scripts/validate_surfaces.py" in line for line in commands),
+            "a commented-out command must not count as a gate",
         )
 
 

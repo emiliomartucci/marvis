@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -36,18 +37,25 @@ FOREIGN_HOSTNAMES = {
     "app.justaskmarvis.com",
     "api.justaskmarvis.com",
 }
-# The proofs a deployable local GUI owes, fixed here rather than read from the
-# manifest: a gate that lets the audited file decide what it is audited against
-# only certifies whatever it was handed.
-REQUIRED_DESKTOP_PREREQUISITES = frozenset(
-    {"local_gui_characterization", "desktop_host_contract", "perimeter_gate"}
-)
+# The proofs a deployable local GUI owes, and the artifact each one means.
+# Fixed here rather than read from the manifest, keys AND values: a gate that
+# lets the audited file decide what it is audited against certifies whatever it
+# was handed, and checking only that the path exists lets any existing file —
+# `pyproject.toml`, or `.` — stand in for the real evidence.
+REQUIRED_DESKTOP_PREREQUISITES = {
+    "local_gui_characterization": "core/cli/tests/test_marvis_console_characterization.py",
+    "desktop_host_contract": "contracts/desktop-host.yaml",
+    "perimeter_gate": "scripts/validate_local_surfaces.py",
+}
+DESKTOP_HOST_CONTRACT = Path("contracts/desktop-host.yaml")
 # What a shipping local GUI must be true of, read from the files that do the
 # shipping. `deployable: true` is a claim about the release, so it is checked
 # against the release.
 RELEASE_WORKFLOW = Path(".github/workflows/release.yml")
 PYPROJECT = Path("pyproject.toml")
-ADR_ACCEPTED_RE = re.compile(r"^status:\s*accepted\s*$", re.IGNORECASE | re.MULTILINE)
+# Front matter only. A whole-document search matched `status: accepted` inside
+# a fenced example or a migration note and read an open ADR as decided.
+FRONT_MATTER_RE = re.compile(r"\A---\n(.*?)\n---\s*\n", re.DOTALL)
 
 
 def pyproject_distribution_name(root: Path) -> str | None:
@@ -68,10 +76,11 @@ def canonical_hostname(host: object) -> str:
 def desktop_prerequisite_errors(root: Path, desktop: dict) -> list[str]:
     """The local GUI may only claim deployable against the fixed proof set.
 
-    The keys come from REQUIRED_DESKTOP_PREREQUISITES, not from the manifest, and
-    each value must name a file that exists in the tree. Before this, `unproven`
-    was computed from whatever mapping the manifest happened to carry: replacing
-    it with a single evidenced key of any name passed.
+    Keys and values both come from REQUIRED_DESKTOP_PREREQUISITES, not from the
+    manifest. `unproven` used to be computed from whatever mapping the manifest
+    carried, so a single evidenced key of any name passed; then only the key set
+    was fixed, so any existing path — `pyproject.toml`, or `.` — could stand in
+    for the proof it was supposed to name.
     """
     errors: list[str] = []
     prereqs = desktop.get("prerequisites")
@@ -79,10 +88,10 @@ def desktop_prerequisite_errors(root: Path, desktop: dict) -> list[str]:
         return ["desktop-ui: prerequisites must be a mapping of proof keys to evidence"]
 
     declared_keys = set(prereqs)
-    missing = REQUIRED_DESKTOP_PREREQUISITES - declared_keys
+    missing = set(REQUIRED_DESKTOP_PREREQUISITES) - declared_keys
     if missing:
         errors.append("desktop-ui: prerequisites missing required keys: " + ", ".join(sorted(missing)))
-    unknown = declared_keys - REQUIRED_DESKTOP_PREREQUISITES
+    unknown = declared_keys - set(REQUIRED_DESKTOP_PREREQUISITES)
     if unknown:
         errors.append("desktop-ui: prerequisites declare unknown keys: " + ", ".join(sorted(unknown)))
 
@@ -91,14 +100,15 @@ def desktop_prerequisite_errors(root: Path, desktop: dict) -> list[str]:
     if desktop.get("deployable") is not True:
         return errors
 
-    for key in sorted(REQUIRED_DESKTOP_PREREQUISITES & declared_keys):
+    for key in sorted(set(REQUIRED_DESKTOP_PREREQUISITES) & declared_keys):
+        expected = REQUIRED_DESKTOP_PREREQUISITES[key]
         evidence = prereqs[key]
-        if not isinstance(evidence, str) or not evidence.strip():
-            errors.append(f"desktop-ui: deployable=true but {key} has no proof")
-        elif not (root / evidence.strip()).exists():
+        if not isinstance(evidence, str) or evidence.strip() != expected:
             errors.append(
-                f"desktop-ui: {key} points at {evidence.strip()}, which does not exist in the tree"
+                f"desktop-ui: deployable=true but {key} must name {expected}, not {evidence!r}"
             )
+        elif not (root / expected).is_file():
+            errors.append(f"desktop-ui: {key} names {expected}, which is not a file in the tree")
 
     errors.extend(shipping_claim_errors(root, desktop))
     return errors
@@ -116,14 +126,33 @@ def desktop_shell_errors(root: Path, desktop: dict) -> list[str]:
         errors.append("desktop-ui: desktop_shell.decision_record must name an existing ADR")
         return errors
 
-    if shell.get("deployable") is True:
-        text = (root / record).read_text(encoding="utf-8")
-        if not ADR_ACCEPTED_RE.search(text):
-            errors.append(
-                f"desktop-ui: desktop_shell.deployable=true while {record} is not accepted — "
-                "no shell technology has been chosen"
-            )
+    deployable = shell.get("deployable")
+    # A malformed truthy value such as the string "true" is not `is True`, so the
+    # identity check read it as undeployable and skipped the ADR gate entirely.
+    if not isinstance(deployable, bool):
+        return errors + ["desktop-ui: desktop_shell.deployable must be a boolean"]
+
+    if deployable and adr_status(root / record) != "accepted":
+        errors.append(
+            f"desktop-ui: desktop_shell.deployable=true while {record} is not accepted — "
+            "no shell technology has been chosen"
+        )
     return errors
+
+
+def adr_status(path: Path) -> str | None:
+    """The `status` field of the ADR front matter, or None if there is none."""
+    match = FRONT_MATTER_RE.match(path.read_text(encoding="utf-8"))
+    if not match:
+        return None
+    try:
+        front = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return None
+    if not isinstance(front, dict):
+        return None
+    status = front.get("status")
+    return status.strip().lower() if isinstance(status, str) else None
 
 
 def shipping_claim_errors(root: Path, desktop: dict) -> list[str]:
@@ -145,33 +174,79 @@ def shipping_claim_errors(root: Path, desktop: dict) -> list[str]:
     if not bundled_at:
         errors.append("desktop-ui: ships_as.bundled_at must name the bundled location")
 
+    served_at = str(ships.get("served_at") or "").strip()
+    # The route is fixed by the desktop host contract, which the launcher is
+    # checked against in turn. Without this, the shipping claim could name any
+    # path and stay green.
     try:
-        workflow = (root / RELEASE_WORKFLOW).read_text(encoding="utf-8")
+        host = yaml.safe_load((root / DESKTOP_HOST_CONTRACT).read_text(encoding="utf-8"))
+    except OSError as exc:
+        errors.append(f"cannot read {DESKTOP_HOST_CONTRACT}: {exc}")
+    else:
+        authoritative = ((host or {}).get("endpoint") or {}).get("ui_path")
+        if served_at != authoritative:
+            errors.append(
+                f"desktop-ui: ships_as.served_at {served_at!r} != {DESKTOP_HOST_CONTRACT} "
+                f"endpoint.ui_path {authoritative!r}"
+            )
+
+    try:
+        workflow_steps = release_run_commands(root)
     except OSError as exc:
         return errors + [f"cannot read {RELEASE_WORKFLOW}: {exc}"]
-    if built_from and built_from not in workflow:
+    if built_from and not any(built_from in line for line in workflow_steps):
         errors.append(
             f"desktop-ui: deployable=true but {RELEASE_WORKFLOW} never builds {built_from}"
         )
-    if bundled_at and bundled_at not in workflow:
+    if bundled_at and not any(bundled_at in line for line in workflow_steps):
         errors.append(
             f"desktop-ui: deployable=true but {RELEASE_WORKFLOW} never produces {bundled_at}"
         )
 
+    # The wheel ships the export as package data. Reading the raw text matched a
+    # commented-out entry, which is how a setuptools setting is usually
+    # disabled: parse the table instead.
     try:
-        pyproject = (root / PYPROJECT).read_text(encoding="utf-8")
+        pyproject = tomllib.loads((root / PYPROJECT).read_text(encoding="utf-8"))
     except OSError as exc:
         return errors + [f"cannot read {PYPROJECT}: {exc}"]
-    # The wheel ships the export as package data; without it the GUI is built
-    # in CI and then dropped on the floor. Match the recursive glob, not the
-    # bare name: pyproject also mentions the directory in prose, and a substring
-    # test reads a comment as a shipping declaration.
+    except tomllib.TOMLDecodeError as exc:
+        return errors + [f"{PYPROJECT} is not valid TOML: {exc}"]
+
+    package_data = (
+        pyproject.get("tool", {}).get("setuptools", {}).get("package-data", {})
+    )
+    shipped_globs = [glob for globs in package_data.values() for glob in globs]
     bundled_package_data = bundled_at.rsplit("/", 1)[-1] if bundled_at else ""
-    if bundled_package_data and f"{bundled_package_data}/**/*" not in pyproject:
+    if bundled_package_data and not any(
+        glob.startswith(f"{bundled_package_data}/") for glob in shipped_globs
+    ):
         errors.append(
             f"desktop-ui: deployable=true but {PYPROJECT} does not ship {bundled_package_data}"
         )
     return errors
+
+
+def release_run_commands(root: Path) -> list[str]:
+    """Active command lines of every `run:` step in the release workflow.
+
+    Parsed, not grepped: a commented-out `# python scripts/validate_surfaces.py`
+    still contains the script name, so a text search reported a gate that no
+    longer executes.
+    """
+    workflow = yaml.safe_load((root / RELEASE_WORKFLOW).read_text(encoding="utf-8"))
+    lines: list[str] = []
+    for job in (workflow.get("jobs") or {}).values():
+        for step in (job or {}).get("steps") or []:
+            script = (step or {}).get("run")
+            if not isinstance(script, str):
+                continue
+            lines.extend(
+                line.strip()
+                for line in script.split("\n")
+                if line.strip() and not line.strip().startswith("#")
+            )
+    return lines
 
 
 def validate(root: Path) -> list[str]:
