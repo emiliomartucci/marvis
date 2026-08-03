@@ -31,11 +31,11 @@ jobs:
         id: mcp
         env:
           MARVIS_MCP_TOKEN: ${{ secrets.MARVIS_MCP_TOKEN }}
-          MARVIS_MCP_URL: https://emilio.cloud.justaskmarvis.com/mcp
+          MARVIS_MCP_URL: "${{ vars.MARVIS_MCP_URL || 'https://emilio.cloud.justaskmarvis.com/mcp' }}"
         run: |
           set -euo pipefail
-          if [ -z "${MARVIS_MCP_TOKEN}" ]; then
-            echo "::notice::MARVIS_MCP_TOKEN is not set - drafting without Marvis project context."
+          if [ -z "${MARVIS_MCP_TOKEN}" ] || [ -z "${MARVIS_MCP_URL}" ]; then
+            echo "::notice::MARVIS_MCP_TOKEN or MARVIS_MCP_URL is not set - drafting without Marvis project context."
             echo "args=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
