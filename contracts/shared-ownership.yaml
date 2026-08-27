@@ -1,0 +1,161 @@
+# Shared-area ownership map — marvis (public product) side of the
+# marvisx public/shared projection (U1/U2 of the 2026-08-25 controlled engine
+# synchronization plan).
+#
+# This file is the reviewed ownership map KTD2/KTD3 speak of: it decides which
+# repository paths a projection import may touch, and which paths are owned by
+# this repository even when the Plan A payload carries them. The exporter's
+# consumer policy (marvisx contracts/projections/oss_consumer_v1.json) is an
+# input, NOT permission: this map is the boundary this repo fails closed on.
+#
+# Ordering rule (enforced by scripts/import_shared_projection.py): a path that
+# matches an oss_owned rule is blocked even when it also sits under a managed
+# area — that is how core/api/tests/ stays ours while core/api/ is shared.
+# Transferring a path between classes is a reviewed change to THIS file, never
+# something an import silently does (KTD3).
+#
+# Authored against OSS base 07821c76b5e890c341eeed80ca2f4002ad482b79
+# (origin/main, 2026-08-27). Pre-candidate exporter reviewed: 936e1e6e.
+schema: marvis-shared-ownership/v1
+ownership_map_version: 1
+
+# Paths a public/shared payload may write. A rule ending in "/" is a prefix;
+# anything else is an exact file. A payload path must match exactly one rule;
+# matching zero or two is a violation, not a best-effort guess.
+managed_areas:
+  # Shared engine code (mirrors marvisx include destinations).
+  - core/api/
+  - core/cli/
+  - core/console/
+  - core/deploy/
+  - core/mcp-pir/
+  - core/platform/
+  - core/scripts/
+  - core/telemetry/
+  - core/wizard/
+  # Shared governed contracts.
+  - contracts/openapi/
+  - contracts/actions/
+  # Shared scaffolding and schema history.
+  - deploy/_template/
+  - migrations/
+  - projects/_template/
+  # Shared documentation that travels with the engine.
+  - docs/install/
+  - docs/SEARCH-QUALITY.md
+  # Root files whose bytes are product-neutral and already synchronized from
+  # the last mirror lineage; receiving them again is a no-op by digest.
+  - CHANGELOG.md
+  - LICENSE
+  - MANIFEST.in
+  - SECURITY.md
+  - THIRD_PARTY_LICENSES
+  # The two GitHub surfaces the engine owns.
+  - .github/workflows/e2e-macos.yml
+  - .github/ISSUE_TEMPLATE/feedback.yml
+
+# Paths owned by THIS repository. A payload path landing here is a blocked
+# collision reported with the matched rule: the shared engine may not
+# overwrite the public product's own surfaces (plan R8/KTD3). Entries that
+# also sit inside a managed area (core/api/tests/, core/api/console_dist/)
+# are the deliberate exceptions documented above.
+oss_owned_areas:
+  # The README documents this product, including its own GUI and tool count.
+  - README.md
+  # Packaging is the consumer's: name, version, entry points, wheel contents.
+  - pyproject.toml
+  # Build hygiene follows the consumer's tree (apps/desktop-ui export).
+  - .gitignore
+  # The release workflow builds the OSS GUI from apps/desktop-ui and runs the
+  # three validator gates; the shared release.yml builds the marvisx Console
+  # instead. Letting the payload overwrite it would swap the shipped product.
+  - .github/workflows/release.yml
+  - .github/workflows/ci.yml
+  # Registry and pins are this repository's own governance artifacts.
+  - contracts/engine-pin.yaml
+  - contracts/desktop-host.yaml
+  - contracts/surfaces/
+  # The local GUI is marvis-owned, never built from marvisx UI bundles.
+  - apps/
+  # Top-level validators (distinct from the shared core/scripts/ area).
+  - scripts/
+  # The API characterization suite tests THIS tree; the public payload
+  # excludes core/api/tests/ upstream, so it can never resync it — deleting
+  # or overwriting it here would blind the repo. core/cli/tests/ is ours for
+  # the same reason (the console launcher characterization).
+  - core/api/tests/
+  - core/cli/tests/
+  # Where the wheel bundles this repo's own GUI export.
+  - core/api/console_dist/
+  # Local decisions and this import's own documentation.
+  - docs/decisions/
+  - docs/projection/
+  - AGENTS.md
+
+# Independent deny policy (defense in depth: the exporter enforces its own,
+# but the consumer must not have to trust it). All checks are fail-closed.
+deny:
+  # Cloud operations, hosted control plane, fleet and tenant filesystems,
+  # Enterprise-private delivery, and provider configs never enter this repo.
+  forbidden_prefixes:
+    - core/kb/
+    - core/hosted_control/
+    - core/hosted_deploy/
+    - core/hosted_edge/
+    - core/hosted_lifecycle/
+    - projects/tenants/
+    - tenants/
+    - enterprise-private/
+    - cloud-operations/
+    - marvis-cloud/
+    - marvis_enterprise/
+    - .claude/
+    - .claude-plugin/
+  forbidden_components:
+    - .env
+    - .git
+    - .ssh
+    - secrets
+  forbidden_suffixes:
+    - .db
+    - .key
+    - .p12
+    - .pem
+    - .sqlite
+    - .sqlite3
+  # Byte markers that must never appear in exported content.
+  forbidden_content_markers:
+    - "-----BEGIN OPENSSH PRIVATE KEY-----"
+    - "-----BEGIN PRIVATE KEY-----"
+    - MARVIS_ENTERPRISE_PRIVATE_SENTINEL_DO_NOT_EXPORT
+    - MARVIS_PRIVATE_SENTINEL_DO_NOT_EXPORT
+    - MARVIS_TENANT_SENTINEL_DO_NOT_EXPORT
+  # High-confidence credential shapes (same set the exporter uses).
+  secret_patterns:
+    - "AKIA[0-9A-Z]{16}"
+    - "gh[pousr]_[A-Za-z0-9]{30,}"
+    - "sk-(?:proj-)?[A-Za-z0-9_-]{40,}"
+    - "xox[baprs]-[A-Za-z0-9-]{20,}"
+  # Python modules that must not be imported at module top level. A guarded
+  # import (inside try/except) is an explicit optional seam and is reported,
+  # not blocked; an unguarded one is a hard Cloud/Enterprise dependency.
+  forbidden_imports:
+    - core.hosted_control
+    - core.hosted_deploy
+    - core.hosted_edge
+    - core.hosted_lifecycle
+    - core.kb
+    - marvis_cloud
+    - marvis_enterprise
+    - workos
+    - stripe
+
+# Hard limits and invariants of the import itself.
+policy:
+  # The importer NEVER deletes: a file tracked here and absent from the
+  # payload survives every import and is reported for maintainer review.
+  never_delete: true
+  # apply requires a fully clean worktree (tracked + untracked).
+  apply_requires_clean_worktree: true
+  # Single-file size cap, mirroring the exporter's max_file_bytes.
+  max_file_bytes: 20971520
