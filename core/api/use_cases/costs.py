@@ -96,11 +96,7 @@ def _build_program_map(programs: dict) -> dict[str, str]:
 
 def _is_explicit_local_single_user(ctx: CallerContext) -> bool:
     """Match only the loopback OSS identity; never infer local from a default id."""
-    return (
-        ctx.user_id == "local"
-        and ctx.username == "local"
-        and ctx.user_type == "human"
-    )
+    return ctx.is_local_os_account
 
 
 def _require_resolved_visibility(

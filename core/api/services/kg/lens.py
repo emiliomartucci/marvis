@@ -44,12 +44,7 @@ def require_kg_visibility(
     empty set when it has no grants.
     """
     workspace_id = require_workspace_ctx(ctx)
-    local_unrestricted = (
-        ctx.username == "local"
-        and ctx.user_id == "local"
-        and ctx.user_type == "human"
-        and workspace_id == "ws_default"
-    )
+    local_unrestricted = ctx.is_local_os_account and workspace_id == "ws_default"
     if visible_projects is None and not local_unrestricted:
         raise AuthorizationError(
             code="project_visibility_required",

@@ -90,11 +90,8 @@ def _dumps(meta: object) -> str:
 
 
 def _is_local_single_user(ctx: CallerContext) -> bool:
-    return (
-        ctx.user_id == "local"
-        and ctx.username == "local"
-        and ctx.user_type == "human"
-    )
+    """Local data-plane compatibility, independent of approval authority."""
+    return ctx.is_local_os_account
 
 
 async def _require_project_access(

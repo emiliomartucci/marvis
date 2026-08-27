@@ -67,18 +67,20 @@ def _env_flag(
 
 
 def _build_local_ctx_from_env(env: Mapping[str, str] | None = None) -> CallerContext:
-    """Build the trusted local single-user identity.
+    """Build the fixed local stdio agent identity.
 
     ``env`` remains an accepted argument for backwards-compatible tests/callers,
     but environment values never select a principal, role, workspace, reviewer,
     or human authority. Remote transports resolve only verified access tokens.
     """
     del env
-    return CallerContext.local_single_user()
+    return CallerContext.local_mcp_agent()
 
 
-# Trusted local stdio is the OSS single-user/CLI surface. Remote HTTP calls never
-# fall back to this identity; they require the verified FastMCP access token.
+# Local stdio is agent-context inside the API. A same-account process can still
+# invoke the separately trusted CLI, so this is an authority classification, not
+# a cryptographic same-shell boundary. Remote HTTP calls never fall back to this
+# identity; they require the verified FastMCP access token.
 LOCAL_CTX: CallerContext = _build_local_ctx_from_env()
 _REMOTE_UNAUTHENTICATED_CTX = CallerContext(
     username="unauthenticated",
@@ -459,7 +461,7 @@ async def require_unambiguous_visible_project(
     sole owner recorded in ``workspace_projects``. Missing/old schema and shared
     slugs fail closed without revealing the competing workspace.
     """
-    if ctx is LOCAL_CTX:
+    if ctx.is_local_os_account:
         return
     project = (project_slug or "").strip()
     if visible_projects is None or project not in visible_projects:

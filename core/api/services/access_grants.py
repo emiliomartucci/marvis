@@ -216,13 +216,14 @@ def actor_from_user_info(user: Any) -> CallerContext:
         scopes=tuple(getattr(user, "scopes", []) or []),
         is_human_session=str(getattr(user, "user_type", "human") or "human") == "human",
         user_id=str(getattr(user, "user_id", "") or ""),
+        local_runtime=getattr(user, "auth_mechanism", "unknown") == "local",
     )
 
 
 def unrestricted_actor(actor: CallerContext) -> bool:
     if actor.system_role in {"admin", "super_admin"}:
         return True
-    if actor.user_id == "local" and actor.user_type == "human":
+    if actor.is_local_os_account:
         return True
     if actor.user_type == "agent" and agent_visibility_bypass_enabled():
         return True
@@ -230,11 +231,8 @@ def unrestricted_actor(actor: CallerContext) -> bool:
 
 
 def _is_local_single_user(actor: CallerContext) -> bool:
-    return (
-        actor.user_id == "local"
-        and actor.username == "local"
-        and actor.user_type == "human"
-    )
+    """Local data-plane compatibility, independent of approval authority."""
+    return actor.is_local_os_account
 
 
 def identity_candidates(actor: CallerContext) -> tuple[str, ...]:

@@ -77,11 +77,7 @@ async def _governing_project(
             return False, None, None, workspace_id
         return True, row[0], row[1], workspace_id
     if target_type == "project":
-        if not (
-            ctx.user_id == "local"
-            and ctx.username == "local"
-            and ctx.user_type == "human"
-        ):
+        if not ctx.is_local_os_account:
             try:
                 owners = {
                     str(row[0])
@@ -100,11 +96,7 @@ async def _governing_project(
                 return False, None, None, workspace_id
         return True, target_id, None, workspace_id
     if target_type == "program":
-        if (
-            ctx.user_id == "local"
-            and ctx.username == "local"
-            and ctx.user_type == "human"
-        ):
+        if ctx.is_local_os_account:
             return True, None, None, workspace_id
         return False, None, None, workspace_id
     return False, None, None, workspace_id

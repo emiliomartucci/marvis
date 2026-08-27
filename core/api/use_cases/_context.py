@@ -7,8 +7,10 @@ it differs per surface:
 - HTTP adapter (SaaS/Enterprise/Console): :meth:`CallerContext.from_user_info`
   maps the existing ``UserInfo`` (resolved by ``Depends(get_current_user_or_agent)``
   inside the router) to a context. ``Depends`` never descends into the use_case.
-- MCP local (OSS single-user): :meth:`CallerContext.local_single_user` builds a
-  default local identity. No token, no JWT.
+- MCP local (single-user stdio): :meth:`CallerContext.local_mcp_agent` builds a
+  fixed agent identity. The trusted local CLI separately uses
+  :meth:`CallerContext.local_single_user`; same-shell access is not claimed as
+  a cryptographic human/agent boundary. No token, no JWT.
 
 This module is intentionally free of ``fastapi`` and ``UserInfo`` at runtime
 (``UserInfo`` is imported only under ``TYPE_CHECKING`` and ``from_user_info`` is
@@ -44,6 +46,9 @@ class CallerContext:
     # approval authority is re-read from the persisted delegation row at the
     # use-case decision point (see ``has_approval_authority`` below).
     delegation_grant_id: str | None = None
+    # Adapter-set provenance for the local single-user process. Identity claims
+    # alone never turn a remote principal into the local OS account.
+    local_runtime: bool = False
 
     @property
     def can_act_as_approver(self) -> bool:
@@ -55,15 +60,49 @@ class CallerContext:
         """
         return self.user_type == "human" and self.is_human_session
 
+    @property
+    def is_local_os_account(self) -> bool:
+        """Whether the caller is the explicit local single-user OS account.
+
+        This is a data/filesystem visibility boundary, not approval authority.
+        Both the trusted local CLI and local stdio MCP operate as this account;
+        only :attr:`can_act_as_approver` distinguishes human approval authority.
+        """
+        return (
+            self.local_runtime
+            and self.username == "local"
+            and self.user_id == "local"
+            and self.workspace_id == "ws_default"
+        )
+
     @classmethod
     def local_single_user(cls) -> "CallerContext":
-        """Default identity for OSS single-user MCP: local operator, human session."""
+        """Trusted local CLI/loopback identity for the current OS account."""
         return cls(
             username="local",
             system_role="operator",
             user_type="human",
             is_human_session=True,
             user_id="local",
+            local_runtime=True,
+        )
+
+    @classmethod
+    def local_mcp_agent(cls) -> "CallerContext":
+        """Local stdio MCP identity: same OS account, but agent authority.
+
+        A process with the same shell authority can invoke the trusted CLI, so
+        this is not a cryptographic separation from the human.  It does keep
+        MCP/automation calls agentic inside the domain layer and prevents them
+        from satisfying human-only approval checks by merely selecting stdio.
+        """
+        return cls(
+            username="local",
+            system_role="operator",
+            user_type="agent",
+            is_human_session=False,
+            user_id="local",
+            local_runtime=True,
         )
 
     @classmethod
@@ -91,6 +130,7 @@ class CallerContext:
             is_human_session=is_human_session,
             user_id=u.user_id,
             delegation_grant_id=delegation_grant_id,
+            local_runtime=getattr(u, "auth_mechanism", "unknown") == "local",
         )
 
 
