@@ -54,7 +54,10 @@
       "kind": "object",
       "property_sha256": {
         "agent_name": "a0d8903014379dcccc36aab8af22dc94406e75ee36b1594cb4589151562e0186",
-        "scopes": "ee35f36b548cd00d2e616312e92619d23a8c921f658ff5afa419fd4bfed02c55"
+        "expires_in_hours": "c91a72a2bdac63b9daafb2707611407b7ed832f7201c7250864ea6ccb0d12246",
+        "overlap_minutes": "a3481aa5d3468a0a3330f63d24df2f2c0054242c50f001859e10d95d25dfe0ed",
+        "scopes": "ee35f36b548cd00d2e616312e92619d23a8c921f658ff5afa419fd4bfed02c55",
+        "supersedes_id": "1bf7bf5a23c813cceeb71d5034214c96126be08866d0b1f13ae1664c3ab94e5f"
       },
       "required": [
         "agent_name"
@@ -64,12 +67,23 @@
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
       "kind": "object",
       "property_sha256": {
+        "acknowledged_at": "3e93c616489892f083a9065df1d7dfcb2ecb557fdead61f39a2d8047d081db31",
         "agent_name": "088873c5401b534165b1181ce1303bfbbeba925b371bedc79ac9bbb5d81e18d7",
         "created_at": "071acca89b9860b822f6d3250b067cf709be6018eeaadf2a2fdf28b6df2ae989",
+        "credential_kind": "ce8600a11d98990e13f9142df10b3e16b91a0a96f439c8bba7d612898d9a28e8",
+        "expires_at": "f3fa301cadd5db7a00ff55bd07603f7535d09759c5b59468e9ad99caa2b396e5",
         "id": "0e6f648c9eb25f1fc66ecdea7f8da328db0a505a93ba40a733b834915ba058e4",
         "is_active": "6365cf691ac5ad9dfb8603c38964c8dc048848b7aa89ef6f9e95c2dd5519f6c7",
+        "issued_at": "d42402c4707fb6c45dbcd2ad56a1260eafee8bcd8ff264faf71a8eb33587d0c3",
+        "label": "a20255fe91be94309a85a6af5d9036f33ce4dc83c3f83247d3e887ffa02d3fc3",
         "last_used_at": "812fbcc4e0492aa4139e03cab3b0dc1121dcea56a451c057cdb974b259fcb044",
+        "overlap_until": "45d851689a2b7234b750b5077d921ba95a2293fd60e9b012d3775c2df9bc3f26",
+        "principal_id": "43ab59bca77fb1df4dfb4d0522ab328ef22ab8b9681fb817ea714ac9694b2940",
+        "principal_type": "f87af30368efd61f67f782356275e638e746e4adb96aaf23e6b5056c18616139",
+        "revoked_at": "795741bdfcbe67ef03089062737c3d986b7b632f71186035d27cf5bf598d1c4d",
+        "rotation_family_id": "bdf2e8cf44d80f4921078a3e4d74526c8675c724ddd621c55b7cf284ec12872e",
         "scopes": "d04c4184e697421fe001363466f4bef55004cc9b8df7d730c47b28703a412ca7",
+        "supersedes_id": "677c02380790e49696e97ddb5ba8644844701e9527ed07647296a626e4e7b204",
         "token": "3be84639d841a7b716ef6651a41ce980b58c23ba2ebc5247d65a415fcd4eb0cb"
       },
       "required": [
@@ -1612,6 +1626,7 @@
       "property_sha256": {
         "cycle_key": "97d58e2ddbeb644c1c4daa35765374299755812b54f72d8eca9d03ad72b150b6",
         "items": "7d804fafa99827d06907ee640e9a26417b255e5e81bff261851e6eeb84ee29f2",
+        "malformed_count": "c29fbdaa8ed1b53a0025ff3a64b151ab0cc639281a7b911a0da7701ed0d53a24",
         "next_cursor": "740d92301344bd15e0b79a912559813fd64245c3ffd4efbf974a590e10657c2d",
         "redacted_count": "b90c32eb0eb417f1f3ca89dc33234406b8a143aaab92e4159f43a7e1607946da",
         "redacted_evidence_count": "3cb1657ed66b094191b044cad24f7f5c9e7d4ad36fbf46a9d1a452c49eaee217",
@@ -1663,44 +1678,70 @@
         "projects"
       ]
     },
-    "GuiFirstValueRequest": {
-      "envelope_sha256": "5a1f0b88c3da70853b5513efaf9fc5d3374ebee53b30b4b1dfb1e8cbc5c3ed64",
-      "kind": "object",
-      "property_sha256": {
-        "cycle_key": "8556784b45fbf7e7a8236d3873ef16f775047e43f4fe579f612e649229a4bff1",
-        "entry_id": "a5111164c87db702174d2e4f9335303fdcced90397aff8412cc982c103a20ca1",
-        "registri_count": "5abc8df58b6289d8102c68b5079ace1eb255e02e9a11bd171a8cc57b328e764f",
-        "route": "57f3c6347bcb5a1bf66cec3336bfd0929f1cd938ccb7dea379b43280891051dc",
-        "run_id": "1c65c705c43fd49ed6448f29d2d359b00f410795976a674f4380a8c8a2945943",
-        "scope_key": "db420b16f905f20a39c4f9021111df8452c8efebc5f193fd84707868a6970864",
-        "scope_type": "30c05092bde8612c0580cee983fdd516bd0cacc4324ab938be72dfb2fbe49eb5",
-        "surface": "b2257ab9fb2a6b5eb1636df0c03fc485e4a21172199acff0518b05c4f54b8032"
-      },
-      "required": [
-        "cycle_key",
-        "entry_id",
-        "registri_count",
-        "route",
-        "run_id",
-        "surface"
-      ]
-    },
-    "GuiFirstValueResponse": {
+    "GraphIngestEdge": {
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
       "kind": "object",
       "property_sha256": {
-        "emitted": "28be309da09ec2fc9888549581acfbfa06e6552b7df8fc65dda226c04f8f67fb",
-        "event_id": "b2d46b340f64074a3963662df5a4196ea0dcc2b1f0e003d33c1d103b36ba4148",
-        "event_name": "11bb92f7d42abe548b339e98a68c9e0d6edf52b7e20cf18882606bb7847c15a4",
-        "first_seen_at": "f71dd3259c89a44bf498d9f3e740ca7adc3970557866c6224ec7465b118c0f3d",
-        "seen_count": "9c6b3b87a198e943d1561bded71eedefd619213d28afe732b02eb6f4ccfa2e47"
+        "confidence": "f16e4e077d03a4ad81ef83a02f29069d90f9c79b1147e2015e3af7106a7d693e",
+        "metadata": "66e547056a26d4965833351543070fbe72265457202881a43390bfd267ad128c",
+        "relation": "da8cbd794bde06c629c23e212e75588282c0353dadce2d915b37c44e1646d48b",
+        "source": "77d87fd7fdaca91dba05777f0c54db0397c0f794d35abf1ca1806dfae75f5495",
+        "source_file": "c12cd2e79a82c9c09264f314438868fe7cab5e3fcceb7e21fb96b7089bc9c505",
+        "source_id": "62a8d6476ec7b199cac7a3975e1b9511534243a2d5b7034821cd30c065184a8a",
+        "source_line": "757bac170569d99240a806646a746d6d94014c90204d7902296cdf92dd4ed3ab",
+        "target_id": "e818587e25ae1b4c3d4744cb8b7e2dd1885069e5756cb2572cd08d1d4ef87243"
       },
       "required": [
-        "emitted",
-        "event_id",
-        "event_name",
-        "first_seen_at",
-        "seen_count"
+        "relation",
+        "source_id",
+        "target_id"
+      ]
+    },
+    "GraphIngestNode": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "file_path": "2c908ec903ce9545e00b2d17b4de0df83d46a7a8772f8cc08b544a9de0848bab",
+        "id": "c71e16cebd30b607b4c7bc75d51ae3355519cdd1be714574201008521998dc64",
+        "line_number": "5d2f59e7da76056dce9d4cfcebf9f2cbb5c74d11b83e586fcf95451c67f3b627",
+        "metadata": "66e547056a26d4965833351543070fbe72265457202881a43390bfd267ad128c",
+        "name": "0114758beb8634202883a609ce694b35aec62bec1b43828c17204e6d46528269",
+        "qualified_name": "54b59297ca0d9ccbc9389fea4ec19ceacf088a673924a46cd561daaecf74ef1e",
+        "type": "436d9c28cdb63599f61f5fbd47354d44cf1d4c5cc616b42ecac4a6157820e809"
+      },
+      "required": [
+        "id",
+        "name",
+        "type"
+      ]
+    },
+    "GraphIngestProvenance": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "commit_sha": "daced1481290ebfba10fe54112496d026618d3dd9de811d897cf7d9d3fab26e9",
+        "dirty": "72eae5a1c886851c70e3d23e027a603359a084348c70929ad55f1d4fbaaa9f85",
+        "generated_at": "a6f503b7258e6136c42eb1b5cf68333b5b097f126aa2e1ee101f3ba3fc159010",
+        "parser_version": "d5f57ba6b388762c58597ba8afadb2083145e33dd27aac44ae23f10c2a96b995",
+        "source": "480e67d9704f12ebac3a509df2297ac9aa726ece0500a4a4dea83aefab4ae652"
+      },
+      "required": [
+        "source"
+      ]
+    },
+    "GraphIngestRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "edges": "e8f6805af5bcdbdaaac05eacfce8b5d25acd0c5f2435d49de859d054b3c87c4c",
+        "nodes": "5655c74ee1bfa2e9442152fb00d59019e0aa2c336b3b5d9887c8dc4346f20fd9",
+        "project": "179a4bc8d4f0424d5a5ce546e9c73402a26b0ef42567c430c169c275875f3b56",
+        "provenance": "6619fc2be47cf8cfc9e7fbcf32bef27af851d67b9993a623d4bf1a1d39fd65ad"
+      },
+      "required": [
+        "nodes",
+        "project",
+        "provenance"
       ]
     },
     "HTTPValidationError": {
@@ -2843,75 +2884,6 @@
         "score"
       ]
     },
-    "NewsletterEditionDetail": {
-      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
-      "kind": "object",
-      "property_sha256": {
-        "edition_number": "5f7ec53e408c197df76f6fb66baa6faddef97d3137e23a8dcf5787f3b0ea5add",
-        "html_content": "f31d07faf2fa1bbd8327457f6b2497b991e6bdeafb7a162fe1e17e3f66a8ea1c",
-        "id": "0e6f648c9eb25f1fc66ecdea7f8da328db0a505a93ba40a733b834915ba058e4",
-        "item_count": "c01cb1bc52aaad35210028c308dbe31be027270a82f73d45bcc1f0cfd7201148",
-        "item_ids": "c1e7532f38a308552911a9ef55c7fb7ce798df5a4396c7eff718b9a40f7014df",
-        "recipient_count": "e0ba0b27e25503ee7384cf119d983bb8937dcb7e2038f22bc2e169a7964c8ebe",
-        "sent_at": "ddc6818c7ab23738fcf1a379adc43567b3481381fc170f921143971cc45c8d8c",
-        "sent_by": "e7679b604afc1a54e06d97949146e5396cc51b49a2fd68c617946fc728c9b17c",
-        "subject": "045435f3f95937f96a6dfbac7a9b1b6638eaa20f4ae205db83cee456fcb5a984"
-      },
-      "required": [
-        "edition_number",
-        "html_content",
-        "id",
-        "item_count",
-        "item_ids",
-        "recipient_count",
-        "sent_at",
-        "sent_by",
-        "subject"
-      ]
-    },
-    "NewsletterEditionSummary": {
-      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
-      "kind": "object",
-      "property_sha256": {
-        "edition_number": "5f7ec53e408c197df76f6fb66baa6faddef97d3137e23a8dcf5787f3b0ea5add",
-        "id": "0e6f648c9eb25f1fc66ecdea7f8da328db0a505a93ba40a733b834915ba058e4",
-        "item_count": "c01cb1bc52aaad35210028c308dbe31be027270a82f73d45bcc1f0cfd7201148",
-        "recipient_count": "e0ba0b27e25503ee7384cf119d983bb8937dcb7e2038f22bc2e169a7964c8ebe",
-        "sent_at": "ddc6818c7ab23738fcf1a379adc43567b3481381fc170f921143971cc45c8d8c",
-        "sent_by": "e7679b604afc1a54e06d97949146e5396cc51b49a2fd68c617946fc728c9b17c",
-        "subject": "045435f3f95937f96a6dfbac7a9b1b6638eaa20f4ae205db83cee456fcb5a984"
-      },
-      "required": [
-        "edition_number",
-        "id",
-        "item_count",
-        "recipient_count",
-        "sent_at",
-        "sent_by",
-        "subject"
-      ]
-    },
-    "NewsletterPreviewRequest": {
-      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
-      "kind": "object",
-      "property_sha256": {
-        "item_ids": "61c3a4312a6fff01938bcbf025c933f6d447b97c3b2a94e7d60902596dd45db2"
-      },
-      "required": [
-        "item_ids"
-      ]
-    },
-    "NewsletterSendRequest": {
-      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
-      "kind": "object",
-      "property_sha256": {
-        "item_ids": "0d45e9157fc5a77d69ab4c17dd2b5c391ba1021cc5842ce36819a557db93bfca",
-        "subject": "b0ed4a548a2b2093332f9d2c8c16f11ba2a2605917f89f4578dd3ecec8a56796"
-      },
-      "required": [
-        "item_ids"
-      ]
-    },
     "OrphanFile": {
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
       "kind": "object",
@@ -3676,17 +3648,6 @@
         "node_id"
       ]
     },
-    "RecipientCreateRequest": {
-      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
-      "kind": "object",
-      "property_sha256": {
-        "email": "86f6ee04dbc2fb0f396ce33336236132c6677ae9b06e54915321c60e026d8c11",
-        "name": "aa8ab790d06f7968e926143cc27f8376abc9f0764e57b9a23b8b185a5ed20fb5"
-      },
-      "required": [
-        "email"
-      ]
-    },
     "ReclassifyRequest": {
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
       "kind": "object",
@@ -3936,6 +3897,7 @@
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
       "kind": "object",
       "property_sha256": {
+        "authority_notice": "177c54f8a9366ebc87e4181577ee83e7582f6471f437d330ff790e0db0aac8f3",
         "doc_id": "bd990366dda99aa424b41bb557d52519f5aa8a8c2010e54631f2a974e428c997",
         "doc_type": "aa9fa7879f9651f512cb05c3d808d89589b97e2307259d7b5e254cadd7fadf7a",
         "edge_path": "67fec69defb63108626742db08ca44ea89ebf4e7e767d3b82b954300e5efe4a1",
@@ -4509,6 +4471,34 @@
       },
       "required": []
     },
+    "TaskConflictContext": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "current_status": "59be20fa1410d77d69ba1150901e278dac133f111249752e7fa734e61cb72ce9",
+        "current_updated_at": "7aeb83fa4f122b63420938090b144842f86319ba536fa5c5ea11fee0a9706d02",
+        "task_id": "f899ab0d355f563757f4936594cf830b172ec30db62087c225960025c49b7961"
+      },
+      "required": [
+        "current_status",
+        "current_updated_at",
+        "task_id"
+      ]
+    },
+    "TaskConflictDetail": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "code": "52ecf5ed009b9bb1a8ae34fb88957187c43044edb6f7af37b4a014995bb58ffa",
+        "context": "e07863fdbdca794b0a9970c9d8b9f4daf125bd5254a3ef94db36fa170bfac8e9",
+        "message": "aec00e7018bb4835e676192519cf82e49f87e5e7b9e94cc5ce56ca9b6bd48377"
+      },
+      "required": [
+        "code",
+        "context",
+        "message"
+      ]
+    },
     "TaskCostEntry": {
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
       "kind": "object",
@@ -4658,6 +4648,7 @@
         "description": "962f66c1f728e25b8a3d391e69f90cc2071cea366cbcc054dd2f460041db688a",
         "due_date": "ee9dfd966faf596613e73d11eb46da3e98c9365c24c1cd3f0e19c0dc224a8eef",
         "ease": "acf12f4ba982fdeb4b05f34ae0b46d892d4213b6054b2685e0a7010d2da441e3",
+        "expected_updated_at": "56d2ae992a8c34012b5b81d3edbdd1185333d0284c769a00412fa1e93fb70aa3",
         "impact": "b9bcf37bc5db4d1f25ef8b4aaac7c4711fd21c664cd570c556530974064ee27b",
         "kind": "957e6b9bc086ab43f528cf43c49770f08f265822230990ad9357fa71ad74cfd3",
         "owner_id": "8999900832f30350c220533099ec26902bfa9e6f7c9e7f89f6f2a2f7fa2133e1",
@@ -4667,6 +4658,16 @@
         "title": "ca8832f5756f2d62c5437ddaa93c508666094a58a6ef2eda184d26745efeb4f7"
       },
       "required": []
+    },
+    "TaskVersionConflict": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "detail": "a7382c6367184a64bb1e79a954b297be5cff6ef5131491a673d0b66509a58d7c"
+      },
+      "required": [
+        "detail"
+      ]
     },
     "TeamCreateRequest": {
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
@@ -5175,8 +5176,8 @@
     "ActionResponse": "08d79fd23d016503365f82de841d07bca3a06b3d2140791a43447799d11611fc",
     "AgentSessionUpdate": "10c9fc525061d333e73a90b36f5ecb635a92aeecdefb4a1acb51c860beef7f0d",
     "AgentSessionView": "e35d77b57c6f077703a586cd65219f08ec04be63cea90bca5255e2e4f69e5fc9",
-    "AgentTokenCreateRequest": "4ae2eaa3bf116529f062df1fd9f572c8e78858157789d9fe2b4d571e902ebb34",
-    "AgentTokenResponse": "7b7bf64d986cac5c1d2e8554340899567736aff2f5ef58c1e811ed3df9fecb3d",
+    "AgentTokenCreateRequest": "89df857309799094e250fb0e1f7490d0f51d7646f49c5a2b12b62882d775bc37",
+    "AgentTokenResponse": "324ac812f09daf38b1cf20c01cf2eedcc29bcd4b9692c1dab0ec469e9ac6b4c6",
     "AlertInfo": "dd175ff247ad4cb876dc62e6a9b3313e3995f40e24f9b1623ec223d21c6ef332",
     "AppSettingResponse": "2665de48ed2cabb5f026df165a96c21988cb639d0472f141433c240ce28b0794",
     "AppSettingUpsertRequest": "44337a5896778d9e829831f20409832a4c1eef082bfe89fd1650ef3a05e12d2e",
@@ -5268,12 +5269,14 @@
     "FindingBulkResultEntry": "b3764d714e43f3de3043c57826a69e280a7ff6175308683d63752af3bfc7b31c",
     "FindingPatchRequest": "a9d6eceaa993a29bda58f010d1635c0ac0c06b1319b4b41015beb00479cb0286",
     "FindingRedacted": "4a1a636f6a5153e05881a5cf2ea49d64a44b59b84e3e2c5bd9d4a394555f5680",
-    "FindingsListResponse": "b21c91322edbe0992f423ef6ea2c297f12726ab73781db8fb1cbe5f9be367b76",
+    "FindingsListResponse": "2c53e6559d9bcaf2132250355ec664405bfdd884e3a8138a918fc317b00e41bf",
     "FlushEntry": "db3a26f82af5aa1ea3a3945f5765a6ba821cec88f145914da4cc37c7aed1fa13",
     "GraphCapabilities": "69ec0ce62d35abdcaa3b1b128ef573e6de329c5426e5e8bdc417e8d8e80d72ea",
     "GraphCosmoOut": "d9d08e4b1c12e99bcd799b82f7a13406cc102d548b7cb030f8731254be684908",
-    "GuiFirstValueRequest": "bb14daac07c0009fe68b59f234c80370badfdbb895c63eef28becfeea8856eeb",
-    "GuiFirstValueResponse": "fea46270937f9a60287dec7f2afd5f890ebf00955ef6fab4ff948464986d1d13",
+    "GraphIngestEdge": "7783c321415ce7fd1cec597ff6145c461c02eca00d542faccce1e4412412da71",
+    "GraphIngestNode": "8c43acf2930a048fe96f28b5310e9d1512822b1cfec63ba3f72a028c3e427305",
+    "GraphIngestProvenance": "81bef4f0e80b4f8a8c4cd14055eab926c66e33473cb5bec3abbb641acd730e8b",
+    "GraphIngestRequest": "c04e3b06738909a8754e71b5a6403e1c9f80a82126995b31aff2959bcdc7a41a",
     "HTTPValidationError": "943dccd103136f3b9df0f9b076c92dbf6b2e3b9de4ea1980fcffe068d145b3ac",
     "HandoffEntry": "f294d1399dbedc88207fadf64ca9a17b06d04c5bf87c6c3bd26489909c9faedf",
     "HandoffSearchResult": "a8e99a48ca7362d59ad9ac41b31d1f46e920f2230209c9eb4bc219c2ef7eaef7",
@@ -5338,10 +5341,6 @@
     "ModifiedFunctionItem": "6a299816f6a6404f1a81e1c0d5d95c50bacfe9a5a559111b1523aa498860bd04",
     "MonitoringSnapshot": "d68478d9a129045fab6ddbe8f3eae5031e1fb9b0c7450c4800545993a259094b",
     "MyelinEffect": "fb80e4f6a109904f163225bc6d88fc95983c35ced941ff5a7556808dfde1e50b",
-    "NewsletterEditionDetail": "1e2f1571a914172867a9182ecf6fafe596f29354c26170572abbe106f3d6b0eb",
-    "NewsletterEditionSummary": "8b7d8b40ad8b89047e6ca16025b0bbf526b65754b9716a7acb10e55faf412476",
-    "NewsletterPreviewRequest": "91f4264c34e657215937051633885157fec86781453aa99a2f7b2aadb26f1371",
-    "NewsletterSendRequest": "94740bd809ddd0d98b7c38e2bc202bcfd3bb8269882b6f8259f4a64a18f4c2fc",
     "OrphanFile": "f96dda8eb9885bf34660cc448f18e489c0c0082e5361e474f3b5259834c3a9e8",
     "OrphanSubCluster": "4a831edb7e2fdfa4d42ebc617e959b4ed053044cd6ac9e2ae8d3aa963daf3e0e",
     "OrphansBundle": "3d736f3209f1820146ce7d16bdb6484a3b88d26dab9031dfa9ed92d463a1350f",
@@ -5390,7 +5389,6 @@
     "RebuildRequest": "3f2a54b1f8c67cda827236bed74e347b9c4c7dcc21cbc4aa35fd600c2bf6e398",
     "RebuildResponse": "d39e02d8ba6d02b86be1fc61ba7c7c51f2a79916f8289362eab586b5c5dc4082",
     "RecentItem": "c513229f7743d163bdbc96b3126ea0f42362e55b530a8d9108cca7ae380e5be7",
-    "RecipientCreateRequest": "07e12f10a5e11a6f08aa8ccf46bb42cb13a8da643de4579a69ac7a4b56bd8709",
     "ReclassifyRequest": "29b4ca24ca7c776f37c908e6abfedb91c953a928774ad5b79ae38b02af5ea266",
     "RecomputeRequest": "01ba0e13b6fcfa7ee97f6f24dbc40c927e926493b0e9c53b85eba802118b84c1",
     "RecomputeResponse": "6749af99d044d532b14db1f8103e5329a303f85e1cbd8f90b1a85c92c06f901b",
@@ -5411,7 +5409,7 @@
     "ScanWorkdirCandidate": "ef0ccec6bc48955f5a287f123afbd23f6657e8646cd2624a5512fa81550ece2f",
     "ScanWorkdirRequest": "60368d4682a78b12c53c8b9f12843dab07c6608b20a129dd418b109df5d355df",
     "ScanWorkdirResponse": "bd7942ccbe30fa672ce0dcd2fd719c0167eabd81821567dd4c3497ccee2a5bb1",
-    "SearchHit": "0ef8b18f8e97941cf5cf7abab926dea4481f89d0c1c31420cd453c253b621ed0",
+    "SearchHit": "4d998b9a11dfb96a475a8de4bb01e792461ea9db2431c82c7f6d23023750bfd7",
     "SearchResponse": "01884c8299e50ed7a2425590354c0fc487a68c8b4c593045a704e4e1cdea958f",
     "SecurityData": "4e8cecd5a87e2bfde18afbf537811e267d6e2f09c41d3a6ccd74de7d6cc9c13b",
     "SecurityEvent": "64735d16abc57a027743eb27f90df6bebad333ba66e820b4665d82923dab891e",
@@ -5446,12 +5444,15 @@
     "SupersedeEdgeIn": "5c4b7ab129782a628c87c691543916420704d6dc03f0904648087036a9faff4c",
     "SupersedeOrphanPartialsResponse": "78d2d5f7e1976ce161d0c139ef3a7c4cefdd42b2f6cf94f934444154c01525d2",
     "SystemMetrics": "3ac5cd99654328228701e10da2875c1663979414441d3714f6236e32682ef4f7",
+    "TaskConflictContext": "623d0c5426ae96364f4d62a885398c0192e1767e6a1148ebf67e0bebffcafec8",
+    "TaskConflictDetail": "f48d0e857b829a8b41a03e86e440635f164284a15471630a0c7e4ec0410f9600",
     "TaskCostEntry": "e728d7a604e7dee5bf876c30841952ba50969d5db7423423efb6b3e7225a8e09",
     "TaskCostSummary": "bfc78e43a23441993a4e765751211550c3e037c5973477960c6fa5c680a1b944",
     "TaskCreateRequest": "adc1be41d2d717342f9248e15bd5cd87c486e024383eabc30e7f2a020ba00c80",
     "TaskDetailResponse": "38bbf6e3c1ac871f2ba7f869f1bfb74d422edc69b33a98b803cf897a2d1256a3",
     "TaskSummary": "dbacd398901aa8c0adc6a753c47cbaecace9fc096d70662c02eaf40d99d463da",
-    "TaskUpdateRequest": "798882056685664793ac68224ad4803da359463582c13d4021254b46f5968941",
+    "TaskUpdateRequest": "40b08bd2b0c29069d4e450e860aee4ee726e9905ea330237fdf6839f9dcec06c",
+    "TaskVersionConflict": "d32589d206e151605c376967aacfdb1803ac568207a4111a6cf9a76cd812b8e9",
     "TeamCreateRequest": "57f9746166609b4c6b99e002585cada02c0b5fa5d29755a0dacb00e08261b05e",
     "TeamMemberRequest": "8abe198cfb6de3041a77c2c2ecefc77cc4033bfb8110e0e05c37b20c7c41174b",
     "TeamMemberResponse": "17355fc7ba1865e65619d0ec712954b11df306cdab2a91ef0982c6531d8ff5ce",
@@ -5487,16 +5488,24 @@
     "WatermarkResetRequest": "d950b99bd6b6b399273c5ebbd1a5c38097604ec46f0fbbca37f4da4e183179d5",
     "ZombieScanResponse": "c144253882af961df2227299edb3d462f9fd545c45907012dc095d7ec179f95b"
   },
-  "contract_version": 2,
-  "deliberate_break": {
-    "baseline": "n-minus-1-contract.json",
-    "kind": "operation_removed",
-    "method": "post",
-    "path": "/agent/pr/abandon/{task_id}"
-  },
+  "contract_version": 3,
   "openapi": "3.1.0",
-  "operation_count": 329,
+  "operation_count": 326,
   "operations": {
+    "/agent/pr/abandon/{task_id}": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "agent_abandon_pr_agent_pr_abandon__task_id__post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
     "/agent/pr/start_branch/{task_id}": {
       "post": {
         "deprecated": false,
@@ -5867,6 +5876,20 @@
         ]
       }
     },
+    "/api/v1/agent-tokens/personal/{token_id}/acknowledge": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "acknowledge_personal_token_rotation_api_v1_agent_tokens_personal__token_id__acknowledge_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:token_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
     "/api/v1/agent-tokens/{token_id}": {
       "delete": {
         "deprecated": false,
@@ -5918,6 +5941,15 @@
       }
     },
     "/api/v1/auth/logout": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "logout_redirect_api_v1_auth_logout_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
       "post": {
         "deprecated": false,
         "operation_id": "logout_api_v1_auth_logout_post",
@@ -5993,42 +6025,45 @@
     },
     "/api/v1/automations": {
       "get": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "list_automations_api_v1_automations_get",
         "request_body_required": false,
         "required_parameters": [],
         "response_codes": [
-          "200"
+          "200",
+          "410"
         ]
       }
     },
     "/api/v1/automations/events": {
       "get": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "list_events_api_v1_automations_events_get",
         "request_body_required": false,
         "required_parameters": [],
         "response_codes": [
           "200",
+          "410",
           "422"
         ]
       }
     },
     "/api/v1/automations/executions": {
       "get": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "list_executions_api_v1_automations_executions_get",
         "request_body_required": false,
         "required_parameters": [],
         "response_codes": [
           "200",
+          "410",
           "422"
         ]
       }
     },
     "/api/v1/automations/{workflow_id}/trigger": {
       "post": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "trigger_automation_api_v1_automations__workflow_id__trigger_post",
         "request_body_required": false,
         "required_parameters": [
@@ -6036,6 +6071,7 @@
         ],
         "response_codes": [
           "200",
+          "410",
           "422"
         ]
       }
@@ -7018,6 +7054,18 @@
         ]
       }
     },
+    "/api/v1/graph/ingest": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "graph_ingest_endpoint_api_v1_graph_ingest_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
     "/api/v1/graph/landing": {
       "get": {
         "deprecated": false,
@@ -7146,6 +7194,20 @@
         ]
       }
     },
+    "/api/v1/graph/provenance/{project}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_provenance_endpoint_api_v1_graph_provenance__project__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:project"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
     "/api/v1/graph/resolve": {
       "get": {
         "deprecated": false,
@@ -7165,18 +7227,6 @@
         "deprecated": false,
         "operation_id": "graph_semantic_modules_api_v1_graph_semantic_modules_get",
         "request_body_required": false,
-        "required_parameters": [],
-        "response_codes": [
-          "200",
-          "422"
-        ]
-      }
-    },
-    "/api/v1/gui/events/first-value": {
-      "post": {
-        "deprecated": false,
-        "operation_id": "post_gui_first_value_api_v1_gui_events_first_value_post",
-        "request_body_required": true,
         "required_parameters": [],
         "response_codes": [
           "200",
@@ -7987,102 +8037,6 @@
         ]
       }
     },
-    "/api/v1/newsletter/compose": {
-      "get": {
-        "deprecated": false,
-        "operation_id": "get_compose_api_v1_newsletter_compose_get",
-        "request_body_required": false,
-        "required_parameters": [],
-        "response_codes": [
-          "200"
-        ]
-      }
-    },
-    "/api/v1/newsletter/editions": {
-      "get": {
-        "deprecated": false,
-        "operation_id": "list_newsletter_editions_api_v1_newsletter_editions_get",
-        "request_body_required": false,
-        "required_parameters": [],
-        "response_codes": [
-          "200",
-          "422"
-        ]
-      }
-    },
-    "/api/v1/newsletter/editions/{edition_id}": {
-      "get": {
-        "deprecated": false,
-        "operation_id": "get_newsletter_edition_api_v1_newsletter_editions__edition_id__get",
-        "request_body_required": false,
-        "required_parameters": [
-          "path:edition_id"
-        ],
-        "response_codes": [
-          "200",
-          "422"
-        ]
-      }
-    },
-    "/api/v1/newsletter/preview": {
-      "post": {
-        "deprecated": false,
-        "operation_id": "post_preview_api_v1_newsletter_preview_post",
-        "request_body_required": true,
-        "required_parameters": [],
-        "response_codes": [
-          "200",
-          "422"
-        ]
-      }
-    },
-    "/api/v1/newsletter/recipients": {
-      "get": {
-        "deprecated": false,
-        "operation_id": "list_recipients_api_v1_newsletter_recipients_get",
-        "request_body_required": false,
-        "required_parameters": [],
-        "response_codes": [
-          "200"
-        ]
-      },
-      "post": {
-        "deprecated": false,
-        "operation_id": "create_recipient_api_v1_newsletter_recipients_post",
-        "request_body_required": true,
-        "required_parameters": [],
-        "response_codes": [
-          "200",
-          "422"
-        ]
-      }
-    },
-    "/api/v1/newsletter/recipients/{recipient_id}": {
-      "delete": {
-        "deprecated": false,
-        "operation_id": "delete_recipient_api_v1_newsletter_recipients__recipient_id__delete",
-        "request_body_required": false,
-        "required_parameters": [
-          "path:recipient_id"
-        ],
-        "response_codes": [
-          "200",
-          "422"
-        ]
-      }
-    },
-    "/api/v1/newsletter/send": {
-      "post": {
-        "deprecated": false,
-        "operation_id": "post_send_api_v1_newsletter_send_post",
-        "request_body_required": true,
-        "required_parameters": [],
-        "response_codes": [
-          "200",
-          "422"
-        ]
-      }
-    },
     "/api/v1/notifications": {
       "get": {
         "deprecated": false,
@@ -8630,30 +8584,32 @@
     },
     "/api/v1/reddit/metrics": {
       "get": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "get_metrics_api_v1_reddit_metrics_get",
         "request_body_required": false,
         "required_parameters": [],
         "response_codes": [
-          "200"
+          "200",
+          "410"
         ]
       }
     },
     "/api/v1/reddit/queue": {
       "get": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "list_queue_api_v1_reddit_queue_get",
         "request_body_required": false,
         "required_parameters": [],
         "response_codes": [
           "200",
+          "410",
           "422"
         ]
       }
     },
     "/api/v1/reddit/queue/{draft_id}": {
       "get": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "get_queue_item_api_v1_reddit_queue__draft_id__get",
         "request_body_required": false,
         "required_parameters": [
@@ -8661,13 +8617,14 @@
         ],
         "response_codes": [
           "200",
+          "410",
           "422"
         ]
       }
     },
     "/api/v1/reddit/queue/{draft_id}/approve": {
       "post": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "approve_draft_api_v1_reddit_queue__draft_id__approve_post",
         "request_body_required": true,
         "required_parameters": [
@@ -8675,13 +8632,14 @@
         ],
         "response_codes": [
           "200",
+          "410",
           "422"
         ]
       }
     },
     "/api/v1/reddit/queue/{draft_id}/edit": {
       "post": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "edit_draft_api_v1_reddit_queue__draft_id__edit_post",
         "request_body_required": true,
         "required_parameters": [
@@ -8689,13 +8647,14 @@
         ],
         "response_codes": [
           "200",
+          "410",
           "422"
         ]
       }
     },
     "/api/v1/reddit/queue/{draft_id}/reject": {
       "post": {
-        "deprecated": false,
+        "deprecated": true,
         "operation_id": "reject_draft_api_v1_reddit_queue__draft_id__reject_post",
         "request_body_required": true,
         "required_parameters": [
@@ -8703,6 +8662,7 @@
         ],
         "response_codes": [
           "200",
+          "410",
           "422"
         ]
       }
@@ -9249,6 +9209,7 @@
         ],
         "response_codes": [
           "200",
+          "409",
           "422"
         ]
       }
@@ -9615,6 +9576,17 @@
         ]
       }
     },
+    "/auth/handoff": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "tenant_auth_handoff_auth_handoff_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
     "/bench/run": {
       "post": {
         "deprecated": false,
@@ -9650,8 +9622,8 @@
       }
     }
   },
-  "path_count": 279,
+  "path_count": 276,
   "schema": "marvis-compatibility-fixture/v1",
-  "source_openapi_sha256": "0bdc79eceecc90e60f5f705afb7b698561ef1c15d13ecdd18ca013e84a9bfef8",
-  "source_ref": "5ccdd41d16e511fb22f7f25329c683ba3268f1a2"
+  "source_openapi_sha256": "403c02d7a595291b62d443bde528ed055655011cca3f47e7ff2eb14f898b60cc",
+  "source_ref": "429cf2500996672c2449a4f34fee427e7f598620"
 }

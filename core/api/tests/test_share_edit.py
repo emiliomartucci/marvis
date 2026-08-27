@@ -96,7 +96,7 @@ def _local_user_info():
         user_type="human",
         display_name="Local Operator",
         workspace_id="ws_default",
-    )
+    ).with_auth_mechanism("local")
 
 
 class _FakeAsyncCursor:

@@ -47,6 +47,7 @@ jobs:
           python scripts/validate_surfaces.py
           python scripts/validate_local_surfaces.py
           python scripts/validate_desktop_host.py
+          python scripts/verify_public_claims.py
 
       - name: Build the local GUI static export in Docker
         run: |
@@ -90,6 +91,14 @@ jobs:
           python -m pip install --quiet --upgrade build
           python -m build --sdist --wheel --outdir dist/
           ls -l dist/
+
+      - name: Gate — public claims in built artifacts
+        run: |
+          set -euo pipefail
+          WHEEL="$(find dist -maxdepth 1 -type f -name '*.whl' -print)"
+          SDIST="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print)"
+          test -n "$WHEEL" && test -n "$SDIST"
+          python scripts/verify_public_claims.py --artifact "$WHEEL" --artifact "$SDIST"
 
       # -------------------------------------------------------------------
       # DECISIVE GATE — fail the build if the wheel is missing data-files.

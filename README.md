@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/marvisx-cli.svg)](https://pypi.org/project/marvisx-cli/) [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE) [![Change Date: Apache-2.0 2030](https://img.shields.io/badge/change%20date-Apache--2.0%20(2030)-lightgrey.svg)](LICENSE)
 
-**The Company Brain your agents install.** Use Claude Code, or whatever coding agent you run, to manage projects and coordinate your agents, not just write code. Marvis captures what your agents do as they work, structures it into a cross-project Knowledge Graph, and hands it back to them, so your work stays on track and the system learns from it. Self-hosted, EU-resident, with a tamper-evident audit log.
+**The Company Brain your agents install.** Use Claude Code, or whatever coding agent you run, to manage projects and coordinate your agents, not just write code. Marvis captures what your agents do as they work, structures it into a cross-project Knowledge Graph, and hands it back to them, so your work stays on track and the system learns from it. Self-hosted, EU-resident, with transactionally append-only audit records.
 
 **Open-core and free to run.** Marvis is the free core: you self-host it, read the source, fork it, audit it, at no cost. MarvisX is the commercial tier on top of the same brain: multi-department teams, data sovereignty and managed hosting, and autonomous, hands-off-the-keyboard operation. Marvis is what you install today; MarvisX is what you reach for when a single self-hosted instance is no longer enough.
 
@@ -35,13 +35,13 @@ To run the full Console + API stack yourself, see [Self-hosting the full stack](
 - **Your agents stop forgetting.** Decisions, specs, playbooks, learnings and mistakes are captured as a side effect of the work your agents already do, not retyped by hand.
 - **Your work stays on track.** A reflective Brain layer compares what agents produce against your intent and surfaces drift early, before it compounds across sessions.
 - **One brain, many projects and teams.** A cross-project Knowledge Graph links decisions, code and documents, so an agent working in one project can see what was decided in another.
-- **Governed by default.** Constitution rules enforced at the hook level, plus a foreign-key-immutable audit log: every action traces back to the human who approved it.
+- **Governed by default.** Constitution rules are enforced at the hook level, while application actions and their recorded actor context are written atomically to an append-only audit trail.
 - **It lives in your terminal, not a dashboard.** An agent-native MCP surface keeps your existing Claude Code / Codex / Cursor as the place you work.
 
 ## Under the hood
 
 - **Cross-project Knowledge Graph** with 17 deterministic edge types covering code, work-chain artifacts, knowledge-chain documents, cross-project references, and bridge edges. Canonical IDs follow `{prefix}:{kind}:{slug}`.
-- **Append-only audit log** (foreign-key + trigger enforced) with provenance pinned at the SQLite level. The managed **MarvisX** tier builds on it to cover the logging surface required by EU Regulation 2024/1689 (AI Act) Article 12.
+- **Transactional append-only audit log** (foreign-key + trigger enforced for application callers) with provenance stored at the SQLite level. A process with direct database-writer access is outside that enforcement boundary; detecting such tampering requires a trusted checkpoint stored independently from the database. The managed **MarvisX** tier builds on this foundation to cover the logging surface required by EU Regulation 2024/1689 (AI Act) Article 12.
 - **Brain reflection pipeline** in five layers — substrate, digest and journal, drift checker, memory operations, findings — closed by a Direction-Aware loop.
 - **Constitution-enforced safety rules** enforced by deterministic hook gates and an MCP mirror for providers without native hooks.
 - **Agent-native MCP surface** exposing 91 tools, callable identically from Claude Code, Codex, Gemini, OpenCode, and a web console.
@@ -57,7 +57,7 @@ This is a deliberate tradeoff: EU residency, self-hosting, and zero external emb
 - **Free to self-host and use internally**, including for commercial purposes. Code is **source-available** under the **Business Source License 1.1**; a paid license is required only to offer Marvis to third parties as a hosted or managed service. The change date automatically converts the code to **Apache License 2.0** four years after release.
 - Documentation and architectural patterns: **CC-BY 4.0**.
 
-This is open-core, not OSI open source: the core is free to run, read and fork, and the BSL holds back only competing commercial-as-a-service use until the change date. GitHub does not recognize the BSL and labels the repo `NOASSERTION`; the authoritative terms are in [`LICENSE`](LICENSE).
+This is an open-core, source-available product under BSL 1.1. The core is free to run, read and fork under those terms; competing commercial-as-a-service use requires a paid license until the applicable Change Date, when Apache License 2.0 applies. The authoritative terms are in [`LICENSE`](LICENSE).
 
 ## Architecture map
 

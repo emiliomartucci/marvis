@@ -9,11 +9,43 @@
     "n_minus_1_consumer_n_contract",
     "old_binary_forward_schema"
   ],
+  "n_only_operations": [
+    {
+      "path": "/api/v1/agent-tokens/personal/{token_id}/acknowledge",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/agent_tokens.py::acknowledge_personal_token_rotation"]
+    },
+    {
+      "path": "/api/v1/auth/logout",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/auth.py"]
+    },
+    {
+      "path": "/api/v1/graph/ingest",
+      "method": "post",
+      "surfaces": ["cli", "http", "package_install"],
+      "evidence": ["core/scripts/graph_export_client.py", "core/api/routers/graph_ingest.py::graph_ingest_endpoint"]
+    },
+    {
+      "path": "/api/v1/graph/provenance/{project}",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/graph_ingest.py::graph_provenance_endpoint"]
+    },
+    {
+      "path": "/auth/handoff",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/auth.py"]
+    }
+  ],
   "rows": [
     {
       "surface": "cli",
       "n_consumer_n_contract": "pass",
-      "n_consumer_n_minus_1_contract": "pass",
+      "n_consumer_n_minus_1_contract": "migration_required",
       "n_minus_1_consumer_n_contract": "pass",
       "old_binary_forward_schema": "deny",
       "evidence": ["core/cli/tests/test_marvis_console_characterization.py", "core/api/db.py:assert_schema_compatible"]
@@ -37,7 +69,7 @@
     {
       "surface": "http",
       "n_consumer_n_contract": "pass",
-      "n_consumer_n_minus_1_contract": "pass",
+      "n_consumer_n_minus_1_contract": "migration_required",
       "n_minus_1_consumer_n_contract": "pass",
       "old_binary_forward_schema": "deny",
       "evidence": ["contracts/compatibility/fixtures/n-contract.json", "contracts/compatibility/fixtures/n-minus-1-contract.json", "core/api/db.py:assert_schema_compatible"]

@@ -11,6 +11,7 @@ from fastapi import HTTPException
 
 from core.api.models.auth import UserInfo
 from core.api.rbac import require_scope
+from core.api.use_cases._context import CallerContext
 
 
 def _agent(scopes: list[str]) -> UserInfo:
@@ -119,3 +120,60 @@ def test_auth_mechanism_is_internal_and_does_not_widen_userinfo_contract():
     user = _human([])
     assert "auth_mechanism" not in user.model_dump()
     assert "auth_mechanism" not in UserInfo.model_json_schema()["properties"]
+
+
+def test_local_user_is_trusted_human():
+    ctx = CallerContext.from_user_info(_local_human([]), is_human_session=True)
+
+    assert ctx.is_local_os_account is True
+    assert ctx.user_type == "human"
+    assert ctx.can_act_as_approver is True
+
+
+def test_local_mcp_keeps_agent_context():
+    from core.api.mcp._adapter import _build_local_ctx_from_env
+
+    ctx = _build_local_ctx_from_env({"MARVIS_MCP_LOCAL_USER_TYPE": "human"})
+
+    assert ctx.is_local_os_account is True
+    assert ctx.user_type == "agent"
+    assert ctx.is_human_session is False
+    assert ctx.can_act_as_approver is False
+
+
+def test_authenticated_human_is_allowed():
+    ctx = CallerContext.from_user_info(_human([]), is_human_session=True)
+
+    assert ctx.is_local_os_account is False
+    assert ctx.can_act_as_approver is True
+
+
+def test_server_agent_cannot_promote_to_human():
+    ctx = CallerContext.from_user_info(_agent(["write"]), is_human_session=False)
+
+    assert ctx.user_type == "agent"
+    assert ctx.can_act_as_approver is False
+
+
+def test_server_rejects_local_ctx_reuse():
+    spoof = UserInfo(
+        username="local",
+        user_id="local",
+        system_role="operator",
+        user_type="agent",
+        workspace_id="ws_default",
+    ).with_auth_mechanism("agent_token")
+
+    ctx = CallerContext.from_user_info(spoof, is_human_session=False)
+
+    assert ctx.local_runtime is False
+    assert ctx.is_local_os_account is False
+    assert ctx.can_act_as_approver is False
+
+
+def test_legacy_human_session_flag_is_ignored():
+    ctx = CallerContext.from_user_info(_agent(["write"]), is_human_session=True)
+
+    assert ctx.user_type == "agent"
+    assert ctx.is_human_session is True
+    assert ctx.can_act_as_approver is False

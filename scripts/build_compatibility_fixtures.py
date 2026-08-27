@@ -29,6 +29,37 @@ def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _schema_compatibility_shape(schema: Any) -> dict[str, Any]:
+    """Retain the parts needed to detect a structural N/N-1 break.
+
+    Full OpenAPI documents remain the canonical API artifacts.  Fixtures keep
+    exact whole-schema digests plus an intentionally small structural view so
+    the verifier can distinguish an optional property addition from a removed
+    or silently changed field without checking out the upstream repository.
+    """
+
+    if not isinstance(schema, dict):
+        return {"kind": "opaque", "sha256": _sha(_canonical(schema))}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return {"kind": "opaque", "sha256": _sha(_canonical(schema))}
+
+    envelope = {
+        key: value
+        for key, value in schema.items()
+        if key not in {"properties", "required", "title", "description"}
+    }
+    return {
+        "kind": "object",
+        "envelope_sha256": _sha(_canonical(envelope)),
+        "required": sorted(str(item) for item in schema.get("required", [])),
+        "property_sha256": {
+            str(name): _sha(_canonical(value))
+            for name, value in sorted(properties.items())
+        },
+    }
+
+
 def _required_parameters(path_item: dict[str, Any], operation: dict[str, Any]) -> list[str]:
     parameters = [*path_item.get("parameters", []), *operation.get("parameters", [])]
     required: set[str] = set()
@@ -71,10 +102,15 @@ def compact_spec(
             operations[path] = methods
 
     schemas: dict[str, str] = {}
+    schema_shapes: dict[str, dict[str, Any]] = {}
     raw_schemas = spec.get("components", {}).get("schemas", {})
     if isinstance(raw_schemas, dict):
         schemas = {
             name: _sha(_canonical(schema))
+            for name, schema in sorted(raw_schemas.items())
+        }
+        schema_shapes = {
+            name: _schema_compatibility_shape(schema)
             for name, schema in sorted(raw_schemas.items())
         }
 
@@ -89,6 +125,7 @@ def compact_spec(
         "component_schema_count": len(schemas),
         "operations": operations,
         "component_schema_sha256": schemas,
+        "component_schema_compatibility": schema_shapes,
     }
     if consumer_bytes is not None:
         fixture["consumer_openapi_sha256"] = _sha(consumer_bytes)
@@ -137,6 +174,12 @@ def main(argv: list[str] | None = None) -> int:
         source_bytes=n_raw,
         consumer_bytes=n_consumer_raw,
     )
+    current_consumer = compact_spec(
+        json.loads(n_consumer_raw),
+        contract_version=3,
+        source_ref=args.n_source_ref,
+        source_bytes=n_consumer_raw,
+    )
     previous = compact_spec(
         previous_spec,
         contract_version=2,
@@ -150,10 +193,15 @@ def main(argv: list[str] | None = None) -> int:
     del broken["operations"][first_path][first_method]
     if not broken["operations"][first_path]:
         del broken["operations"][first_path]
+    broken["path_count"] = len(broken["operations"])
+    broken["operation_count"] = sum(
+        len(methods) for methods in broken["operations"].values()
+    )
     broken["deliberate_break"] = {
         "kind": "operation_removed",
         "path": first_path,
         "method": first_method,
+        "baseline": "n-minus-1-contract.json",
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -161,6 +209,9 @@ def main(argv: list[str] | None = None) -> int:
         "n-contract.json": _write(args.output_dir / "n-contract.json", current),
         "n-minus-1-contract.json": _write(
             args.output_dir / "n-minus-1-contract.json", previous
+        ),
+        "n-consumer-contract.json": _write(
+            args.output_dir / "n-consumer-contract.json", current_consumer
         ),
         "deliberate-break.json": _write(
             args.output_dir / "deliberate-break.json", broken

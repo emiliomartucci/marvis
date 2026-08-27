@@ -71,7 +71,7 @@ jobs:
   # requirements-test.txt) are intentionally not mirrored.
   platform-boundary:
     name: core/platform boundary (enforcement)
-    # CI cost: DISABLED. This gate can only run on the PRIVATE repo (its test deps
+    # CI cost: DISABLED (covered-by-public-windows-install-smoke). This gate can only run on the PRIVATE repo (its test deps
     # — tests/, requirements-test.txt — are intentionally not mirrored to the
     # public repo), so it cannot be moved to the free mirror. The OS-seam is still
     # exercised end-to-end by the real `install-smoke-windows` job on the public
