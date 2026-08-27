@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
-MIGRATIONS_DIR = Path(__file__).resolve().parent.parent.parent / "migrations"
+from core.api.paths import repo_path
+
+MIGRATIONS_DIR = repo_path(__file__, "migrations")
 
 
 def _seed_minimum_schema(conn: sqlite3.Connection) -> None:

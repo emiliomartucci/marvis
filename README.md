@@ -94,7 +94,7 @@ The Console becomes available on the configured `CONSOLE_PORT` and the API on th
 
 ## MCP surface
 
-Marvis ships an MCP server exposing 91 tools across 11 categories: project and session context, tasks, handoffs, semantic search, learnings, costs, pull requests, knowledge graph queries, ingest triage, brain reflection layer, and audit-and-monitoring controls.
+Marvis ships an MCP server exposing project and session context, tasks, handoffs, semantic search, learnings, costs, knowledge graph queries, ingest triage, brain reflection, and audit-and-monitoring controls. Repository lifecycle is deliberately excluded: Git owns worktrees, branches, and commits, while GitHub owns pull requests, checks, review, closure, and merge.
 
 The same surface is used by autonomous agents and by humans through the web console. The intent is parity: any action a user can take through the console, an agent can also take through MCP, and the reverse.
 

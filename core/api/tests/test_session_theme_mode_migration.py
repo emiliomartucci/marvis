@@ -4,6 +4,7 @@ import sqlite3
 
 from core.api import db as db_module
 from core.api.db import _add_session_theme_mode_column
+from core.api.paths import repo_path
 
 
 def test_add_session_theme_mode_column_is_idempotent() -> None:
@@ -40,6 +41,8 @@ def test_migration_057_marks_schema_current_when_column_already_exists(
         conn.close()
 
     monkeypatch.setattr(db_module.settings, "db_path", str(db_path))
+    migration = repo_path(__file__, "migrations", "057_session_theme_mode_backfill.sql")
+    monkeypatch.setattr(db_module, "discover_up_migrations", lambda: [migration])
 
     db_module.run_migrations()
 

@@ -49,8 +49,9 @@ RM_RF_ROOT_RE = re.compile(
     r"(?:--\s+)?(?:/|/\*|'/'|\"/\"|'/?\*'|\"/?\*\")(?:\s|$)"
 )
 SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)(api[_-]?key|secret|token|password|authorization|bearer)"
-    r"[^=\n:]{0,40}[:=]\s*['\"]?[A-Za-z0-9_./+=-]{20,}"
+    r"(?i)\b(api[_-]?key|secret|token|password|authorization|bearer)\b"
+    r"(?:[ \t_-]+[A-Za-z0-9_-]+){0,4}[ \t]*[:=][ \t]*"
+    r"['\"]?[A-Za-z0-9_./+=-]{20,}"
 )
 
 SAFETY_RULES = frozenset(
@@ -166,6 +167,33 @@ def _git_output(args: list[str], cwd: str | None) -> str | None:
         return result.stdout.strip()
     except Exception:
         return None
+
+
+def _command_has_git_subcommand(command: str, subcommand: str) -> bool:
+    """Recognize shell-equivalent git commands without raw-text bypasses.
+
+    POSIX shells concatenate adjacent quoted and unquoted fragments, so
+    ``g''it commit`` executes exactly like ``git commit``.  Tokenizing with
+    ``shlex`` models that behavior closely enough for the hook boundary and
+    keeps compound commands separated at shell control operators.
+    """
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+
+    for index, token in enumerate(tokens):
+        if token != "git":
+            continue
+        for candidate in tokens[index + 1 :]:
+            if candidate and all(character in ";&|" for character in candidate):
+                break
+            if candidate == subcommand:
+                return True
+    return False
 
 
 def resolve_repo_root(file_path: str | None, cwd: str | None = None) -> str | None:
@@ -295,7 +323,7 @@ def check_worktree(
     return _deny(
         f"Blocked: editing '{rel_path}' on branch '{branch}'. "
         "Reason: enforce-worktree rule — code edits (non-metadata) on protected branches must flow through PR review. "
-        "Fix: create a worktree from a feat/task-{task_id} branch (mcp__marvis__register_branch), edit there, then mcp__marvis__submit_pr. "
+        "Fix: create a repository-native worktree on feat/task-{task_id}, edit and commit there, push it, then open the PR on GitHub. "
         "If this file should be editable on main (metadata/docs/config), add its extension/prefix to "
         ".claude/hooks/config.json under worktree.whitelist_{extensions,dirs,files}.",
         "worktree",
@@ -321,8 +349,8 @@ def check_bash_merge(
 
     return _deny(
         f"Blocked: git merge/cherry-pick/rebase/am/apply/stash on protected branch '{branch}'. "
-        "Reason: constitution rule 3 (No Merge on Main) — merges must go through Marvis PR approval to prevent bypass of review. "
-        "Fix: from a feat/task-{task_id} worktree → commit → `mcp__marvis__submit_pr(task_id, title, body)` → review via `mcp__marvis__approve_pr` or `mcp__marvis__request_pr_changes` → merge via `mcp__marvis__merge_pr`. "
+        "Reason: constitution rule 3 (No Merge on Main) — merges must go through GitHub PR review to prevent bypass of review. "
+        "Fix: from a feat/task-{task_id} worktree → commit → push → open the GitHub PR → pass checks/review → merge on GitHub. Reconcile the linked Marvis task only from verified GitHub evidence. "
         "Bypass: none available to agents; this is an immutable constitution rule.",
         "bash-merge",
     )
@@ -350,7 +378,7 @@ def check_db_direct_write(command: str | None, config: dict[str, Any]) -> Decisi
     return _deny(
         "Blocked: direct write to a Marvis SQLite DB (INSERT/UPDATE/DELETE/DROP/ALTER or .execute()). "
         "Reason: constitution rule 2 (No Hotfix Prod) — DB writes must flow through the Marvis API so audit trail, RBAC, and invariants are enforced. "
-        "Fix: use the Marvis API instead — mcp__marvis__create_task / update_task / create_learning / boost_document / register_branch / submit_pr / close_pr etc. "
+        "Fix: use the Marvis API instead for project state — mcp__marvis__create_task / update_task / create_learning / boost_document etc. Repository branch and PR operations belong to Git/GitHub. "
         "If a write endpoint is missing, create a Marvis task first, then add the route to api/routers/ in a feature branch.",
         "db-write",
     )
@@ -431,8 +459,8 @@ def check_push_no_task(
                 f"Blocked: push target '{target}' is not associated with a Marvis task. "
                 f"Reason: block-push-no-task rule — every code change needs traceability back to a tracked task (constitution rule 1). "
                 f"Expected branch pattern: {pattern!r} (e.g. feat/task-<uuid>). "
-                f"Fix: 1) create task via mcp__marvis__create_task, 2) mcp__marvis__register_branch(task_id, branch_name) to get a canonical name, 3) retry push. "
-                f"Or push to a protected branch ({', '.join(sorted(protected)) or '<none configured>'}) if you're the orchestrator merging an approved PR.",
+                f"Fix: 1) create a task via mcp__marvis__create_task, 2) create or rename the local branch to feat/task-<task_id>, 3) retry push and open the PR on GitHub. "
+                f"Or push to a protected branch ({', '.join(sorted(protected)) or '<none configured>'}) only through the repository's approved merge workflow.",
                 "push-no-task",
             )
         if not ambiguous_targets:
@@ -455,8 +483,8 @@ def check_push_no_task(
         f"Blocked: current branch '{branch}' is not associated with a Marvis task. "
         f"Reason: block-push-no-task rule — every code change needs traceability back to a tracked task (constitution rule 1). "
         f"Expected branch pattern: {pattern!r} (e.g. feat/task-<uuid>). "
-        "Fix: 1) create task via mcp__marvis__create_task(title, project, ...), 2) check out a branch matching feat/task-<task_id>, "
-        "3) mcp__marvis__register_branch(task_id, branch_name) to register the draft PR, 4) retry push.",
+        "Fix: 1) create a task via mcp__marvis__create_task(title, project, ...), 2) check out a local branch matching feat/task-<task_id>, "
+        "3) retry push, 4) open and verify the PR on GitHub.",
         "push-no-task",
     )
 
@@ -476,7 +504,7 @@ def check_subtree_push(
     return _deny(
         f"Blocked: git subtree push (or push to console-deploy remote) from branch '{branch or 'unknown'}'. "
         "Reason: constitution rule 5 (No Bypass Orchestrator) — deploys must flow through merge-to-main so the Triage gate stays meaningful. "
-        "Fix: submit the PR (`mcp__marvis__submit_pr`), complete review/merge via `mcp__marvis__approve_pr` and `mcp__marvis__merge_pr`, THEN run `bash scripts/deploy-from-ref.sh origin/main all` from main. "
+        "Fix: open the PR on GitHub, complete checks/review/merge there, THEN run `bash scripts/deploy-from-ref.sh origin/main all` from main. "
         "Never subtree-push from a feature branch — it would publish code that has not been reviewed.",
         "subtree-push",
     )
@@ -496,7 +524,7 @@ def check_staging_to_prod(command: str | None, _config: dict[str, Any]) -> Decis
             "Reason: staging-to-prod rule — hot-copying a staging or working tree directly into production bypasses code review. "
             "NOTE: this is a substring match on the FULL command string, so an innocent payload that happens to include '/data/pir/api/' may also trip. "
             "Fix: if you were actually trying to deploy, run the official deploy script AFTER the PR is merged. "
-            "If you were only sending an API request (curl/wget), use the MCP tool instead (e.g. `mcp__marvis__submit_pr`) — it bypasses shell matching entirely. "
+            "If you were only sending an API request (curl/wget), rephrase it so it does not look like a file copy into the production path. "
             "If neither applies, rephrase the command so it doesn't copy into '/data/pir/api/' literally.",
             "staging-to-prod",
         )
@@ -547,11 +575,22 @@ def check_dangerous_bash(command: str | None, _config: dict[str, Any]) -> Decisi
 
 
 def check_secret_scan(command: str | None, cwd: str | None, _config: dict[str, Any]) -> Decision:
-    if not command or not re.search(r"\bgit\s+commit\b", command):
+    if not command or not _command_has_git_subcommand(command, "commit"):
         return _allow()
 
     repo_root = resolve_repo_root(None, cwd)
     if not repo_root:
+        # Outside a git repo there is no staged diff to inspect, but the scan must
+        # NOT fail open (previously it silently allowed, so `git commit` of an
+        # `API_KEY=sk-live-...` outside a repo slipped through). Scan the command
+        # text itself so the secret-scan rule runs regardless of git context.
+        if command and SECRET_ASSIGNMENT_RE.search(command):
+            return _deny(
+                "Blocked: possible secret in commit command. "
+                "Reason: secret-scan safety rule protects credentials in every governance profile. "
+                "Fix: remove the secret from the command and use the BYOK vault or environment configuration instead.",
+                "secret-scan",
+            )
         return _allow()
 
     diff = _git_output(["diff", "--cached", "--unified=0", "--no-ext-diff"], repo_root)
@@ -586,7 +625,7 @@ def check_quality_gate(
     Only triggers on `git commit` with staged files inside package dirs that
     expose both `knip:check` and `lint` scripts.
     """
-    if not command or not re.search(r"\bgit\s+commit\b", command):
+    if not command or not _command_has_git_subcommand(command, "commit"):
         return _allow()
 
     repo_root = resolve_repo_root(None, cwd)
@@ -786,7 +825,7 @@ def resolve_rule_key(rule: str) -> str | None:
 def governance_rule_state(rule: str) -> tuple[str, str, str | None]:
     canonical = resolve_rule_key(rule)
     if canonical is None:
-        return "warn", "undefined-rule", None
+        return "block", "undefined-rule", None
     profile, source = load_governance_profile()
     state = PROFILE_RULE_STATES.get(profile, PROFILE_RULE_STATES["strict"]).get(
         canonical, "block"
@@ -802,10 +841,9 @@ def _apply_governance_state(rule: str, decision: Decision) -> Decision:
 
     state, _source, canonical = governance_rule_state(rule)
     if canonical is None:
-        return _advise(
-            f"Advisory: safety bridge rule key '{rule}' is not defined. "
-            "Allowed instead of hard-blocking because unresolved rule keys must not create a fail-closed outage. "
-            "Fix: keep the old key as an alias or update the hook reference in a separate additive change.",
+        return _deny(
+            f"Blocked (fail-closed): safety bridge rule key '{rule}' is not defined. "
+            "Fix: restore the canonical rule or retain the old key as an explicit alias in the same reviewed change.",
             rule,
         )
     if state == "block":
@@ -829,10 +867,9 @@ def evaluate_rule(
 ) -> Decision:
     canonical = resolve_rule_key(rule)
     if canonical is None:
-        return _advise(
-            f"Advisory: safety bridge rule key '{rule}' is not defined. "
-            "Allowed instead of hard-blocking because unresolved rule keys must not create a fail-closed outage. "
-            "Fix: keep the old key as an alias or update the hook reference in a separate additive change.",
+        return _deny(
+            f"Blocked (fail-closed): safety bridge rule key '{rule}' is not defined. "
+            "Fix: restore the canonical rule or retain the old key as an explicit alias in the same reviewed change.",
             rule,
         )
     cfg = config or load_config()

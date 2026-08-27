@@ -66,6 +66,8 @@ router's import surface, parsed by FastAPI before the use_case is called.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import logging
 import os
 import time
@@ -84,13 +86,136 @@ from core.api.models import (
     StatusUpdateFeedItem,
     StatusUpdateFeedResponse,
 )
-from core.api.use_cases._context import CallerContext, require_role_ctx
-from core.api.use_cases._errors import ConflictError, NotFoundError, ServiceError
-
+from core.api.use_cases._context import (
+    CallerContext,
+    require_role_ctx,
+    require_workspace_ctx,
+)
+from core.api.use_cases._errors import (
+    ConflictError,
+    NotFoundError,
+    ServiceError,
+    ServiceUnavailableError,
+)
 logger = logging.getLogger(__name__)
 
 # Default data dir for new work projects on the MANAGED deploy.
 _SERVER_DATA_PROJECT_DIR = Path("/data/projects")
+
+
+def load_signed_project_entitlement():
+    tenant_id = (
+        os.environ.get("TENANT_ID")
+        or os.environ.get("MARVIS_TENANT_ID")
+        or ""
+    ).strip()
+    if not tenant_id:
+        return None
+    try:
+        from core.hosted_lifecycle.state import (
+            ProjectEntitlementValidationError,
+            read_signed_project_entitlement,
+        )
+    except ImportError as exc:
+        raise ServiceUnavailableError(
+            code="project_entitlement_runtime_missing",
+            message="Hosted project entitlement support is unavailable",
+        ) from exc
+    entitlement_path = Path(
+        os.environ.get(
+            "MARVIS_TENANT_ENTITLEMENT_FILE",
+            f"/etc/marvis/tenants/{tenant_id}/entitlement.json",
+        )
+    )
+    public_key_path = Path(
+        os.environ.get(
+            "MARVIS_ENTITLEMENT_PUBLIC_KEY",
+            "/etc/marvis/entitlement-signing.pub",
+        )
+    )
+    try:
+        return read_signed_project_entitlement(
+            entitlement_path=entitlement_path,
+            public_key_path=public_key_path,
+            tenant_id=tenant_id,
+        )
+    except ProjectEntitlementValidationError as exc:
+        logger.error(
+            "project entitlement rejected tenant=%s reason=%s",
+            tenant_id,
+            exc.reason,
+        )
+        raise ServiceUnavailableError(
+            code="project_entitlement_invalid",
+            message="Signed local project entitlement is missing or invalid",
+        ) from exc
+
+
+def _customer_project_count(data_dir: Path) -> int:
+    try:
+        from core.hosted_lifecycle.state import count_customer_project_directories
+    except ImportError as exc:
+        raise ServiceUnavailableError(
+            code="project_inventory_unavailable",
+            message="Hosted project inventory support is unavailable",
+        ) from exc
+    try:
+        return count_customer_project_directories(data_dir)
+    except OSError as exc:
+        raise ServiceUnavailableError(
+            code="project_inventory_unavailable",
+            message="Project inventory cannot be read",
+        ) from exc
+
+
+@contextmanager
+def project_creation_guard(data_dir: Path):
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ServiceError(
+            code="data_dir_missing",
+            message=f"Data directory does not exist and cannot be created: {data_dir}",
+        ) from exc
+    lock_path = data_dir / ".project-create.lock"
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ServiceUnavailableError(
+            code="project_limit_lock_unavailable",
+            message="Project limit lock is unavailable",
+        ) from exc
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        entitlement = load_signed_project_entitlement()
+        if entitlement is not None and entitlement.project_limit is not None:
+            current = _customer_project_count(data_dir)
+            if current >= entitlement.project_limit:
+                try:
+                    from core.api.services.hosted_entitlements import HostedLimitError
+                except ImportError as exc:
+                    raise ServiceUnavailableError(
+                        code="project_entitlement_runtime_missing",
+                        message="Hosted project entitlement support is unavailable",
+                    ) from exc
+                tier = (
+                    entitlement.tier.value
+                    if entitlement.tier is not None
+                    else entitlement.entitlement_class
+                )
+                raise HostedLimitError.project(
+                    tier=tier,
+                    current=current,
+                    limit=entitlement.project_limit,
+                )
+        yield entitlement
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def data_project_dir() -> Path:
@@ -133,6 +258,34 @@ def _enforce_project_access(slug: str, visible_projects: set[str] | None) -> Non
     """
     if visible_projects is not None and slug not in visible_projects:
         raise NotFoundError(code="project_not_found", message="Not found")
+
+
+async def _require_project_filesystem_access(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+    slug: str,
+    visible_projects: set[str] | None,
+) -> None:
+    """Gate every shared filesystem lookup on one provable workspace owner."""
+    _enforce_project_access(slug, visible_projects)
+    from core.api.services.access_grants import require_unique_project_for_actor
+
+    await require_unique_project_for_actor(db, ctx, slug)
+
+
+async def _require_unambiguous_status_project(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+    slug: str,
+    visible_projects: set[str] | None,
+) -> str | None:
+    """Quarantine shared slugs for the legacy status table without workspace_id."""
+    await _require_project_filesystem_access(
+        ctx, db, slug, visible_projects
+    )
+    if ctx.user_id == "local" and ctx.username == "local":
+        return None
+    return require_workspace_ctx(ctx)
 
 
 async def _project_colors(
@@ -211,10 +364,36 @@ async def list_programs(
         _build_project_index()
     project_index = _projects_mod._project_index
 
-    visible_slugs = visible_projects  # already resolved by the adapter (DECISION 1)
+    if ctx.user_id == "local" and ctx.username == "local":
+        visible_slugs = visible_projects
+        task_workspace = None
+    else:
+        from core.api.services.access_grants import (
+            project_uniquely_owned_by_actor,
+            visible_projects_for_actor,
+        )
 
-    task_counts = await _get_all_task_counts(db)
-    status_updates = await _get_latest_status_updates(db)
+        resolved_visible = (
+            await visible_projects_for_actor(db, ctx)
+            if visible_projects is None
+            else visible_projects
+        )
+        visible_slugs = {
+            slug
+            for slug in (resolved_visible or set())
+            if await project_uniquely_owned_by_actor(db, ctx, slug)
+        }
+        task_workspace = require_workspace_ctx(ctx)
+
+    task_counts = await _get_all_task_counts(db, workspace_id=task_workspace)
+    status_workspace = (
+        None
+        if ctx.user_id == "local" and ctx.username == "local"
+        else require_workspace_ctx(ctx)
+    )
+    status_updates = await _get_latest_status_updates(
+        db, workspace_id=status_workspace
+    )
     colors = await _project_colors(
         db,
         workspace_id=ctx.workspace_id or "ws_default",
@@ -320,6 +499,7 @@ async def create_project(
     lifecycle: str,
     language: str | None,
     type: str,
+    owner: str | None = None,
 ) -> ProjectCreateResponse:
     """Create a new work project on the server (operator+).
 
@@ -335,42 +515,166 @@ async def create_project(
     require_role_ctx(ctx, "operator", "admin", "super_admin")
 
     from core.api.routers.projects import _create_project_on_disk, _find_project_entry
+    from core.api.services.access_grants import (
+        ProjectWorkspaceOwnershipError,
+        bind_workspace_project,
+        require_unique_project_workspace,
+        seed_creator_grant,
+    )
 
     data_dir = data_project_dir()
     project_dir = data_dir / slug
+    workspace_id = require_workspace_ctx(ctx)
+    local_single_user = ctx.user_id == "local" and ctx.username == "local"
+    try:
+        with project_creation_guard(data_dir):
+            if _find_project_entry(slug) is not None:
+                raise ConflictError(
+                    code="project_exists",
+                    message=f"Project '{slug}' already exists",
+                )
+            if project_dir.exists():
+                raise ConflictError(
+                    code="project_dir_exists",
+                    message=f"Project directory already exists: {project_dir}",
+                )
 
-    if _find_project_entry(slug) is not None:
-        raise ConflictError(code="project_exists", message=f"Project '{slug}' already exists")
-    if project_dir.exists():
-        raise ConflictError(
-            code="project_dir_exists",
-            message=f"Project directory already exists: {project_dir}",
-        )
-    if not data_dir.is_dir():
-        # Local tier: the configured projects root may not exist yet on a
-        # fresh machine — create it instead of failing the first project
-        # (gh #17). A real filesystem error still surfaces as 500.
-        try:
-            data_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise ServiceError(
-                code="data_dir_missing",
-                message=f"Data directory does not exist and cannot be created: {data_dir} ({exc})",
+            if not local_single_user:
+                try:
+                    owners_cursor = await db.execute(
+                        "SELECT DISTINCT workspace_id FROM workspace_projects "
+                        "WHERE project_slug = ? LIMIT 2",
+                        (slug,),
+                    )
+                    owners = {
+                        str(row[0])
+                        for row in await owners_cursor.fetchall()
+                        if row[0]
+                    }
+                except aiosqlite.Error as exc:
+                    raise ServiceUnavailableError(
+                        code="project_ownership_unavailable",
+                        message="Project ownership cannot be verified",
+                    ) from exc
+                if owners:
+                    raise ConflictError(
+                        code="project_exists",
+                        message=f"Project '{slug}' already exists",
+                    )
+                # Reserve the slug before touching disk. SQLite's write lock keeps
+                # a competing workspace from racing another ownership row into
+                # this transaction until the final commit or rollback.
+                await bind_workspace_project(
+                    db,
+                    workspace_id=workspace_id,
+                    project_slug=slug,
+                    source="project_create",
+                    created_by=ctx.user_id or ctx.username,
+                )
+                try:
+                    await require_unique_project_workspace(
+                        db,
+                        project_slug=slug,
+                        workspace_id=workspace_id,
+                    )
+                except ProjectWorkspaceOwnershipError as exc:
+                    raise ConflictError(
+                        code="project_exists",
+                        message=f"Project '{slug}' already exists",
+                    ) from exc
+
+            display_name = name or slug
+            metadata_path = _create_project_on_disk(
+                slug=slug,
+                display_name=display_name,
+                program=program,
+                scope=scope,
+                description=description,
+                lifecycle=lifecycle,
+                language=language,
+                type=type,
             )
-
-    display_name = name or slug
-    metadata_path = _create_project_on_disk(
-        slug=slug,
-        display_name=display_name,
-        program=program,
-        scope=scope,
-        description=description,
-        lifecycle=lifecycle,
-        language=language,
-        type=type,
-    )
+    except Exception:
+        await db.rollback()
+        raise
 
     logger.info("Project created: %s by %s", slug, ctx.username)
+
+    # RBAC F2.6 — creator=project-admin. Persons get the bootstrap grant
+    # automatically; bearer/agent callers get none unless they name an
+    # explicit owner. No automatic backfill for pre-existing projects.
+    creator_identity: str | None = None
+    if ctx.user_type == "human" and ctx.user_id and ctx.user_id != "local":
+        creator_identity = ctx.user_id
+    elif owner and owner.strip():
+        creator_identity = owner.strip()
+    if local_single_user:
+        await bind_workspace_project(
+            db,
+            workspace_id=workspace_id,
+            project_slug=slug,
+            source="project_create",
+            created_by=ctx.user_id or ctx.username,
+        )
+    if creator_identity:
+
+        await seed_creator_grant(
+            db, identity=creator_identity, project_slug=slug,
+            granted_by=ctx.user_id or ctx.username,
+            workspace_id=workspace_id,
+            commit=False,
+        )
+    await db.commit()
+
+    # Funnel: the first real project a customer creates is the activation
+    # milestone the acquisition events (signup, tenant ready) cannot see.
+    #
+    # Three things this has to get right, each a Codex finding on the first cut:
+    #  - Commit it. The HTTP router and the MCP tool are caller-commit contexts
+    #    that never commit after create_project returns, and _acquire_writer only
+    #    rolls back on error — so an event left in the transaction is lost on the
+    #    connection's release. seed_creator_grant above commits its own write for
+    #    the same reason; this commits explicitly too. A second write context here
+    #    instead would deadlock behind the request's single-writer lock.
+    #  - Not the demo. casa-lorenzi is created through this very function, and its
+    #    verified-demo marker is written only afterwards, so is_verified_demo_project
+    #    is still false here. scope="demo" is the reliable signal at creation time.
+    #  - Only the genuine first project. Gating on the customer-project count being
+    #    exactly one keeps a tenant that already had projects before this shipped
+    #    from mislabelling a later project as its first.
+    try:
+        from core.api.services.first_value import hosted_tenant_id
+    except ImportError:
+        tenant_id = None
+    else:
+        tenant_id = hosted_tenant_id()
+    is_demo_seed = (scope or "").strip().lower() == "demo"
+    if tenant_id is not None and not is_demo_seed and _customer_project_count(data_dir) == 1:
+        try:
+            from core.api.services.product_events import record_product_event
+        except ImportError:
+            record_product_event = None
+        try:
+            if record_product_event is not None:
+                await record_product_event(
+                    db,
+                    subject_type="tenant",
+                    subject_id=tenant_id,
+                    tenant_id=tenant_id,
+                    event_name="customer_project_created",
+                    event_key="first-customer-project-v1",
+                    source="tenant_api",
+                    payload={"surface": "create_project"},
+                )
+                await db.commit()
+        except Exception:  # noqa: BLE001 - analytics must never fail a creation
+            # Discard a half-written event (e.g. product_events inserted, outbox
+            # not) so a later commit cannot persist it without its outbox row.
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.warning("customer_project_created write failed", exc_info=True)
 
     return ProjectCreateResponse(
         slug=slug,
@@ -397,7 +701,7 @@ async def get_project(
     Visibility enforced (DECISION 1, 404). Returns ``kg_context=None``; the adapter
     attaches KG context + does rate-limit/log when ``deep`` is effective (D2).
     """
-    _enforce_project_access(slug, visible_projects)
+    await _require_project_filesystem_access(ctx, db, slug, visible_projects)
 
     from core.api.routers.projects import (
         _find_project_entry,
@@ -466,7 +770,7 @@ async def update_project(
 ) -> ProjectDetail:
     """Update additive GUI metadata for one project."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
-    _enforce_project_access(slug, visible_projects)
+    await _require_project_filesystem_access(ctx, db, slug, visible_projects)
 
     from core.api.routers.projects import _find_project_entry
 
@@ -535,7 +839,7 @@ async def get_session_brief(
     rate-limited), so it is built INSIDE the use_case (D2 note). ``deep`` only
     widens the per-bucket KG limits.
     """
-    _enforce_project_access(slug, visible_projects)
+    await _require_project_filesystem_access(ctx, db, slug, visible_projects)
 
     import json
     from core.api.config import settings
@@ -555,7 +859,7 @@ async def get_session_brief(
     path = entry.metadata_path.resolve()
 
     meta = _get_project_metadata(path)
-    workspace_id = ctx.workspace_id or "ws_default"
+    workspace_id = require_workspace_ctx(ctx)
 
     identity = (
         "Tu sei Marvis, AI assistant per project management e development. "
@@ -579,6 +883,17 @@ async def get_session_brief(
         "language": meta.get("language"),
         "program": program,
         "repo_path": str(entry.repo_path) if entry.repo_path else None,
+        # F3 di 781bc52d: due sessioni in un giorno hanno scambiato il clone
+        # hosted per una base di lavoro git e ricevuto worktree stale. Il campo
+        # dichiara la natura del path, cosi' il brief non puo' piu' ingannare.
+        "repo_path_nature": (
+            "graph-only mirror: alimenta grafo e ricerca, NON e' una base di "
+            "lavoro git. Lavora da clone locale (branch feat/task-<id> -> "
+            "GitHub). GitHub possiede PR, review, check e merge; Marvis conserva "
+            "solo il task collegato e lo stato verificato."
+        )
+        if entry.repo_path
+        else None,
         "metadata_path": str(path),
     }
 
@@ -694,7 +1009,13 @@ async def get_session_brief(
         "wip_limit": settings.wip_max_in_progress,
     }
 
-    kg_context = await build_kg_context_for_project(db, slug, deep=deep)
+    kg_context = await build_kg_context_for_project(
+        db,
+        slug,
+        deep=deep,
+        ctx=ctx,
+        visible_projects=visible_projects,
+    )
 
     brief = {
         "identity": identity,
@@ -736,6 +1057,33 @@ async def get_session_brief(
             f"graph_impact('project:artifact:{slug}', edge_types=['depends_on']) — blast radius cross-project",
         ]
 
+    # Shared REST + FastMCP producer. The output has already succeeded and the
+    # evaluator re-resolves every evidence reference from the tenant DB.
+    try:
+        from core.api.services.first_value import (
+            hosted_tenant_id,
+            maybe_record_session_brief_first_value,
+        )
+    except ImportError:
+        tenant_id = None
+    else:
+        tenant_id = hosted_tenant_id()
+    if tenant_id:
+        try:
+            from core.api.db import acquire_write_db
+
+            async with acquire_write_db(label="customer_first_value.session_brief") as event_db:
+                await maybe_record_session_brief_first_value(
+                    event_db,
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    project_slug=slug,
+                    output=brief,
+                )
+                await event_db.commit()
+        except Exception as exc:  # noqa: BLE001 - analytics never breaks the tool
+            logger.warning("customer first value session_brief write failed: %s", exc)
+
     return brief
 
 
@@ -747,7 +1095,7 @@ async def get_handoffs(
     visible_projects: set[str] | None = None,
 ) -> list[HandoffEntry]:
     """List handoff files for a project (visibility enforced, 404)."""
-    _enforce_project_access(slug, visible_projects)
+    await _require_project_filesystem_access(ctx, db, slug, visible_projects)
 
     from core.api.routers.projects import _find_project_path, _parse_handoffs
 
@@ -771,7 +1119,9 @@ async def list_status_updates_feed(
     present in the index (parity: the original returned the service result, which
     yields no derived entries when paths are ``None``).
     """
-    _enforce_project_access(slug, visible_projects)
+    workspace_id = await _require_unambiguous_status_project(
+        ctx, db, slug, visible_projects
+    )
 
     from core.api.routers.projects import _find_project_entry
     from core.api.services import project_status_updates as status_feed_service
@@ -779,13 +1129,17 @@ async def list_status_updates_feed(
     entry = _find_project_entry(slug)
     metadata_path = entry.metadata_path if entry else None
     repo_path = entry.repo_path if entry else None
-    updates, total = await status_feed_service.list_feed(
-        db,
-        slug,
-        metadata_path=metadata_path,
-        repo_path=repo_path,
-        limit=limit,
-    )
+    try:
+        updates, total = await status_feed_service.list_feed(
+            db,
+            slug,
+            metadata_path=metadata_path,
+            repo_path=repo_path,
+            limit=limit,
+            workspace_id=workspace_id,
+        )
+    except LookupError as exc:
+        raise NotFoundError(code="project_not_found", message="Not found") from exc
     return StatusUpdateFeedResponse(updates=updates, total=total)
 
 
@@ -800,18 +1154,24 @@ async def create_status_update_feed(
 ) -> StatusUpdateFeedItem:
     """Create a manual feed entry for a project (operator+, visibility enforced)."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
-    _enforce_project_access(slug, visible_projects)
+    workspace_id = await _require_unambiguous_status_project(
+        ctx, db, slug, visible_projects
+    )
 
     from core.api.services import project_status_updates as status_feed_service
 
     author_display_final = author_display or ctx.username
-    return await status_feed_service.create_manual_update(
-        db,
-        slug=slug,
-        content_md=content_md,
-        author=ctx.username,
-        author_display=author_display_final,
-    )
+    try:
+        return await status_feed_service.create_manual_update(
+            db,
+            slug=slug,
+            content_md=content_md,
+            author=ctx.username,
+            author_display=author_display_final,
+            workspace_id=workspace_id,
+        )
+    except LookupError as exc:
+        raise NotFoundError(code="project_not_found", message="Not found") from exc
 
 
 async def get_plans(
@@ -822,7 +1182,7 @@ async def get_plans(
     visible_projects: set[str] | None = None,
 ) -> list[DocEntry]:
     """List all docs for a project (iterates docs/ subdirs). Visibility enforced (404)."""
-    _enforce_project_access(slug, visible_projects)
+    await _require_project_filesystem_access(ctx, db, slug, visible_projects)
 
     from core.api.routers.projects import _find_project_path, _parse_docs
 
@@ -861,7 +1221,7 @@ async def resolve_git_repo(
     ``400 "Project type '<t>' has no git repository"`` the original router raised
     — preserving the 404-vs-400 split per endpoint.
     """
-    _enforce_project_access(slug, visible_projects)
+    await _require_project_filesystem_access(ctx, db, slug, visible_projects)
 
     from core.api.routers.projects import _find_git_path, _find_project_entry
 

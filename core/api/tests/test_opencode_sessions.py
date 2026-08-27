@@ -35,10 +35,14 @@ def _make_session_db(path: Path) -> sqlite3.Connection:
 
 
 def _insert_sessions(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    normalized_rows = [
+        (*row[:4], opencode_sessions._normalize_directory(str(row[4])), *row[5:])
+        for row in rows
+    ]
     conn.executemany(
         "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, permission, time_created, time_updated) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        rows,
+        normalized_rows,
     )
     conn.commit()
 

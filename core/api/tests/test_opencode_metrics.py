@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from core.api.services import opencode_metrics
+from core.api.services import model_registry
 from core.api.services.opencode_metrics import (
     OPENCODE_SESSION_ID_RE,
     OpenCodeMetricsProvider,
@@ -29,6 +30,44 @@ _MESSAGE_COLS = (
     "time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, "
     "data TEXT NOT NULL"
 )
+
+
+def _enable_test_opencode_pricing(monkeypatch) -> None:
+    """Use a tiny public test matrix; OSS never imports the private kb/ tree."""
+    monkeypatch.setattr(
+        model_registry,
+        "_OPENCODE_PRICING_CACHE",
+        {
+            "version": "2026-04-23",
+            "providers": {
+                "openai": {
+                    "gpt-5.4": {
+                        "input": 1.25,
+                        "output": 10.0,
+                        "cache_read": 0.13,
+                        "cache_write_5m": 1.56,
+                        "cache_write_1h": 2.5,
+                    }
+                },
+                "anthropic": {
+                    "claude-opus-4-7": {
+                        "input": 5.0,
+                        "output": 25.0,
+                        "cache_read": 0.5,
+                        "cache_write_5m": 6.25,
+                        "cache_write_1h": 10.0,
+                    },
+                    "claude-sonnet-4-5": {
+                        "input": 3.0,
+                        "output": 15.0,
+                        "cache_read": 0.3,
+                        "cache_write_5m": 3.75,
+                        "cache_write_1h": 6.0,
+                    },
+                },
+            },
+        },
+    )
 
 
 def _seed_db(path) -> None:
@@ -212,6 +251,7 @@ def test_session_id_regex_positive():
 
 
 def test_tool_calls_finish_included_in_cost(tmp_path, monkeypatch):
+    _enable_test_opencode_pricing(monkeypatch)
     """finish='tool-calls' is legitimate (LLM emitted a tool call — real tokens
     billed). Must be INCLUDED in both real and equivalent cost aggregation.
     Only finish in ('error', None) are genuine failures to skip."""
@@ -564,7 +604,9 @@ def test_pricing_version_set(seeded_db):
 # --------------------------------------------------------------------------
 
 
-def test_cost_equivalent_populated_when_provider_model_known(seeded_db):
+def test_cost_equivalent_populated_when_provider_model_known(
+    seeded_db, monkeypatch
+):
     """Anthropic/claude-sonnet-4-5 is in kb/opencode-pricing → equivalent > 0.
 
     Using the real kb/opencode-pricing-2026-04-23.json pricing:
@@ -578,6 +620,7 @@ def test_cost_equivalent_populated_when_provider_model_known(seeded_db):
              = 24060 / 1_000_000
              = 0.02406
     """
+    _enable_test_opencode_pricing(monkeypatch)
     mp = OpenCodeMetricsProvider()
     m = mp.parse_session("ses_test123")
     assert m is not None
@@ -685,6 +728,7 @@ def test_cost_equivalent_none_when_model_unknown(tmp_path, monkeypatch):
 
 
 def test_cost_equivalent_shadow_for_oauth_session(tmp_path, monkeypatch):
+    _enable_test_opencode_pricing(monkeypatch)
     """OAuth session: cost=0 but token volume → equivalent > 0 (shadow value)."""
     import json
 

@@ -34,8 +34,9 @@ class GateReport:
 
 
 _INTERNAL_URL_PATTERN = r"https?://(?:100\.\d+\.\d+\.\d+|localhost|127\.0\.0\.1)(?::\d+)?"
+_DEFAULT_PERSONAL_DOMAIN_PATTERN = r"\bllm\.example\.invalid\b"
 _PERSONAL_DOMAIN_PATTERN = os.environ.get(
-    "DOCS_GATE_PERSONAL_DOMAIN_REGEX", r"\bllm\.example\.invalid\b"
+    "DOCS_GATE_PERSONAL_DOMAIN_REGEX", _DEFAULT_PERSONAL_DOMAIN_PATTERN
 )
 _INTERNAL_PATH_PATTERN = r"(?:/data/projects/|/home/[^/]+/|/data/pir/)"
 _INTERNAL_CODENAME_PATTERN = (
@@ -69,12 +70,31 @@ def check_frontmatter_valid(path: str | Path) -> GateResult:
     )
 
 
+def _personal_domain_pattern() -> re.Pattern[str]:
+    """Resolve the operator domain pattern at call time, not import time.
+
+    The personal domain must stay out of the source tree, so it arrives via
+    DOCS_GATE_PERSONAL_DOMAIN_REGEX; reading it lazily lets deployments and
+    tests set it without re-importing this module.
+    """
+    return re.compile(
+        os.environ.get(
+            "DOCS_GATE_PERSONAL_DOMAIN_REGEX", _DEFAULT_PERSONAL_DOMAIN_PATTERN
+        ),
+        re.IGNORECASE,
+    )
+
+
 def check_no_security_leaks(text: str) -> GateResult:
     """Block internal endpoints, paths, codenames, and implementation traces."""
     matches = [
         name
         for name, pattern in SECURITY_LEAK_PATTERNS
-        if pattern.search(text)
+        if (
+            _personal_domain_pattern()
+            if name == "personal_gateway_domain"
+            else pattern
+        ).search(text)
     ]
     return GateResult("no_security_leaks", not matches, ",".join(matches))
 

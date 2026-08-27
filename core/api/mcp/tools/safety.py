@@ -30,9 +30,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Annotated, Any, Literal
-
-from pydantic import Field
+from typing import Any, Literal
 
 # Resolve core/scripts/safety_bridge.py relative to this file
 # (core/api/mcp/tools/safety.py -> parents[3] == core/).
@@ -85,7 +83,7 @@ def register(mcp) -> None:
 
         QUANDO USARLO: su provider senza native PreToolUse hook (Codex, Gemini, OpenClaw container) — mirror dell'enforcement che Claude Code ha gratis via hook.
         QUANDO NON USARLO: NOT su Claude Code con hook attivi — e' ridondante. NOT come sostituto della Constitution (e' un preflight, non un substitute).
-        RESTITUISCE: {allowed:bool, violations[], reason?, rule_id?}."""
+        RESTITUISCE: {allowed:bool, reason, rule}."""
         # In-process port of `safety_bridge check`: import the stdlib bridge and call
         # the SAME `evaluate_action` the Node subprocess invokes. Map the Decision to
         # the {allowed, reason, rule} dict shape Node's checkSafety returns. Fail

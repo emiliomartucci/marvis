@@ -2,16 +2,22 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import glob
 import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
+import stat
 import time
 import uuid as uuid_mod
 from collections import Counter, defaultdict, deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, AsyncGenerator
@@ -49,11 +55,1112 @@ def _resolve_migrations_dir() -> Path:
 
 MIGRATIONS_DIR = _resolve_migrations_dir()
 
+# Migration runner hardening (IMPL §C, plan 2026-07-06 dockerization enterprise).
+# The runner must survive an UNSUPERVISED boot on a customer box: fail-loud on
+# anything it does not recognize instead of guessing an execution order.
+
+# Allowlist for UP migration stems: NNN_name (digits, then a name of word chars
+# and dashes). Anything else in the migrations dir is an error, not a skip.
+MIGRATION_STEM_RE = re.compile(r"^\d+_[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+# Subdirectory + filename prefix deliberately OUTSIDE every rotation glob
+# (runner legacy `<db>.backup-*`, backup-db.sh `<db>.backup-<tag>-<ts>`,
+# cleanup-disk.sh non-recursive `console.db.backup-*`): the pre-update backup is
+# the ONLY rollback point after a failed upgrade (P0-1) — nothing may evict it.
+PRE_UPDATE_BACKUP_SUBDIR = "pre-update"
+PRE_UPDATE_BACKUP_KEEP = 2
+
+# These versions install write-rejecting security contracts. Applying them
+# while an older process still writes the same SQLite file would break that
+# process mid-rollout. Existing databases therefore require an explicit
+# operator assertion that all writers are stopped; fresh databases have no
+# predecessor process and may bootstrap normally.
+QUIESCED_REQUIRED_MIGRATIONS = frozenset(
+    {176, 177, 179, 180, 181, 182, 183, 185, 186}
+)
+QUIESCED_MIGRATION_ENV = "MARVIS_SCHEMA_WRITERS_QUIESCED"
+
+
+@dataclass(frozen=True)
+class MigrationResult:
+    """Machine-readable evidence from one migration runner invocation."""
+
+    initial_version: int
+    final_version: int
+    code_max_version: int
+    applied_versions: tuple[int, ...]
+    repaired_versions: tuple[int, ...]
+    backup_path: str | None
+
+
+def _require_security_migration_quiescence(
+    current_version: int,
+    pending_versions: set[int],
+    *,
+    fresh_database: bool,
+    env: dict[str, str] | None = None,
+) -> None:
+    if (current_version == 0 and fresh_database) or not (
+        pending_versions & QUIESCED_REQUIRED_MIGRATIONS
+    ):
+        return
+    source = os.environ if env is None else env
+    if source.get(QUIESCED_MIGRATION_ENV, "").strip() == "1":
+        return
+    versions = ", ".join(
+        str(version)
+        for version in sorted(pending_versions & QUIESCED_REQUIRED_MIGRATIONS)
+    )
+    raise RuntimeError(
+        "Security migrations require all SQLite writers to be stopped "
+        f"(pending: {versions}). Run `marvis schema upgrade` locally or the "
+        "managed receipt-backed upgrade command; refusing an online rolling "
+        "upgrade."
+    )
+
+
+def _is_rollback_stem(stem: str) -> bool:
+    """True for any rollback artifact: `_down`, `_down_v2`, `_rollback`, ... (substring, not suffix)."""
+    lowered = stem.lower()
+    return "_down" in lowered or "_rollback" in lowered
+
+
+def _migration_version(path: Path) -> int:
+    return int(path.stem.split("_")[0])
+
+
+def discover_up_migrations(migrations_dir: Path | None = None) -> list[Path]:
+    """UP migrations in execution order, allowlisted by stem (F8).
+
+    Rollback stems are skipped; any other ``.sql`` that does not match
+    ``NNN_name`` raises (a `002_x_rollback.sql` or stray `notes.sql` would
+    otherwise run as an UP on the next boot). An empty dir raises too —
+    the wheel once shipped 0 migrations and the runtime booted on an
+    unmigrated schema without failing (learning 9e527cfa).
+    """
+    directory = Path(migrations_dir) if migrations_dir is not None else MIGRATIONS_DIR
+    ups: list[Path] = []
+    unrecognized: list[str] = []
+    for path in sorted(directory.glob("*.sql")):
+        stem = path.stem
+        if _is_rollback_stem(stem):
+            continue
+        if MIGRATION_STEM_RE.match(stem):
+            ups.append(path)
+        else:
+            unrecognized.append(path.name)
+    if unrecognized:
+        raise RuntimeError(
+            f"Unrecognized migration file(s) in {directory}: {', '.join(sorted(unrecognized))}. "
+            "Expected NNN_name.sql (rollbacks contain '_down'/'_rollback'); refusing to guess "
+            "an execution order."
+        )
+    if not ups:
+        raise RuntimeError(
+            f"No UP migrations found in {directory} — packaging is broken (learning 9e527cfa); "
+            "refusing to boot on an unmigrated schema."
+        )
+    return ups
+
+
+def code_max_version(migration_files: list[Path]) -> int:
+    return max(_migration_version(f) for f in migration_files)
+
+
+# Spot checks on the REAL schema (learning 79ce177f): a forward-only MAX() can
+# report "current" on a database whose actual DDL silently diverged. Each entry
+# is (version that introduced it, table, column); verified when the DB claims to
+# be at code max.
+SCHEMA_ASSERTIONS: tuple[tuple[int, str, str], ...] = (
+    (16, "users", "system_role"),
+    (63, "tasks", "completion_mode"),
+    (162, "documents", "confidential"),
+    (168, "gui_events", "registri_count"),
+    (171, "product_event_outbox", "next_attempt_at"),
+    (175, "audit_log", "workspace_id"),
+    (175, "audit_log", "workspace_sequence"),
+    (175, "audit_log", "previous_hash"),
+    (175, "audit_log", "entry_hash"),
+    (175, "audit_log", "hash_version"),
+    (175, "audit_chain_state", "legacy_root_hash"),
+    (178, "agent_tokens", "principal_id"),
+    (178, "agent_tokens", "expires_at"),
+    (178, "agent_tokens", "revoked_at"),
+    (178, "agent_tokens", "rotation_family_id"),
+    (178, "agent_tokens", "credential_kind"),
+    (179, "access_grants", "workspace_id"),
+    (179, "file_meta", "workspace_id"),
+    (180, "user_provisioning_queue", "workspace_id"),
+    (181, "teams", "workspace_id"),
+    (182, "todos", "workspace_id"),
+    (183, "ingest_pending", "workspace_id"),
+    (183, "ingest_skipped", "workspace_id"),
+    (183, "ingest_change_history", "workspace_id"),
+    (183, "ingest_webhook_nonces", "workspace_id"),
+    (185, "session_costs", "workspace_id"),
+    (185, "session_conversations", "workspace_id"),
+    (186, "session_operation_leases", "generation"),
+)
+
+# Exact index contracts for workspace-owned schemas that cannot be represented
+# by a column-only spot check. Each entry is:
+# (version, table, index, unique, ((column, descending), ...), WHERE predicate).
+# The contract is deliberately read-only: a claimed version with malformed DDL
+# must stop startup rather than silently rebuilding an index under live writers.
+SCHEMA_INDEX_ASSERTIONS: tuple[
+    tuple[
+        int,
+        str,
+        str,
+        bool,
+        tuple[tuple[str, bool], ...],
+        str | None,
+    ],
+    ...,
+] = (
+    (
+        180,
+        "user_provisioning_queue",
+        "idx_upq_workspace_email_pending",
+        True,
+        (("workspace_id", False), ("email", False)),
+        "status = 'queued' and workspace_id is not null",
+    ),
+    (
+        180,
+        "user_provisioning_queue",
+        "idx_upq_workspace_status_created",
+        False,
+        (
+            ("workspace_id", False),
+            ("status", False),
+            ("created_at", False),
+        ),
+        None,
+    ),
+    (
+        180,
+        "user_provisioning_queue",
+        "idx_upq_workspace_requester_created",
+        False,
+        (
+            ("workspace_id", False),
+            ("requester_id", False),
+            ("created_at", True),
+        ),
+        None,
+    ),
+    (
+        181,
+        "teams",
+        "idx_teams_workspace_slug",
+        True,
+        (("workspace_id", False), ("slug", False)),
+        None,
+    ),
+    (
+        181,
+        "teams",
+        "idx_teams_workspace",
+        False,
+        (("workspace_id", False),),
+        None,
+    ),
+    (
+        182,
+        "todos",
+        "idx_todos_workspace_open",
+        False,
+        (
+            ("workspace_id", False),
+            ("status", False),
+            ("fu", False),
+            ("created_at", True),
+        ),
+        None,
+    ),
+    (
+        182,
+        "todos",
+        "idx_todos_workspace_project",
+        False,
+        (
+            ("workspace_id", False),
+            ("project", False),
+            ("fu", False),
+            ("created_at", True),
+        ),
+        None,
+    ),
+    (
+        182,
+        "todos",
+        "idx_todos_workspace_source_ref",
+        True,
+        (
+            ("workspace_id", False),
+            ("source", False),
+            ("source_ref", False),
+        ),
+        "source_ref is not null",
+    ),
+    (
+        183,
+        "ingest_pending",
+        "idx_ingest_pending_workspace_sha_project",
+        True,
+        (
+            ("workspace_id", False),
+            ("sha256", False),
+            ("project_slug", False),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_pending",
+        "idx_ingest_pending_workspace_status",
+        False,
+        (
+            ("workspace_id", False),
+            ("status", False),
+            ("created_at", True),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_pending",
+        "idx_ingest_pending_workspace_project",
+        False,
+        (
+            ("workspace_id", False),
+            ("project_slug", False),
+            ("created_at", True),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_pending",
+        "idx_ingest_pending_workspace_created",
+        False,
+        (("workspace_id", False), ("created_at", True)),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_pending",
+        "idx_ingest_pending_workspace_lock",
+        False,
+        (("workspace_id", False), ("locked_at", False)),
+        "workspace_id is not null and locked_at is not null",
+    ),
+    (
+        183,
+        "ingest_pending",
+        "idx_ingest_pending_workspace_source",
+        False,
+        (("workspace_id", False), ("source", False)),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_pending",
+        "idx_ingest_pending_workspace_api_key",
+        False,
+        (("workspace_id", False), ("api_key_id", False)),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_skipped",
+        "idx_ingest_skipped_workspace_project_created",
+        False,
+        (
+            ("workspace_id", False),
+            ("project_slug", False),
+            ("created_at", True),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_skipped",
+        "idx_ingest_skipped_workspace_sha256",
+        False,
+        (
+            ("workspace_id", False),
+            ("sha256", False),
+            ("project_slug", False),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_change_history",
+        "idx_change_hist_workspace_ingest_id",
+        False,
+        (
+            ("workspace_id", False),
+            ("ingest_pending_id", False),
+            ("changed_at", True),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_webhook_nonces",
+        "idx_ingest_webhook_nonces_workspace_source_nonce",
+        True,
+        (
+            ("workspace_id", False),
+            ("source", False),
+            ("nonce", False),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        183,
+        "ingest_webhook_nonces",
+        "idx_ingest_webhook_nonces_workspace_received",
+        False,
+        (("workspace_id", False), ("received_at", True)),
+        "workspace_id is not null",
+    ),
+    (
+        185,
+        "sessions_meta",
+        "idx_sessions_workspace_name_unique",
+        True,
+        (("workspace_id", False), ("name", False)),
+        None,
+    ),
+    (
+        185,
+        "session_costs",
+        "idx_session_costs_workspace_project_updated",
+        False,
+        (
+            ("workspace_id", False),
+            ("project_slug", False),
+            ("updated_at", False),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        185,
+        "session_costs",
+        "idx_session_costs_workspace_session",
+        False,
+        (
+            ("workspace_id", False),
+            ("session_name", False),
+            ("updated_at", False),
+        ),
+        "workspace_id is not null and session_name is not null",
+    ),
+    (
+        185,
+        "session_costs",
+        "idx_session_costs_workspace_completed",
+        False,
+        (("workspace_id", False), ("completed_at", False)),
+        "workspace_id is not null and completed_at is not null",
+    ),
+    (
+        185,
+        "session_costs",
+        "idx_session_costs_conversation_lookup",
+        False,
+        (("conversation_id", False),),
+        None,
+    ),
+    (
+        185,
+        "session_conversations",
+        "idx_session_conversations_workspace_ord",
+        True,
+        (
+            ("workspace_id", False),
+            ("session_name", False),
+            ("ord", False),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        185,
+        "session_conversations",
+        "idx_session_conversations_workspace_name",
+        False,
+        (
+            ("workspace_id", False),
+            ("session_name", False),
+            ("ord", False),
+        ),
+        "workspace_id is not null",
+    ),
+    (
+        185,
+        "session_conversations",
+        "idx_session_conversations_workspace_conversation",
+        False,
+        (("workspace_id", False), ("conversation_id", False)),
+        "workspace_id is not null",
+    ),
+    (
+        186,
+        "session_operation_leases",
+        "idx_session_operation_leases_active",
+        False,
+        (("workspace_id", False), ("lease_expires_at", False)),
+        "operation is not null",
+    ),
+)
+
+# Write guards are part of the security shape, not optional migration helpers.
+# Each entry is (version, object type, object name, normalized SQL fragments).
+SCHEMA_OBJECT_ASSERTIONS: tuple[
+    tuple[int, str, str, tuple[str, ...]], ...
+] = (
+    (
+        186,
+        "table",
+        "session_operation_leases",
+        (
+            "primary key (workspace_id, session_name)",
+            "generation integer not null default 0 check (generation >= 0)",
+            "'complete', 'delete', 'hibernate', 'resume', 'restart'",
+            "operation is null and lease_expires_at is null",
+        ),
+    ),
+    (
+        182,
+        "trigger",
+        "todos_workspace_required_insert",
+        (
+            "before insert on todos",
+            "new.workspace_id is null",
+            "length(trim(new.workspace_id)) = 0",
+            "raise(abort, 'todo workspace_id required')",
+        ),
+    ),
+    (
+        182,
+        "trigger",
+        "todos_workspace_required_update",
+        (
+            "before update on todos",
+            "new.workspace_id is null",
+            "length(trim(new.workspace_id)) = 0",
+            "raise(abort, 'todo workspace_id required')",
+        ),
+    ),
+    (
+        182,
+        "trigger",
+        "todos_workspace_immutable",
+        (
+            "before update of workspace_id on todos",
+            "old.workspace_id is not new.workspace_id",
+            "new.workspace_id is not null",
+            "length(trim(new.workspace_id)) > 0",
+            "raise(abort, 'todo workspace_id immutable')",
+        ),
+    ),
+    (
+        182,
+        "trigger",
+        "todos_historical_attribution_guard",
+        (
+            "before update of workspace_id on todos",
+            "old.workspace_id is null",
+            "new.workspace_id is not null",
+            "raise(abort, 'todo workspace attribution not proven')",
+        ),
+    ),
+) + tuple(
+    (
+        183,
+        "trigger",
+        f"{table}_workspace_required_{operation}",
+        (
+            f"before {operation} on {table}",
+            "new.workspace_id is null",
+            "length(trim(new.workspace_id)) = 0",
+            f"raise(abort, '{error_prefix} workspace_id required')",
+        ),
+    )
+    for table, error_prefix in (
+        ("ingest_pending", "ingest pending"),
+        ("ingest_skipped", "ingest skipped"),
+        ("ingest_change_history", "ingest change history"),
+        ("ingest_webhook_nonces", "ingest webhook nonce"),
+    )
+    for operation in ("insert", "update")
+) + tuple(
+    (
+        183,
+        "trigger",
+        f"{table}_workspace_immutable",
+        (
+            f"before update of workspace_id on {table}",
+            "old.workspace_id is not null",
+            "old.workspace_id != new.workspace_id",
+            f"raise(abort, '{error_prefix} workspace_id immutable')",
+        ),
+    )
+    for table, error_prefix in (
+        ("ingest_pending", "ingest pending"),
+        ("ingest_skipped", "ingest skipped"),
+        ("ingest_change_history", "ingest change history"),
+        ("ingest_webhook_nonces", "ingest webhook nonce"),
+    )
+) + (
+    (
+        183,
+        "trigger",
+        "ingest_skipped_parent_workspace_insert",
+        (
+            "before insert on ingest_skipped",
+            "when new.existing_ingest_id is not null and not exists (",
+            "p.id = new.existing_ingest_id",
+            "p.workspace_id = new.workspace_id",
+            "raise(abort, 'ingest skipped parent workspace mismatch')",
+        ),
+    ),
+    (
+        183,
+        "trigger",
+        "ingest_skipped_parent_workspace_update",
+        (
+            "before update of workspace_id, existing_ingest_id on ingest_skipped",
+            "when new.existing_ingest_id is not null and not exists (",
+            "p.id = new.existing_ingest_id",
+            "p.workspace_id = new.workspace_id",
+            "raise(abort, 'ingest skipped parent workspace mismatch')",
+        ),
+    ),
+    (
+        183,
+        "trigger",
+        "ingest_change_history_parent_workspace_insert",
+        (
+            "before insert on ingest_change_history",
+            "when not exists (",
+            "p.id = new.ingest_pending_id",
+            "p.workspace_id = new.workspace_id",
+            "raise(abort, 'ingest change history parent workspace mismatch')",
+        ),
+    ),
+    (
+        183,
+        "trigger",
+        "ingest_change_history_parent_workspace_update",
+        (
+            "before update of workspace_id, ingest_pending_id on ingest_change_history",
+            "when not exists (",
+            "p.id = new.ingest_pending_id",
+            "p.workspace_id = new.workspace_id",
+            "raise(abort, 'ingest change history parent workspace mismatch')",
+        ),
+    ),
+    (
+        183,
+        "trigger",
+        "ingest_pending_api_key_workspace_insert",
+        (
+            "before insert on ingest_pending",
+            "when new.api_key_id is not null and not exists (",
+            "k.id = new.api_key_id",
+            "k.workspace_id = new.workspace_id",
+            "raise(abort, 'ingest pending api key workspace mismatch')",
+        ),
+    ),
+    (
+        183,
+        "trigger",
+        "ingest_pending_api_key_workspace_update",
+        (
+            "before update of workspace_id, api_key_id on ingest_pending",
+            "when new.api_key_id is not null and not exists (",
+            "k.id = new.api_key_id",
+            "k.workspace_id = new.workspace_id",
+            "raise(abort, 'ingest pending api key workspace mismatch')",
+        ),
+    ),
+    (
+        183,
+        "trigger",
+        "ingest_api_keys_pending_workspace_update",
+        (
+            "before update of workspace_id on ingest_api_keys",
+            "when exists (",
+            "p.api_key_id = old.id",
+            "p.workspace_id != new.workspace_id",
+            "raise(abort, 'ingest api key pending workspace mismatch')",
+        ),
+    ),
+) + (
+    (
+        185,
+        "trigger",
+        "session_costs_workspace_required_insert",
+        (
+            "before insert on session_costs",
+            "new.workspace_id is null",
+            "count(distinct sm.workspace_id)",
+            "raise(abort, 'session cost workspace_id required')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "session_costs_parent_workspace_insert",
+        (
+            "before insert on session_costs",
+            "sm.name = new.session_name",
+            "sm.workspace_id = new.workspace_id",
+            "raise(abort, 'session cost parent workspace mismatch')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "session_costs_workspace_immutable",
+        (
+            "before update of workspace_id on session_costs",
+            "old.workspace_id is not new.workspace_id",
+            "raise(abort, 'session cost workspace_id immutable')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "session_conversations_workspace_required_insert",
+        (
+            "before insert on session_conversations",
+            "new.workspace_id is null",
+            "count(distinct sm.workspace_id)",
+            "raise(abort, 'session conversation workspace_id required')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "session_conversations_parent_workspace_insert",
+        (
+            "before insert on session_conversations",
+            "sm.name = new.session_name",
+            "sm.workspace_id = new.workspace_id",
+            "raise(abort, 'session conversation parent workspace mismatch')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "session_conversations_workspace_immutable",
+        (
+            "before update of workspace_id on session_conversations",
+            "old.workspace_id is not new.workspace_id",
+            "raise(abort, 'session conversation workspace_id immutable')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "task_cost_entries_conversation_workspace_insert",
+        (
+            "before insert on task_cost_entries",
+            "sc.workspace_id = t.workspace_id",
+            "sc.conversation_id = new.conversation_id",
+            "raise(abort, 'task cost conversation workspace mismatch')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "pull_requests_conversation_workspace_insert",
+        (
+            "before insert on pull_requests",
+            "sc.workspace_id = new.workspace_id",
+            "sc.conversation_id = new.conversation_id",
+            "raise(abort, 'pull request cost workspace mismatch')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "pull_requests_conversation_workspace_update",
+        (
+            "before update of workspace_id, conversation_id on pull_requests",
+            "sc.workspace_id = new.workspace_id",
+            "sc.conversation_id = new.conversation_id",
+            "raise(abort, 'pull request cost workspace mismatch')",
+        ),
+    ),
+)
+
+
+def _index_matches_assertion(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    index: str,
+    unique: bool,
+    columns: tuple[tuple[str, bool], ...],
+    predicate: str | None,
+) -> bool:
+    """Return whether one SQLite index has the exact declared key contract."""
+    quoted_table = '"' + table.replace('"', '""') + '"'
+    quoted_index = '"' + index.replace('"', '""') + '"'
+    row = next(
+        (
+            candidate
+            for candidate in conn.execute(
+                f"PRAGMA index_list({quoted_table})"
+            ).fetchall()
+            if str(candidate[1]) == index
+        ),
+        None,
+    )
+    if row is None:
+        return False
+    is_partial = predicate is not None
+    if bool(row[2]) != unique or bool(row[4]) != is_partial:
+        return False
+
+    actual_columns = tuple(
+        (str(detail[2]), bool(detail[3]))
+        for detail in conn.execute(f"PRAGMA index_xinfo({quoted_index})").fetchall()
+        if bool(detail[5])
+    )
+    if actual_columns != columns:
+        return False
+
+    sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+        (index,),
+    ).fetchone()
+    sql = str(sql_row[0]) if sql_row and sql_row[0] else ""
+    match = re.search(r"\bWHERE\b(?P<predicate>.+?)\s*$", sql, re.IGNORECASE | re.DOTALL)
+    actual_predicate = (
+        " ".join(match.group("predicate").lower().split()) if match else None
+    )
+    expected_predicate = (
+        " ".join(predicate.lower().split()) if predicate is not None else None
+    )
+    return actual_predicate == expected_predicate
+
+
+def _sql_object_matches_assertion(
+    conn: sqlite3.Connection,
+    *,
+    object_type: str,
+    name: str,
+    required_fragments: tuple[str, ...],
+) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type=? AND name=?",
+        (object_type, name),
+    ).fetchone()
+    definition = " ".join(str(row[0]).lower().split()) if row and row[0] else ""
+    return bool(definition) and all(
+        " ".join(fragment.lower().split()) in definition
+        for fragment in required_fragments
+    )
+
+
+def assert_schema_compatible(
+    conn: sqlite3.Connection,
+    code_max: int,
+    known_versions: set[int] | None = None,
+) -> int:
+    """F7 guard: refuse to run when the volume is AHEAD of the code.
+
+    Returns the current schema version. The forward-only runner treats
+    ``MAX(schema_versions) > code max`` as "nothing pending" and would happily
+    serve an unknown schema (silent 500s) — the rollback-of-the-image-only
+    scenario. When the DB claims to be exactly at code max, spot-check the real
+    schema artifacts so a silently-skipped file does not masquerade as current.
+    Spot checks apply only to migrations actually present in the discovered set
+    (``known_versions``): tests drive the runner with partial migration dirs.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_versions "
+        "(version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+    )
+    row = conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()
+    current = row[0] if row and row[0] is not None else 0
+    if current > code_max:
+        raise RuntimeError(
+            f"Database schema is at v{current} but this code only knows migrations up to "
+            f"v{code_max}: an OLDER image is running on an already-migrated volume. "
+            f"Restore the pre-update backup or run an image >= v{current}; refusing to "
+            "boot on an unknown schema."
+        )
+    if current == code_max:
+        for version, table, column in SCHEMA_ASSERTIONS:
+            if known_versions is not None and version not in known_versions:
+                continue
+            if version <= current and not _column_exists(conn, table, column):
+                raise RuntimeError(
+                    f"schema_versions claims v{current} but {table}.{column} "
+                    f"(migration {version:03d}) is missing — the version table and the real "
+                    "schema diverged; restore from a known-good backup."
+                )
+        for version, table, index, unique, columns, predicate in SCHEMA_INDEX_ASSERTIONS:
+            if known_versions is not None and version not in known_versions:
+                continue
+            if version <= current and not _index_matches_assertion(
+                conn,
+                table=table,
+                index=index,
+                unique=unique,
+                columns=columns,
+                predicate=predicate,
+            ):
+                raise RuntimeError(
+                    f"schema_versions claims v{current} but index {index} "
+                    f"(migration {version:03d}) is missing or malformed — the version "
+                    "table and the real schema diverged; restore from a known-good backup."
+                )
+        for version, object_type, name, fragments in SCHEMA_OBJECT_ASSERTIONS:
+            if known_versions is not None and version not in known_versions:
+                continue
+            if version <= current and not _sql_object_matches_assertion(
+                conn,
+                object_type=object_type,
+                name=name,
+                required_fragments=fragments,
+            ):
+                raise RuntimeError(
+                    f"schema_versions claims v{current} but {object_type} {name} "
+                    f"(migration {version:03d}) is missing or malformed — the version "
+                    "table and the real schema diverged; restore from a known-good backup."
+                )
+    return current
+
+
+@contextmanager
+def _migration_lock(db_path: str):
+    """Cross-process single-runner guard (flock, F7/6733c88c).
+
+    ``init_pool()`` runs migrations from EVERY entry point (API, MCP, brain,
+    CLI, workers) — two processes booting on the same volume must serialize
+    here, not interleave executescript batches. Belt-and-braces on top of any
+    orchestration-level single runner (e.g. a compose one-shot service).
+    """
+    if not db_path or db_path == ":memory:" or db_path.startswith("file:"):
+        yield
+        return
+    lock_path = f"{db_path}.migrate.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _db_is_fresh(conn: sqlite3.Connection) -> bool:
+    """True when the DB has no user tables yet (nothing to protect with a backup)."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' AND name != 'schema_versions'"
+    ).fetchone()
+    return (row[0] or 0) == 0
+
+
+def _database_is_empty_for_security_bootstrap(conn: sqlite3.Connection) -> bool:
+    """True only before any application schema object has ever been created.
+
+    An empty ``schema_versions`` table is still evidence of an existing database,
+    not permission to run write-rejecting migrations under live writers.
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+        ).fetchone()
+        is None
+    )
+
+
+def _last_migration_epoch(conn: sqlite3.Connection) -> float | None:
+    """Epoch of the newest applied migration (schema_versions.applied_at, UTC)."""
+    row = conn.execute("SELECT MAX(applied_at) FROM schema_versions").fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return (
+            datetime.strptime(str(row[0]), "%Y-%m-%d %H:%M:%S")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except ValueError:
+        return None
+
+
+def _backup_database_before_migration(
+    conn: sqlite3.Connection, current_version: int
+) -> str | None:
+    """Fail-closed, hot-safe pre-update backup (IMPL §C + P0-1).
+
+    ``shutil.copy2`` on a live WAL database is incoherent and its failure used
+    to be tolerated ("continuing") — the runner migrated with no rollback
+    point. This uses the sqlite ``.backup()`` API + integrity check and RAISES
+    on any failure: the backup IS the rollback strategy (down-migrations are
+    forbidden, F11).
+
+    P0-1: the file lives in a dedicated ``pre-update/`` namespace no rotation
+    touches, and a pre-update backup newer than the last applied migration is
+    REUSED — a failed upgrade retry must never overwrite or rotate away the
+    clean pre-run state. Pruning (keep-2) happens only after a successful run.
+
+    Returns the backup path, or None on a fresh DB (nothing to protect;
+    rollback = recreate the empty volume).
+    """
+    if _db_is_fresh(conn):
+        logger.info("Pre-migration backup skipped: fresh database")
+        return None
+    db_path = str(settings.db_path)
+    db_name = os.path.basename(db_path)
+    base_dir = settings.db_backup_dir or os.path.dirname(db_path) or "."
+    backup_dir = os.path.join(base_dir, PRE_UPDATE_BACKUP_SUBDIR)
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+        directory_metadata = os.lstat(backup_dir)
+        if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(
+            directory_metadata.st_mode
+        ):
+            raise OSError("backup path is not a real directory")
+        os.chmod(backup_dir, 0o700)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot create pre-update backup dir {backup_dir}: {exc}; refusing to "
+            "migrate without a rollback point"
+        ) from exc
+
+    backup_path = os.path.join(
+        backup_dir, f"{db_name}.pre-update-v{current_version}"
+    )
+    last_applied = _last_migration_epoch(conn)
+    if os.path.isfile(backup_path):
+        if last_applied is None or os.path.getmtime(backup_path) >= last_applied:
+            metadata = os.lstat(backup_path)
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+            ):
+                raise RuntimeError(
+                    "Existing pre-migration backup is not a private regular file; "
+                    "refusing to overwrite the rollback point"
+                )
+            existing_connection = sqlite3.connect(
+                f"file:{backup_path}?mode=ro", uri=True
+            )
+            try:
+                check = existing_connection.execute(
+                    "PRAGMA integrity_check"
+                ).fetchone()
+                version_row = existing_connection.execute(
+                    "SELECT MAX(version) FROM schema_versions"
+                ).fetchone()
+            finally:
+                existing_connection.close()
+            if (
+                not check
+                or str(check[0]).lower() != "ok"
+                or not version_row
+                or int(version_row[0] or 0) != current_version
+            ):
+                raise RuntimeError(
+                    "Existing pre-migration backup failed integrity/version proof; "
+                    "refusing to overwrite the rollback point"
+                )
+            logger.info(
+                "Pre-migration backup reused (newer than last applied migration): %s",
+                backup_path,
+            )
+            return backup_path
+        metadata = os.lstat(backup_path)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
+            raise RuntimeError(
+                "Stale pre-migration backup path is unsafe; refusing to migrate"
+            )
+        os.unlink(backup_path)
+
+    db_size = os.path.getsize(db_path)
+    free = shutil.disk_usage(backup_dir).free
+    if free < 2 * db_size:
+        raise RuntimeError(
+            f"Refusing to migrate: free space in {backup_dir} ({free} B) is below 2x "
+            f"the database size ({db_size} B) — a backup would fill the volume "
+            "(learning b5275327)."
+        )
+
+    try:
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(backup_path, flags, 0o600)
+        os.close(descriptor)
+        dest = sqlite3.connect(backup_path)
+        try:
+            conn.backup(dest)
+            check = dest.execute("PRAGMA integrity_check").fetchone()
+            if not check or str(check[0]).lower() != "ok":
+                raise RuntimeError(f"integrity_check returned {check!r}")
+        finally:
+            dest.close()
+    except Exception as exc:
+        try:
+            os.remove(backup_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Pre-migration backup to {backup_path} failed — refusing to migrate "
+            f"without a rollback point: {exc}"
+        ) from exc
+    logger.info("Pre-migration backup: %s", backup_path)
+    return backup_path
+
+
+def _prune_pre_update_backups(keep: int = PRE_UPDATE_BACKUP_KEEP) -> None:
+    """Keep the newest ``keep`` pre-update backups. Called ONLY after a successful run."""
+    db_name = os.path.basename(str(settings.db_path))
+    base_dir = settings.db_backup_dir or os.path.dirname(str(settings.db_path)) or "."
+    backup_dir = os.path.join(base_dir, PRE_UPDATE_BACKUP_SUBDIR)
+    backups = sorted(
+        glob.glob(os.path.join(backup_dir, f"{db_name}.pre-update-v*")),
+        key=os.path.getmtime,
+    )
+    for old_backup in backups[:-keep] if keep > 0 else backups:
+        try:
+            os.remove(old_backup)
+            logger.info("Pruned old pre-update backup: %s", old_backup)
+        except OSError:
+            pass
+
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """Check if a column exists in a table. Used for migration idempotency (partial failure recovery)."""
     cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(c[1] == column for c in cols)
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return bool(row[0])
 
 
 def get_sync_connection() -> sqlite3.Connection:
@@ -125,7 +1232,13 @@ async def init_pool(size: int = 2) -> None:
     # Fail-loud here is a clearer signal than a later "no such column" on the
     # first write against a half-upgraded DB. (#12)
     run_migrations()
-    global _pool, _pool_size, _writer
+    global _pool, _pool_size, _writer, _write_lock
+    # The lock belongs to this pool lifecycle. Reusing a lock after the pool was
+    # closed can retain an event-loop binding from an old runtime/test loop and
+    # make the next otherwise-valid writer fail with "bound to a different event
+    # loop". Production initializes one pool per process; tests and controlled
+    # restarts legitimately initialize more than once.
+    _write_lock = asyncio.Lock()
     actual_size = 8  # read-only pool: expanded for KG lens 4-subquery parallel pattern (Phase 7.0)
     _pool = asyncio.Queue(maxsize=actual_size)
     _pool_size = actual_size
@@ -481,14 +1594,28 @@ def _request_writer_label(request: Request | None) -> str:
     return f"{method} {route_path} -> {endpoint_name}"
 
 
+class WriterLockTimeout(TimeoutError):
+    """The writer lock could not be acquired within the caller's deadline.
+
+    Raised only by bounded acquisitions (acquire_write_db(timeout=...)).
+    Unbounded callers keep the historical wait-forever behavior.
+    """
+
+
 @asynccontextmanager
 async def _acquire_writer(
-    *, label: str | None = None
+    *, label: str | None = None, timeout: float | None = None
 ) -> AsyncGenerator[aiosqlite.Connection, None]:
     """Internal: acquire write lock, yield writer, rollback on error.
 
     All public write primitives (write_db, get_write_db, acquire_write_db)
     delegate here for consistent lock + rollback semantics.
+
+    timeout bounds only the lock wait, never the hold: a caller that cannot
+    tolerate queuing behind a stuck holder (2026-08-04: a wedged external
+    console.db writer kept this lock held and every webhook delivery — then
+    the whole tenant write path — queued forever) passes a deadline and gets
+    WriterLockTimeout instead of joining the pile-up.
     """
     owner_label = _writer_owner_label(label)
     task = asyncio.current_task()
@@ -496,7 +1623,17 @@ async def _acquire_writer(
     queued_at = time.time()
     queued_perf = time.perf_counter()
     blocked_by = _current_writer_blocker(queued_perf) if _write_lock.locked() else None
-    await _write_lock.acquire()
+    if timeout is None:
+        await _write_lock.acquire()
+    else:
+        try:
+            await asyncio.wait_for(_write_lock.acquire(), timeout)
+        except TimeoutError:
+            holder_label = blocked_by.get("label") if isinstance(blocked_by, dict) else None
+            raise WriterLockTimeout(
+                f"writer lock not acquired within {timeout}s"
+                + (f" (blocked by: {holder_label})" if holder_label else "")
+            ) from None
     acquired_at = time.time()
     holder = _start_writer_hold(
         label=owner_label,
@@ -525,8 +1662,8 @@ async def write_db(
 ) -> AsyncGenerator[aiosqlite.Connection, None]:
     """Background tasks: auto-commit on success, auto-rollback on error.
 
-    Use for metrics_collector, cost_service, security_collector,
-    event_dispatcher — any periodic background write.
+    Use for metrics_collector, cost_service, security_collector, or any other
+    periodic background write.
 
     Do NOT do slow work (HTTP calls, computation) inside this context.
     Gather data first, then write in a fast batch.
@@ -552,13 +1689,15 @@ async def get_write_db(
 @asynccontextmanager
 async def acquire_write_db(
     label: str | None = None,
+    timeout: float | None = None,
 ) -> AsyncGenerator[aiosqlite.Connection, None]:
     """WebSocket/non-DI writers: caller must commit. Auto-rollback on error.
 
     Use this for code that needs to write outside FastAPI dependency injection
-    (e.g. WebSocket handlers, terminal upload).
+    (e.g. WebSocket handlers, terminal upload). With timeout set, raises
+    WriterLockTimeout instead of waiting forever behind a stuck holder.
     """
-    async with _acquire_writer(label=label) as w:
+    async with _acquire_writer(label=label, timeout=timeout) as w:
         yield w
 
 
@@ -574,7 +1713,8 @@ async def wal_checkpoint() -> tuple[int, int, int]:
         return (row[0], row[1], row[2])
 
 
-# sqlite-vec support
+# sqlite-vec support. Kept as a compatibility symbol for older tests/importers;
+# readiness is connection-scoped below because one process can open many DBs.
 _vec_table_ready = False
 
 # Platform-specific loadable-extension suffixes. The vec0 loadable is `.so` on
@@ -632,7 +1772,6 @@ def resolve_vec0_loadable() -> tuple[str | None, bool]:
 
 async def ensure_vec_documents(db: aiosqlite.Connection) -> bool:
     """Load sqlite-vec on an existing connection and ensure vec_documents exists."""
-    global _vec_table_ready
     load_arg, found = resolve_vec0_loadable()
     if not found or load_arg is None:
         return False
@@ -641,14 +1780,14 @@ async def ensure_vec_documents(db: aiosqlite.Connection) -> bool:
         await db._execute(db._conn.enable_load_extension, True)
         await db.execute("SELECT load_extension(?)", [load_arg])
         setattr(db, "_pir_vec_extension_loaded", True)
-    if not _vec_table_ready:
+    if not getattr(db, "_pir_vec_table_ready", False):
         await db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_documents USING vec0(
                 doc_id INTEGER PRIMARY KEY,
                 embedding float[512]
             )
         """)
-        _vec_table_ready = True
+        setattr(db, "_pir_vec_table_ready", True)
     return True
 
 
@@ -664,73 +1803,107 @@ async def get_vec_db() -> AsyncGenerator[aiosqlite.Connection, None]:
         await db.close()
 
 
-def run_migrations() -> None:
-    """Apply pending SQL migrations in order."""
-    conn = get_sync_connection()
-    try:
-        # Ensure schema_versions exists for first run
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_versions "
-            "(version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
-        )
-        cursor = conn.execute("SELECT MAX(version) FROM schema_versions")
-        row = cursor.fetchone()
-        current_version = row[0] if row[0] is not None else 0
+def run_migrations() -> MigrationResult:
+    """Apply pending SQL migrations in order.
 
-        migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
-        pending = [
-            f
-            for f in migration_files
-            if not f.stem.endswith("_down")
-            and int(f.stem.split("_")[0]) > current_version
-        ]
-
-        # Pre-migration backup (enterprise rollback strategy).
-        # Snapshots go to settings.db_backup_dir (a roomy data volume in prod)
-        # when set, otherwise next to the DB. Rotation is GLOBAL keep-2 across
-        # ALL tags in that dir (migration `backup-v*`, kg `backup-pre-rebuild-*`,
-        # etc.) — full DB copies are >1GB, so only the two newest are retained.
-        if pending:
-            db_name = os.path.basename(settings.db_path)
-            backup_dir = settings.db_backup_dir or os.path.dirname(settings.db_path) or "."
-            backup_path = os.path.join(backup_dir, f"{db_name}.backup-v{current_version}")
-            try:
-                os.makedirs(backup_dir, exist_ok=True)
-                shutil.copy2(settings.db_path, backup_path)
-                logger.info("Pre-migration backup: %s", backup_path)
-                # Rotate: keep only the 2 most recent backups (global, all tags)
-                import glob
-
-                backups = sorted(
-                    glob.glob(os.path.join(backup_dir, f"{db_name}.backup-*")),
-                    key=os.path.getmtime,
+    Hardened for unsupervised boots (enterprise kit, IMPL §C dockerization plan):
+    allowlisted discovery (F8), older-image guard (F7), fail-closed hot backup
+    pinned outside rotation (P0-1), cross-process flock, per-version post-hooks
+    preserved (F-2), and a post-run schema re-check that logs the FINAL version.
+    """
+    migration_files = discover_up_migrations()
+    code_max = code_max_version(migration_files)
+    known_versions = {_migration_version(f) for f in migration_files}
+    with _migration_lock(str(settings.db_path)):
+        conn = get_sync_connection()
+        try:
+            # Read the claimed version without creating or repairing anything.
+            # Existing databases that still need a security migration must be
+            # writer-quiesced before a retryable post-hook can mutate them.
+            fresh_database = _database_is_empty_for_security_bootstrap(conn)
+            claimed_version = _claimed_schema_version(conn)
+            claimed_pending = [
+                f for f in migration_files if _migration_version(f) > claimed_version
+            ]
+            claimed_repairs = _claimed_security_repairs_needed(
+                conn, known_versions
+            )
+            quiescence_versions = {
+                _migration_version(path) for path in claimed_pending
+            } | claimed_repairs
+            # v175 creates the audit-chain shape and activation guard. Once a
+            # database claims v176+, repairing any v175 object changes an active
+            # write contract and therefore inherits v176's offline requirement.
+            if 175 in claimed_repairs and claimed_version >= 176:
+                quiescence_versions.add(176)
+            _require_security_migration_quiescence(
+                claimed_version,
+                quiescence_versions,
+                fresh_database=fresh_database,
+            )
+            backup_path: str | None = None
+            # A repair hook mutates an already-versioned database before the
+            # ordinary pending-file loop.  It therefore needs the same durable
+            # rollback point as a SQL migration, created before the first
+            # repair write rather than after it.
+            if claimed_repairs:
+                backup_path = _backup_database_before_migration(
+                    conn, claimed_version
                 )
-                for old_backup in backups[:-2]:
-                    try:
-                        os.remove(old_backup)
-                        logger.info("Rotated old backup: %s", old_backup)
-                    except OSError:
-                        pass
-            except OSError as e:
-                logger.warning("Pre-migration backup failed (continuing): %s", e)
+            if not claimed_repairs:
+                # Preserve the fail-closed version-table drift guard on an
+                # otherwise healthy claimed schema. A concrete recoverable
+                # security invariant is handled by the controlled repair path
+                # below instead, after its writer-quiescence gate.
+                assert_schema_compatible(conn, code_max, known_versions)
+            # A guarded post-hook can fail after the SQL file has durably marked
+            # its version. Repair such retryable, additive invariants before the
+            # MAX-version compatibility assertion (v175 is the first one that
+            # explicitly guarantees this recovery path).
+            _repair_versioned_schema_invariants(conn, known_versions)
+            # F7 guard + schema_versions bootstrap. Re-read the version INSIDE
+            # the lock: another runner may have migrated while we waited.
+            current_version = assert_schema_compatible(conn, code_max, known_versions)
 
-        for migration_file in migration_files:
-            if migration_file.stem.endswith("_down"):
-                continue
-            version = int(migration_file.stem.split("_")[0])
-            if version > current_version:
+            pending = [
+                f for f in migration_files if _migration_version(f) > current_version
+            ]
+            if pending and backup_path is None:
+                backup_path = _backup_database_before_migration(conn, current_version)
+
+            for migration_file in pending:
+                version = _migration_version(migration_file)
                 logger.info("Applying migration %s", migration_file.name)
-                sql = migration_file.read_text()
-                conn.executescript(sql)
-                # executescript() resets PRAGMA foreign_keys; re-enable
-                conn.execute("PRAGMA foreign_keys=ON")
-                conn.execute(
-                    "INSERT OR IGNORE INTO schema_versions (version) VALUES (?)",
-                    (version,),
-                )
-                conn.commit()
+                try:
+                    sql = migration_file.read_text()
+                    conn.executescript(sql)
+                    # executescript() resets PRAGMA foreign_keys; re-enable
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    conn.execute(
+                        "INSERT OR IGNORE INTO schema_versions (version) VALUES (?)",
+                        (version,),
+                    )
+                    conn.commit()
+                except Exception as exc:
+                    # executescript is NOT atomic (P0-2): a mid-file failure leaves
+                    # committed partial DDL with no version row. Any retry or
+                    # image re-tag without a restore boots on a half-applied
+                    # schema — and if the FIRST new migration failed, the F7
+                    # guard cannot catch it (MAX == old code max).
+                    hint = (
+                        f"restore the pre-update backup ({backup_path})"
+                        if backup_path
+                        else "recreate the database volume"
+                    )
+                    raise RuntimeError(
+                        f"Migration {migration_file.name} failed: {exc}. The database "
+                        "may hold a partially applied schema (executescript is not "
+                        f"atomic) — {hint} before retrying or re-tagging the image; "
+                        "NEVER apply partial _down migrations (F11)."
+                    ) from exc
 
-                # Post-migration hooks
+                # Post-migration hooks (F-2: per-version chain preserved — the
+                # v16/v18 seeds are what make a fresh-volume boot usable).
                 if version == 8:
                     _backfill_session_uuids(conn)
                 if version == 16:
@@ -772,15 +1945,47 @@ def run_migrations() -> None:
                     _migration_135_graph_edges_provider(conn)
                 if version == 136:
                     _backfill_documents_fts(conn)
+                if version == 175:
+                    _migration_175_audit_chain(conn)
+                if version == 176:
+                    _migration_176_activate_audit_chain(conn)
+                if version == 177:
+                    _migration_177_delegation_workspace(conn)
+                if version == 178:
+                    _migration_178_agent_token_lifecycle(conn)
+                if version == 179:
+                    _migration_179_workspace_isolation(conn)
 
                 logger.info("Migration %s applied", migration_file.name)
 
-        if not _column_exists(conn, "sessions_meta", "theme_mode"):
-            _add_session_theme_mode_column(conn)
+            if _table_exists(conn, "sessions_meta") and not _column_exists(
+                conn, "sessions_meta", "theme_mode"
+            ):
+                _add_session_theme_mode_column(conn)
 
-        logger.info("Database at version %d", max(current_version, 0))
-    finally:
-        conn.close()
+            # Re-run recoverable invariants after the pending chain as an
+            # idempotency gate. This also proves a successful per-version hook
+            # did not depend on a one-shot schema shape.
+            _repair_versioned_schema_invariants(conn, known_versions)
+
+            # Post-run: re-check (spot-checks the real schema at code max) and
+            # log the FINAL version — the old runner logged the stale pre-run one.
+            final_version = assert_schema_compatible(conn, code_max, known_versions)
+            if pending:
+                _prune_pre_update_backups()
+            logger.info(
+                "Database at version %d (code max v%d)", final_version, code_max
+            )
+            return MigrationResult(
+                initial_version=claimed_version,
+                final_version=final_version,
+                code_max_version=code_max,
+                applied_versions=tuple(_migration_version(path) for path in pending),
+                repaired_versions=tuple(sorted(claimed_repairs)),
+                backup_path=backup_path,
+            )
+        finally:
+            conn.close()
 
 
 def _backfill_session_uuids(conn: sqlite3.Connection) -> None:
@@ -1244,7 +2449,7 @@ def _migration_072_digest_app_settings_recovery(conn: sqlite3.Connection) -> Non
 
 
 def _seed_missing_agents(conn: sqlite3.Connection) -> None:
-    """Migration 047 post-hook: seed DevX, System Health, Reddit agents (idempotent).
+    """Migration 047 post-hook: seed the retained DevX and System Health agents.
 
     Must be in Python hook (not SQL) because executescript() + PRAGMA foreign_keys=ON
     causes FK constraint errors when inserting users + agents in the same script.
@@ -1273,17 +2478,6 @@ def _seed_missing_agents(conn: sqlite3.Connection) -> None:
             "haiku",
             "System Health Check",
             "system-monitor",
-        ),
-        (
-            "usr_reddit",
-            "reddit",
-            "Reddit",
-            "#F97316",
-            "agt-reddit",
-            "system",
-            "haiku",
-            "Reddit Morning Digest",
-            "reddit",
         ),
     ]
     for (
@@ -1322,17 +2516,16 @@ def _seed_missing_agents(conn: sqlite3.Connection) -> None:
             ],
         )
     conn.commit()
-    logger.info("Migration 047: seeded DevX + System Health + Reddit agents")
+    logger.info("Migration 047: seeded DevX + System Health agents")
 
 
 def _fix_agent_paths_and_roles(conn: sqlite3.Connection) -> None:
-    """Migration 048 post-hook: fix soul_path/tools_path for devx, system-health, reddit, analyst + system_role."""
+    """Migration 048 post-hook: fix retained agent paths and roles."""
     agents_base = settings.effective_agents_base
-    # Fix paths for devx, system-health, reddit (Bug 1: were NULL)
+    # Fix paths for the retained system agents (Bug 1: were NULL).
     path_fixes = [
         ("agt-devx", "devx"),
         ("agt-system-health", "system-monitor"),
-        ("agt-reddit", "reddit"),
     ]
     for agt_id, agent_dir in path_fixes:
         conn.execute(
@@ -1353,10 +2546,10 @@ def _fix_agent_paths_and_roles(conn: sqlite3.Connection) -> None:
             f"{agents_base}/analyst/IDENTITY.md",
         ],
     )
-    # Fix system_role from 'agent' to 'operator' for the three new agent users (Bug 4)
+    # Fix system_role from 'agent' to 'operator' for the retained agent users (Bug 4).
     conn.execute(
         "UPDATE users SET system_role = 'operator', updated_at = datetime('now','utc') "
-        "WHERE id IN ('usr_devx', 'usr_system_health', 'usr_reddit') AND system_role = 'agent'"
+        "WHERE id IN ('usr_devx', 'usr_system_health') AND system_role = 'agent'"
     )
     conn.commit()
     logger.info("Migration 048: fixed agent paths + system_role")
@@ -1628,6 +2821,859 @@ def _promote_llm_costs_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE llm_costs ADD COLUMN litellm_request_id TEXT")
         logger.info("Migration 102: added llm_costs.litellm_request_id")
     conn.commit()
+
+
+def _repair_versioned_schema_invariants(
+    conn: sqlite3.Connection, known_versions: set[int]
+) -> None:
+    """Repair idempotent post-hook state already claimed by schema_versions."""
+    needed = _claimed_security_repairs_needed(conn, known_versions)
+    if 175 in needed and _table_exists(conn, "audit_log"):
+        _migration_175_audit_chain(conn)
+    if 176 in needed and _table_exists(conn, "audit_log"):
+        _migration_176_activate_audit_chain(conn)
+    if 177 in needed and _table_exists(conn, "delegations"):
+        _migration_177_delegation_workspace(conn)
+    if 178 in needed and _table_exists(conn, "agent_tokens"):
+        _migration_178_agent_token_lifecycle(conn)
+    if 179 in needed and _table_exists(conn, "access_grants"):
+        _migration_179_workspace_isolation(conn)
+
+
+def _claimed_schema_version(conn: sqlite3.Connection) -> int:
+    """Read the version marker without creating schema_versions or repairing state."""
+    if not _table_exists(conn, "schema_versions"):
+        return 0
+    row = conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _sqlite_object_exists(
+    conn: sqlite3.Connection, object_type: str, name: str
+) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?",
+            (object_type, name),
+        ).fetchone()
+    )
+
+
+def _claimed_security_repairs_needed(
+    conn: sqlite3.Connection, known_versions: set[int]
+) -> set[int]:
+    """Return claimed v175-v179 hooks that need a write to restore invariants.
+
+    This preflight is intentionally read-only: a normal startup with all
+    concrete artifacts present does not acquire the controlled-migration
+    quiescence requirement or execute a no-op repair hook.
+    """
+    if not known_versions or not _table_exists(conn, "schema_versions"):
+        return set()
+    claimed = _claimed_schema_version(conn)
+    if claimed > max(known_versions):
+        # The older-image guard owns unknown schemas; never infer repairs.
+        return set()
+
+    needed: set[int] = set()
+    if 175 in known_versions and claimed >= 175 and _table_exists(conn, "audit_log"):
+        required_columns = (
+            "workspace_id",
+            "workspace_sequence",
+            "previous_hash",
+            "entry_hash",
+            "hash_version",
+        )
+        state_ready = (
+            _table_exists(conn, "audit_chain_state")
+            and _column_exists(conn, "audit_chain_state", "legacy_root_hash")
+            and conn.execute(
+                "SELECT 1 FROM audit_chain_state "
+                "WHERE id = 1 AND legacy_root_hash IS NOT NULL"
+            ).fetchone()
+            is not None
+        )
+        if (
+            not state_ready
+            or not _table_exists(conn, "audit_chain_heads")
+            or any(not _column_exists(conn, "audit_log", column) for column in required_columns)
+            or not _sqlite_object_exists(
+                conn, "index", "idx_audit_log_workspace_sequence"
+            )
+            or not _sqlite_object_exists(conn, "trigger", "audit_log_chain_shape")
+            or not _sqlite_object_exists(
+                conn, "trigger", "audit_log_chainless_after_activation"
+            )
+        ):
+            needed.add(175)
+
+    if (
+        176 in known_versions
+        and claimed >= 176
+        and (
+            _table_exists(conn, "audit_chain_state")
+            or _table_exists(conn, "audit_log")
+        )
+    ):
+        active = (
+            conn.execute(
+                "SELECT enforcement_enabled, activated_at, legacy_root_hash "
+                "FROM audit_chain_state WHERE id = 1"
+            ).fetchone()
+            if _table_exists(conn, "audit_chain_state")
+            else None
+        )
+        if active is None or int(active[0]) != 1 or not active[1] or not active[2]:
+            needed.add(176)
+
+    if 177 in known_versions and claimed >= 177 and _table_exists(conn, "delegations"):
+        if (
+            not _column_exists(conn, "delegations", "workspace_id")
+            or _sqlite_object_exists(conn, "index", "idx_delegations_agent_active")
+            or not _sqlite_object_exists(
+                conn, "index", "idx_delegations_workspace_agent_active"
+            )
+            or not _sqlite_object_exists(
+                conn, "trigger", "delegations_workspace_required"
+            )
+        ):
+            needed.add(177)
+
+    if 178 in known_versions and claimed >= 178 and _table_exists(conn, "agent_tokens"):
+        required_columns = (
+            "principal_id",
+            "principal_type",
+            "label",
+            "issued_at",
+            "expires_at",
+            "revoked_at",
+            "revoked_by",
+            "rotation_family_id",
+            "supersedes_id",
+            "overlap_until",
+            "acknowledged_at",
+            "acknowledgement_actor",
+            "credential_kind",
+        )
+        backfill_needed = False
+        if all(_column_exists(conn, "agent_tokens", column) for column in required_columns):
+            backfill_needed = bool(
+                conn.execute(
+                    "SELECT 1 FROM agent_tokens WHERE "
+                    "(issued_at IS NULL AND created_at IS NOT NULL) "
+                    "OR rotation_family_id IS NULL "
+                    "OR credential_kind IS NULL "
+                    "OR (principal_type IS NULL AND principal_id IS NOT NULL) LIMIT 1"
+                ).fetchone()
+            )
+        if (
+            any(not _column_exists(conn, "agent_tokens", column) for column in required_columns)
+            or backfill_needed
+            or _sqlite_object_exists(conn, "index", "idx_agent_tokens_active")
+            or not _sqlite_object_exists(
+                conn, "index", "idx_agent_tokens_workspace_principal_active"
+            )
+            or not _sqlite_object_exists(
+                conn, "index", "idx_agent_tokens_rotation_family"
+            )
+            or not _sqlite_object_exists(
+                conn, "index", "idx_agent_tokens_live_successor"
+            )
+            or not _sqlite_object_exists(
+                conn, "trigger", "agent_tokens_individual_shape_insert"
+            )
+            or not _sqlite_object_exists(
+                conn, "trigger", "agent_tokens_individual_shape_update"
+            )
+        ):
+            needed.add(178)
+
+    if 179 in known_versions and claimed >= 179 and _table_exists(conn, "access_grants"):
+        file_meta_present = _table_exists(conn, "file_meta")
+        required_triggers = (
+            "access_grants_workspace_required_insert",
+            "access_grants_workspace_required_update",
+            "access_grants_workspace_immutable",
+        ) + (
+            (
+                "file_meta_workspace_required_insert",
+                "file_meta_workspace_required_update",
+                "file_meta_workspace_immutable",
+            )
+            if file_meta_present
+            else ()
+        )
+        required_indexes = (
+            "idx_tasks_workspace_id",
+            "idx_prs_workspace_task_status_created",
+            "idx_prs_workspace_project_status_created",
+            "idx_learnings_workspace_id",
+        )
+        if (
+            not _column_exists(conn, "access_grants", "workspace_id")
+            or (file_meta_present and not _column_exists(conn, "file_meta", "workspace_id"))
+            or not _table_exists(conn, "workspace_projects")
+            or not _unique_index_has_columns(
+                conn, "access_grants", ("workspace_id", "identity", "project_slug")
+            )
+            or (
+                file_meta_present
+                and not _unique_index_has_columns(
+                    conn, "file_meta", ("workspace_id", "project_slug", "rel_path")
+                )
+            )
+            or any(
+                not _sqlite_object_exists(conn, "trigger", trigger)
+                for trigger in required_triggers
+            )
+            or any(
+                not _sqlite_object_exists(conn, "index", index)
+                for index in required_indexes
+            )
+        ):
+            needed.add(179)
+
+    return needed
+
+
+def _migration_175_audit_chain(conn: sqlite3.Connection) -> None:
+    """Install/repair the additive v175 audit-chain schema.
+
+    SQLite has no portable ``ALTER TABLE ADD COLUMN IF NOT EXISTS``. Every
+    operation here is guarded or ``IF NOT EXISTS`` so a retry can finish after
+    either a partially executed hook or a version row committed before a hook
+    failure. Existing rows and the migration-145 immutability triggers are never
+    removed or rewritten. Activation is inserted only when state is absent and
+    therefore cannot be reset by a retry.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_chain_heads ("
+        "workspace_id TEXT PRIMARY KEY CHECK (length(trim(workspace_id)) > 0), "
+        "last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0), "
+        "last_entry_hash TEXT NOT NULL CHECK ("
+        "length(last_entry_hash) = 64 "
+        "AND last_entry_hash = lower(last_entry_hash) "
+        "AND last_entry_hash NOT GLOB '*[^0-9a-f]*'), "
+        "hash_version INTEGER NOT NULL DEFAULT 1 CHECK (hash_version = 1), "
+        "updated_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_chain_state ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "enforcement_enabled INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (enforcement_enabled IN (0, 1)), "
+        "activated_at TEXT, "
+        "legacy_root_hash TEXT CHECK (legacy_root_hash IS NULL OR ("
+        "length(legacy_root_hash) = 64 "
+        "AND legacy_root_hash = lower(legacy_root_hash) "
+        "AND legacy_root_hash NOT GLOB '*[^0-9a-f]*')), "
+        "CHECK ((enforcement_enabled = 0 AND activated_at IS NULL) "
+        "OR (enforcement_enabled = 1 AND activated_at IS NOT NULL)))"
+    )
+    if not _column_exists(conn, "audit_chain_state", "legacy_root_hash"):
+        conn.execute("ALTER TABLE audit_chain_state ADD COLUMN legacy_root_hash TEXT")
+        logger.info("Migration 175: added audit_chain_state.legacy_root_hash")
+    conn.execute(
+        "INSERT OR IGNORE INTO audit_chain_state "
+        "(id, enforcement_enabled, activated_at, legacy_root_hash) "
+        "VALUES (1, 0, NULL, NULL)"
+    )
+
+    columns = (
+        ("workspace_id", "TEXT"),
+        ("workspace_sequence", "INTEGER"),
+        ("previous_hash", "TEXT"),
+        ("entry_hash", "TEXT"),
+        ("hash_version", "INTEGER"),
+    )
+    for column, declaration in columns:
+        if not _column_exists(conn, "audit_log", column):
+            conn.execute(f"ALTER TABLE audit_log ADD COLUMN {column} {declaration}")
+            logger.info("Migration 175: added audit_log.%s", column)
+
+    state = conn.execute(
+        "SELECT legacy_root_hash FROM audit_chain_state WHERE id=1"
+    ).fetchone()
+    if state is None:
+        raise RuntimeError("migration 175 audit_chain_state singleton is missing")
+    if state[0] is None:
+        from core.api.services.audit_chain import legacy_root_hash_v1
+
+        legacy_rows = [
+            {
+                "id": row[0],
+                "timestamp": row[1],
+                "action": row[2],
+                "user": row[3],
+                "resource_type": row[4],
+                "resource_id": row[5],
+                "details_json": row[6],
+            }
+            for row in conn.execute(
+                "SELECT id, timestamp, action, user, resource_type, resource_id, "
+                "details_json FROM audit_log "
+                "WHERE workspace_id IS NULL AND workspace_sequence IS NULL "
+                "AND previous_hash IS NULL AND entry_hash IS NULL "
+                "AND hash_version IS NULL ORDER BY timestamp, id"
+            ).fetchall()
+        ]
+        conn.execute(
+            "UPDATE audit_chain_state SET legacy_root_hash=? "
+            "WHERE id=1 AND legacy_root_hash IS NULL",
+            (legacy_root_hash_v1(legacy_rows),),
+        )
+
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_log_workspace_sequence "
+        "ON audit_log(workspace_id, workspace_sequence) "
+        "WHERE workspace_id IS NOT NULL AND workspace_sequence IS NOT NULL"
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS audit_log_chain_shape
+        BEFORE INSERT ON audit_log
+        WHEN NOT (
+            (
+                NEW.workspace_id IS NULL
+                AND NEW.workspace_sequence IS NULL
+                AND NEW.previous_hash IS NULL
+                AND NEW.entry_hash IS NULL
+                AND NEW.hash_version IS NULL
+            )
+            OR
+            (
+                typeof(NEW.workspace_id) = 'text'
+                AND length(trim(NEW.workspace_id)) > 0
+                AND typeof(NEW.workspace_sequence) = 'integer'
+                AND NEW.workspace_sequence >= 1
+                AND typeof(NEW.previous_hash) = 'text'
+                AND length(NEW.previous_hash) = 64
+                AND NEW.previous_hash = lower(NEW.previous_hash)
+                AND NEW.previous_hash NOT GLOB '*[^0-9a-f]*'
+                AND typeof(NEW.entry_hash) = 'text'
+                AND length(NEW.entry_hash) = 64
+                AND NEW.entry_hash = lower(NEW.entry_hash)
+                AND NEW.entry_hash NOT GLOB '*[^0-9a-f]*'
+                AND NEW.hash_version = 1
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'audit_log chain fields are incomplete or invalid');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS audit_log_chainless_after_activation
+        BEFORE INSERT ON audit_log
+        WHEN (
+            SELECT enforcement_enabled FROM audit_chain_state WHERE id = 1
+        ) = 1 AND NEW.hash_version IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'audit_log chain fields required after activation');
+        END
+        """
+    )
+    conn.commit()
+
+
+def _migration_176_activate_audit_chain(conn: sqlite3.Connection) -> None:
+    """Freeze the complete legacy prefix and enable chain enforcement atomically.
+
+    This security floor is intentionally forward-only. The hook is recovery-safe
+    when the SQL migration has already recorded v176: an active chain is left
+    byte-identical, while an inactive state is activated only when no chained
+    rows or heads exist yet.
+    """
+    if conn.in_transaction:
+        raise RuntimeError("audit chain activation requires transaction ownership")
+
+    from core.api.services.audit_chain import legacy_root_hash_v1
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        state = conn.execute(
+            "SELECT enforcement_enabled, activated_at, legacy_root_hash "
+            "FROM audit_chain_state WHERE id=1"
+        ).fetchone()
+        if state is None:
+            raise RuntimeError("audit_chain_state singleton is missing")
+        if int(state[0]) == 1:
+            if not state[1] or not state[2]:
+                raise RuntimeError("active audit chain state is incomplete")
+            conn.commit()
+            return
+
+        head_count = int(
+            conn.execute("SELECT COUNT(*) FROM audit_chain_heads").fetchone()[0]
+        )
+        chained_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE hash_version IS NOT NULL"
+            ).fetchone()[0]
+        )
+        if head_count or chained_count:
+            raise RuntimeError(
+                "inactive audit chain has persisted heads or chained rows"
+            )
+
+        legacy_rows = [
+            {
+                "id": row[0],
+                "timestamp": row[1],
+                "action": row[2],
+                "user": row[3],
+                "resource_type": row[4],
+                "resource_id": row[5],
+                "details_json": row[6],
+            }
+            for row in conn.execute(
+                "SELECT id, timestamp, action, user, resource_type, resource_id, "
+                "details_json FROM audit_log "
+                "WHERE workspace_id IS NULL AND workspace_sequence IS NULL "
+                "AND previous_hash IS NULL AND entry_hash IS NULL "
+                "AND hash_version IS NULL ORDER BY timestamp, id"
+            ).fetchall()
+        ]
+        legacy_root = legacy_root_hash_v1(legacy_rows)
+        activated_at = datetime.now(timezone.utc).isoformat()
+        cursor = conn.execute(
+            "UPDATE audit_chain_state SET legacy_root_hash=?, "
+            "enforcement_enabled=1, activated_at=? "
+            "WHERE id=1 AND enforcement_enabled=0",
+            (legacy_root, activated_at),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("audit chain activation compare-and-set failed")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migration_177_delegation_workspace(conn: sqlite3.Connection) -> None:
+    """Install/repair fail-closed workspace scoping for delegations.
+
+    Existing grants remain NULL intentionally. The runtime requires an exact
+    workspace match, so an older unscoped credential can never become live by
+    inference during upgrade or hook retry.
+    """
+    if not _column_exists(conn, "delegations", "workspace_id"):
+        conn.execute("ALTER TABLE delegations ADD COLUMN workspace_id TEXT")
+        logger.info("Migration 177: added delegations.workspace_id")
+    conn.execute("DROP INDEX IF EXISTS idx_delegations_agent_active")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delegations_workspace_agent_active "
+        "ON delegations(workspace_id, agent_username, expires_at)"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS delegations_workspace_required "
+        "BEFORE INSERT ON delegations "
+        "WHEN NEW.workspace_id IS NULL OR length(trim(NEW.workspace_id)) = 0 "
+        "BEGIN SELECT RAISE(ABORT, 'delegation workspace_id required'); END"
+    )
+    conn.commit()
+
+
+def _migration_178_agent_token_lifecycle(conn: sqlite3.Connection) -> None:
+    """Install/repair the additive per-principal token lifecycle schema.
+
+    Existing rows become ``legacy_individual`` credentials.  They retain their
+    compatibility-mode behavior only when their principal can be resolved
+    unambiguously at authentication time; the migration never invents an
+    expiry or silently upgrades them into the strict credential class.
+    """
+    columns = (
+        ("principal_id", "TEXT"),
+        ("principal_type", "TEXT"),
+        ("label", "TEXT"),
+        ("issued_at", "TEXT"),
+        ("expires_at", "TEXT"),
+        ("revoked_at", "TEXT"),
+        ("revoked_by", "TEXT"),
+        ("rotation_family_id", "TEXT"),
+        ("supersedes_id", "TEXT"),
+        ("overlap_until", "TEXT"),
+        ("acknowledged_at", "TEXT"),
+        ("acknowledgement_actor", "TEXT"),
+        ("credential_kind", "TEXT"),
+    )
+    for column, declaration in columns:
+        if not _column_exists(conn, "agent_tokens", column):
+            conn.execute(
+                f"ALTER TABLE agent_tokens ADD COLUMN {column} {declaration}"
+            )
+            logger.info("Migration 178: added agent_tokens.%s", column)
+
+    # Backfill only facts that already exist.  Ambiguous/missing principals stay
+    # NULL and therefore fail closed in both compatibility and strict modes.
+    conn.execute(
+        "UPDATE agent_tokens SET issued_at = created_at "
+        "WHERE issued_at IS NULL AND created_at IS NOT NULL"
+    )
+    conn.execute(
+        "UPDATE agent_tokens SET rotation_family_id = id "
+        "WHERE rotation_family_id IS NULL"
+    )
+    conn.execute(
+        "UPDATE agent_tokens SET credential_kind = 'legacy_individual' "
+        "WHERE credential_kind IS NULL"
+    )
+    conn.execute(
+        "UPDATE agent_tokens SET principal_id = ("
+        " SELECT MIN(u.id) FROM users u"
+        " WHERE u.slug = agent_tokens.agent_name"
+        " AND u.deleted_at IS NULL"
+        " AND COALESCE(u.workspace_id, 'ws_default') = "
+        "     COALESCE(agent_tokens.workspace_id, 'ws_default')"
+        ") WHERE principal_id IS NULL AND ("
+        " SELECT COUNT(*) FROM users u"
+        " WHERE u.slug = agent_tokens.agent_name"
+        " AND u.deleted_at IS NULL"
+        " AND COALESCE(u.workspace_id, 'ws_default') = "
+        "     COALESCE(agent_tokens.workspace_id, 'ws_default')"
+        ") = 1"
+    )
+    conn.execute(
+        "UPDATE agent_tokens SET principal_type = ("
+        " SELECT u.type FROM users u WHERE u.id = agent_tokens.principal_id"
+        ") WHERE principal_type IS NULL AND principal_id IS NOT NULL"
+    )
+
+    conn.execute("DROP INDEX IF EXISTS idx_agent_tokens_active")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_tokens_workspace_principal_active "
+        "ON agent_tokens(workspace_id, principal_id, is_active, expires_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_tokens_rotation_family "
+        "ON agent_tokens(rotation_family_id, issued_at)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_tokens_live_successor "
+        "ON agent_tokens(supersedes_id) WHERE supersedes_id IS NOT NULL "
+        "AND revoked_at IS NULL AND is_active = 1"
+    )
+
+    strict_shape = """
+        NEW.credential_kind = 'individual' AND (
+            NEW.principal_id IS NULL OR length(trim(NEW.principal_id)) = 0 OR
+            NEW.principal_type IS NULL OR
+            NEW.principal_type NOT IN ('human', 'agent') OR
+            NEW.workspace_id IS NULL OR length(trim(NEW.workspace_id)) = 0 OR
+            NEW.issued_at IS NULL OR length(trim(NEW.issued_at)) = 0 OR
+            NEW.expires_at IS NULL OR length(trim(NEW.expires_at)) = 0 OR
+            NEW.rotation_family_id IS NULL OR
+            length(trim(NEW.rotation_family_id)) = 0
+        )
+    """
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS agent_tokens_individual_shape_insert "
+        f"BEFORE INSERT ON agent_tokens WHEN {strict_shape} "
+        "BEGIN SELECT RAISE(ABORT, "
+        "'individual token lifecycle fields required'); END"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS agent_tokens_individual_shape_update "
+        f"BEFORE UPDATE ON agent_tokens WHEN {strict_shape} "
+        "BEGIN SELECT RAISE(ABORT, "
+        "'individual token lifecycle fields required'); END"
+    )
+    conn.commit()
+
+
+def _unique_index_has_columns(
+    conn: sqlite3.Connection, table: str, columns: tuple[str, ...]
+) -> bool:
+    for row in conn.execute(f'PRAGMA index_list("{table}")').fetchall():
+        if not bool(row[2]) or bool(row[4]):
+            continue
+        actual = tuple(
+            str(detail[2])
+            for detail in conn.execute(
+                f'PRAGMA index_info("{str(row[1])}")'
+            ).fetchall()
+        )
+        if actual == columns:
+            return True
+    return False
+
+
+def _rebuild_workspace_keyed_tables(conn: sqlite3.Connection) -> None:
+    """Replace legacy global uniqueness with workspace-scoped uniqueness."""
+    access_ready = _unique_index_has_columns(
+        conn, "access_grants", ("workspace_id", "identity", "project_slug")
+    )
+    file_ready = not _table_exists(conn, "file_meta") or _unique_index_has_columns(
+        conn, "file_meta", ("workspace_id", "project_slug", "rel_path")
+    )
+    if access_ready and file_ready:
+        return
+
+    if conn.in_transaction:
+        conn.commit()
+    foreign_keys_enabled = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not access_ready:
+            access_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(access_grants)")
+            }
+            created = (
+                "created_at"
+                if "created_at" in access_columns
+                else "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+            )
+            updated = (
+                "updated_at"
+                if "updated_at" in access_columns
+                else "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+            )
+            confidential = (
+                "COALESCE(confidential_clearance, 0)"
+                if "confidential_clearance" in access_columns
+                else "0"
+            )
+            clearance = (
+                "COALESCE(clearance, CASE WHEN confidential_clearance=1 "
+                "THEN 'confidential' ELSE 'internal' END)"
+                if "clearance" in access_columns
+                else "CASE WHEN " + confidential + "=1 THEN 'confidential' ELSE 'internal' END"
+            )
+            scope = (
+                "COALESCE(scope, 'project:' || project_slug)"
+                if "scope" in access_columns
+                else "'project:' || project_slug"
+            )
+            conn.execute(
+                "CREATE TABLE access_grants_workspace_new ("
+                "identity TEXT NOT NULL, project_slug TEXT NOT NULL, "
+                "role TEXT NOT NULL CHECK(role IN ('admin','member','viewer','membro')), "
+                "confidential_clearance INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(confidential_clearance IN (0,1)), "
+                "clearance TEXT NOT NULL DEFAULT 'internal' "
+                "CHECK(clearance IN ('public','internal','confidential')), "
+                "scope TEXT NOT NULL DEFAULT 'all', created_at TEXT NOT NULL "
+                "DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), "
+                "updated_at TEXT NOT NULL DEFAULT "
+                "(strftime('%Y-%m-%dT%H:%M:%fZ','now')), workspace_id TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO access_grants_workspace_new "
+                "(identity,project_slug,role,confidential_clearance,clearance,"
+                "scope,created_at,updated_at,workspace_id) "
+                "SELECT identity,project_slug,CASE role WHEN 'membro' THEN 'member' "
+                "ELSE COALESCE(role,'viewer') END," + confidential + "," +
+                clearance + "," + scope + "," + created + "," + updated +
+                ",workspace_id FROM access_grants"
+            )
+            conn.execute("DROP TABLE access_grants")
+            conn.execute(
+                "ALTER TABLE access_grants_workspace_new RENAME TO access_grants"
+            )
+
+        if not file_ready:
+            file_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(file_meta)")
+            }
+            created = (
+                "created_at"
+                if "created_at" in file_columns
+                else "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+            )
+            updated = (
+                "updated_at"
+                if "updated_at" in file_columns
+                else "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+            )
+            conn.execute(
+                "CREATE TABLE file_meta_workspace_new ("
+                "id TEXT PRIMARY KEY, project_slug TEXT NOT NULL, "
+                "rel_path TEXT NOT NULL, owner_user_id TEXT, "
+                "confidential INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(confidential IN (0,1)), created_at TEXT NOT NULL DEFAULT "
+                "(strftime('%Y-%m-%dT%H:%M:%fZ','now')), "
+                "updated_at TEXT NOT NULL DEFAULT "
+                "(strftime('%Y-%m-%dT%H:%M:%fZ','now')), workspace_id TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO file_meta_workspace_new "
+                "(id,project_slug,rel_path,owner_user_id,confidential,created_at,"
+                "updated_at,workspace_id) SELECT id,project_slug,rel_path,"
+                "owner_user_id,COALESCE(confidential,0)," + created + "," + updated +
+                ",workspace_id FROM file_meta"
+            )
+            conn.execute("DROP TABLE file_meta")
+            conn.execute(
+                "ALTER TABLE file_meta_workspace_new RENAME TO file_meta"
+            )
+
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_access_grants_workspace_identity_project "
+            "ON access_grants(workspace_id, identity, project_slug)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_access_grants_identity "
+            "ON access_grants(identity)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_access_grants_project "
+            "ON access_grants(project_slug)"
+        )
+        if _table_exists(conn, "file_meta"):
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_file_meta_workspace_project_path "
+                "ON file_meta(workspace_id, project_slug, rel_path)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_meta_confidential "
+                "ON file_meta(project_slug) WHERE confidential = 1"
+            )
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("migration 179 introduced a foreign-key violation")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute(
+            "PRAGMA foreign_keys=" + ("ON" if foreign_keys_enabled else "OFF")
+        )
+
+
+def _migration_179_workspace_isolation(conn: sqlite3.Connection) -> None:
+    """Install workspace-scoped ownership, uniqueness, and lookup contracts."""
+    if not _column_exists(conn, "access_grants", "workspace_id"):
+        conn.execute("ALTER TABLE access_grants ADD COLUMN workspace_id TEXT")
+        logger.info("Migration 179: added access_grants.workspace_id")
+
+    if _table_exists(conn, "users") and _column_exists(conn, "users", "workspace_id"):
+        conn.execute(
+            "UPDATE access_grants SET workspace_id = ("
+            " SELECT MIN(COALESCE(u.workspace_id, 'ws_default')) FROM users u"
+            " WHERE u.deleted_at IS NULL AND ("
+            " u.id = access_grants.identity OR u.slug = access_grants.identity"
+            " OR 'agent:' || u.slug = access_grants.identity))"
+            " WHERE workspace_id IS NULL AND ("
+            " SELECT COUNT(DISTINCT COALESCE(u.workspace_id, 'ws_default'))"
+            " FROM users u WHERE u.deleted_at IS NULL AND ("
+            " u.id = access_grants.identity OR u.slug = access_grants.identity"
+            " OR 'agent:' || u.slug = access_grants.identity)) = 1"
+        )
+
+    if _table_exists(conn, "file_meta"):
+        if not _column_exists(conn, "file_meta", "workspace_id"):
+            conn.execute("ALTER TABLE file_meta ADD COLUMN workspace_id TEXT")
+            logger.info("Migration 179: added file_meta.workspace_id")
+        if _table_exists(conn, "users") and _column_exists(conn, "users", "workspace_id"):
+            conn.execute(
+                "UPDATE file_meta SET workspace_id = ("
+                " SELECT MIN(COALESCE(u.workspace_id, 'ws_default')) FROM users u"
+                " WHERE u.deleted_at IS NULL AND u.id = file_meta.owner_user_id)"
+                " WHERE workspace_id IS NULL AND owner_user_id IS NOT NULL AND ("
+                " SELECT COUNT(DISTINCT COALESCE(u.workspace_id, 'ws_default'))"
+                " FROM users u WHERE u.deleted_at IS NULL"
+                " AND u.id = file_meta.owner_user_id) = 1"
+            )
+        if (
+            _table_exists(conn, "documents")
+            and _column_exists(conn, "documents", "workspace_id")
+            and _column_exists(conn, "documents", "project")
+        ):
+            conn.execute(
+                "UPDATE file_meta SET workspace_id = ("
+                " SELECT MIN(COALESCE(d.workspace_id, 'ws_default'))"
+                " FROM documents d WHERE d.project = file_meta.project_slug)"
+                " WHERE workspace_id IS NULL AND ("
+                " SELECT COUNT(DISTINCT COALESCE(d.workspace_id, 'ws_default'))"
+                " FROM documents d WHERE d.project = file_meta.project_slug) = 1"
+            )
+    conn.commit()
+    _rebuild_workspace_keyed_tables(conn)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS workspace_projects ("
+            "workspace_id TEXT NOT NULL, project_slug TEXT NOT NULL, "
+            "source TEXT NOT NULL CHECK(source IN ('project_create','grant','team','migration')), "
+            "created_by TEXT, created_at TEXT NOT NULL DEFAULT "
+            "(strftime('%Y-%m-%dT%H:%M:%fZ','now')), "
+            "PRIMARY KEY(workspace_id, project_slug))"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO workspace_projects "
+            "(workspace_id,project_slug,source,created_by) "
+            "SELECT workspace_id,project_slug,'grant',identity FROM access_grants "
+            "WHERE workspace_id IS NOT NULL AND length(trim(workspace_id)) > 0"
+        )
+        if _table_exists(conn, "teams") and _table_exists(conn, "project_teams"):
+            if _column_exists(conn, "teams", "workspace_id"):
+                conn.execute(
+                    "INSERT OR IGNORE INTO workspace_projects "
+                    "(workspace_id,project_slug,source,created_by) "
+                    "SELECT DISTINCT t.workspace_id,pt.project,'team',t.id "
+                    "FROM project_teams pt JOIN teams t ON t.id=pt.team_id "
+                    "WHERE t.workspace_id IS NOT NULL "
+                    "AND length(trim(t.workspace_id)) > 0"
+                )
+        trigger_statements = (
+            "CREATE TRIGGER IF NOT EXISTS access_grants_workspace_required_insert "
+            "BEFORE INSERT ON access_grants WHEN NEW.workspace_id IS NULL OR "
+            "length(trim(NEW.workspace_id))=0 BEGIN SELECT RAISE(ABORT, "
+            "'access grant workspace_id required'); END",
+            "CREATE TRIGGER IF NOT EXISTS access_grants_workspace_required_update "
+            "BEFORE UPDATE ON access_grants WHEN NEW.workspace_id IS NULL OR "
+            "length(trim(NEW.workspace_id))=0 BEGIN SELECT RAISE(ABORT, "
+            "'access grant workspace_id required'); END",
+            "CREATE TRIGGER IF NOT EXISTS access_grants_workspace_immutable "
+            "BEFORE UPDATE OF workspace_id ON access_grants WHEN "
+            "OLD.workspace_id IS NOT NULL AND OLD.workspace_id != NEW.workspace_id "
+            "BEGIN SELECT RAISE(ABORT, 'access grant workspace_id immutable'); END",
+        )
+        for statement in trigger_statements:
+            conn.execute(statement)
+        if _table_exists(conn, "file_meta"):
+            for statement in (
+                "CREATE TRIGGER IF NOT EXISTS file_meta_workspace_required_insert "
+                "BEFORE INSERT ON file_meta WHEN NEW.workspace_id IS NULL OR "
+                "length(trim(NEW.workspace_id))=0 BEGIN SELECT RAISE(ABORT, "
+                "'file metadata workspace_id required'); END",
+                "CREATE TRIGGER IF NOT EXISTS file_meta_workspace_required_update "
+                "BEFORE UPDATE ON file_meta WHEN NEW.workspace_id IS NULL OR "
+                "length(trim(NEW.workspace_id))=0 BEGIN SELECT RAISE(ABORT, "
+                "'file metadata workspace_id required'); END",
+                "CREATE TRIGGER IF NOT EXISTS file_meta_workspace_immutable "
+                "BEFORE UPDATE OF workspace_id ON file_meta WHEN "
+                "OLD.workspace_id IS NOT NULL AND OLD.workspace_id != NEW.workspace_id "
+                "BEGIN SELECT RAISE(ABORT, 'file metadata workspace_id immutable'); END",
+            ):
+                conn.execute(statement)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_workspace_id "
+            "ON tasks(workspace_id, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_prs_workspace_task_status_created "
+            "ON pull_requests(workspace_id, task_id, status, created_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_prs_workspace_project_status_created "
+            "ON pull_requests(workspace_id, project, status, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_learnings_workspace_id "
+            "ON learnings(workspace_id, id)"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _migration_135_graph_edges_provider(conn: sqlite3.Connection) -> None:

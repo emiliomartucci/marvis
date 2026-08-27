@@ -1,4 +1,4 @@
-"""Dedicated LLM Gateway wiring for newsletter and inbox automations."""
+"""Dedicated LLM Gateway wiring for newsletter and inbox flows."""
 
 from __future__ import annotations
 

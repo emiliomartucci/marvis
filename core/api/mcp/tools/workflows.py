@@ -35,8 +35,16 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from core.api.mcp._adapter import LOCAL_CTX, acquire_db, raise_mcp_error
-from core.api.use_cases._errors import ServiceError
+from core.api.mcp._adapter import (
+    LOCAL_CTX,
+    acquire_db,
+    current_mcp_context,
+    current_visible_projects,
+    require_unambiguous_visible_project,
+    raise_mcp_error,
+)
+from core.api.use_cases._context import CallerContext, require_workspace_ctx
+from core.api.use_cases._errors import NotFoundError, ServiceError
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +57,43 @@ _PLAYBOOKS_DIR = Path(__file__).parent / "workflow_playbooks"
 #: Kebab-case slug for the dated plan filename (mirrors the conventional-commit
 #: title rule: strip the ``type:`` prefix, lowercase, collapse to ``a-z0-9-``).
 _KEBAB_STRIP_RE = re.compile(r"[^a-z0-9]+")
+
+
+async def _current_workflow_scope() -> tuple[CallerContext, set[str] | None]:
+    """Resolve one authenticated workspace and project allowlist per tool call."""
+    ctx = current_mcp_context()
+    require_workspace_ctx(ctx)
+    if ctx is LOCAL_CTX:
+        return ctx, None
+    async with acquire_db() as db:
+        visible_projects = await current_visible_projects(db, ctx)
+        if visible_projects is None:
+            raise NotFoundError(code="project_not_found", message="Project not found")
+        safe: set[str] = set()
+        for project_slug in sorted(visible_projects):
+            try:
+                await require_unambiguous_visible_project(
+                    db,
+                    ctx,
+                    project_slug,
+                    visible_projects,
+                )
+            except NotFoundError:
+                continue
+            safe.add(project_slug)
+        return ctx, safe
+
+
+def _require_visible_project(
+    project: str | None,
+    visible_projects: set[str] | None,
+) -> None:
+    if (
+        project is not None
+        and visible_projects is not None
+        and project not in visible_projects
+    ):
+        raise NotFoundError(code="project_not_found", message="Project not found")
 
 
 def _load_playbook(name: str) -> str:
@@ -70,7 +115,13 @@ def _kebab_title(title: str) -> str:
     return slug or "doc"
 
 
-async def _prefetch_brain_context(feature: str, project: str | None) -> str:
+async def _prefetch_brain_context(
+    feature: str,
+    project: str | None,
+    *,
+    ctx: CallerContext = LOCAL_CTX,
+    visible_projects: set[str] | None = None,
+) -> str:
     """Pull related prior work + applicable learnings, best-effort, fastapi-free.
 
     Calls the SAME use_cases the host agent is told to call, so the returned
@@ -82,16 +133,21 @@ async def _prefetch_brain_context(feature: str, project: str | None) -> str:
 
     Returns a markdown block (the ``{brain_context}`` substitution) — never raises.
     """
+    require_workspace_ctx(ctx)
+    _require_visible_project(project, visible_projects)
     try:
         from core.api.use_cases import learnings as learnings_uc
         from core.api.use_cases import search as search_uc
 
         # search opens its own connections from settings (no request db); learnings
         # needs a read connection.
-        search_res = await search_uc.search(LOCAL_CTX, q=feature)
+        search_res = await search_uc.search(ctx, q=feature)
         async with acquire_db() as db:
             learn_res = await learnings_uc.check_learnings(
-                LOCAL_CTX, db, query=feature
+                ctx,
+                db,
+                query=feature,
+                visible_projects=visible_projects,
             )
     except Exception:
         logger.debug("plan prefetch unavailable (non-critical)", exc_info=True)
@@ -100,10 +156,18 @@ async def _prefetch_brain_context(feature: str, project: str | None) -> str:
             "`mcp__marvis__search` + `mcp__marvis__check_learnings` before drafting._"
         )
 
-    return _format_brain_context(search_res, learn_res)
+    return _format_brain_context(
+        search_res,
+        learn_res,
+        visible_projects=visible_projects,
+    )
 
 
-def _format_brain_context(search_res: Any, learn_res: Any) -> str:
+def _format_brain_context(
+    search_res: Any,
+    learn_res: Any,
+    visible_projects: set[str] | None = None,
+) -> str:
     """Render the prefetched search + learnings DTOs into a compact markdown block.
 
     Pulls the highest-signal hits (related plans/tasks/files + applicable learnings)
@@ -125,6 +189,19 @@ def _format_brain_context(search_res: Any, learn_res: Any) -> str:
             title = _get(hit, "title", "")
             score = _get(hit, "score", 0.0) or 0.0
             doc_type = _get(hit, "doc_type", bucket.rstrip("s"))
+            project = _get(hit, "project", None)
+            if visible_projects is not None:
+                project_bound = bucket in {
+                    "plans",
+                    "files",
+                    "tasks",
+                    "handoffs",
+                    "projects",
+                }
+                if (project_bound and not project) or (
+                    project and project not in visible_projects
+                ):
+                    continue
             if title:
                 hits.append((float(score), str(doc_type), str(title)))
     hits.sort(key=lambda h: h[0], reverse=True)
@@ -153,7 +230,13 @@ def _format_brain_context(search_res: Any, learn_res: Any) -> str:
     return "\n".join(lines)
 
 
-async def _build_plan_playbook(feature: str, project: str | None = None) -> str:
+async def _build_plan_playbook(
+    feature: str,
+    project: str | None = None,
+    *,
+    ctx: CallerContext | None = None,
+    visible_projects: set[str] | None = None,
+) -> str:
     """Build the plan playbook text, with the brain prefetch spliced into CONSULT.
 
     The bundled ``plan.md`` carries the 3-beat skeleton with ``{brain_context}`` and
@@ -162,13 +245,27 @@ async def _build_plan_playbook(feature: str, project: str | None = None) -> str:
     runnable. Module-level + SDK-free so tests call it directly.
     """
     template = _load_playbook("plan")
-    brain_context = await _prefetch_brain_context(feature, project)
+    if ctx is None:
+        brain_context = await _prefetch_brain_context(feature, project)
+    else:
+        brain_context = await _prefetch_brain_context(
+            feature,
+            project,
+            ctx=ctx,
+            visible_projects=visible_projects,
+        )
     return template.replace("{brain_context}", brain_context).replace(
         "{feature}", feature
     )
 
 
-async def _build_brainstorm_playbook(topic: str, project: str | None = None) -> str:
+async def _build_brainstorm_playbook(
+    topic: str,
+    project: str | None = None,
+    *,
+    ctx: CallerContext | None = None,
+    visible_projects: set[str] | None = None,
+) -> str:
     """Build the brainstorm playbook text, brain prefetch spliced into CONSULT.
 
     Twin of :func:`_build_plan_playbook` — same prefetch (best-effort, degrades to a
@@ -177,13 +274,27 @@ async def _build_brainstorm_playbook(topic: str, project: str | None = None) -> 
     fills them. Module-level + SDK-free so tests call it directly.
     """
     template = _load_playbook("brainstorm")
-    brain_context = await _prefetch_brain_context(topic, project)
+    if ctx is None:
+        brain_context = await _prefetch_brain_context(topic, project)
+    else:
+        brain_context = await _prefetch_brain_context(
+            topic,
+            project,
+            ctx=ctx,
+            visible_projects=visible_projects,
+        )
     return template.replace("{brain_context}", brain_context).replace(
         "{topic}", topic
     )
 
 
-async def _build_compound_playbook(what: str, project: str | None = None) -> str:
+async def _build_compound_playbook(
+    what: str,
+    project: str | None = None,
+    *,
+    ctx: CallerContext | None = None,
+    visible_projects: set[str] | None = None,
+) -> str:
     """Build the compound playbook text, brain prefetch spliced into CONSULT.
 
     Twin of :func:`_build_plan_playbook`. The bundled ``compound.md`` carries
@@ -192,7 +303,15 @@ async def _build_compound_playbook(what: str, project: str | None = None) -> str
     tests call it directly.
     """
     template = _load_playbook("compound")
-    brain_context = await _prefetch_brain_context(what, project)
+    if ctx is None:
+        brain_context = await _prefetch_brain_context(what, project)
+    else:
+        brain_context = await _prefetch_brain_context(
+            what,
+            project,
+            ctx=ctx,
+            visible_projects=visible_projects,
+        )
     return template.replace("{brain_context}", brain_context).replace("{what}", what)
 
 
@@ -215,6 +334,8 @@ async def _save_doc_artifact(
     *,
     subdir: str,
     suffix: str,
+    ctx: CallerContext = LOCAL_CTX,
+    visible_projects: set[str] | None = None,
 ) -> dict[str, Any]:
     """Write a workflow artifact under ``<project>/docs/<subdir>/`` + index/embed best-effort.
 
@@ -234,10 +355,10 @@ async def _save_doc_artifact(
     ``-plan``/``-brainstorm``); an empty suffix means the dated kebab slug stands
     alone (solutions).
     """
+    workspace_id = require_workspace_ctx(ctx)
+    _require_visible_project(project, visible_projects)
     project_path = _resolve_project_path(project)
     if project_path is None:
-        from core.api.use_cases._errors import NotFoundError
-
         raise NotFoundError(
             code="project_not_found",
             message=f"Project '{project}' not found",
@@ -264,7 +385,7 @@ async def _save_doc_artifact(
             title=title,
             content=body,
             project=project,
-            workspace_id=LOCAL_CTX.workspace_id,
+            workspace_id=workspace_id,
         )
         indexed = True
     except Exception:
@@ -283,7 +404,7 @@ async def _save_doc_artifact(
             title=title,
             content=body,
             project=project,
-            workspace_id=LOCAL_CTX.workspace_id,
+            workspace_id=workspace_id,
         )
         # is_available() gates the embed; treat a no-op (unavailable) as not embedded
         # so the return reflects reality.
@@ -299,7 +420,12 @@ async def _save_doc_artifact(
 
 
 async def _save_plan_artifact(
-    project: str, title: str, body: str
+    project: str,
+    title: str,
+    body: str,
+    *,
+    ctx: CallerContext = LOCAL_CTX,
+    visible_projects: set[str] | None = None,
 ) -> dict[str, Any]:
     """Persist a plan to ``<project>/docs/plans/<date>-<kebab>-plan.md`` (+ embed).
 
@@ -307,12 +433,23 @@ async def _save_plan_artifact(
     for the ``plan`` workflow. Returns ``{path, embedded}``.
     """
     return await _save_doc_artifact(
-        project, title, body, subdir="plans", suffix="-plan"
+        project,
+        title,
+        body,
+        subdir="plans",
+        suffix="-plan",
+        ctx=ctx,
+        visible_projects=visible_projects,
     )
 
 
 async def _save_brainstorm_artifact(
-    project: str, title: str, body: str
+    project: str,
+    title: str,
+    body: str,
+    *,
+    ctx: CallerContext = LOCAL_CTX,
+    visible_projects: set[str] | None = None,
 ) -> dict[str, Any]:
     """Persist a brainstorm to ``<project>/docs/brainstorms/<date>-<kebab>-brainstorm.md``.
 
@@ -320,12 +457,23 @@ async def _save_brainstorm_artifact(
     for the ``brainstorm`` workflow. Returns ``{path, embedded}``.
     """
     return await _save_doc_artifact(
-        project, title, body, subdir="brainstorms", suffix="-brainstorm"
+        project,
+        title,
+        body,
+        subdir="brainstorms",
+        suffix="-brainstorm",
+        ctx=ctx,
+        visible_projects=visible_projects,
     )
 
 
 async def _save_compound_artifact(
-    project: str, title: str, body: str
+    project: str,
+    title: str,
+    body: str,
+    *,
+    ctx: CallerContext = LOCAL_CTX,
+    visible_projects: set[str] | None = None,
 ) -> dict[str, Any]:
     """Persist a solution doc to ``<project>/docs/solutions/<date>-<kebab>.md`` (+ embed).
 
@@ -334,7 +482,13 @@ async def _save_compound_artifact(
     ``-brainstorm`` suffix (just the dated kebab slug). Returns ``{path, embedded}``.
     """
     return await _save_doc_artifact(
-        project, title, body, subdir="solutions", suffix=""
+        project,
+        title,
+        body,
+        subdir="solutions",
+        suffix="",
+        ctx=ctx,
+        visible_projects=visible_projects,
     )
 
 
@@ -346,13 +500,19 @@ def register(mcp) -> None:
         feature: Annotated[str, Field(min_length=1, max_length=2000)],
         project: str | None = None,
     ) -> str:
-        """Return a brain-grounded planning playbook for a feature, bug, or improvement.
+        """Return a planning playbook (istruzioni) — NON pianifica e NON esegue nulla.
 
         QUANDO USARLO: stai per pianificare un lavoro (feature/bug/refactor) e vuoi un piano strutturato che parte dalla memoria invece che da zero. Il tool pre-carica il contesto rilevante dal cervello (lavori correlati + learning applicabili) e lo mette in cima al playbook, poi ti guida CONSULT -> DO -> SAVE.
         QUANDO NON USARLO: NOT per eseguire il piano (questo restituisce solo le istruzioni; l'agente ospite le esegue). NOT per cercare contesto puntuale -> usa search / check_learnings direttamente.
-        RESTITUISCE: il testo del playbook (markdown) con il bundle di contesto gia' incorporato; salva il risultato via save_plan."""
+        RESTITUISCE: il testo del playbook (markdown) con il bundle di contesto gia' incorporato. Poi save_plan salva IL PIANO che scrivi tu eseguendo il playbook, NON il testo del playbook."""
         try:
-            return await _build_plan_playbook(feature, project)
+            ctx, visible_projects = await _current_workflow_scope()
+            return await _build_plan_playbook(
+                feature,
+                project,
+                ctx=ctx,
+                visible_projects=visible_projects,
+            )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -362,13 +522,20 @@ def register(mcp) -> None:
         title: Annotated[str, Field(min_length=1, max_length=200)],
         body: Annotated[str, Field(min_length=1)],
     ) -> dict[str, Any]:
-        """Persist a plan to the project's docs/plans/ folder and embed it into the brain.
+        """Persist a new plan to the project's docs/plans/ folder and embed it into the brain.
 
-        QUANDO USARLO: hai finito di redigere un piano (tipicamente al passo SAVE del playbook plan) e vuoi salvarlo. Il tool sceglie il nome file datato/kebab corretto, lo scrive nella cartella giusta, e lo embedda cosi' che la prossima ricerca lo trovi per significato. NON scrivere il file a mano.
-        QUANDO NON USARLO: NOT per ottenere il playbook -> usa plan. NOT per artefatti diversi da un piano.
+        QUANDO USARLO: hai finito di redigere un piano nuovo (tipicamente al passo SAVE del playbook plan) e vuoi creare il suo carrier. Il tool sceglie il nome file datato/kebab corretto, lo scrive nella cartella giusta, e lo embedda cosi' che la prossima ricerca lo trovi per significato. NON scrivere il file a mano.
+        QUANDO NON USARLO: NOT per ottenere il playbook -> usa plan. NOT per artefatti diversi da un piano -> brainstorm in docs/brainstorms/ con save_brainstorm, documento-soluzione in docs/solutions/ con save_compound. NOT per review, approfondimento o modifica di un piano esistente: usa read_file, poi write_file sullo stesso path con if_match_sha256, infine read_file per verificare.
         RESTITUISCE: {path, indexed, embedded} — il percorso del file scritto, se l'indice testuale e' stato aggiornato e se l'embedding e' andato a buon fine (best-effort: il salvataggio riesce anche se l'index/embed fallisce)."""
         try:
-            return await _save_plan_artifact(project, title, body)
+            ctx, visible_projects = await _current_workflow_scope()
+            return await _save_plan_artifact(
+                project,
+                title,
+                body,
+                ctx=ctx,
+                visible_projects=visible_projects,
+            )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -377,13 +544,19 @@ def register(mcp) -> None:
         topic: Annotated[str, Field(min_length=1, max_length=2000)],
         project: str | None = None,
     ) -> str:
-        """Return a brain-grounded brainstorming playbook to explore WHAT to build.
+        """Return a brainstorming playbook (istruzioni) — NON esplora e NON esegue nulla.
 
         QUANDO USARLO: stai per esplorare un'idea/funzionalita' e vuoi ragionare sul COSA costruire (approcci, tradeoff) prima di pianificare il COME. Il tool pre-carica il contesto rilevante dal cervello (lavori correlati + learning) e lo mette in cima al playbook, poi ti guida CONSULT -> DO (esplora 2-3 approcci concreti, applica YAGNI, una domanda alla volta) -> SAVE.
         QUANDO NON USARLO: NOT per pianificare l'implementazione -> usa plan. NOT per eseguire (questo restituisce solo le istruzioni). NOT per cercare contesto puntuale -> usa search / check_learnings.
-        RESTITUISCE: il testo del playbook (markdown) con il bundle di contesto gia' incorporato; salva il risultato via save_brainstorm."""
+        RESTITUISCE: il testo del playbook (markdown) con il bundle di contesto gia' incorporato. Poi save_brainstorm salva IL BRAINSTORM che scrivi tu eseguendo il playbook, NON il testo del playbook."""
         try:
-            return await _build_brainstorm_playbook(topic, project)
+            ctx, visible_projects = await _current_workflow_scope()
+            return await _build_brainstorm_playbook(
+                topic,
+                project,
+                ctx=ctx,
+                visible_projects=visible_projects,
+            )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -396,10 +569,17 @@ def register(mcp) -> None:
         """Persist a brainstorm to the project's docs/brainstorms/ folder and embed it.
 
         QUANDO USARLO: hai finito di esplorare un'idea (tipicamente al passo SAVE del playbook brainstorm) e vuoi salvarla. Il tool sceglie il nome file datato/kebab corretto, lo scrive nella cartella giusta, e lo embedda cosi' che la prossima ricerca lo trovi per significato. NON scrivere il file a mano.
-        QUANDO NON USARLO: NOT per ottenere il playbook -> usa brainstorm. NOT per artefatti diversi da un brainstorm.
+        QUANDO NON USARLO: NOT per ottenere il playbook -> usa brainstorm. NOT per artefatti diversi da un brainstorm -> piano in docs/plans/ con save_plan, documento-soluzione in docs/solutions/ con save_compound.
         RESTITUISCE: {path, indexed, embedded} — il percorso del file scritto, se l'indice testuale e' stato aggiornato e se l'embedding e' andato a buon fine (best-effort: il salvataggio riesce anche se l'index/embed fallisce)."""
         try:
-            return await _save_brainstorm_artifact(project, title, body)
+            ctx, visible_projects = await _current_workflow_scope()
+            return await _save_brainstorm_artifact(
+                project,
+                title,
+                body,
+                ctx=ctx,
+                visible_projects=visible_projects,
+            )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -408,13 +588,19 @@ def register(mcp) -> None:
         what: Annotated[str, Field(min_length=1, max_length=2000)],
         project: str | None = None,
     ) -> str:
-        """Return a brain-grounded playbook to capture a finished solution as durable knowledge.
+        """Return a knowledge-capture playbook (istruzioni) — NON cattura e NON esegue nulla.
 
         QUANDO USARLO: hai appena risolto un problema / costruito qualcosa e vuoi catturarlo come conoscenza durevole e riusabile. Il tool pre-carica il contesto rilevante dal cervello e ti guida CONSULT -> DO (distilla problema, soluzione, trappole, cosa faresti diversamente) -> SAVE, dove salvi sia il documento-soluzione sia una regola di prevenzione (learning) immediatamente recuperabile.
         QUANDO NON USARLO: NOT prima di aver finito il lavoro (cattura conoscenza gia' verificata, non piani). NOT per pianificare -> usa plan. NOT per eseguire (questo restituisce solo le istruzioni).
-        RESTITUISCE: il testo del playbook (markdown) con il bundle di contesto gia' incorporato; salva il risultato via save_compound + create_learning."""
+        RESTITUISCE: il testo del playbook (markdown) con il bundle di contesto gia' incorporato. Poi save_compound (+ create_learning) salva IL DOCUMENTO-SOLUZIONE che scrivi tu eseguendo il playbook, NON il testo del playbook."""
         try:
-            return await _build_compound_playbook(what, project)
+            ctx, visible_projects = await _current_workflow_scope()
+            return await _build_compound_playbook(
+                what,
+                project,
+                ctx=ctx,
+                visible_projects=visible_projects,
+            )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -427,9 +613,16 @@ def register(mcp) -> None:
         """Persist a solution doc to the project's docs/solutions/ folder and embed it.
 
         QUANDO USARLO: hai distillato una soluzione (tipicamente al passo SAVE del playbook compound) e vuoi salvarla come documento-soluzione. Il tool sceglie il nome file datato/kebab corretto, lo scrive in docs/solutions/, e lo embedda cosi' che la prossima ricerca lo trovi per significato. NON scrivere il file a mano. Ricorda di chiamare anche create_learning per la regola di prevenzione riusabile.
-        QUANDO NON USARLO: NOT per ottenere il playbook -> usa compound. NOT per artefatti diversi da una soluzione.
+        QUANDO NON USARLO: NOT per ottenere il playbook -> usa compound. NOT per artefatti diversi da una soluzione -> piano in docs/plans/ con save_plan, brainstorm in docs/brainstorms/ con save_brainstorm.
         RESTITUISCE: {path, indexed, embedded} — il percorso del file scritto, se l'indice testuale e' stato aggiornato e se l'embedding e' andato a buon fine (best-effort: il salvataggio riesce anche se l'index/embed fallisce)."""
         try:
-            return await _save_compound_artifact(project, title, body)
+            ctx, visible_projects = await _current_workflow_scope()
+            return await _save_compound_artifact(
+                project,
+                title,
+                body,
+                ctx=ctx,
+                visible_projects=visible_projects,
+            )
         except ServiceError as e:
             raise_mcp_error(e)

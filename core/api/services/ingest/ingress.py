@@ -17,9 +17,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
+import os
+import re
+import time
 import uuid
 from datetime import datetime, timezone
+from typing import Mapping
 
 import aiosqlite
 
@@ -33,6 +38,130 @@ MAX_JSON_BODY_BYTES = 32 * 1024 * 1024
 MAX_INGRESS_FILE_COUNT = 50
 MAX_IDEMPOTENCY_KEY_LEN = 255
 IDEMPOTENCY_TTL_HOURS = 24
+WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300
+MAX_WEBHOOK_NONCE_LEN = 255
+MAX_WEBHOOK_SOURCE_LEN = 128
+
+
+
+# --------------------------------------------------------------------------- #
+# Signed webhook auth (U8)
+# --------------------------------------------------------------------------- #
+
+
+def _env_list(name: str) -> list[str]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return []
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def webhook_secrets() -> list[str]:
+    secrets = _env_list("MARVIS_INGEST_WEBHOOK_SECRETS")
+    single = os.environ.get("MARVIS_INGEST_WEBHOOK_SECRET", "").strip()
+    if single:
+        secrets.append(single)
+    seen: list[str] = []
+    for secret in secrets:
+        if secret and secret not in seen:
+            seen.append(secret)
+    return seen
+
+
+def webhook_project_scope() -> set[str]:
+    return set(_env_list("MARVIS_INGEST_WEBHOOK_PROJECT_SCOPE"))
+
+
+def webhook_workspace_id(env: Mapping[str, str] | None = None) -> str:
+    """Return the exact workspace configured for the signed webhook surface."""
+    source = os.environ if env is None else env
+    workspace_id = (
+        source.get("MARVIS_INGEST_WEBHOOK_WORKSPACE_ID", "").strip()
+        or source.get("MARVIS_MCP_WORKSPACE_ID", "").strip()
+    )
+    if not workspace_id:
+        err = ServiceError(
+            code="webhook_workspace_not_configured",
+            message="Webhook workspace is not configured.",
+        )
+        err.http_status = 401
+        raise err
+    return workspace_id
+
+
+def parse_webhook_headers(headers: Mapping[str, str]) -> tuple[str, str, str, str]:
+    source = (headers.get("x-marvis-webhook-source") or "").strip()
+    timestamp = (headers.get("x-marvis-webhook-timestamp") or "").strip()
+    nonce = (headers.get("x-marvis-webhook-nonce") or "").strip()
+    signature = (headers.get("x-marvis-webhook-signature") or "").strip()
+    if not source or not timestamp or not nonce or not signature:
+        raise ValueError("missing webhook headers")
+    if len(source) > MAX_WEBHOOK_SOURCE_LEN or len(nonce) > MAX_WEBHOOK_NONCE_LEN:
+        raise ValueError("webhook header too long")
+    if not re.fullmatch(r"[A-Za-z0-9_.:&-]+", source):
+        raise ValueError("invalid webhook source")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", nonce):
+        raise ValueError("invalid webhook nonce")
+    if not timestamp.isdigit():
+        raise ValueError("invalid webhook timestamp")
+    if not re.fullmatch(r"sha256=[0-9a-fA-F]{64}", signature):
+        raise ValueError("invalid webhook signature format")
+    return source, timestamp, nonce, signature
+
+
+def verify_webhook_signature(raw_body: bytes, *, timestamp: str, signature: str, now: int | None = None) -> str:
+    secrets = webhook_secrets()
+    if not secrets:
+        err = ServiceError(code="webhook_not_configured", message="Webhook signing secret is not configured.")
+        err.http_status = 401
+        raise err
+    current = int(time.time()) if now is None else now
+    ts = int(timestamp)
+    if abs(current - ts) > WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS:
+        err = ServiceError(code="webhook_timestamp_stale", message="Webhook timestamp is outside the allowed window.")
+        err.http_status = 401
+        raise err
+    expected_prefix = "sha256="
+    received = signature[len(expected_prefix):]
+    signed_payload = timestamp.encode("utf-8") + b"." + raw_body
+    for secret in secrets:
+        digest = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(received, digest):
+            return hashlib.sha256(raw_body).hexdigest()
+    err = ServiceError(code="webhook_signature_invalid", message="Webhook signature is invalid.")
+    err.http_status = 401
+    raise err
+
+
+async def claim_webhook_nonce(
+    workspace_id: str,
+    source: str,
+    nonce: str,
+    request_sha256: str,
+) -> bool:
+    if not workspace_id.strip():
+        raise ValueError("workspace_id is required for webhook nonce claims")
+    async with write_db(label="ingest.webhook.nonce_claim") as db:
+        cur = await db.execute(
+            """
+            INSERT INTO ingest_webhook_nonces(
+                workspace_id, source, nonce, request_sha256, received_at
+            )
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(workspace_id, source, nonce) WHERE workspace_id IS NOT NULL
+            DO NOTHING
+            """,
+            (workspace_id, source, nonce, request_sha256),
+        )
+        return cur.rowcount == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -51,7 +180,7 @@ def decode_json_content(content: IngestJsonContent) -> tuple[bytes, str]:
             code="content_url_unsupported",
             message=(
                 "content.url (server-side fetch) is not supported in M1 — it is an "
-                "SSRF pivot and unnecessary under the n8n-as-orchestrator model. "
+                "SSRF pivot and unnecessary when the external client has the bytes. "
                 "Fix: send the bytes inline as content.text or content.base64."
             ),
         )

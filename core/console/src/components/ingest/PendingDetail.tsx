@@ -2,53 +2,28 @@
 
 import { useState, type ReactNode } from "react";
 import type { IngestPendingItem } from "@/lib/types";
-import { APIError, deleteIngestPending, patchIngestPending } from "@/lib/api";
-import ProjectSelectorModal from "@/components/ProjectSelectorModal";
 import { basename, fileLabel, formatBytes, formatStatus, previewKind, statusTone } from "./format";
 import { MimeIcon } from "./MimeIcon";
 import { MarkdownPreview } from "./preview/MarkdownPreview";
 import { PdfPreview } from "./preview/PdfPreview";
 import { XlsxPreview } from "./preview/XlsxPreview";
 import { ImagePreview } from "./preview/ImagePreview";
-import { ParseErrorBanner } from "./states/ParseErrorBanner";
 
 const TABS = ["preview", "extract", "proposal", "saga", "raw"] as const;
 
-const PROJECT_CHANGE_ALLOWED_STATES = new Set<IngestPendingItem["status"]>([
-  "awaiting_triage",
-  "parse_error",
-  "rejected",
-]);
-
 type InspectorTab = (typeof TABS)[number];
 
-type ItemState =
-  | { status: "idle" }
-  | { status: "approving" }
-  | { status: "rejecting" }
-  | { status: "retrying" }
-  | { status: "moving" }
-  | { status: "deleting" }
-  | { status: "error"; error: string };
 
 interface PendingDetailProps {
   item: IngestPendingItem;
   previewText: string;
   previewLoading?: boolean;
-  onApprove: (item: IngestPendingItem) => Promise<void>;
-  onReject: (item: IngestPendingItem) => Promise<void>;
-  onRetryParse: (item: IngestPendingItem) => Promise<void>;
-  onRefresh?: () => void;
 }
 
 export function PendingDetail({
   item,
   previewText,
   previewLoading = false,
-  onApprove,
-  onReject,
-  onRetryParse,
-  onRefresh,
 }: PendingDetailProps) {
   return (
     <PendingDetailContent
@@ -56,10 +31,6 @@ export function PendingDetail({
       item={item}
       previewText={previewText}
       previewLoading={previewLoading}
-      onApprove={onApprove}
-      onReject={onReject}
-      onRetryParse={onRetryParse}
-      onRefresh={onRefresh}
     />
   );
 }
@@ -68,62 +39,9 @@ function PendingDetailContent({
   item,
   previewText,
   previewLoading = false,
-  onApprove,
-  onReject,
-  onRetryParse,
-  onRefresh,
 }: PendingDetailProps) {
   const [activeTab, setActiveTab] = useState<InspectorTab>("preview");
-  const [state, setState] = useState<ItemState>({ status: "idle" });
-  const [moveSelectorOpen, setMoveSelectorOpen] = useState(false);
-  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
-
-  const busy = state.status !== "idle" && state.status !== "error";
   const tone = statusTone(item.status);
-  const canChangeProject = PROJECT_CHANGE_ALLOWED_STATES.has(item.status);
-
-  async function run(kind: "approve" | "reject" | "retry") {
-    setState({ status: actionState(kind) });
-    try {
-      if (kind === "approve") await onApprove(item);
-      else if (kind === "reject") await onReject(item);
-      else await onRetryParse(item);
-    } catch (err) {
-      setState({ status: "error", error: err instanceof Error ? err.message : "Action failed" });
-      return;
-    }
-  }
-
-  async function handleDeleteConfirm() {
-    setDeleteConfirmOpen(false);
-    setState({ status: "deleting" });
-    try {
-      await deleteIngestPending(item.id);
-      onRefresh?.();
-    } catch (err) {
-      setState({ status: "error", error: err instanceof Error ? err.message : "Delete failed" });
-    }
-  }
-
-  async function handleProjectChange(newSlug: string) {
-    if (!newSlug || newSlug === item.project_slug) {
-      setMoveSelectorOpen(false);
-      return;
-    }
-    setState({ status: "moving" });
-    try {
-      await patchIngestPending(
-        item.id,
-        { project_slug: newSlug },
-        { ifMatch: item.updated_at }
-      );
-      setMoveSelectorOpen(false);
-      setState({ status: "idle" });
-      onRefresh?.();
-    } catch (err) {
-      setState({ status: "error", error: projectChangeErrorMessage(err) });
-    }
-  }
 
   return (
     <article className="flex h-full min-h-0 flex-col bg-pir-base">
@@ -141,50 +59,16 @@ function PendingDetailContent({
                 <span className={`h-1.5 w-1.5 rounded-full ${tone.dot}`} />
                 {formatStatus(item.status)}
               </span>
-              <SagaTimelineCompact item={item} activeState={state.status} />
+              <SagaTimelineCompact item={item} />
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={() => canChangeProject && setMoveSelectorOpen(true)}
-                disabled={!canChangeProject || state.status === "moving"}
-                title={
-                  canChangeProject
-                    ? "Click per cambiare progetto"
-                    : `Project change non consentito in stato ${item.status}`
-                }
-                className="inline-flex h-7 items-center gap-1.5 rounded-sm border border-pir-accent/40 bg-pir-accent/10 px-2 font-mono text-[11px] font-semibold uppercase tracking-[0.08em] text-pir-accent transition-colors hover:border-pir-accent hover:bg-pir-accent/15 focus:border-pir-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                aria-label={`Project: ${item.project_slug}${canChangeProject ? " (click to change)" : ""}`}
+              <span
+                className="inline-flex h-7 items-center gap-1.5 rounded-sm border border-pir-accent/40 bg-pir-accent/10 px-2 font-mono text-[11px] font-semibold uppercase tracking-[0.08em] text-pir-accent"
+                aria-label={`Project: ${item.project_slug}`}
               >
                 <FolderGlyph />
                 <span>{item.project_slug}</span>
-                {canChangeProject && (
-                  <ChevronDownGlyph className={state.status === "moving" ? "animate-pulse" : ""} />
-                )}
-              </button>
-              {canChangeProject && (() => {
-                const llm = item.classification?.llm_metadata;
-                const llmSlug = llm?.project_slug;
-                const llmConf = llmConfidence(llm);
-                if (!llmSlug || llmSlug === item.project_slug) return null;
-                const confSuffix = llmConf != null ? ` (conf ${llmConf.toFixed(2)})` : "";
-                const tooltip = `LLM suggerisce: ${llmSlug}${confSuffix}`;
-                return (
-                  <button
-                    type="button"
-                    onClick={() => void handleProjectChange(llmSlug)}
-                    disabled={state.status === "moving"}
-                    title={tooltip}
-                    className="inline-flex h-7 items-center gap-1.5 rounded-sm border border-pir-success/50 bg-pir-success/10 px-2 font-mono text-[11px] font-semibold uppercase tracking-[0.08em] text-pir-success transition-colors hover:border-pir-success hover:bg-pir-success/20 focus:border-pir-success focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                    aria-label={`Sposta in ${llmSlug} (suggerito da LLM)`}
-                  >
-                    <span>→ {llmSlug}</span>
-                    {llmConf != null && (
-                      <span className="text-pir-success/80">{(llmConf * 100).toFixed(0)}%</span>
-                    )}
-                  </button>
-                );
-              })()}
+              </span>
               <div className="flex flex-wrap items-center gap-2 font-mono text-caption text-pir-text-tertiary">
                 <span>{item.mime_type ?? "unknown"}</span>
                 <span aria-hidden="true">·</span>
@@ -218,16 +102,8 @@ function PendingDetailContent({
       </header>
 
       {item.status === "parse_error" && (
-        <ParseErrorBanner
-          message={item.error_message}
-          busy={busy}
-          onRetry={() => void run("retry")}
-          onQuarantine={() => void run("reject")}
-        />
-      )}
-      {state.status === "error" && (
         <div className="border-b border-pir-error bg-pir-error/10 px-5 py-2 font-mono text-caption text-pir-error" role="alert">
-          {state.error}
+          {item.error_message ?? "Parsing failed"}
         </div>
       )}
 
@@ -237,152 +113,19 @@ function PendingDetailContent({
         )}
         {activeTab === "extract" && <ExtractPane item={item} text={previewText} />}
         {activeTab === "proposal" && <ProposalPane item={item} />}
-        {activeTab === "saga" && <SagaPane item={item} activeState={state.status} />}
+        {activeTab === "saga" && <SagaPane item={item} />}
         {activeTab === "raw" && <RawPane item={item} />}
       </section>
 
-      <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-pir bg-pir-surface-1 px-5 py-3">
+      <footer className="flex shrink-0 items-center border-t border-pir bg-pir-surface-1 px-5 py-3">
         <p className="min-w-0 truncate font-mono text-caption text-pir-text-tertiary">
           {item.target_folder && item.target_filename
             ? `${item.target_folder}/${item.target_filename}`
             : basename(item.file_path)}
         </p>
-        <div className="flex shrink-0 gap-2">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => setDeleteConfirmOpen(true)}
-            title="Elimina row + file fisici (irreversibile)"
-            className="h-8 rounded-sm border border-pir-error/40 bg-transparent px-3 font-mono text-caption uppercase tracking-[0.08em] text-pir-error transition-colors hover:border-pir-error hover:bg-pir-error/10 disabled:cursor-wait disabled:opacity-50 focus:outline-none"
-          >
-            {state.status === "deleting" ? "Elimino..." : "Elimina"}
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => void run("reject")}
-            className="h-8 rounded-sm border border-pir bg-transparent px-3 font-mono text-caption uppercase tracking-[0.08em] text-pir-text-tertiary transition-colors hover:border-pir-error hover:text-pir-error disabled:cursor-wait disabled:opacity-50 focus:border-pir-accent focus:outline-none"
-          >
-            Reject
-          </button>
-          <button
-            type="button"
-            disabled={busy || item.status !== "awaiting_triage"}
-            onClick={() => void run("approve")}
-            className="h-8 rounded-sm border border-pir-accent bg-pir-accent px-3 font-mono text-caption font-semibold uppercase tracking-[0.08em] text-pir-base transition-opacity hover:opacity-90 disabled:cursor-wait disabled:opacity-50 focus:border-pir-accent focus:outline-none"
-          >
-            {state.status === "approving" ? "Approvazione..." : "Approve"}
-          </button>
-        </div>
       </footer>
-
-      {moveSelectorOpen && (
-        <ProjectSelectorModal
-          currentSlug={item.project_slug}
-          onSubmit={(slug) => void handleProjectChange(slug)}
-          onClose={() => setMoveSelectorOpen(false)}
-          filter={(p) => p.on_server === true && p.path !== null}
-        />
-      )}
-      {deleteConfirmOpen && (
-        <DeleteConfirmDialog
-          filename={fileLabel(item)}
-          onCancel={() => setDeleteConfirmOpen(false)}
-          onConfirm={() => void handleDeleteConfirm()}
-        />
-      )}
     </article>
   );
-}
-
-function DeleteConfirmDialog({
-  filename,
-  onCancel,
-  onConfirm,
-}: {
-  filename: string;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="delete-ingest-title"
-      aria-describedby="delete-ingest-description"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
-      onClick={onCancel}
-    >
-      <div
-        onClick={(event) => event.stopPropagation()}
-        className="w-full max-w-md rounded-sm border border-pir bg-pir-surface-0 shadow-2xl"
-      >
-        <header className="border-b border-pir px-5 py-3">
-          <h2
-            id="delete-ingest-title"
-            className="font-display text-[16px] font-bold text-pir-text-primary"
-          >
-            Eliminare file
-          </h2>
-        </header>
-        <div className="space-y-3 px-5 py-4 font-mono text-caption text-pir-text-secondary">
-          <p className="break-all text-pir-text-primary">{filename}</p>
-          <p id="delete-ingest-description">
-            La row e i file fisici associati saranno rimossi. Operazione irreversibile.
-          </p>
-        </div>
-        <footer className="flex flex-wrap items-center justify-end gap-2 border-t border-pir px-5 py-3">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="h-8 rounded-sm border border-pir bg-transparent px-3 font-mono text-caption uppercase tracking-[0.08em] text-pir-text-tertiary transition-colors hover:border-pir-strong hover:text-pir-text-primary focus:border-pir-accent focus:outline-none"
-          >
-            Annulla
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            className="h-8 rounded-sm border border-pir-error bg-pir-error px-3 font-mono text-caption font-semibold uppercase tracking-[0.08em] text-pir-base transition-opacity hover:opacity-90 focus:border-pir-error focus:outline-none"
-          >
-            Elimina
-          </button>
-        </footer>
-      </div>
-    </div>
-  );
-}
-
-function projectChangeErrorMessage(err: unknown): string {
-  if (err instanceof APIError && err.status === 409) {
-    const code = apiErrorCode(err.detail);
-    if (code === "target_sha_collision") {
-      const existingId = apiErrorString(err.detail, "existing_ingest_id");
-      return existingId
-        ? `Contenuto gia presente nel progetto target. Row esistente: ${existingId}.`
-        : "Contenuto gia presente nel progetto target. Apri la row esistente o elimina il duplicato.";
-    }
-    if (code === "target_filename_collision") {
-      return "Nome file gia presente nel progetto target.";
-    }
-    if (code === "source_file_missing") {
-      return "File sorgente non trovato su disco. Ricarica e verifica la row.";
-    }
-    return "Modifica concorrente — ricarica e riprova";
-  }
-  if (err instanceof Error) return err.message;
-  return "Errore sposta progetto";
-}
-
-function apiErrorCode(detail: unknown): string | null {
-  if (!detail || typeof detail !== "object" || !("error" in detail)) return null;
-  const error = (detail as { error?: unknown }).error;
-  return typeof error === "string" ? error : null;
-}
-
-function apiErrorString(detail: unknown, key: string): string | null {
-  if (!detail || typeof detail !== "object" || !(key in detail)) return null;
-  const value = (detail as Record<string, unknown>)[key];
-  return typeof value === "string" ? value : null;
 }
 
 function llmConfidence(
@@ -490,25 +233,6 @@ function FolderGlyph() {
       aria-hidden="true"
     >
       <path d="M2 4.5a1 1 0 0 1 1-1h3.5l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4.5Z" />
-    </svg>
-  );
-}
-
-function ChevronDownGlyph({ className }: { className?: string }) {
-  return (
-    <svg
-      width="10"
-      height="10"
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.75"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      className={className}
-    >
-      <path d="m4 6 4 4 4-4" />
     </svg>
   );
 }
@@ -756,14 +480,8 @@ function computeKgNodeId(
   return `${type}:artifact:${projectSlug}/${targetFolder}/${targetFilename}`;
 }
 
-function SagaTimelineCompact({
-  item,
-  activeState,
-}: {
-  item: IngestPendingItem;
-  activeState: ItemState["status"];
-}) {
-  const steps = sagaSteps(item, activeState);
+function SagaTimelineCompact({ item }: { item: IngestPendingItem }) {
+  const steps = sagaSteps(item);
   const summary = steps.map(([label, status]) => `${label}: ${status}`).join(" · ");
   return (
     <div
@@ -787,8 +505,8 @@ function SagaTimelineCompact({
   );
 }
 
-function SagaPane({ item, activeState }: { item: IngestPendingItem; activeState: ItemState["status"] }) {
-  const steps = sagaSteps(item, activeState);
+function SagaPane({ item }: { item: IngestPendingItem }) {
+  const steps = sagaSteps(item);
   return (
     <div className="space-y-4 p-5">
       <SectionLabel>Saga · ingestion pipeline</SectionLabel>
@@ -815,14 +533,6 @@ function RawPane({ item }: { item: IngestPendingItem }) {
   );
 }
 
-type BusyState = Extract<ItemState["status"], "approving" | "rejecting" | "retrying">;
-
-function actionState(kind: "approve" | "reject" | "retry"): BusyState {
-  if (kind === "approve") return "approving";
-  if (kind === "reject") return "rejecting";
-  return "retrying";
-}
-
 function tabLabel(tab: InspectorTab): string {
   if (tab === "preview") return "Anteprima";
   if (tab === "extract") return "Estratto";
@@ -833,10 +543,7 @@ function tabLabel(tab: InspectorTab): string {
 type SagaStatus = "done" | "running" | "pending" | "error";
 type SagaStep = [string, SagaStatus];
 
-function sagaSteps(
-  item: IngestPendingItem,
-  activeState: ItemState["status"]
-): SagaStep[] {
+function sagaSteps(item: IngestPendingItem): SagaStep[] {
   return [
     ["parse_file", item.status === "parse_error" ? "error" : "done"],
     [
@@ -848,17 +555,14 @@ function sagaSteps(
         : "done",
     ],
     ["triage", item.status === "awaiting_triage" ? "running" : "done"],
-    ["insert_file", insertFileStatus(item, activeState)],
+    ["insert_file", insertFileStatus(item)],
     ["index_kg", indexKgStatus(item)],
   ];
 }
 
-function insertFileStatus(
-  item: IngestPendingItem,
-  activeState: ItemState["status"]
-): SagaStatus {
+function insertFileStatus(item: IngestPendingItem): SagaStatus {
   if (item.status === "inserted" || item.status === "done") return "done";
-  if (activeState === "approving" || item.status === "approved") return "running";
+  if (item.status === "approved") return "running";
   return "pending";
 }
 

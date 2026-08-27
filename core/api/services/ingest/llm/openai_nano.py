@@ -98,147 +98,15 @@ def _build_user_prompt(sanitized_content: str, context: dict) -> str:
     )
 
 
-async def _list_visible_projects() -> list[dict]:
-    """Iterate ``/data/projects/*/project.yaml`` and return on-server projects.
-
-    Replaces the (non-existent) ``_list_projects_internal`` referenced in the
-    plan: we use the same source of truth (project.yaml on disk) the rest of
-    the ingest pipeline uses via ``_load_project_entry``.
-    """
-    from pathlib import Path
-
-    import yaml
-
-    projects: list[dict] = []
-    root = Path("/data/projects")
-    if not root.exists():
-        return projects
-    try:
-        entries = sorted(p for p in root.iterdir() if p.is_dir())
-    except OSError:
-        return projects
-
-    for d in entries:
-        yaml_path = d / "project.yaml"
-        if not yaml_path.exists():
-            continue
-        try:
-            data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        if not data.get("on_server", True):
-            continue
-        if not (d / "input").exists():
-            # Only projects with an input/ landing zone are valid ingest targets.
-            continue
-        projects.append(
-            {
-                "slug": data.get("project") or d.name,
-                "name": data.get("name") or d.name,
-                "description": (data.get("description") or "")[:200],
-                "type": data.get("type", "work"),
-            }
-        )
-    return projects
-
-
-async def _fetch_recent_hotspots(db: Any, limit: int = 5) -> list[dict]:
-    """Top-N hotspots by ``touch_count_30d``. Mirrors graph_landing()."""
-    try:
-        cur = await db.execute(
-            """
-            SELECT id, type, name, qualified_name, touch_count_30d
-              FROM graph_nodes
-             WHERE deprecated_at IS NULL
-             ORDER BY touch_count_30d DESC, touch_last_at DESC
-             LIMIT ?
-            """,
-            (limit,),
-        )
-        rows = await cur.fetchall()
-    except Exception:  # noqa: BLE001 - graph table optional in tests
-        return []
-    out: list[dict] = []
-    for r in rows or []:
-        try:
-            out.append(
-                {
-                    "node_id": r["id"] if hasattr(r, "keys") else r[0],
-                    "label": (
-                        (r["qualified_name"] if hasattr(r, "keys") else r[3])
-                        or (r["name"] if hasattr(r, "keys") else r[2])
-                    ),
-                    "kind": r["type"] if hasattr(r, "keys") else r[1],
-                    "touch_count": (
-                        r["touch_count_30d"] if hasattr(r, "keys") else r[4]
-                    )
-                    or 0,
-                }
-            )
-        except Exception:  # noqa: BLE001 - schema variants
-            continue
-    return out
-
-
-async def _semantic_similar(content: str, db: Any, limit: int = 5) -> list[dict]:
-    """Best-effort semantic search. Empty list if embedding/sqlite-vec unavailable."""
-    try:
-        from core.api.config import settings
-        from core.api.services.embedding_service import search_by_type
-    except Exception:  # noqa: BLE001
-        return []
-
-    db_path = (
-        getattr(settings, "db_path", None)
-        or os.environ.get("MARVIS_DB_PATH")
-        or os.environ.get("PIR_DB_PATH", "")
-    )
-    vec0_path = getattr(settings, "vec0_path", None) or os.environ.get(
-        "VEC0_PATH", ""
-    )
-    if not db_path or not vec0_path:
-        return []
-    try:
-        grouped = await search_by_type(
-            content[:500],
-            "ws_default",
-            db_path,
-            vec0_path,
-            top_k=limit,
-        )
-    except Exception:  # noqa: BLE001 - the embedding backend may be unavailable in dev/test
-        return []
-    files = grouped.get("file", []) if isinstance(grouped, dict) else []
-    return files[:limit]
-
-
-async def gather_classification_context(content: str, db: Any) -> dict:
-    """Discovery context via internal services in parallel (H-D1).
-
-    All three discovery calls are best-effort — exceptions are swallowed and
-    the missing slice falls back to an empty list.
-    """
-    projects, similar, hotspots = await asyncio.gather(
-        _list_visible_projects(),
-        _semantic_similar(content, db),
-        _fetch_recent_hotspots(db),
-        return_exceptions=True,
+async def gather_classification_context(
+    content: str, db: Any, workspace_id: str
+) -> dict:
+    """Compatibility export of the canonical workspace-scoped context builder."""
+    from core.api.services.ingest.llm.classification_context import (
+        gather_classification_context as gather_workspace_context,
     )
 
-    if isinstance(projects, BaseException):
-        projects = []
-    if isinstance(similar, BaseException):
-        similar = []
-    if isinstance(hotspots, BaseException):
-        hotspots = []
-
-    return {
-        "projects": projects,
-        "similar_artifacts": similar if isinstance(similar, list) else [],
-        "hotspots": hotspots if isinstance(hotspots, list) else [],
-    }
+    return await gather_workspace_context(content, db, workspace_id)
 
 
 async def _log_llm_cost(
@@ -246,6 +114,7 @@ async def _log_llm_cost(
     model: str,
     input_tokens: int,
     output_tokens: int,
+    workspace_id: str,
 ) -> None:
     """Append a row to llm_costs (best effort)."""
     cost = (
@@ -265,7 +134,7 @@ async def _log_llm_cost(
             await db.execute(
                 "INSERT INTO llm_costs "
                 "(id, feature, model, input_tokens, output_tokens, cost_usd, workspace_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'ws_default')",
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(uuid.uuid4()),
                     feature,
@@ -273,6 +142,7 @@ async def _log_llm_cost(
                     int(input_tokens or 0),
                     int(output_tokens or 0),
                     float(cost),
+                    workspace_id,
                 ),
             )
             await db.commit()
@@ -289,6 +159,10 @@ async def classify_with_llm(
     Returns ``None`` on any failure (missing key, timeout, API error, parse
     refusal). Caller falls back to the deterministic classifier.
     """
+    workspace_id = str(context.get("_workspace_id") or "").strip()
+    if not workspace_id:
+        logger.warning("openai_classifier_workspace_missing")
+        return None
     sanitized = redact(_sanitize(content_excerpt[:EXCERPT_MAX_CHARS], EXCERPT_MAX_CHARS))
 
     prompt = _build_user_prompt(sanitized, context)
@@ -337,6 +211,7 @@ async def classify_with_llm(
             model=LLM_MODEL,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            workspace_id=workspace_id,
         )
 
         return parsed

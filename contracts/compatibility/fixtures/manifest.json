@@ -1,0 +1,8 @@
+{
+  "files": {
+    "deliberate-break.json": "bc5019df7fd97e1647832fe3244684f2f179d6ab0d704ffa3883b66f3e35f9a4",
+    "n-contract.json": "eb9c5fbb5e932d5d865732453ec5455a5d341e35d3daa6394fd35636a38d1459",
+    "n-minus-1-contract.json": "b38336ce4cbfb1aaefd87d7ed3b78ec69a311f1c0fa6647c4ad51931da393fd5"
+  },
+  "schema": "marvis-compatibility-fixture-manifest/v1"
+}

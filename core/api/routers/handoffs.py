@@ -31,7 +31,7 @@ from core.api.rbac import require_role
 from core.api.routers._adapter import to_http
 from core.api.security import get_current_user_or_agent
 from core.api.services.kg.audit import check_deep_rate_limit, log_kg_deep_access
-from core.api.services.kg.lens import build_kg_context_for_handoff
+from core.api.services.kg.lens import build_kg_context_for_handoff, require_kg_visibility
 from core.api.use_cases import handoffs as uc
 from core.api.use_cases._context import CallerContext
 from core.api.use_cases._errors import ServiceError
@@ -121,6 +121,8 @@ async def get_handoff(
 
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
+        if deep:
+            require_kg_visibility(ctx, visible_projects)
         result = await uc.get_handoff(
             ctx,
             db,
@@ -137,7 +139,13 @@ async def get_handoff(
         log_kg_deep_access(user.username, "get_handoff", filename)
         # Builder normalizes raw filename (strips .md + handoff- prefix, then
         # prepends handoff:artifact:). Do not pre-prefix here.
-        result["kg_context"] = await build_kg_context_for_handoff(db, filename, deep=True)
+        result["kg_context"] = await build_kg_context_for_handoff(
+            db,
+            filename,
+            deep=True,
+            ctx=ctx,
+            visible_projects=visible_projects,
+        )
 
     return result
 

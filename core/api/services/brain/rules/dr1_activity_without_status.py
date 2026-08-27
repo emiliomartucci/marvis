@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from core.api.models.brain import DriftSignal
 from core.api.services.brain.cycle_snapshot import CycleSnapshot, DigestEventRow

@@ -62,7 +62,6 @@ bodies are unchanged.
 from __future__ import annotations
 
 import logging
-import re
 from typing import Literal
 
 import aiosqlite
@@ -85,7 +84,7 @@ from core.api.models.graph_ux import (
 from core.api.models.graph_cosmo import GraphCosmoOut
 from core.api.rate_limit import limiter
 from core.api.security import get_current_user_or_agent
-from core.api.services import graph_cosmo_service
+from core.api.services import access_grants, graph_cosmo_service
 from core.api.use_cases import graph as uc
 from core.api.use_cases._context import CallerContext
 from core.api.use_cases._errors import ServiceError
@@ -185,11 +184,12 @@ async def graph_neighbors(
 
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
-        return await uc.graph_neighbors(
+        result = await uc.graph_neighbors(
             ctx, db,
             node_id=node_id, relation=relation, edge_types=edge_types,
             project=project, direction=direction, limit=limit, rank=rank, as_of=as_of,
         )
+        return await access_grants.filter_graph_response(db, ctx, result)
     except ServiceError as e:
         raise to_http_legacy(e)
 
@@ -226,10 +226,11 @@ async def graph_hotspots(
 
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
-        return await uc.graph_hotspots(
+        result = await uc.graph_hotspots(
             ctx, db,
             window=window, limit=limit, type_filter=type_filter, project=project,
         )
+        return await access_grants.filter_graph_response(db, ctx, result)
     except ServiceError as e:
         raise to_http_legacy(e)
 
@@ -280,11 +281,12 @@ async def graph_impact_endpoint(
 
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
-        return await uc.graph_impact(
+        result = await uc.graph_impact(
             ctx, db,
             node_id=node_id, depth=depth, limit=limit,
             edge_types=edge_types, project=project,
         )
+        return await access_grants.filter_graph_response(db, ctx, result)
     except ServiceError as e:
         raise to_http_legacy(e)
 
@@ -319,10 +321,11 @@ async def graph_context_endpoint(
 
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
-        return await uc.graph_context(
+        result = await uc.graph_context(
             ctx, db,
             node_id=node_id, per_category_limit=per_category_limit, project=project,
         )
+        return await access_grants.filter_graph_response(db, ctx, result)
     except ServiceError as e:
         raise to_http_legacy(e)
 
@@ -359,9 +362,10 @@ async def graph_pattern_endpoint(
 
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
-        return await uc.graph_pattern(
+        result = await uc.graph_pattern(
             ctx, db, scope=scope, limit=limit, project=project,
         )
+        return await access_grants.filter_graph_response(db, ctx, result)
     except ServiceError as e:
         raise to_http_legacy(e)
 
@@ -483,13 +487,31 @@ async def share_function_endpoint(
 
     # 3. Lookup the function node (pure → use_case, 404 via ServiceError).
     try:
-        node_row = await uc.lookup_function_node(db, qualified_name=qualified_name)
+        visible_projects = None
+        if await access_grants.workspace_isolation_enabled(db):
+            visible_projects = await get_visible_projects(db, current_user)
+        node_row = await uc.lookup_function_node(
+            db,
+            qualified_name=qualified_name,
+            visible_projects=visible_projects,
+        )
     except ServiceError as e:
         raise to_http_legacy(e)
 
     node_id = node_row["id"]
     file_path = node_row["file_path"]
     line_number = node_row["line_number"]
+
+    # A graph node being visible is not authorization to expose its source.
+    # Bind the repository-relative path to the indexed project and run the
+    # same file-level predicate used by Finder before minting a public token.
+    logical_path = access_grants.project_qualified_path(
+        node_row["project_id"], file_path
+    )
+    if logical_path is None or not await access_grants.file_readable(
+        db, ctx, logical_path, direct_read=True
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
 
     # 4. Generate the share URL (transport side effect — primary pull-factor).
     #    Pattern mirrors finder._create_share_link_impl workspace branch.
@@ -590,13 +612,15 @@ async def graph_landing(
 
     hotspots_key = f"hotspots:{ws_id}"
     recent_key = f"recent:{ws_id}"
-    pins_key = f"pins:{user_id}"
+    pins_key = f"pins:{ws_id}:{user_id}"
 
     ctx = CallerContext.from_user_info(user, is_human_session=False)
+    visible = await get_visible_projects(db, user)
     try:
         bundle, hotspots, recent, saved = await uc.graph_landing(
             ctx, db,
             workspace_id=ws_id, user_id=user_id,
+            visible_projects=visible,
             hotspots_cached=_hotspots_cache.get(hotspots_key),
             recent_cached=_recent_cache.get(recent_key),
             pins_cached=_pins_cache.get(pins_key),
@@ -627,8 +651,11 @@ async def list_graph_pins(
     """
     user_id = getattr(user, "user_id", "unknown")
     ctx = CallerContext.from_user_info(user, is_human_session=False)
+    visible = await get_visible_projects(db, user)
     try:
-        return await uc.list_graph_pins(ctx, db, user_id=user_id)
+        return await uc.list_graph_pins(
+            ctx, db, user_id=user_id, visible_projects=visible
+        )
     except ServiceError as e:
         raise to_http_legacy(e)
 
@@ -660,16 +687,21 @@ async def create_graph_pin(
     ws_id = getattr(user, "workspace_id", "ws_default") or "ws_default"
 
     ctx = CallerContext.from_user_info(user, is_human_session=False)
+    visible = await get_visible_projects(db, user)
     try:
         result = await uc.create_graph_pin(
             ctx, db,
-            workspace_id=ws_id, user_id=user_id, node_id=body.node_id, note=body.note,
+            workspace_id=ws_id,
+            user_id=user_id,
+            node_id=body.node_id,
+            note=body.note,
+            visible_projects=visible,
         )
     except ServiceError as e:
         raise to_http_legacy(e)
 
     # Invalidate pins_cache for this user (transport).
-    _pins_cache.pop(f"pins:{user_id}", None)
+    _pins_cache.pop(f"pins:{ws_id}:{user_id}", None)
     return result
 
 
@@ -692,6 +724,7 @@ async def delete_graph_pin(
     Invalidates pins_cache[user_id] for landing bundle consistency.
     """
     user_id = getattr(user, "user_id", "unknown")
+    ws_id = getattr(user, "workspace_id", "ws_default") or "ws_default"
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
         result = await uc.delete_graph_pin(ctx, db, user_id=user_id, node_id=node_id)
@@ -699,7 +732,7 @@ async def delete_graph_pin(
         raise to_http_legacy(e)
 
     # Invalidate pins_cache for this user (transport).
-    _pins_cache.pop(f"pins:{user_id}", None)
+    _pins_cache.pop(f"pins:{ws_id}:{user_id}", None)
     return result
 
 
@@ -719,8 +752,14 @@ async def mark_node_verified(
     Inert (422) when MARVIS_TEMPORAL_MEMORY is off. 404 if the node is missing.
     """
     ctx = CallerContext.from_user_info(user, is_human_session=False)
+    visible = await get_visible_projects(db, user)
     try:
-        return await uc.mark_node_verified(ctx, db, node_id=body.node_id)
+        return await uc.mark_node_verified(
+            ctx,
+            db,
+            node_id=body.node_id,
+            visible_projects=visible,
+        )
     except ServiceError as e:
         raise to_http_legacy(e)
 
@@ -739,6 +778,7 @@ async def mark_edge_superseded(
     flag is off. 404 if the triple is absent.
     """
     ctx = CallerContext.from_user_info(user, is_human_session=False)
+    visible = await get_visible_projects(db, user)
     try:
         return await uc.mark_edge_superseded(
             ctx, db,
@@ -746,6 +786,7 @@ async def mark_edge_superseded(
             target_id=body.target_id,
             relation=body.relation,
             superseded_by=body.superseded_by,
+            visible_projects=visible,
         )
     except ServiceError as e:
         raise to_http_legacy(e)

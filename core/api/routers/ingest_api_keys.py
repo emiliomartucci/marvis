@@ -18,6 +18,10 @@ from core.api.models import (
 from core.api.models.ingest_keys import PROJECT_SLUG_PATTERN
 from core.api.rbac import require_role
 from core.api.security import _hash_token
+from core.api.services.ingest.watcher import (
+    ProjectWorkspaceOwnershipError,
+    require_unique_project_workspace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +69,10 @@ async def create_ingest_key(
 ) -> IngestKeyResponse:
     """Mint a scoped ingestion key. The raw token is returned ONCE.
 
-    Admin+ human-only. project_scope is validated for slug FORMAT only (the real
-    access boundary is enforced per-request: project ∈ key.project_scope,
-    default-deny). An empty scope is rejected by the model (a key that can ingest
-    nowhere is a footgun, not a feature).
+    Admin+ human-only. Every scoped slug must have exactly one owner and that
+    owner must be the authenticated workspace before token bytes are generated.
+    Per-request use rechecks the same project/workspace boundary. An empty scope
+    is rejected by the model (a key that can ingest nowhere is a footgun).
     """
     invalid = [s for s in body.project_scope if not _SLUG_RE.fullmatch(s)]
     if invalid:
@@ -81,11 +85,23 @@ async def create_ingest_key(
             ),
         )
 
+    ws = (getattr(caller, "workspace_id", None) or "").strip()
+    if not ws:
+        raise HTTPException(status_code=401, detail="Authenticated workspace is required")
+    try:
+        for project_slug in sorted(set(body.project_scope)):
+            await require_unique_project_workspace(
+                db,
+                project_slug=project_slug,
+                workspace_id=ws,
+            )
+    except ProjectWorkspaceOwnershipError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
     raw_token = f"{_TOKEN_PREFIX}{secrets.token_urlsafe(_TOKEN_BYTES)}"
     token_hash = _hash_token(raw_token)
     key_id = f"ing_key_{uuid.uuid4().hex[:16]}"
     prefix = raw_token[:_DISPLAY_PREFIX_LEN]
-    ws = getattr(caller, "workspace_id", None) or "ws_default"
     scope_json = json.dumps(sorted(set(body.project_scope)))
 
     try:
@@ -124,7 +140,8 @@ async def create_ingest_key(
         )
 
     async with db.execute(
-        "SELECT * FROM ingest_api_keys WHERE id = ?", (key_id,)
+        "SELECT * FROM ingest_api_keys WHERE workspace_id = ? AND id = ?",
+        (ws, key_id),
     ) as cursor:
         row = await cursor.fetchone()
     if row is None:
@@ -173,8 +190,10 @@ async def revoke_ingest_key(
     resolve_ingest_key (401). In-flight rows already created proceed (intake was
     authorized); only new requests are rejected.
     """
+    ws = getattr(caller, "workspace_id", None) or "ws_default"
     async with db.execute(
-        "SELECT id, name FROM ingest_api_keys WHERE id = ?", (key_id,)
+        "SELECT id, name FROM ingest_api_keys WHERE workspace_id = ? AND id = ?",
+        (ws, key_id),
     ) as cursor:
         row = await cursor.fetchone()
     if row is None:
@@ -187,18 +206,29 @@ async def revoke_ingest_key(
             ),
         )
 
-    await db.execute(
+    cursor = await db.execute(
         """
         UPDATE ingest_api_keys
            SET is_active = 0,
                revoked_at = datetime('now'),
                revoked_by = ?,
                revoke_reason = ?
-         WHERE id = ?
+         WHERE workspace_id = ?
+           AND id = ?
         """,
-        (caller.username, reason, key_id),
+        (caller.username, reason, ws, key_id),
     )
+    if cursor.rowcount != 1:
+        raise HTTPException(status_code=404, detail="Ingestion key not found")
     await db.commit()
+    async with db.execute(
+        "SELECT is_active, revoked_at FROM ingest_api_keys "
+        "WHERE workspace_id = ? AND id = ?",
+        (ws, key_id),
+    ) as readback:
+        revoked = await readback.fetchone()
+    if revoked is None or revoked["is_active"] or revoked["revoked_at"] is None:
+        raise HTTPException(status_code=500, detail="Ingestion key revoke was not persisted")
     logger.info(
         "revoke_ingest_key: key %s ('%s') revoked by %s (reason=%s)",
         key_id, row["name"], caller.username, reason,

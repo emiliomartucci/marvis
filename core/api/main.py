@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -62,11 +63,8 @@ from core.api.routers.agent_tokens import router as agent_tokens_router
 from core.api.routers.handoffs import router as handoffs_router
 from core.api.routers.teams import router as teams_router
 from core.api.routers.graph import router as graph_router
+from core.api.routers.graph_ingest import router as graph_ingest_router
 from core.api.routers.learnings import router as learnings_router
-try:
-    from core.api.routers.automations import router as automations_router
-except ImportError:  # SaaS-only module, absent in OSS mirror
-    automations_router = None
 from core.api.routers.notifications import router as notifications_router
 from core.api.routers.onboarding import router as onboarding_router
 from core.api.routers.push import router as push_router
@@ -80,6 +78,11 @@ from core.api.routers.inbox import router as inbox_router
 from core.api.routers.ingest_triage import router as ingest_triage_router
 from core.api.routers.ingest_api_keys import router as ingest_api_keys_router
 from core.api.routers.llm_config import router as llm_config_router
+from core.api.routers.retired_integrations import router as retired_integrations_router
+try:
+    from core.api.routers.gui_events import router as gui_events_router
+except ImportError:  # Hosted product-events module, absent in public projection
+    gui_events_router = None
 try:
     from core.api.routers.newsletter import router as newsletter_router
 except ImportError:  # SaaS-only module, absent in OSS mirror
@@ -87,9 +90,9 @@ except ImportError:  # SaaS-only module, absent in OSS mirror
 from core.api.routers.bench import router as bench_router
 from core.api.routers.app_settings import router as app_settings_router
 try:
-    from core.api.routers.reddit import router as reddit_router
-except ImportError:  # SaaS-only module, absent in OSS mirror
-    reddit_router = None
+    from core.api.routers.account import router as hosted_account_router
+except ImportError:  # Hosted control-plane account module, absent in public projection
+    hosted_account_router = None
 from core.api.routers.terminal import router as terminal_metrics_router
 from core.api.routers.brain import router as brain_router
 from core.api.routers.brain_directions import router as brain_directions_router
@@ -109,7 +112,6 @@ _metrics_task: asyncio.Task | None = None
 _security_task: asyncio.Task | None = None
 _maintenance_task: asyncio.Task | None = None
 _reminder_task: asyncio.Task | None = None
-_n8n_dispatch_task: asyncio.Task | None = None
 _push_delivery_task: asyncio.Task | None = None
 _notifications_sync_task: asyncio.Task | None = None
 _inbox_digest_task: asyncio.Task | None = None
@@ -199,48 +201,94 @@ async def _periodic_session_maintenance() -> None:
                 # Pending SQL operations: list of (sql, params) tuples
                 pending_ops: list[tuple[str, tuple]] = []
                 active_cli_cache: dict[tuple[str, str], bool] = {}
+                local_session_compatibility = (
+                    settings.deploy_mode == "core"
+                    and not settings.multi_tenant_enabled
+                )
 
-                try:
-                    reconciled = await sessions.reconcile_sessions_metadata()
-                    if reconciled:
-                        logger.info(
-                            "Session maintenance: reconciled %d session metadata rows",
-                            reconciled,
+                if local_session_compatibility:
+                    reconciliation_workspaces: list[str | None] = [None]
+                else:
+                    async with acquire_db() as workspace_db:
+                        workspace_cursor = await workspace_db.execute(
+                            "SELECT DISTINCT workspace_id FROM sessions_meta "
+                            "WHERE workspace_id IS NOT NULL "
+                            "AND length(trim(workspace_id)) > 0 "
+                            "ORDER BY workspace_id"
                         )
-                except Exception:
-                    logger.exception("Session metadata reconciliation failed")
+                        reconciliation_workspaces = [
+                            str(row["workspace_id"])
+                            for row in await workspace_cursor.fetchall()
+                        ]
+
+                for workspace_scope in reconciliation_workspaces:
+                    try:
+                        reconciled = await sessions.reconcile_sessions_metadata(
+                            workspace_scope
+                        )
+                        if reconciled:
+                            logger.info(
+                                "Session maintenance: reconciled %d metadata rows "
+                                "for workspace %s",
+                                reconciled,
+                                workspace_scope or "local",
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Session metadata reconciliation failed for workspace %s",
+                            workspace_scope or "local",
+                        )
 
                 # ============================================================
                 # PHASE 1: READ — fetch all needed data from DB (read pool)
                 # ============================================================
                 async with acquire_db() as rdb:
+                    workspace_filter = (
+                        ""
+                        if local_session_compatibility
+                        else " AND workspace_id IS NOT NULL "
+                        "AND length(trim(workspace_id)) > 0"
+                    )
                     cursor = await rdb.execute(
-                        """SELECT name, auto_hibernate_minutes, conversation_id, project_slug, provider
+                        f"""SELECT name, workspace_id, auto_hibernate_minutes, conversation_id, project_slug, provider
                         FROM sessions_meta
                         WHERE hibernated = 0
-                        AND (auto_hibernate_minutes > 0 OR auto_hibernate_minutes IS NULL)"""
+                        AND (auto_hibernate_minutes > 0 OR auto_hibernate_minutes IS NULL)
+                        {workspace_filter}"""
                     )
                     hibernate_rows = [dict(r) for r in await cursor.fetchall()]
                     if not settings.auto_hibernate_enabled:
                         hibernate_rows = []
 
                     detect_cursor = await rdb.execute(
-                        """SELECT name, project_slug, provider FROM sessions_meta
-                           WHERE hibernated = 0 AND conversation_id IS NULL"""
+                        f"""SELECT name, workspace_id, project_slug, provider FROM sessions_meta
+                           WHERE hibernated = 0 AND conversation_id IS NULL
+                           {workspace_filter}"""
                     )
                     detect_rows = [dict(r) for r in await detect_cursor.fetchall()]
 
                     cost_cursor = await rdb.execute(
-                        "SELECT name, conversation_id, project_slug, provider FROM sessions_meta "
-                        "WHERE conversation_id IS NOT NULL"
+                        "SELECT name, workspace_id, conversation_id, project_slug, provider "
+                        "FROM sessions_meta WHERE conversation_id IS NOT NULL"
+                        f"{workspace_filter}"
                     )
                     cost_rows = [dict(r) for r in await cost_cursor.fetchall()]
 
                     metrics_cursor = await rdb.execute(
-                        """SELECT name, conversation_id, provider FROM sessions_meta
-                           WHERE hibernated = 0 AND conversation_id IS NOT NULL"""
+                        f"""SELECT name, workspace_id, conversation_id, provider FROM sessions_meta
+                           WHERE hibernated = 0 AND conversation_id IS NOT NULL
+                           {workspace_filter}"""
                     )
                     metrics_rows = [dict(r) for r in await metrics_cursor.fetchall()]
+
+                    if local_session_compatibility:
+                        for row in (
+                            hibernate_rows + detect_rows + cost_rows + metrics_rows
+                        ):
+                            row["workspace_id"] = (
+                                str(row.get("workspace_id") or "ws_default").strip()
+                                or "ws_default"
+                            )
 
                     # PR3: Step 3 (pane-scraped working_seconds accumulator) removed.
                     # `working_seconds_msg` (migration 087) is the single source of
@@ -251,24 +299,33 @@ async def _periodic_session_maintenance() -> None:
                 # PHASE 2: GATHER — all external I/O outside any DB context
                 # ============================================================
 
-                # Get tmux statuses once (reused by all steps)
-                statuses = (
-                    await tmux.get_all_session_statuses()
-                    if (
-                        hibernate_rows
-                        or detect_rows
-                        or cost_rows
-                        or metrics_rows
+                # Remote mode probes only names already owned by a concrete
+                # workspace. Local OSS retains global discovery compatibility.
+                registered_names = {
+                    row["name"]
+                    for row in hibernate_rows + detect_rows + cost_rows + metrics_rows
+                }
+                if local_session_compatibility:
+                    statuses = (
+                        await tmux.get_all_session_statuses()
+                        if registered_names
+                        else {}
                     )
-                    else {}
-                )
+                else:
+                    status_values = await asyncio.gather(
+                        *(tmux.get_session_status(name) for name in registered_names)
+                    )
+                    statuses = dict(zip(registered_names, status_values))
 
                 # Cache metrics parsed during hibernate check for reuse in cost upsert
-                parsed_metrics: dict[str, claude_metrics.SessionMetrics] = {}
+                parsed_metrics: dict[
+                    tuple[str, str], claude_metrics.SessionMetrics
+                ] = {}
 
                 # --- Step 1: Auto-hibernate gather ---
                 for row in hibernate_rows:
                     name = row["name"]
+                    workspace_id = row["workspace_id"]
                     max_idle_min = row["auto_hibernate_minutes"] or 240
                     status = statuses.get(name)
                     row_provider = row["provider"] if row["provider"] else "claude"
@@ -299,7 +356,7 @@ async def _periodic_session_maintenance() -> None:
                         io_pool, mp.parse_session, conv_id, None
                     )
                     if metrics:
-                        parsed_metrics[conv_id] = metrics
+                        parsed_metrics[(workspace_id, conv_id)] = metrics
 
                     if not metrics or not metrics.last_timestamp:
                         continue
@@ -363,7 +420,7 @@ async def _periodic_session_maintenance() -> None:
                                 conversation_id = ?, model = ?,
                                 last_cost_usd = ?,
                                 last_message_count = ?
-                            WHERE name = ?""",
+                            WHERE name = ? AND workspace_id = ?""",
                                 (
                                     now,
                                     conv_id,
@@ -371,14 +428,16 @@ async def _periodic_session_maintenance() -> None:
                                     metrics.cost_usd,
                                     metrics.message_count,
                                     name,
+                                    workspace_id,
                                 ),
                             )
                         )
 
                 # --- Step 1.5: Detect conversation_id gather ---
-                newly_detected: dict[str, set[str]] = {}
+                newly_detected: dict[tuple[str, str], set[str]] = {}
                 for row in detect_rows:
                     name = row["name"]
+                    workspace_id = row["workspace_id"]
                     status = statuses.get(name)
                     row_provider = row["provider"] if row["provider"] else "claude"
                     if not await _session_has_active_cli_for_provider(
@@ -428,6 +487,7 @@ async def _periodic_session_maintenance() -> None:
                                 r["conversation_id"]
                                 for r in cost_rows
                                 if r["name"] != name
+                                and r["workspace_id"] == workspace_id
                                 and r["conversation_id"]
                                 and (r["provider"] or "claude") == "opencode"
                             ]
@@ -443,10 +503,13 @@ async def _periodic_session_maintenance() -> None:
                             r["conversation_id"]
                             for r in cost_rows
                             if r["name"] != name
+                            and r["workspace_id"] == workspace_id
                             and r["conversation_id"]
                             and (r["provider"] or "claude") == "codex"
                         ]
-                        already_linked.extend(newly_detected.get("codex", set()))
+                        already_linked.extend(
+                            newly_detected.get((workspace_id, "codex"), set())
+                        )
                         codex_pid = await tmux.get_cli_pid(
                             name, get_provider("codex").process_names
                         )
@@ -469,13 +532,16 @@ async def _periodic_session_maintenance() -> None:
                             )
 
                     if conv_id:
-                        newly_detected.setdefault(row_provider, set()).add(conv_id)
+                        newly_detected.setdefault(
+                            (workspace_id, row_provider), set()
+                        ).add(conv_id)
                         if row_provider == "codex":
                             # Codex footer fields come from sessions_meta; refresh
                             # the newly linked JSONL in this maintenance cycle
                             # instead of waiting for the next 2-minute pass.
                             linked_row = {
                                 "name": name,
+                                "workspace_id": workspace_id,
                                 "conversation_id": conv_id,
                                 "project_slug": row["project_slug"],
                                 "provider": row_provider,
@@ -484,8 +550,9 @@ async def _periodic_session_maintenance() -> None:
                             metrics_rows.append(linked_row)
                         pending_ops.append(
                             (
-                                "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-                                (conv_id, name),
+                                "UPDATE sessions_meta SET conversation_id = ? "
+                                "WHERE name = ? AND workspace_id = ?",
+                                (conv_id, name, workspace_id),
                             )
                         )
                         # PR2: track into resume chain. INSERT OR IGNORE so
@@ -493,13 +560,16 @@ async def _periodic_session_maintenance() -> None:
                         pending_ops.append(
                             (
                                 "INSERT OR IGNORE INTO session_conversations "
-                                "(session_name, conversation_id, ord, created_at) "
-                                "VALUES (?, ?, "
-                                "COALESCE((SELECT MAX(ord)+1 FROM session_conversations WHERE session_name=?), 0), "
+                                "(workspace_id, session_name, conversation_id, ord, created_at) "
+                                "VALUES (?, ?, ?, "
+                                "COALESCE((SELECT MAX(ord)+1 FROM session_conversations "
+                                "WHERE workspace_id=? AND session_name=?), 0), "
                                 "?)",
                                 (
+                                    workspace_id,
                                     name,
                                     conv_id,
+                                    workspace_id,
                                     name,
                                     datetime.now(timezone.utc).isoformat(),
                                 ),
@@ -517,11 +587,12 @@ async def _periodic_session_maintenance() -> None:
                 for row in cost_rows:
                     try:
                         conv_id = row["conversation_id"]
+                        workspace_id = row["workspace_id"]
                         row_provider = row["provider"] if row["provider"] else "claude"
                         mp = get_metrics_provider(row_provider)
                         if mp is None:
                             continue
-                        metrics = parsed_metrics.get(conv_id)
+                        metrics = parsed_metrics.get((workspace_id, conv_id))
                         if not metrics:
                             metrics = await loop.run_in_executor(
                                 io_pool,
@@ -535,11 +606,11 @@ async def _periodic_session_maintenance() -> None:
                         pending_ops.append(
                             (
                                 """
-                            INSERT INTO session_costs (conversation_id, session_name, project_slug, model,
+                            INSERT INTO session_costs (workspace_id, conversation_id, session_name, project_slug, model,
                                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                                 cost_usd, message_count, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                            ON CONFLICT(conversation_id) DO UPDATE SET
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                            ON CONFLICT(workspace_id, conversation_id) DO UPDATE SET
                                 session_name = excluded.session_name,
                                 project_slug = excluded.project_slug,
                                 model = excluded.model,
@@ -552,6 +623,7 @@ async def _periodic_session_maintenance() -> None:
                                 updated_at = excluded.updated_at
                             """,
                                 (
+                                    workspace_id,
                                     conv_id,
                                     row["name"],
                                     row["project_slug"],
@@ -586,7 +658,10 @@ async def _periodic_session_maintenance() -> None:
                                     equiv_version_db,
                                     cost_session_complete,
                                 ) = await compute_cost_session_extended(
-                                    _rdb, row["name"], row_provider
+                                    _rdb,
+                                    row["name"],
+                                    row_provider,
+                                    workspace_id=workspace_id,
                                 )
                                 cost_session_incomplete = not cost_session_complete
                                 if equiv_total is not None:
@@ -622,7 +697,7 @@ async def _periodic_session_maintenance() -> None:
                                 pricing_version = ?,
                                 last_message_count = ?,
                                 model = COALESCE(?, model)
-                            WHERE name = ?""",
+                            WHERE name = ? AND workspace_id = ?""",
                                 (
                                     metrics.cost_usd,  # legacy alias (= conversation)
                                     metrics.cost_conversation_usd or metrics.cost_usd,
@@ -641,6 +716,7 @@ async def _periodic_session_maintenance() -> None:
                                     metrics.message_count,
                                     metrics.model,
                                     row["name"],
+                                    workspace_id,
                                 ),
                             )
                         )
@@ -652,6 +728,7 @@ async def _periodic_session_maintenance() -> None:
                 metrics_updated = 0
                 for row in metrics_rows:
                     name = row["name"]
+                    workspace_id = row["workspace_id"]
                     conv_id = row["conversation_id"]
                     status = statuses.get(name)
                     row_provider = row["provider"] if row["provider"] else "claude"
@@ -680,8 +757,9 @@ async def _periodic_session_maintenance() -> None:
                                 real_pct = min(round(pm.used_pct, 1), 100.0)
                                 pending_ops.append(
                                     (
-                                        "UPDATE sessions_meta SET last_context_pct_real = ? WHERE name = ?",
-                                        (real_pct, name),
+                                        "UPDATE sessions_meta SET last_context_pct_real = ? "
+                                        "WHERE name = ? AND workspace_id = ?",
+                                        (real_pct, name, workspace_id),
                                     )
                                 )
                                 metrics_updated += 1
@@ -693,8 +771,9 @@ async def _periodic_session_maintenance() -> None:
                     if context_pct is not None:
                         pending_ops.append(
                             (
-                                "UPDATE sessions_meta SET last_context_pct_real = ? WHERE name = ?",
-                                (context_pct, name),
+                                "UPDATE sessions_meta SET last_context_pct_real = ? "
+                                "WHERE name = ? AND workspace_id = ?",
+                                (context_pct, name, workspace_id),
                             )
                         )
                         metrics_updated += 1
@@ -801,25 +880,6 @@ async def _periodic_metrics_maintenance() -> None:
             logger.exception("Metrics maintenance error")
 
 
-async def _periodic_n8n_dispatch() -> None:
-    """Background task: dispatch pending events to n8n webhook."""
-    from core.api.services.event_dispatcher import dispatch_pending_events
-
-    while True:
-        try:
-            await asyncio.sleep(settings.n8n_dispatch_interval)
-            await dispatch_pending_events()
-        except asyncio.CancelledError:
-            logger.info("n8n dispatcher shutting down, final drain...")
-            try:
-                await asyncio.wait_for(dispatch_pending_events(), timeout=30.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
-            break
-        except Exception:
-            logger.exception("n8n dispatch error")
-
-
 async def _periodic_reminder_check() -> None:
     """Background task: check and send task due-date reminders every 60 minutes."""
     while True:
@@ -855,6 +915,31 @@ async def _periodic_push_delivery() -> None:
             logger.exception("Push delivery error")
 
 
+async def _sync_task_pending_notifications(db, *, now: str) -> int:
+    """Mark resolved task notices inside the notice's exact workspace only."""
+    cursor = await db.execute(
+        # Drive off the small still-pending set + idx_notifications_pending_sync
+        # (migration 144). A missing exact-workspace task is treated as resolved,
+        # while a foreign pending task can never keep this workspace's notice live.
+        """UPDATE notifications
+           SET acted_at = ?, read_at = COALESCE(read_at, ?)
+           WHERE acted_at IS NULL
+             AND type = 'task_pending'
+             AND target_type = 'task'
+             AND workspace_id IS NOT NULL
+             AND length(trim(workspace_id)) > 0
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM tasks
+                  WHERE tasks.id = notifications.target_id
+                    AND tasks.workspace_id = notifications.workspace_id
+                    AND tasks.status = 'pending'
+             )""",
+        (now, now),
+    )
+    return max(int(cursor.rowcount or 0), 0)
+
+
 async def _notifications_acted_at_sync_loop() -> None:
     """Background task: auto-mark task_pending notifications as acted/read when
     corresponding task is no longer pending. Runs every 60s to avoid inline
@@ -873,21 +958,7 @@ async def _notifications_acted_at_sync_loop() -> None:
 
             async with write_db() as db:
                 now = datetime.now(timezone.utc).isoformat()
-                await db.execute(
-                    # Drive off the small still-pending set + idx_notifications_pending_sync
-                    # (migration 144): NOT IN (pending) is sargable, the prior
-                    # `!= 'pending'` forced a full scan -> ~15s writer-lock hold.
-                    # A target_id pointing at a deleted task is now acted too (benign:
-                    # the task is no longer pending). tasks.id is PK so no NULL in the
-                    # subquery -> NOT IN is safe.
-                    """UPDATE notifications
-                       SET acted_at = ?, read_at = COALESCE(read_at, ?)
-                       WHERE acted_at IS NULL AND type = 'task_pending'
-                       AND target_type = 'task' AND target_id NOT IN (
-                           SELECT id FROM tasks WHERE status = 'pending'
-                       )""",
-                    (now, now),
-                )
+                await _sync_task_pending_notifications(db, now=now)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -993,7 +1064,6 @@ async def lifespan(app: FastAPI):
         _security_task, \
         _maintenance_task, \
         _reminder_task, \
-        _n8n_dispatch_task, \
         _push_delivery_task, \
         _notifications_sync_task, \
         _inbox_digest_task, \
@@ -1078,8 +1148,12 @@ async def lifespan(app: FastAPI):
     from core.api.services.terminal_metrics_dump import terminal_metrics_background_loop
 
     app.state.terminal_metrics = TerminalMetricsCollector()
+    app.state.terminal_metrics_by_workspace = {}
     _terminal_metrics_dump_task = asyncio.create_task(
-        terminal_metrics_background_loop(app.state.terminal_metrics)
+        terminal_metrics_background_loop(
+            app.state.terminal_metrics,
+            collectors_by_workspace=app.state.terminal_metrics_by_workspace,
+        )
     )
 
     # Load project directories: settings.yaml -> env -> DB row (last wins).
@@ -1165,24 +1239,6 @@ async def lifespan(app: FastAPI):
         register_all_collectors()
         _brain_jobs_task = asyncio.create_task(_periodic_brain_jobs())
     _wal_checkpoint_task = asyncio.create_task(_periodic_wal_checkpoint())
-
-    # n8n integration
-    if canary_mode and settings.n8n_webhook_url:
-        logger.info("[canary] skipping n8n event dispatcher")
-    elif settings.n8n_webhook_url:
-        from core.api.services.event_dispatcher import init_session
-
-        await init_session()
-        _n8n_dispatch_task = asyncio.create_task(_periodic_n8n_dispatch())
-        logger.info(
-            "n8n event dispatcher started (interval=%ds)",
-            settings.n8n_dispatch_interval,
-        )
-    if settings.n8n_api_url:
-        from core.api.services.n8n_client import init_api_session
-
-        await init_api_session()
-        logger.info("n8n API client initialized")
 
     # Web Push delivery (outbox pattern)
     if canary_mode and settings.vapid_private_key:
@@ -1309,21 +1365,6 @@ async def lifespan(app: FastAPI):
 
         await close_push_session()
 
-    # Stop n8n dispatcher + close API client
-    if _n8n_dispatch_task:
-        _n8n_dispatch_task.cancel()
-        try:
-            await _n8n_dispatch_task
-        except asyncio.CancelledError:
-            pass
-        from core.api.services.event_dispatcher import close_session
-
-        await close_session()
-    if settings.n8n_api_url:
-        from core.api.services.n8n_client import close_api_session
-
-        await close_api_session()
-
     # Stop monitoring collectors
     for task in (_metrics_task, _security_task, _maintenance_task):
         if task:
@@ -1365,6 +1406,13 @@ app = FastAPI(
 
 # slowapi: attach limiter to app state + register 429 handler
 app.state.limiter = limiter
+try:
+    from core.api.tenant_handoff_runtime import configure_tenant_handoff  # noqa: E402
+except ImportError:  # Hosted edge handoff, absent in public projection
+    configure_tenant_handoff = None
+
+if configure_tenant_handoff is not None:
+    configure_tenant_handoff(app)
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS
@@ -1409,6 +1457,7 @@ async def security_headers(request: Request, call_next) -> Response:
 
 # Routers
 app.include_router(auth.router, prefix="/api/v1")
+app.include_router(auth.handoff_router)
 app.include_router(sessions.router, prefix="/api/v1")
 app.include_router(tasks_router)
 app.include_router(todos_router)
@@ -1443,10 +1492,7 @@ app.include_router(handoffs_router)
 app.include_router(teams_router)
 app.include_router(learnings_router)
 app.include_router(graph_router)
-if automations_router is not None:
-    app.include_router(automations_router)
-else:
-    logger.info("automations router absent (SaaS-only module) — skipping")
+app.include_router(graph_ingest_router)
 app.include_router(notifications_router)
 app.include_router(onboarding_router)
 app.include_router(push_router)
@@ -1460,16 +1506,17 @@ app.include_router(inbox_router)
 app.include_router(ingest_triage_router)
 app.include_router(ingest_api_keys_router)
 app.include_router(llm_config_router)
+app.include_router(retired_integrations_router)
+if gui_events_router is not None:
+    app.include_router(gui_events_router)
 if newsletter_router is not None:
     app.include_router(newsletter_router)
 else:
     logger.info("newsletter router absent (SaaS-only module) — skipping")
 app.include_router(bench_router)
 app.include_router(app_settings_router)
-if reddit_router is not None:
-    app.include_router(reddit_router)
-else:
-    logger.info("reddit router absent (SaaS-only module) — skipping")
+if hosted_account_router is not None:
+    app.include_router(hosted_account_router)
 app.include_router(brain_router)
 app.include_router(brain_directions_router)
 
@@ -1580,7 +1627,13 @@ async def health_check() -> dict:
 async def _resolve_ws_user(ws: WebSocket):
     """Authenticate a /ws/brain client via cookie OR Bearer token."""
     from core.api.db import acquire_db
-    from core.api.security import _lookup_agent_token, _resolve_agent_userinfo
+    from core.api.security import (
+        TokenPrincipalInvalid,
+        TokenStoreUnavailable,
+        _legacy_shared_token_enabled,
+        _lookup_agent_token,
+        _resolve_agent_userinfo,
+    )
     from core.api.security import verify_session_jwt
 
     # 1. Bearer (agents) — header OR `?token=` query (browsers can't set WS headers)
@@ -1596,11 +1649,26 @@ async def _resolve_ws_user(ws: WebSocket):
     if bearer_token:
         async with acquire_db() as db:
             db.row_factory = aiosqlite.Row
-            resolved = await _lookup_agent_token(bearer_token, db)
+            try:
+                resolved = await _lookup_agent_token(bearer_token, db)
+            except TokenStoreUnavailable:
+                return None
             if resolved is not None:
-                agent_name, scopes, ws_id = resolved
-                return await _resolve_agent_userinfo(agent_name, db, scopes, ws_id)
-            if settings.tasks_api_token and bearer_token == settings.tasks_api_token:
+                try:
+                    return await _resolve_agent_userinfo(
+                        resolved.agent_name,
+                        db,
+                        list(resolved.scopes),
+                        resolved.workspace_id,
+                        resolved.principal_id,
+                    )
+                except TokenPrincipalInvalid:
+                    return None
+            if (
+                _legacy_shared_token_enabled()
+                and settings.tasks_api_token
+                and secrets.compare_digest(bearer_token, settings.tasks_api_token)
+            ):
                 return await _resolve_agent_userinfo(
                     "agent", db, workspace_id="ws_default"
                 )
@@ -1629,16 +1697,17 @@ async def _resolve_ws_user(ws: WebSocket):
         return None
     from core.api.models import UserInfo
 
+    workspace_id = str(row["workspace_id"] or "").strip()
+    claimed_workspace = str(payload.get("workspace_id") or "").strip()
+    if not workspace_id or (claimed_workspace and claimed_workspace != workspace_id):
+        return None
+
     return UserInfo(
         username=slug,
         user_id=row["id"],
         system_role=row["system_role"],
         display_name=row["display_name"],
-        workspace_id=(
-            payload.get("workspace_id")
-            or (row["workspace_id"] if "workspace_id" in row.keys() else None)
-            or "ws_default"
-        ),
+        workspace_id=workspace_id,
     )
 
 
@@ -1674,7 +1743,7 @@ async def brain_websocket(ws: WebSocket) -> None:
                     await get_visible_projects(
                         db,
                         user,
-                        user.workspace_id or "ws_default",
+                        user.workspace_id,
                     )
                 )
         except Exception:
@@ -1684,7 +1753,7 @@ async def brain_websocket(ws: WebSocket) -> None:
         ws=ws,
         user_id=user.user_id or user.username or "",
         system_role=user.system_role,
-        workspace_id=user.workspace_id or "ws_default",
+        workspace_id=user.workspace_id,
         visible_projects=visible_projects,
         is_unrestricted=is_unrestricted,
     )

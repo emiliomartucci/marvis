@@ -20,7 +20,11 @@ from core.api.models.todos import (
     TodoResponse,
 )
 from core.api.use_cases import tasks as tasks_uc
-from core.api.use_cases._context import CallerContext, require_role_ctx
+from core.api.use_cases._context import (
+    CallerContext,
+    require_role_ctx,
+    require_workspace_ctx,
+)
 from core.api.use_cases._errors import (
     AuthorizationError,
     ConflictError,
@@ -106,10 +110,18 @@ def _transition_action(new_status: str) -> str:
     return "todo.decide"
 
 
-async def _fetch_todo(db: aiosqlite.Connection, todo_id: str) -> aiosqlite.Row:
+async def _fetch_todo(
+    db: aiosqlite.Connection,
+    todo_id: str,
+    *,
+    workspace_id: str,
+) -> aiosqlite.Row:
     db.row_factory = aiosqlite.Row
     row = await (
-        await db.execute("SELECT * FROM todos WHERE id = ?", (todo_id,))
+        await db.execute(
+            "SELECT * FROM todos WHERE id = ? AND workspace_id = ?",
+            (todo_id, workspace_id),
+        )
     ).fetchone()
     if row is None:
         raise _todo_not_found(todo_id)
@@ -169,6 +181,7 @@ def _passes_virtual_filters(
 async def _list_virtual_approvals(
     db: aiosqlite.Connection,
     *,
+    workspace_id: str,
     status: str | None,
     todo_type: str | None,
     project: str | None,
@@ -183,8 +196,11 @@ async def _list_virtual_approvals(
             "FROM tasks t "
             "JOIN pull_requests pr ON pr.task_id = t.id "
             "AND pr.status IN ('draft', 'open', 'merging') "
+            "AND pr.workspace_id = t.workspace_id "
             "WHERE t.status = 'review' AND t.deleted_at IS NULL "
-            "ORDER BY t.updated_at DESC"
+            "AND t.workspace_id = ? "
+            "ORDER BY t.updated_at DESC",
+            (workspace_id,),
         )
     ).fetchall()
     for row in task_rows:
@@ -211,12 +227,15 @@ async def _list_virtual_approvals(
 
     finding_rows = await (
         await db.execute(
-            "SELECT finding_id, title, summary, scope_type, scope_key, "
-            "severity, confidence, approval_state, created_at, updated_at "
-            "FROM brain_findings "
-            "WHERE approval_state IN ('open', 'pending_bootstrap') "
-            "AND superseded_by_finding_id IS NULL "
-            "ORDER BY created_at DESC"
+            "SELECT f.finding_id, f.title, f.summary, f.scope_type, f.scope_key, "
+            "f.severity, f.confidence, f.approval_state, f.created_at, f.updated_at "
+            "FROM brain_findings f "
+            "JOIN brain_runs r ON r.run_id = f.run_id "
+            "WHERE f.approval_state IN ('open', 'pending_bootstrap') "
+            "AND f.superseded_by_finding_id IS NULL "
+            "AND r.workspace_id = ? "
+            "ORDER BY f.created_at DESC",
+            (workspace_id,),
         )
     ).fetchall()
     for row in finding_rows:
@@ -242,12 +261,16 @@ async def _list_virtual_approvals(
 
     memory_rows = await (
         await db.execute(
-            "SELECT operation_id, operation_type, summary, scope_type, scope_key, "
-            "score, approval_state, created_at, updated_at, proposed_write_json "
-            "FROM brain_memory_operations "
-            "WHERE approval_state = 'pending' "
-            "AND superseded_by_operation_id IS NULL "
-            "ORDER BY score DESC, created_at DESC"
+            "SELECT o.operation_id, o.operation_type, o.summary, o.scope_type, "
+            "o.scope_key, o.score, o.approval_state, o.created_at, o.updated_at, "
+            "o.proposed_write_json "
+            "FROM brain_memory_operations o "
+            "JOIN brain_runs r ON r.run_id = o.run_id "
+            "WHERE o.approval_state = 'pending' "
+            "AND o.superseded_by_operation_id IS NULL "
+            "AND r.workspace_id = ? "
+            "ORDER BY o.score DESC, o.created_at DESC",
+            (workspace_id,),
         )
     ).fetchall()
     for row in memory_rows:
@@ -288,9 +311,10 @@ async def list_todos(
 ) -> list[TodoResponse]:
     """List persisted todos plus read-only virtual approval projections."""
     require_role_ctx(ctx, "viewer", "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
     db.row_factory = aiosqlite.Row
-    conditions: list[str] = []
-    params: list[Any] = []
+    conditions: list[str] = ["workspace_id = ?"]
+    params: list[Any] = [workspace_id]
 
     if status:
         statuses = [s.strip() for s in status.split(",") if s.strip()]
@@ -318,7 +342,11 @@ async def list_todos(
     if include_virtual:
         items.extend(
             await _list_virtual_approvals(
-                db, status=status, todo_type=type, project=project
+                db,
+                workspace_id=workspace_id,
+                status=status,
+                todo_type=type,
+                project=project,
             )
         )
     items.sort(key=lambda item: (item.fu, item.created_at))
@@ -328,6 +356,7 @@ async def list_todos(
 def _schedule_classify(
     *,
     todo_id: str,
+    workspace_id: str,
     text: str,
     original_updated_at: str,
     missing_fields: set[str],
@@ -335,6 +364,7 @@ def _schedule_classify(
     async def _runner() -> None:
         await _classify_and_update(
             todo_id=todo_id,
+            workspace_id=workspace_id,
             text=text,
             original_updated_at=original_updated_at,
             missing_fields=missing_fields,
@@ -377,6 +407,7 @@ def _heuristic_project_candidates() -> list[tuple[str, str | None]]:
 async def _classify_and_update(
     *,
     todo_id: str,
+    workspace_id: str,
     text: str,
     original_updated_at: str,
     missing_fields: set[str],
@@ -396,7 +427,9 @@ async def _classify_and_update(
             from core.api.services.todos.llm.byok_provider import build_todo_classifier
 
             async with acquire_db() as cfg_db:
-                resolved = await resolve_function_provider(cfg_db, "classify")
+                resolved = await resolve_function_provider(
+                    cfg_db, "classify", workspace_id
+                )
             classifier = build_todo_classifier(resolved)
         except Exception:  # noqa: BLE001 - BYOK is optional; never block classify
             logger.debug("todos BYOK classify resolution failed", exc_info=True)
@@ -441,8 +474,9 @@ async def _classify_and_update(
         now = _now()
         async with acquire_write_db(label="todos.classify") as db:
             cur = await db.execute(
-                "SELECT payload FROM todos WHERE id = ? AND updated_at = ?",
-                (todo_id, original_updated_at),
+                "SELECT payload FROM todos "
+                "WHERE id = ? AND workspace_id = ? AND updated_at = ?",
+                (todo_id, workspace_id, original_updated_at),
             )
             row = await cur.fetchone()
             if row is None:
@@ -454,10 +488,10 @@ async def _classify_and_update(
 
             assignments = [f"{field} = ?" for field in updates]
             params = list(updates.values())
-            params.extend([now, todo_id, original_updated_at])
+            params.extend([now, todo_id, workspace_id, original_updated_at])
             await db.execute(
                 f"UPDATE todos SET {', '.join(assignments)}, updated_at = ? "
-                "WHERE id = ? AND updated_at = ?",
+                "WHERE id = ? AND workspace_id = ? AND updated_at = ?",
                 params,
             )
             await db.commit()
@@ -474,7 +508,12 @@ async def create_todo(
     schedule_classify: bool = True,
 ) -> TodoResponse:
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
     from core.api.services.audit import log_audit
+    from core.api.services.access_grants import require_workspace_project_bound
+
+    if body.project:
+        await require_workspace_project_bound(db, ctx, body.project)
 
     todo_type = body.type or "promemoria"
     if todo_type == "approva":
@@ -502,8 +541,9 @@ async def create_todo(
     try:
         await db.execute(
             "INSERT INTO todos (id, type, family, status, text, payload, fu, project, "
-            "source, source_ref, doer, linked_task_id, created_at, updated_at, resolved_at) "
-            "VALUES (?, ?, ?, 'aperto', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)",
+            "source, source_ref, doer, linked_task_id, created_at, updated_at, resolved_at, "
+            "workspace_id) "
+            "VALUES (?, ?, ?, 'aperto', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?)",
             (
                 todo_id,
                 todo_type,
@@ -517,9 +557,9 @@ async def create_todo(
                 body.doer,
                 now,
                 now,
+                workspace_id,
             ),
         )
-        await db.commit()
     except aiosqlite.IntegrityError:
         raise ConflictError(
             code="duplicate_todo",
@@ -539,12 +579,15 @@ async def create_todo(
             "source": body.source,
             "source_ref": body.source_ref,
         },
+        workspace_id=workspace_id,
     )
+    await db.commit()
 
-    row = await _fetch_todo(db, todo_id)
+    row = await _fetch_todo(db, todo_id, workspace_id=workspace_id)
     if schedule_classify:
         _schedule_classify(
             todo_id=todo_id,
+            workspace_id=workspace_id,
             text=body.text,
             original_updated_at=now,
             missing_fields=missing_fields,
@@ -553,13 +596,18 @@ async def create_todo(
 
 
 async def _existing_task_id_for_todo(
-    db: aiosqlite.Connection, todo_id: str
+    db: aiosqlite.Connection,
+    todo_id: str,
+    *,
+    workspace_id: str,
 ) -> str | None:
     row = await (
         await db.execute(
             "SELECT id FROM tasks WHERE source = 'todo' AND source_ref = ? "
-            "AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1",
-            (todo_id,),
+            "AND deleted_at IS NULL "
+            "AND workspace_id = ? "
+            "ORDER BY created_at ASC LIMIT 1",
+            (todo_id, workspace_id),
         )
     ).fetchone()
     return row["id"] if row else None
@@ -576,6 +624,7 @@ async def _create_task_from_todo(
     sync_graph: Callable[..., Awaitable[bool]],
     schedule_embed: Callable[..., None],
 ) -> str:
+    workspace_id = require_workspace_ctx(ctx)
     task_title = (title or row["text"]).strip()[:200]
     body = TaskCreateRequest(
         title=task_title,
@@ -604,7 +653,11 @@ async def _create_task_from_todo(
         return task.id
     except ConflictError:
         await db.rollback()
-        existing = await _existing_task_id_for_todo(db, row["id"])
+        existing = await _existing_task_id_for_todo(
+            db,
+            row["id"],
+            workspace_id=workspace_id,
+        )
         if existing:
             return existing
         raise
@@ -620,9 +673,10 @@ async def delegate_todo(
     schedule_embed: Callable[..., None],
 ) -> TodoResponse:
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
     from core.api.services.audit import log_audit
 
-    row = await _fetch_todo(db, todo_id)
+    row = await _fetch_todo(db, todo_id, workspace_id=workspace_id)
     if row["type"] not in {"azione", "rivedi"}:
         raise ValidationError(
             code="todo_not_delegable",
@@ -660,10 +714,9 @@ async def delegate_todo(
     now = _now()
     await db.execute(
         "UPDATE todos SET status = 'delegato', project = ?, linked_task_id = ?, "
-        "updated_at = ?, resolved_at = ? WHERE id = ?",
-        (project, task_id, now, now, todo_id),
+        "updated_at = ?, resolved_at = ? WHERE id = ? AND workspace_id = ?",
+        (project, task_id, now, now, todo_id, workspace_id),
     )
-    await db.commit()
     await log_audit(
         db,
         action="todo.delegate",
@@ -671,8 +724,12 @@ async def delegate_todo(
         resource_type="todo",
         resource_id=todo_id,
         details={"from_status": row["status"], "to_status": "delegato", "task_id": task_id},
+        workspace_id=workspace_id,
     )
-    return _row_to_todo(await _fetch_todo(db, todo_id))
+    await db.commit()
+    return _row_to_todo(
+        await _fetch_todo(db, todo_id, workspace_id=workspace_id)
+    )
 
 
 async def _promote_idea(
@@ -685,6 +742,15 @@ async def _promote_idea(
     schedule_embed: Callable[..., None],
 ) -> TodoResponse:
     from core.api.services.audit import log_audit
+    workspace_id = require_workspace_ctx(ctx)
+
+    if row["status"] == "promosso" and row["linked_task_id"]:
+        return _row_to_todo(row)
+    if row["status"] != "aperto":
+        raise ValidationError(
+            code="invalid_transition",
+            message=f"Cannot promote todo from status {row['status']}.",
+        )
 
     target_project = project or row["project"]
     if not target_project:
@@ -705,10 +771,9 @@ async def _promote_idea(
     now = _now()
     await db.execute(
         "UPDATE todos SET status = 'promosso', project = ?, linked_task_id = ?, "
-        "updated_at = ?, resolved_at = ? WHERE id = ?",
-        (target_project, task_id, now, now, row["id"]),
+        "updated_at = ?, resolved_at = ? WHERE id = ? AND workspace_id = ?",
+        (target_project, task_id, now, now, row["id"], workspace_id),
     )
-    await db.commit()
     await log_audit(
         db,
         action="todo.promote",
@@ -720,8 +785,12 @@ async def _promote_idea(
             "to_status": "promosso",
             "task_id": task_id,
         },
+        workspace_id=workspace_id,
     )
-    return _row_to_todo(await _fetch_todo(db, row["id"]))
+    await db.commit()
+    return _row_to_todo(
+        await _fetch_todo(db, row["id"], workspace_id=workspace_id)
+    )
 
 
 async def update_todo(
@@ -734,9 +803,10 @@ async def update_todo(
     schedule_embed: Callable[..., None],
 ) -> TodoResponse:
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
     from core.api.services.audit import log_audit
 
-    row = await _fetch_todo(db, todo_id)
+    row = await _fetch_todo(db, todo_id, workspace_id=workspace_id)
     if body.status == "delegato":
         return await delegate_todo(
             ctx,
@@ -794,6 +864,12 @@ async def update_todo(
         if body.type not in PERSISTED_TODO_TYPES:
             raise ValidationError(code="invalid_todo_type", message=f"Invalid type: {body.type}")
         updates["type"] = body.type
+        audits.append(
+            (
+                "todo.reclassify",
+                {"from_type": row["type"], "to_type": body.type},
+            )
+        )
 
     if "text" in body.model_fields_set and body.text is not None:
         updates["text"] = body.text
@@ -803,12 +879,24 @@ async def update_todo(
         updates["fu"] = body.fu
         audits.append(("todo.postpone", {"from_fu": row["fu"], "to_fu": body.fu}))
     if "project" in body.model_fields_set and body.project != row["project"]:
+        if body.project:
+            from core.api.services.access_grants import (
+                require_workspace_project_bound,
+            )
+
+            await require_workspace_project_bound(db, ctx, body.project)
         updates["project"] = body.project
         audits.append(
             ("todo.reassign", {"from_project": row["project"], "to_project": body.project})
         )
-    if "doer" in body.model_fields_set:
+    if "doer" in body.model_fields_set and body.doer != row["doer"]:
         updates["doer"] = body.doer
+        audits.append(
+            (
+                "todo.assign",
+                {"from_doer": row["doer"], "to_doer": body.doer},
+            )
+        )
 
     if not updates:
         return _row_to_todo(row)
@@ -816,21 +904,16 @@ async def update_todo(
     updates["updated_at"] = now
     assignments = [f"{field} = ?" for field in updates]
     params = list(updates.values())
-    params.append(todo_id)
-    await db.execute(
-        f"UPDATE todos SET {', '.join(assignments)} WHERE id = ?",
-        params,
+    params.extend([todo_id, workspace_id])
+    # A filesystem ADR cannot share SQLite's transaction. The decision,
+    # transition audit, and durable intent commit together first; the ADR is
+    # then written and a correlated final receipt is appended separately.
+    is_decidi_confirmation = (
+        row["type"] == "decidi" and updates.get("status") == "deciso"
     )
-    await db.commit()
-
-    # gh #25 — Decidi gate writes a durable ADR artefact (+ audit) every time
-    # a ``decidi`` todo lands in ``deciso``. The transition is already
-    # committed: any filesystem failure is logged + audited but never rolls
-    # back the decision (README §C contract: gate produces artefact + audit;
-    # missing artefact is captured in the audit trail).
-    if row["type"] == "decidi" and updates.get("status") == "deciso":
-        from core.api.services.todos.adr import write_adr
-
+    adr_context: dict[str, Any] | None = None
+    adr_correlation_id: str | None = None
+    if is_decidi_confirmation:
         effective_project = updates.get("project", row["project"])
         if "payload" in updates:
             effective_payload = _loads_payload(updates["payload"]) or {}
@@ -843,36 +926,18 @@ async def update_todo(
         if not str(effective_payload.get("domanda") or "").strip():
             effective_payload["domanda"] = row["text"]
 
-        adr_details: dict[str, Any] = {
+        adr_correlation_id = uuid.uuid4().hex
+        adr_context = {
             "todo_id": todo_id,
             "project": effective_project,
-            "adr_path": None,
+            "payload": effective_payload,
         }
-        try:
-            adr_path = write_adr(
-                project_slug=effective_project,
-                payload=effective_payload,
-                decisore=ctx.username,
-                now=datetime.now(timezone.utc),
-            )
-            adr_details["adr_path"] = str(adr_path) if adr_path is not None else None
-        except (OSError, PermissionError) as exc:
-            logger.warning(
-                "decidi gate ADR write failed for todo=%s project=%s: %s",
-                todo_id,
-                effective_project,
-                exc,
-            )
-            adr_details["write_error"] = str(exc)
 
-        await log_audit(
-            db,
-            action="todo.decidi.confirmed",
-            user=ctx.username,
-            resource_type="todo",
-            resource_id=todo_id,
-            details=adr_details,
-        )
+    await db.execute(
+        f"UPDATE todos SET {', '.join(assignments)} "
+        "WHERE id = ? AND workspace_id = ?",
+        params,
+    )
 
     for action, details in audits:
         await log_audit(
@@ -882,5 +947,67 @@ async def update_todo(
             resource_type="todo",
             resource_id=todo_id,
             details=details,
+            workspace_id=workspace_id,
         )
-    return _row_to_todo(await _fetch_todo(db, todo_id))
+
+    if adr_context is not None and adr_correlation_id is not None:
+        await log_audit(
+            db,
+            action="todo.decidi.intent",
+            user=ctx.username,
+            resource_type="todo",
+            resource_id=todo_id,
+            details={
+                "todo_id": todo_id,
+                "project": adr_context["project"],
+                "from_status": row["status"],
+                "to_status": "deciso",
+                "correlation_id": adr_correlation_id,
+            },
+            workspace_id=workspace_id,
+        )
+    await db.commit()
+
+    if adr_context is not None and adr_correlation_id is not None:
+        from core.api.services.todos.adr import write_adr
+
+        final_details = {
+            "todo_id": todo_id,
+            "project": adr_context["project"],
+            "correlation_id": adr_correlation_id,
+            "adr_written": False,
+            "adr_name": None,
+        }
+        try:
+            adr_path = write_adr(
+                project_slug=adr_context["project"],
+                payload=adr_context["payload"],
+                decisore=ctx.username,
+                now=datetime.now(timezone.utc),
+            )
+            final_details["adr_written"] = adr_path is not None
+            final_details["adr_name"] = (
+                getattr(adr_path, "name", None) if adr_path is not None else None
+            )
+        except (OSError, PermissionError) as exc:
+            logger.warning(
+                "decidi gate ADR write failed for todo=%s project=%s: %s",
+                todo_id,
+                adr_context["project"],
+                exc,
+            )
+            final_details["failure_type"] = type(exc).__name__
+        await db.execute("BEGIN IMMEDIATE")
+        await log_audit(
+            db,
+            action="todo.decidi.confirmed",
+            user=ctx.username,
+            resource_type="todo",
+            resource_id=todo_id,
+            details=final_details,
+            workspace_id=workspace_id,
+        )
+        await db.commit()
+    return _row_to_todo(
+        await _fetch_todo(db, todo_id, workspace_id=workspace_id)
+    )

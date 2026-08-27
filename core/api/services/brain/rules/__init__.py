@@ -7,6 +7,8 @@
 # brain_digest_events / brain_journal_entries / substrate tables.
 from __future__ import annotations
 
+import os
+
 from core.api.services.brain.rules.dr1_activity_without_status import (
     build_signals as dr1_build_signals,
 )
@@ -31,6 +33,9 @@ from core.api.services.brain.rules.dr7_claimed_decision_gap import (
 from core.api.services.brain.rules.dr8_direction_misalignment import (
     build_signals as dr8_build_signals,
 )
+from core.api.services.brain.rules.dr9_task_superseded import (
+    build_signals as dr9_build_signals,
+)
 
 # CE4 §11.5: deterministic per-rule axis assignment. Drift author MUST update
 # the matrix below — and the test_dr_axis_matrix invariant — when adding rules.
@@ -43,6 +48,7 @@ DR_AXIS_MATRIX = {
     "DR6": "context",   # world changed, our docs/code didn't
     "DR7": "intent",    # claim-and-act gap
     "DR8": "intent",    # declared direction vs observed execution
+    "DR9": "intent",    # task declared open vs observed resolution (merged PR / done handoff)
 }
 
 
@@ -56,10 +62,35 @@ REGISTERED_RULES = (
     ("DR6", dr6_build_signals),
     ("DR7", dr7_build_signals),
     ("DR8", dr8_build_signals),
+    ("DR9", dr9_build_signals),
 )
+
+
+# DR8 default-off (audit 2026-08-03): with the knowledge_form classifier
+# returning 'unknown' for nearly every event, DR8 degrades to an activity
+# counter — one medium signal per active project per cycle at fixed
+# confidence — and the noise buries the actionable DR9 signals.
+# Override with MARVIS_BRAIN_DISABLED_RULES (comma-separated rule ids;
+# an empty string runs every registered rule).
+_DEFAULT_DISABLED_RULES = "DR8"
+
+
+def disabled_rule_ids() -> frozenset[str]:
+    raw = os.environ.get("MARVIS_BRAIN_DISABLED_RULES")
+    if raw is None:
+        raw = _DEFAULT_DISABLED_RULES
+    return frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
+
+
+def active_rules():
+    # Resolved at call time so the env override works without re-import.
+    disabled = disabled_rule_ids()
+    return tuple(entry for entry in REGISTERED_RULES if entry[0] not in disabled)
 
 
 __all__ = [
     "DR_AXIS_MATRIX",
     "REGISTERED_RULES",
+    "active_rules",
+    "disabled_rule_ids",
 ]

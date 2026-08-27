@@ -1,0 +1,13 @@
+{
+  "schema": "marvis-local-server-trust-matrix/v1",
+  "same_shell_limit": "A process with the same OS-account shell authority can invoke the trusted local CLI; it is not cryptographically separable from the human.",
+  "rows": [
+    {"context": "local_cli_os_account", "expected": "allow_local_operator", "evidence": "core/api/tests/test_require_scope_empty_deny.py::test_local_user_is_trusted_human"},
+    {"context": "local_mcp_agent", "expected": "agent_context", "evidence": "core/api/tests/test_require_scope_empty_deny.py::test_local_mcp_keeps_agent_context"},
+    {"context": "same_shell_agent_as_human", "expected": "not_a_separate_security_boundary", "evidence": "README.md"},
+    {"context": "server_authenticated_human", "expected": "allow_real_identity", "evidence": "core/api/tests/test_require_scope_empty_deny.py::test_authenticated_human_is_allowed"},
+    {"context": "server_agent", "expected": "deny_human_promotion", "evidence": "core/api/tests/test_require_scope_empty_deny.py::test_server_agent_cannot_promote_to_human"},
+    {"context": "server_local_ctx_reuse", "expected": "deny", "evidence": "core/api/tests/test_require_scope_empty_deny.py::test_server_rejects_local_ctx_reuse"},
+    {"context": "server_legacy_human_flag", "expected": "deny", "evidence": "core/api/tests/test_require_scope_empty_deny.py::test_legacy_human_session_flag_is_ignored"}
+  ]
+}

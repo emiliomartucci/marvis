@@ -177,17 +177,49 @@ def parse_conversation_cost_memo(
 # --------------------------------------------------------------------------
 
 
+async def _resolve_session_workspace(
+    db,
+    session_name: str,
+    workspace_id: str | None,
+) -> str | None:
+    """Resolve one exact parent workspace; never invent a tenant identity.
+
+    ``workspace_id=None`` is a temporary compatibility path for callers that
+    have not threaded identity yet.  It is safe only because sessions_meta.name
+    is the concrete parent: missing, blank, or mismatched ownership fails
+    closed.  Remote callers should always pass the workspace explicitly.
+    """
+    if workspace_id is not None and not workspace_id.strip():
+        return None
+    cursor = await db.execute(
+        "SELECT workspace_id FROM sessions_meta "
+        "WHERE name = ? AND workspace_id IS NOT NULL "
+        "AND length(trim(workspace_id)) > 0",
+        (session_name,),
+    )
+    rows = await cursor.fetchall()
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    resolved = row["workspace_id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
+    if workspace_id is not None and resolved != workspace_id:
+        return None
+    return str(resolved)
+
+
 async def on_conversation_id_changed(
     db,
     session_name: str,
     new_conv_id: str,
+    *,
+    workspace_id: str | None = None,
 ) -> None:
     """Append a conversation_id to the session's resume chain.
 
     Called from the maintenance loop / router when `sessions_meta.conversation_id`
-    changes for a session. INSERT OR IGNORE dedupes via the composite PK
-    `(session_name, conversation_id)` so repeated calls for the same pair are
-    no-ops.
+    changes for a session. The composite conflict target
+    ``(workspace_id, session_name, conversation_id)`` makes repeated calls for
+    the same tenant-scoped pair no-ops.
 
     Caller passes an aiosqlite connection (write_db or write_pool session) —
     this helper does not open its own transaction so it composes with the
@@ -196,15 +228,29 @@ async def on_conversation_id_changed(
     if not session_name or not new_conv_id:
         return
     try:
+        resolved_workspace = await _resolve_session_workspace(
+            db, session_name, workspace_id
+        )
+        if resolved_workspace is None:
+            logger.warning(
+                "Refusing resume-chain append without exact workspace "
+                "(name=%s requested_workspace=%s)",
+                session_name,
+                workspace_id,
+            )
+            return
         await db.execute(
-            "INSERT OR IGNORE INTO session_conversations "
-            "(session_name, conversation_id, ord, created_at) "
-            "VALUES (?, ?, "
-            "COALESCE((SELECT MAX(ord)+1 FROM session_conversations WHERE session_name=?), 0), "
-            "?)",
+            "INSERT INTO session_conversations "
+            "(workspace_id, session_name, conversation_id, ord, created_at) "
+            "VALUES (?, ?, ?, "
+            "COALESCE((SELECT MAX(ord)+1 FROM session_conversations "
+            "WHERE workspace_id=? AND session_name=?), 0), ?) "
+            "ON CONFLICT(workspace_id, session_name, conversation_id) DO NOTHING",
             (
+                resolved_workspace,
                 session_name,
                 new_conv_id,
+                resolved_workspace,
                 session_name,
                 datetime.now(timezone.utc).isoformat(),
             ),
@@ -221,6 +267,8 @@ async def compute_cost_session(
     db,
     session_name: str,
     provider: str,
+    *,
+    workspace_id: str | None = None,
 ) -> tuple[float, bool]:
     """Aggregate cost across all conversation_ids for a session.
 
@@ -229,7 +277,7 @@ async def compute_cost_session(
     New code (PR4+) should use the extended variant directly.
     """
     total, _equivalent, _version, is_complete = await compute_cost_session_extended(
-        db, session_name, provider
+        db, session_name, provider, workspace_id=workspace_id
     )
     return total, is_complete
 
@@ -238,6 +286,8 @@ async def compute_cost_session_extended(
     db,
     session_name: str,
     provider: str,
+    *,
+    workspace_id: str | None = None,
 ) -> tuple[float, float | None, str | None, bool]:
     """Aggregate real + shadow cost across all conversation_ids for a session.
 
@@ -254,13 +304,24 @@ async def compute_cost_session_extended(
 
     NOTE: I/O-intensive for long chains — caller should run it off-loop.
     """
+    resolved_workspace = await _resolve_session_workspace(
+        db, session_name, workspace_id
+    )
+    if resolved_workspace is None:
+        return 0.0, None, None, False
+
     cursor = await db.execute(
         "SELECT conversation_id FROM session_conversations "
-        "WHERE session_name=? ORDER BY ord",
-        (session_name,),
+        "WHERE workspace_id=? AND session_name=? ORDER BY ord",
+        (resolved_workspace, session_name),
     )
     rows = await cursor.fetchall()
-    conv_ids = [r["conversation_id"] if isinstance(r, dict) or hasattr(r, "keys") else r[0] for r in rows]
+    conv_ids = [
+        r["conversation_id"]
+        if isinstance(r, dict) or hasattr(r, "keys")
+        else r[0]
+        for r in rows
+    ]
 
     if not conv_ids:
         return 0.0, None, None, True

@@ -989,6 +989,11 @@ from core.cli.marvis_task import register as _register_task  # noqa: E402
 
 _register_task(app)
 
+# `marvis schema upgrade/restore` — controlled offline SQLite lifecycle.
+from core.cli.marvis_schema import register as _register_schema  # noqa: E402
+
+_register_schema(app)
+
 
 @app.command("show-state")
 def show_state_cmd(

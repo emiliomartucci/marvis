@@ -1,0 +1,4494 @@
+{
+  "component_schema_count": 314,
+  "component_schema_sha256": {
+    "ActionResponse": "08d79fd23d016503365f82de841d07bca3a06b3d2140791a43447799d11611fc",
+    "AgentSessionUpdate": "10c9fc525061d333e73a90b36f5ecb635a92aeecdefb4a1acb51c860beef7f0d",
+    "AgentSessionView": "e35d77b57c6f077703a586cd65219f08ec04be63cea90bca5255e2e4f69e5fc9",
+    "AgentTokenCreateRequest": "4ae2eaa3bf116529f062df1fd9f572c8e78858157789d9fe2b4d571e902ebb34",
+    "AgentTokenResponse": "7b7bf64d986cac5c1d2e8554340899567736aff2f5ef58c1e811ed3df9fecb3d",
+    "AlertInfo": "dd175ff247ad4cb876dc62e6a9b3313e3995f40e24f9b1623ec223d21c6ef332",
+    "AppSettingResponse": "2665de48ed2cabb5f026df165a96c21988cb639d0472f141433c240ce28b0794",
+    "AppSettingUpsertRequest": "44337a5896778d9e829831f20409832a4c1eef082bfe89fd1650ef3a05e12d2e",
+    "ApplyNextAction": "6d83b5e811370ec5d7de18398d84a8b92b6d03035d6a31689a8b4757df0621df",
+    "ApplyResponse": "9a72e5bedb73c251bdcdf7600822f8bd04847ff246da4f7d91c4970f69e0e86c",
+    "ApproveRequest": "4ca8bd2275d523372c5074cdf55d65da08e678031ec00157fe4498736239b1e3",
+    "ApproveResponse": "433aae80113c5e0e7719b91d8c4f0021596020e6763d454e9e49fcff98b4eb47",
+    "ArchiveResponse": "eabe45fca040e2c8fbdeb67c4f8ce20854eb93e67e6c780b712798fa5bc8c53d",
+    "ArtifactSelector": "0fc3a11efcd116c8385e8dd1ccb28ae6e296b8e6f56711bff58cca22f00541c2",
+    "AuditEntry": "12f2f50a03a6ccee49b569bd3725b7443ca86bf8eca48d4e2c95cfce1734768f",
+    "BackfillRequest": "7e75b3d6de1fe8bedf5e169a67e4965f4b650d900c5f70e88cee8d2a032f6282",
+    "BackfillResponse": "b0bd511a4d33ad68aefd2389ae689cf34e3a25096fa2f609196bf38b3e7618df",
+    "BanInfo": "a049db6e56962c2b19ba2e30ab70487b8654a93b2018cfdc08d763129a3dd05b",
+    "BatchDecayRequest": "06fc47acbc11cc12ecd893b54e45eb5834e03e71f71f6a6fa382f26dcfc15eb8",
+    "BatchDecayResponse": "d504f3f8c9e2fe237a19ceffd08ae40e7ebe06c57800708b2d0494e175b1f22e",
+    "BenchModelResult": "ce878b1826bd9dd7e6e6a11702ab8f0ac618706a1979ebd75f2dcf455e08641f",
+    "BenchRequest": "4fe0122240f705bee140c07a6843bff4f0e8f14774fed9c408caf2985610dd8e",
+    "BenchResponse": "1dd160aa8887a16e6f30ddb76e91c86684717e8875626f993415e8a8871cc15f",
+    "BoostResponse": "fa1bff6aab7a8511b15fb9d009d648242ee95b5a414eba23829ab663d5181f14",
+    "BrainCapabilities": "0c0bc1d4f640e817bbc33f3e0d626695c1a1050bdd3388c1dfc25ffe817f2cb3",
+    "BrainRun": "e769ccab12acd191faab4d6ffaaaab25388ba4e3768da1b6d0f51191cf9d8077",
+    "BrainRunTriggerResponse": "03eb3524227adda51b2215010a758346022bb6927579b1242ffc5f348a60962b",
+    "BranchItem": "91f9127b74b3a133e85ed0aba05ef172361cde439a30f5b80a177842423ad17e",
+    "BranchesResponse": "7458d424d93dd80199472a87c3510fbcb507c8b665cf27108e835ce2389ab855",
+    "BulkRejectRequest": "a3e042f87efdeb5b747aeca6f65088e137e3f9b854cc47186cb7ff502556b68f",
+    "BulkRejectResponse": "967d1b43f1dc4df032080ff48640b7f06b8faca00d1e2682b92de54484cf2bc6",
+    "CandleDatapoint": "fcb0d785671cf94cd1d6588ce054995dca1dabb0dc2e1b193cb4ec5380def690",
+    "ClosePrRequest": "de76880258b6cfb8ee50a86982cdf037dab940a8a260c3f108c3341b12cf2bc5",
+    "ClosureArtifactExists": "ed814136626a17e11204d28d049478ce59a115c45f07367f47c97f838cb51c81",
+    "ClosureDriftSignalClears": "9785b4012b7bc8b476322a2cd882378c9c4b8db4d713371de05ff91bd81de179",
+    "ClosureManualAttest": "c7e2521f80dc4607e33f1a4bbf48828e5888cfc47174ef76bba22970e1d994e1",
+    "ClosureMemoryOpApplied": "12592cb712c9f4fd7eda689c8d3b419834be22727731351d12fa9a495632d000",
+    "CodexFunctionItem": "c9c3e234aba0824fcb11829fe1eefd7f74c75cfda1c8807a24ac4846a1ff063a",
+    "CodexFunctionsResponse": "d4c0e7602b2de32118303f6ae324547e7a68d710d05b36f52b4ad8c175743bde",
+    "CodexModuleEdgeItem": "07e1e48e68bd576ea580156a771f664a590c7873c79e0c8e5a8a81d054404345",
+    "CodexModuleItem": "d880ddff0fe2b5a33c2a4047e0825d0a04427f3f7473fe09c4baf921ed577732",
+    "CodexModulesResponse": "ac5e6fe37c3c8aaa532d91698c98dd0c511ee8718ccd9e0e9b0b260216b8df33",
+    "CommentCreateRequest": "03cd475c7158ec84f673aae032d434f37599943a885bd99696b3e165f3911077",
+    "CommentReaction": "779b2e807038037e4ed93942ba664a6f53989c7f6461448c75ab2ed231f8e636",
+    "CommentResponse": "1fd3f236ccb31f0f237696e900a3e2fd47eec7846ebbcce8391dd479e7652094",
+    "CommentUpdateRequest": "98571282b66194350eb2463d5d3534dace6f580c34219242575c05477f692f83",
+    "ConflictPair": "5cdf861ffcb531e94859792938f6505c70fa78542fdf78f3ce88e167e6161b24",
+    "ConflictsResponse": "20edfd69e37d9e6748bfbdb195c8da9d7961c8c284a5e042a8c0fb0654704ec7",
+    "ConnectivityStatus": "51f3181b9ee04cb984c124f55a910edf4a47924ffb9c66779570c96499c018bd",
+    "ContainerMetrics": "1e9104b31202ddb700a4f34dee18ccea78f86b0faef192261021ce4f0d0e7449",
+    "ConversationCost": "26e2e490f05fde31821f0d194c8a1e27e9eb3a7df276038bc6bd0d9100db1748",
+    "CoverageResponse": "b113ade0be063e8ba4e00f17cd5f8e433dfb06f5b3ffe32a6a6a7a07b2a89ea4",
+    "DelegationCreateRequest": "3494b2f7115ae9c47a806b53f1b6d95855a29dd0c8bc6587dd2c8be6f061f74f",
+    "DelegationResponse": "c1eb36f398ce2adba305cd87e3086cc2e9cd0242d4a1599b8722cfc3c79714e1",
+    "DeliveriesResponse": "7c88a44ff9d5bae7e0f7ff6f19ee8b5b0dd95517a6b157a97dc28ade2141ffc6",
+    "DeliverySummary": "f0a547e0b4895212c94cce76e4b0fcde2f71911595fc1bbcfb011f9d9aec9761",
+    "DemoSeedRequest": "a2608a6ac9877d6c0a5d8d93a194f4bc42591e91fad1ca0e54633fea5fe10b93",
+    "DemoSeedResponse": "ae4b82a9e7657c47d6998e22dd98e7173fe012d036ce289061e8c50997b1827a",
+    "DemoTeardownResponse": "e70a0100bb82bc5521c13a563397a053a6686df64f7b05f145f4097a23892f53",
+    "DigestEvent": "9ef17ce26ad70bd73fc865d16eaf4f7eb7003e14aedf0561009e47f58b953a0e",
+    "DigestEventRedacted": "4bea5f1929691df6b46dbaf09c6b1f72921bb1ec058dc85e06d577d275a574ee",
+    "DirectionResponse": "bb6f708ee4352541f09c39ee980b530bf0b212e4ed5b0849c48f47ea38ca081c",
+    "DiskTreeNode": "d2cee8fbea4659be72bfefab414e303161a6ae0f87938b945b99620fcf5f6586",
+    "DiskTreeResponse": "61806f0b7d8ee87c872075bd9f4d298d766732bc88822d519938e72e8169e66a",
+    "DlqReplayRequest": "9fe8f47e59be72422aaf4431a6a022a62ab31ef579f91cd56b8f3e42391b47c8",
+    "DlqReplayResponse": "92d0e1335ff90c99afcdd9c184e340201f99903ae92b6d23be692833449d3c56",
+    "DocEntry": "c3471fafb394f0529804b73140ad355bc285738bdfc2cf8e6ad955660502a11f",
+    "DocsGovernanceTriageResponse": "2823639667ac894aca8c67084e981d2a9bce7f0b3509f7920cd5fceb83b9941c",
+    "DocumentResponse": "1f0cf54e9258df50ffdc37287ee120a1650ab59eb31ef3ea3bb721404429360a",
+    "DraftDetail": "1cae4bb6cd16cca7b698e30c5e38dadadab6dc6c6911c55466a9f8570c23016f",
+    "DraftSummary": "d3ed5d08dad0be450017a09e71c667fa01af84beac246ed581b17f6a0fbd7203",
+    "DriftListResponse": "b282d6e73b7516e2951a599e127fb4907cb55418688677679b232bdab4e8fd51",
+    "DriftPatchRequest": "e1c11a5f592804c37929f653898c86b1c7a6c80002c4af288bae86bdeeaf086e",
+    "DriftSignal": "7eba9be5c62b7989f2530d0d44fd8f507bcd01f8cebc0bb8fe46e5f1677b533c",
+    "DriftSignalRedacted": "eeeef3444b17e811235589a72df0145a9b41309f4a691bfe0102ca36efd0cc37",
+    "Edge": "28d5aa690d42f967b7262a9200129a076c067c1b8906fcdcd01a4f6cd56ea7a9",
+    "EditDirectionRequest": "11a47d49e57cf08d566ec295ae9f5c4399201b757089c307c0e573b5358d1e0e",
+    "EditRequest": "9ad7a5c0df28433a21308fbf201cacb0fe25694a3b68ca615382ec3162d6bbf2",
+    "EditResponse": "c29684f2e774ad82539d5f432acb82198d600b340fa81106921e99b2d8aa1d75",
+    "EnvCheckResponse": "c52906a0299edc2f7300f7c9b7d308c2c785c4e4f5f29de42f09c143d6ac1a85",
+    "EnvCheckSummary": "1b4ce5c219d2241ef34e592ac4bade34473a1e710d7e17778d7ec39c3f7435ac",
+    "EnvVarStatus": "657b31211a04743aa68605b27172b27d329abba39afd6675d0c4d6a4edf55c19",
+    "EventsListResponse": "1b854f7a273b53ed447735687b622aac91d4b3fd8378b92cb66b3b1059efb6f0",
+    "ExecBody": "829ee91ac6cdde59a1a0e4b12e6b866a8ff16c9f695a153c3635e18ddbca0164",
+    "FileContent": "b324758fa794d3a15395971e20cf96da4f626c737844d0d90cfa5498eae40945",
+    "FinderFileContent": "a1928d13b2e5f7fc91a3916aae7851c90f19dbd15f2c40db4bbc1a4a66869874",
+    "FinderFileUpdate": "f6e94d1e03d6eb70ce93dc568dbe436c9798e2acbdaeeb9daa627670696f64cc",
+    "FinderListItem": "f98de6a338fdb73048d449268f81ca2a0b9aab5bdcf894404017563f1d5956ad",
+    "FinderListResponse": "36551eb9764e9dea2e3dc85aaa488d4c3aa1198017fea19fc30cf4203a16417f",
+    "FinderTreeNode": "ceb0412bcbbb1279baa0a6595a38863574408f6d3ff1f9f790370165b0f1c5e3",
+    "Finding": "a61690439fcb7688abe6c4c67bce0b5e48c0854beb5820421041cbf330444a36",
+    "FindingBulkPatchRequest": "461f2a555d7fed242cfea1c6ec62cab0a1803b5f562085dbf562a6f9d5d2b9d3",
+    "FindingBulkPatchResponse": "725919c522a760dfba7d5bb439df6a03916739bae5f9f12d4a515e2a02952a87",
+    "FindingBulkResultEntry": "b3764d714e43f3de3043c57826a69e280a7ff6175308683d63752af3bfc7b31c",
+    "FindingPatchRequest": "a9d6eceaa993a29bda58f010d1635c0ac0c06b1319b4b41015beb00479cb0286",
+    "FindingRedacted": "4a1a636f6a5153e05881a5cf2ea49d64a44b59b84e3e2c5bd9d4a394555f5680",
+    "FindingsListResponse": "b21c91322edbe0992f423ef6ea2c297f12726ab73781db8fb1cbe5f9be367b76",
+    "FlushEntry": "db3a26f82af5aa1ea3a3945f5765a6ba821cec88f145914da4cc37c7aed1fa13",
+    "GraphCapabilities": "69ec0ce62d35abdcaa3b1b128ef573e6de329c5426e5e8bdc417e8d8e80d72ea",
+    "GraphCosmoOut": "d9d08e4b1c12e99bcd799b82f7a13406cc102d548b7cb030f8731254be684908",
+    "GuiFirstValueRequest": "bb14daac07c0009fe68b59f234c80370badfdbb895c63eef28becfeea8856eeb",
+    "GuiFirstValueResponse": "fea46270937f9a60287dec7f2afd5f890ebf00955ef6fab4ff948464986d1d13",
+    "HTTPValidationError": "943dccd103136f3b9df0f9b076c92dbf6b2e3b9de4ea1980fcffe068d145b3ac",
+    "HandoffEntry": "f294d1399dbedc88207fadf64ca9a17b06d04c5bf87c6c3bd26489909c9faedf",
+    "HandoffSearchResult": "a8e99a48ca7362d59ad9ac41b31d1f46e920f2230209c9eb4bc219c2ef7eaef7",
+    "HealthResponse": "535fbcd23c631480cfed4a61fa69856ec9e15831a1fddbc60fe1c5e40a5d95db",
+    "HotspotItem": "5a1fcad604ef8d4901dd9d08c154e63fbe6d9c1faac2e20abb01360f41ddf7ef",
+    "HumanCostEntryCreate": "422aa50a39bb67058eea9f0ae37af7a52ea84790dbfded7209916e73f262dad3",
+    "InboxGmailSyncCandidate": "03a679319b60e4e2b00dae4e24295d43c18fc95f8859cc047783798bc1867b17",
+    "InboxGmailSyncCompleteRequest": "8b4bc50723be2c43c6a6b1888ac9fa852590858233c655f4f6c48b718f6fef1f",
+    "InboxIngestBatchItemError": "d68649f06d6973aacb8ba3e5bb032901c1fb48986a8d6cbfc81e8a22a83a3155",
+    "InboxIngestBatchRequest": "373651c1ba9284d50f624927b5aa84f5181919109b76a6a5cb394440ba8c64d2",
+    "InboxIngestBatchResponse": "7e1f8e8433ef80d490316f832f40e7f53c3f5fdeec20da430c8b57e2708efdc5",
+    "InboxIngestRequest": "99f101746063a3389428ed5b031789f3889e6a31a655bc713c43f8e8897efbba",
+    "InboxIngestResponse": "5ca7d79dcf75bbc6d2a9eb44a318431a9c364ad6143420a5b98a12b7a573750e",
+    "InboxItemDetail": "31e06b051a6eb39a240ef7303914a671f33d622179bff1e7ea87df1bd31bad40",
+    "InboxItemSummary": "68ca1d722ccbb5b4d78805592242678de401b582e600a80bb9a3fc270aef6bd7",
+    "InboxStatsResponse": "460c4684d98c6d2cab1fa64453c39f33606f8e9d2c5750176b65a83df7027687",
+    "InboxStatusUpdateRequest": "6f9ed454e2cd848093890b45d7ca2332170fcf8080253d1d39c7b8e265441337",
+    "InboxTaxonomyUpdateRequest": "784775bae6445114111622519242bbbff294e656b6184459040427568d5d6e71",
+    "InboxTaxonomyUpdateResponse": "c45e397196b35c943b8d13aafa1592901daad210bc409c3d800284d59a788594",
+    "InboxTriageDecisionRequest": "bf96d703ed5b378e706ba78f3c5377a6b36038be83f3226421ca7fd066793113",
+    "InboxTriageDecisionResponse": "c6825b551049c5f09b1d2127824d3a8b07f41cfabcd7bbb806282136e21d5254",
+    "IngestHistoryEntry": "fd8121e3ea03ebc71bf451e4c737135817607e6a3b645d692030e5e48de8db5a",
+    "IngestIngressResponse": "f4173cddf92e72c3593605912a4491994b5af978fc80e7bca0cca76ec262d38e",
+    "IngestKeyCreateRequest": "c75448a5c20a2dda97e7b0d121220cbd97ebaeb91b96195348e268790636fe8a",
+    "IngestKeyResponse": "6d14f228393668ff030bd2c15baf52320c9c81e9d4a42d88554701e32452a601",
+    "IngestPendingItem": "8dcba93a677cb77b6ed42bd2907c021c0f2f54b850be4de40715eb95a262e81f",
+    "IngestPreflightResponse": "e01485e1ff84e19a6e2f2e5c459e1df8444b14abff2abd3f2eae354f5ad08d3f",
+    "IngestSkipEntry": "e2c2ee189b02bc1a07079ecae72b8238263e1cf93a3132330a5f5ab2df79455e",
+    "InputBody": "1962a6ace78716cdfc8811554e4ffeb9d2d08d316de3bef6e211831dbee75812",
+    "IssueResetTokenRequest": "786e8931991cd78c34613aa0347ce4833fa9d78242cd4997e2f429e7ee81a9b5",
+    "JournalBody": "773f30b29e16ad377b8942cd669ba27b774b18f9e0ad00e16b4a80ecda547d33",
+    "JournalEntry": "5f6c86d157a38e5abe2ad2168ad290f79d667ff5928fec7d333f2736dc7e517c",
+    "JournalListResponse": "fccb242906e22e94e0c402e4abeae81ff05bef28cd92ede93097c3ebb0cb4c25",
+    "JudgeCriterion": "d4201b7f9208125e371610c5c4aa4848efa6d760b1ce9d716b3e1352927467e6",
+    "JudgeRequest": "3544be95fcb612284e6897d2f8c46e50855ffa7f14377e8f87c421fd52c78484",
+    "JudgeResponse": "8585a9ce859b8f0e15ebe8e7afa6ba598821cabe5ebcebe1a8e0e9620cd2fbb7",
+    "KGStatus": "8e80d434c2575e81672ba8a2b975ac01b94456022b98d6546e4123aecc552b95",
+    "LLMFunctionConfigItem": "2b10b07279cacf912bb84b1961c26dbeefaa719e6a9c81834f1988c6e67d2123",
+    "LLMFunctionConfigUpdate": "0e96a2d4f2b86c801787b06a1795cca347c752709036c25ea4c3c293882c7530",
+    "LandingBundle": "10df79225dd67675f812b2f63b46e2d834346b9ac1b0bebb8191f2809f70a57a",
+    "LearningCheckResponse": "39cb02b62d6969ad0b8eb5ca3c7c7542b4e57b6be05b8dcb3ce144e1d6c331d2",
+    "LearningCreateRequest": "2eeae0899ee2126e75e6d10ffc493a678fcedacb15d64ee0203cb9b9a80ab6f2",
+    "LearningHistoryLink": "f02734cd32e65d5829589107c73b5136fe876b6c4ed7e1326e83e7a9310c6a82",
+    "LearningHistoryResponse": "9b1bbc612fad9335035b168a09a32bd4b44c8c142517e2bf3428d38a81b84f04",
+    "LearningResponse": "1f4119de6118073dcbe7cc9c70a2281e7531ea958c3290dd42e8f1f14cec781f",
+    "LearningUpdateRequest": "8c7af1ec3756586979e88f5357ebe98ead52694aa0feec9c2058443036c279c2",
+    "LoginRequest": "58a0c01632d0c531db797b77be559ee75fd5a2e7e8085ff167fdf72b4de1c61c",
+    "ManualDirectionRequest": "53f1f34edcd9370077a8a6475ed994a119b7c6a74821c5ff61b31488d986a5b5",
+    "ManualProjectEdgeDeleteResponse": "d39b7ef683e59b8c777d3842f09349b1af15175470155f124a7b610f85d737ef",
+    "ManualProjectEdgeOut": "5f87929e88e631935aeb016585587bc932d17204036bcd33683bd47b13e121d7",
+    "ManualProjectEdgeRequest": "82cb08b47d9f82e6fd06717d6a5f132965f4428d6dde5c6281b57ab662a39e76",
+    "ManualProjectEdgeUpsertResponse": "2247240767d6a337554e3002c20e80f52572dfbd2867a2407ea71ea23bcac1b3",
+    "MemoryOpPatchRequest": "5df8219349e04913c79d1f0c054712794ce2b2b71094b6305f73e86b99efab55",
+    "MemoryOperation": "4eb48059e975fba92487332b0efb669a1e0c0a4cb16f3a697be45b2ba0c9d245",
+    "MemoryOperationRedacted": "c4d2e377f8498fbefcedea77be8f3aa9f7cfc79c2a8784c734bd4a67dfee0b4f",
+    "MemoryOperationsListResponse": "2d285d4eaf69481a834224c11a3015a0d3695c6e7877b8aeda40b1f555622af7",
+    "MergeConflictEntry": "6565f21f29c62ac908e8cda5ec82e76a3fd9910cc8e8f5f0b02126203f026eb0",
+    "MergeConflictGroup": "9cf0743ef0ccb482c97ac78f30698e338b95ed4ca416b63bf8221c3001c44559",
+    "MergeConflictResponse": "b4b92979af8fc0de6ef1721b80dfc0a80ea78295836d225e6f7c01db8aafbc4e",
+    "MetricDatapoint": "2963d82e4372b714364145077d53f59bdde3d210935d2f6134fb484d677d436c",
+    "Metrics": "012a8bcc1a7e753d141fc31d8d2b7c8c950ccc075dd04a91c9d832426411b91a",
+    "ModifiedFunctionItem": "6a299816f6a6404f1a81e1c0d5d95c50bacfe9a5a559111b1523aa498860bd04",
+    "MonitoringSnapshot": "d68478d9a129045fab6ddbe8f3eae5031e1fb9b0c7450c4800545993a259094b",
+    "MyelinEffect": "fb80e4f6a109904f163225bc6d88fc95983c35ced941ff5a7556808dfde1e50b",
+    "NewsletterEditionDetail": "1e2f1571a914172867a9182ecf6fafe596f29354c26170572abbe106f3d6b0eb",
+    "NewsletterEditionSummary": "8b7d8b40ad8b89047e6ca16025b0bbf526b65754b9716a7acb10e55faf412476",
+    "NewsletterPreviewRequest": "91f4264c34e657215937051633885157fec86781453aa99a2f7b2aadb26f1371",
+    "NewsletterSendRequest": "94740bd809ddd0d98b7c38e2bc202bcfd3bb8269882b6f8259f4a64a18f4c2fc",
+    "OrphanFile": "f96dda8eb9885bf34660cc448f18e489c0c0082e5361e474f3b5259834c3a9e8",
+    "OrphanSubCluster": "4a831edb7e2fdfa4d42ebc617e959b4ed053044cd6ac9e2ae8d3aa963daf3e0e",
+    "OrphansBundle": "3d736f3209f1820146ce7d16bdb6484a3b88d26dab9031dfa9ed92d463a1350f",
+    "OverviewBundle": "13d6c628035f66f60ceeeec2846896f406d6d08181c5f531683719f78fb47cbf",
+    "OverviewEdge": "7319efa3e2c4e9e66e370579d631ee23788425d4713833cc192b269e3bea4ef0",
+    "OverviewNode": "36dce33c4a74b4c699ea37395097749dc679c964ad4d1fe20788d9b0f3879162",
+    "OwnerHint": "6dcf70330b52a1922862b7c290817588c578452b9a6b05bcf5af78f1202b44e9",
+    "PaneResponse": "68f6d5ba5ab2f1a803a79f9a85694d5370ad6b9107e8cc8ea843049157a6ea74",
+    "PinIn": "b73d99fa9b3783c727672be5507a91d7104eb4a9b23206610c08cda1067fd946",
+    "PinOut": "0ce2d98858e5cde153b23c94738206032fabe5f141f6750c55c4fa77c6b59209",
+    "PipelineCounters": "6402cbe62e42f2fb9c8314859ee4228edf385a8d308b68125ff143e873aaa982",
+    "PolishPendingResponse": "24f5fcdaf51baca14df83757ec04b984bd82e04fb396302de629d5a499050609",
+    "PrImpactResponse": "cacdd5e3df4fea1135915a1283dbb6c13bf5ac319befe2089b162af45a2e2ce4",
+    "PrMetadata": "cee09e4ef6cc3c7f969474ab8e53d228570cd392a7f7d696b55508a611d50420",
+    "ProgramInfo": "0f4b6131e50911813ba9bc88f61dd1ecd2466668d5aee2134b452ef3f5dc6032",
+    "Project": "e4e4fd8bb9ed2321d2f70bb4dee1fbf5ed5a3e61773481e4facec03844869d3d",
+    "ProjectBillingSummary": "54a742c3f04ab2c077a83c91e5c3c00f3e9f79cad9093c7657c26c3c971dfbbc",
+    "ProjectCostSummary": "f3b3a246b67c522f71f14537fd7aad6ee77f9d43e9049302dd58e28ee4737982",
+    "ProjectCreateRequest": "6973776acc422dc297c26e1af06b48c01efd04907ad4457c64bd2fc1e2da5942",
+    "ProjectCreateResponse": "0f07f58ab4bd7d7919f33ca9362a942a1aaf869c0e95e93526a56cf6a453f3c2",
+    "ProjectDetail": "07e1993f10c5cf833309a415002b19b56358578ec728db3dc56f94f7012a4f80",
+    "ProjectDirsResponse": "e0a20d0f82832e257c9598a2d40fe4b05113797da5d85072da56ec707a50543c",
+    "ProjectDirsUpdate": "c4276e1bdb385942fc39dc60c99a60f249e834b39a0ca4429b399741aa5039f5",
+    "ProjectInfo": "a8b7af69dd98d82ad51133501d1307baa9ee790847bcb2185370fc2b59bd8426",
+    "ProjectStatusBreakdown": "c558b9cb077dd33af9b721377935c0bd5738b3ed167d7e30802c54da687c1073",
+    "ProjectSummary": "778fab747b53fec05a2fa28b2e7f5a1dc886e367d3e30613ec0617d2b1a59083",
+    "ProjectUpdateRequest": "f3995483eca9bb41de5ba7faadd3eb38da6e169494cef98095a732630453d95d",
+    "PromoteFindingToTaskRequest": "cce9eab83887fe1a0196f466bff9b5976d772edcb0f2781a2f0c2c0d058b43c4",
+    "PromoteFindingToTaskResponse": "6969b3716e93cf8ebb00f97911378061e09621032c96faff5939df733c3672c6",
+    "ProposedDirectionResponse": "e00814f459087e9b671d117ec5e4729671843285709fcb261bc691a3de795963",
+    "ProposedWriteADR": "074fa1014ec7b750dbd8b8f5086c44fb66f20c0eeee0c8aff55fa1e9187d055d",
+    "ProposedWriteContextMdAppend": "bc98b608bf2b18877a9ed2e4ea81ab2568cd1f974adb9c20131b517f434f09c6",
+    "ProposedWriteDocPatch": "4aeb450602bdbeced416bc774b59db71b0efc514d7a61abcd40ca1726c73b278",
+    "ProposedWriteGuide": "17c94d98e219531191b841bf21db16df9b55db5ebfddba78f51881f8d7ce1953",
+    "ProposedWriteKGEdgeMetric": "3d36f4e250597eb5680753f7333eb21b980eb0db649b3d046ef2785ac7dbfe1f",
+    "ProposedWriteLearning": "61ae0a2b7e69f3515a96eb95b9e78c62ef999913895ddbedde5d36164d2b8dcc",
+    "ProposedWriteNone": "8b21b668c5c6d7083245872b8e12ddc81da7f5fbc1d88240cc97b64459342328",
+    "ProposedWriteTask": "35e3af4972362edd619e41a4ef29896809855e9a0fda3ebc7965c4c95a7bebb5",
+    "ProviderKeyCreateRequest": "1909f61f0c0e1fab9e5f3688844c9aeeff47727b001dd5af10fd7b4cd5de4b61",
+    "ProviderKeyResponse": "13381a74ea21aecf002dd8b08e49b2c96b163f24ecf2a98bdd96d32980cda59f",
+    "QueueListResponse": "693fc95bd38e7761133bbebf023ad6710c6c7ef36d024c445f8a8877f3c9236e",
+    "RaciAddRequest": "e26d4338a3de15a6c1aa395ea714ba3276c3488b64ffe2853659044cc5b89475",
+    "RaciEntry": "6ccd7fbe0662e106b3d5dd55032608d66833fc49c904dc23c1edd5c4b323b663",
+    "RaciReplaceRequest": "2a1a2c08f17aad7791b5fb7ce82ef6109d7611b1b9dc4823d6a9849faad4dd87",
+    "ReactionCreateRequest": "a240f68540728c26480b017b0f0def79639e64a8ac4de90afbd114ffd2db61c6",
+    "RebuildRequest": "3f2a54b1f8c67cda827236bed74e347b9c4c7dcc21cbc4aa35fd600c2bf6e398",
+    "RebuildResponse": "d39e02d8ba6d02b86be1fc61ba7c7c51f2a79916f8289362eab586b5c5dc4082",
+    "RecentItem": "c513229f7743d163bdbc96b3126ea0f42362e55b530a8d9108cca7ae380e5be7",
+    "RecipientCreateRequest": "07e12f10a5e11a6f08aa8ccf46bb42cb13a8da643de4579a69ac7a4b56bd8709",
+    "ReclassifyRequest": "29b4ca24ca7c776f37c908e6abfedb91c953a928774ad5b79ae38b02af5ea266",
+    "RecomputeRequest": "01ba0e13b6fcfa7ee97f6f24dbc40c927e926493b0e9c53b85eba802118b84c1",
+    "RecomputeResponse": "6749af99d044d532b14db1f8103e5329a303f85e1cbd8f90b1a85c92c06f901b",
+    "RegisterBranchRequest": "840d3d80a246b22678922c5fa0121f4af163173a15aef6373288882c663a31dc",
+    "ReindexPathRequest": "e6f8349240e9652758caca07cfe24f33103d56a5be818b879228127d633819cc",
+    "ReindexPathResponse": "8050c34a21226b68e6fc959d990c7701621873178f8866b5d640a3f763179ca4",
+    "ReindexPathsRequest": "2b6ce975d41028166bd5fa553f1b57e9eb8f2223510535413c581599eaf1274d",
+    "RejectRequest": "fefe45297ece497ea5d58267bf83981fdd8d62f62224c29fda38689c5177bc78",
+    "RejectResponse": "88cc9145ae97e67207f436dc019ba32d30592eda3f674679fb7b6d7ea565e1f2",
+    "RequestChangesBody": "0bfa77455d1ad22442dbf01f74611720ac7e9737fa5e24facc3a7e4efb6d87a1",
+    "ResetPasswordRequest": "1813111cc7668bb78fc25a48ae619b900135211978fea722350d45e651be0603",
+    "ResolveOut": "8fccf3a6afa6a28f5cadff40404c79907bade53f6b34efefbe59caaafed9266e",
+    "RunsListResponse": "4fda1f5a0d8edc1f6db41c1e31243863f7482e6a43a6e4ece5fa253a752e9e6f",
+    "SSHSummary": "bf77b8393e998a110efc13019839ffa2e196102b84f746ef4e685521f5fee0f2",
+    "SalienceUpdateRequest": "b9b6d05cce9854102af98e9d77937ce74d6d75644ba0b3ea3b9db00887047581",
+    "SatelliteItem": "8bfedfb9e8adbf349d73ab30aa923a8b3a7d3e4af662a247c250d7fa7464b278",
+    "SatelliteSummary": "9583a5c8ccc6a0bd66ba586ec76028ae22ac9b10196f0bb9ea45b77978ae845d",
+    "ScanWorkdirCandidate": "ef0ccec6bc48955f5a287f123afbd23f6657e8646cd2624a5512fa81550ece2f",
+    "ScanWorkdirRequest": "60368d4682a78b12c53c8b9f12843dab07c6608b20a129dd418b109df5d355df",
+    "ScanWorkdirResponse": "bd7942ccbe30fa672ce0dcd2fd719c0167eabd81821567dd4c3497ccee2a5bb1",
+    "SearchHit": "0ef8b18f8e97941cf5cf7abab926dea4481f89d0c1c31420cd453c253b621ed0",
+    "SearchResponse": "01884c8299e50ed7a2425590354c0fc487a68c8b4c593045a704e4e1cdea958f",
+    "SecurityData": "4e8cecd5a87e2bfde18afbf537811e267d6e2f09c41d3a6ccd74de7d6cc9c13b",
+    "SecurityEvent": "64735d16abc57a027743eb27f90df6bebad333ba66e820b4665d82923dab891e",
+    "SecuritySummary": "ce15af812e85297d20635da96297d9a9b01e1e98687002a842c4051398567e1f",
+    "SemanticModuleItem": "75e64a11696fd54f0ca573eecc4f79572e9773a7594ab49ed2577d0948af416a",
+    "SemanticModulesResponse": "da3a333956797e01160e766a37101ae7eb2e1dea057db63cb4739350495d56c4",
+    "SendMessageBody": "8fff901555244126b20bc0357efeb35238890cd48e6a550b7f8c349482f16163",
+    "ServiceStatus": "97df7d18f153d13277fdb8f76d5a577b5b132fe9fba9655e0e3db0b0289246a3",
+    "SessionCatalogModel": "2d10361fb6bca1eb976ad901d9ac089db84ac5a9f325cb23d5eb6568c0aa59fc",
+    "SessionCatalogProvider": "5985c14c2342f7762ba1cfb8fae200241b408480353f529090b99c350d622342",
+    "SessionCatalogResponse": "080967bb59c2f5d08a4200d2a1e61e061699f1358e806f0ed5a582915ac46a3f",
+    "SessionCreate": "ec1fda4078d8b448bedfea2baaf63f9015d29bb07ba406affb9a9e02f86e55fb",
+    "SessionInfo": "0c32dc121a1e46f65aa525c6d3bc08d50a317473b16ed3093763334a1d04190d",
+    "SessionMetricsResponse": "cc5ed74cb9c84bf4044931ff78b62fb438db07b774d700aa9d3f507ed9965199",
+    "SessionPermissionPreset": "3021edc94a15ca49b2953a5a3be512d8e541062826fde705429d552a50eb8c7b",
+    "SessionReorder": "e365dbb464d616e577aa906c85b491048f054f82c810eab22435f838f57bf0f0",
+    "SessionStateUpdate": "eb9470e1e3b46822deda34af7f08cf9dec003f2c2abc26412844f5ce70974bdf",
+    "SessionUpdate": "ea5b89eadcb6d8efa98c099e4b1318d1e8706be16ae10940fb18eec204558eea",
+    "SetupReadResponse": "3ca9988da416893b85aae4c7e0f24c17bfdec6e388a27bce8bd72cbab0301154",
+    "SetupWriteRequest": "641433202c48082c5f6f0e61076b669da22f9d3763bcd55a534b912884916e69",
+    "SkippedFileEntry": "e5646777a18d82488b6cc7b385e5e0d12213c09c1b96d6ac0bda5a72f9d8a249",
+    "SourceCreateRequest": "4070f78d34b4196d77ee0faca6bcb0f137c983920518faf40eaa128c5e49a2f7",
+    "SourceUpdateRequest": "d899023fda27ce1c10d3cc4891ed1242fda3dacd956dec9dfd86894e9f47c8e9",
+    "StatusCounts": "239330130d793786214b63702422b2e8e3b588fd9b5624baaba766325ee1ba10",
+    "StatusUpdateCreateRequest": "93d2d24c096eb08962c0629373f8c50002bb4bc6a40404c4e16ad6fbf4fedd97",
+    "StatusUpdateFeedCreateRequest": "954505b4458dc658b8fb1ea75e05c2cd2c532b05a20969044f444d1d56fea79a",
+    "StatusUpdateFeedItem": "d3453b668c992a3362a2db5cb4db57067874d5c3c45eec765ef3e983b8f39ff6",
+    "StatusUpdateFeedResponse": "0a451d8d4d654ea2a50fe25488fdf3f08c7fbbcc774eb2beb73d7f1089b29cec",
+    "StatusUpdateResponse": "5096b4aa4a30c8bd98673c0d85a645445cde98f5cfdc40bc1d86ceac8a32f6b9",
+    "SubmitPrRequest": "c258228679df1f056c65828700062ce07affdd266b7f51a6ba5e8c3555eaa0c8",
+    "SubscribeRequest": "1d00f615ed6cef9eff8e29235f7a054db7199db6a0013766cc3131e04ebdfad9",
+    "SupersedeEdgeIn": "5c4b7ab129782a628c87c691543916420704d6dc03f0904648087036a9faff4c",
+    "SupersedeOrphanPartialsResponse": "78d2d5f7e1976ce161d0c139ef3a7c4cefdd42b2f6cf94f934444154c01525d2",
+    "SystemMetrics": "3ac5cd99654328228701e10da2875c1663979414441d3714f6236e32682ef4f7",
+    "TaskCostEntry": "e728d7a604e7dee5bf876c30841952ba50969d5db7423423efb6b3e7225a8e09",
+    "TaskCostSummary": "bfc78e43a23441993a4e765751211550c3e037c5973477960c6fa5c680a1b944",
+    "TaskCreateRequest": "adc1be41d2d717342f9248e15bd5cd87c486e024383eabc30e7f2a020ba00c80",
+    "TaskDetailResponse": "38bbf6e3c1ac871f2ba7f869f1bfb74d422edc69b33a98b803cf897a2d1256a3",
+    "TaskSummary": "dbacd398901aa8c0adc6a753c47cbaecace9fc096d70662c02eaf40d99d463da",
+    "TaskUpdateRequest": "798882056685664793ac68224ad4803da359463582c13d4021254b46f5968941",
+    "TeamCreateRequest": "57f9746166609b4c6b99e002585cada02c0b5fa5d29755a0dacb00e08261b05e",
+    "TeamMemberRequest": "8abe198cfb6de3041a77c2c2ecefc77cc4033bfb8110e0e05c37b20c7c41174b",
+    "TeamMemberResponse": "17355fc7ba1865e65619d0ec712954b11df306cdab2a91ef0982c6531d8ff5ce",
+    "TeamProjectAssignRequest": "f210c6e59dfb69edba2c39079209136fbad631cda6c3f8d8cc9bd8320927cd4c",
+    "TeamProjectResponse": "214dab9b7137ced00edf71e2a38e3391dd5acaed9c26c6a6b8b21841822541a1",
+    "TeamResponse": "0a09930216813d462e5d9f75894e05aa9d5dbf5a8fcf5802bd266a5a9a87eb51",
+    "TeamUpdateRequest": "382a5df1d32da92ce4c2340732d04a89d6022b8ebdc74c850ff47d547e760bc5",
+    "TerminalMetricsBatch": "a68f77ce365224f49acd007769c1fb6fd0d93e8d7bc29160fa699ba5a643cbf7",
+    "ThreadContext": "769a383bd6dddf59091e02fbcccc1bd06471e905d5673ef15bd3a41c2dad0f11",
+    "TicketRequest": "830df9337b6345f00ba3f24a6e4541dd4608de3a474f9d5eb19c3d9fea3c7e3e",
+    "TicketResponse": "e67ecc8b55ea60ae390e4022ddbaa364f8ecab39ab8dc0beb749d28da5c0b77e",
+    "TodoCreateRequest": "22212ac2a3b13b8a602b057ccfe455b7ec0e2e2038afaf2631e399b459a2a17d",
+    "TodoDelegateRequest": "18189f5b2797bef79643e73079328a50a5d1546adbdc0e23a0d23fbe851719f7",
+    "TodoOrigin": "afa4085e9163a87012445d8dd0ad8de0e2166fa70336dd1aa423b11ee0a5dc20",
+    "TodoResponse": "ec0c095963c1c2f0cd99620a3f61a3c937517706b7ee807546faa513600a2f12",
+    "TodoUpdateRequest": "f66f01f99bccf88db6fa786899059e33dc15e5d33d539b2cfbe48278cd7db740",
+    "TransitiveImpactItem": "a906fc67115e2763cd31bacf5f40b15caba7c0799237f268c55c69fcee9ab354",
+    "TriageDocsRequest": "f1579e1c9a2bd9ef5327956bac2f41d2f888f2375571448cfc2865fdcc7427ac",
+    "TriggerRequest": "4e9122238e7164914daf211c1f786d52069c8c35d94b106ca9288ecf661d9e4a",
+    "UnsubscribeRequest": "505a4c9fcc0555a2019c878310c0717f3677ccc441cc368bd5472a3be3348e49",
+    "UpdatePrRequest": "c759761e434136749daa2aaa2e00607411fecede1da23b48670d63fe2141e570",
+    "UserCreateRequest": "1cbed3c3cc17d83a2d3a754e6c84d42853d2defb345b17511e76a208b59f14c2",
+    "UserResponse": "46c3293850f839102819b335d9552bbef458b3211f06888073c12c522a71c0b0",
+    "UserSummary": "7c0e01b961b682cde48467fbb09ecf31d07362d35323e6b8323e7c1498932c9a",
+    "UserTeamSummary": "7f7a783046f2408b8347fc672563b81ee36e1ed596a9090e4034a1c6399b1ce4",
+    "UserUpdateRequest": "5446931001b3136f53caba0d743306b9fb04c909ab7fc797cea6431fbb55c46b",
+    "ValidationError": "2fde730bc63792d989c7e82f19a460c4a0b1b9f66dfedc196ea017726c1e25f9",
+    "ValidationFlag": "d7b418cd1ef5f06318468dad3b8c77049429c691e05e049270b6fe7f54edf5c0",
+    "VerifyNodeIn": "069be09e7ab093394125e63ee12fae74763530775e524841d5e3eaa88f7ea50d",
+    "VisibilityFooter": "9b365f56088fa233e97088acf53790a8703e63adecf9a0911f22bc509a424123",
+    "WatcherControlRequest": "f205ca9e385ce9d6dc350418a32114044ab60d2568bbd4f5b584670b91fa2e8d",
+    "WatcherControlResponse": "2e9ce3f8521b7360551a124648f2b55ad02fec69e6a2e3a7a8529b53a144fa55",
+    "WatermarkResetRequest": "d950b99bd6b6b399273c5ebbd1a5c38097604ec46f0fbbca37f4da4e183179d5",
+    "ZombieScanResponse": "c144253882af961df2227299edb3d462f9fd545c45907012dc095d7ec179f95b"
+  },
+  "contract_version": 2,
+  "openapi": "3.1.0",
+  "operation_count": 330,
+  "operations": {
+    "/agent/pr/abandon/{task_id}": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "agent_abandon_pr_agent_pr_abandon__task_id__post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/pr/start_branch/{task_id}": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "agent_start_branch_agent_pr_start_branch__task_id__post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/pr/status/{task_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "agent_get_pr_status_agent_pr_status__task_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/pr/submit/{task_id}": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "agent_submit_pr_agent_pr_submit__task_id__post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/pr/update/{task_id}": {
+      "patch": {
+        "deprecated": false,
+        "operation_id": "agent_update_pr_agent_pr_update__task_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_sessions_agent_sessions_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions/{uuid}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_session_agent_sessions__uuid__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      },
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_session_agent_sessions__uuid__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_session_agent_sessions__uuid__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions/{uuid}/complete": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "complete_session_agent_sessions__uuid__complete_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions/{uuid}/conversation": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_agent_session_conversation_agent_sessions__uuid__conversation_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions/{uuid}/exec": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "exec_input_agent_sessions__uuid__exec_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions/{uuid}/hibernate": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "hibernate_session_agent_sessions__uuid__hibernate_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "202",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions/{uuid}/input": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "send_input_agent_sessions__uuid__input_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions/{uuid}/pane": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_pane_agent_sessions__uuid__pane_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions/{uuid}/resume": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "resume_session_agent_sessions__uuid__resume_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/agent/sessions/{uuid}/tasks": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_session_cc_tasks_agent_sessions__uuid__tasks_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/admin/app-settings": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_app_settings_api_v1_admin_app_settings_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/admin/app-settings/{key}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_app_setting_api_v1_admin_app_settings__key__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:key"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      },
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_app_setting_api_v1_admin_app_settings__key__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:key"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "put": {
+        "deprecated": false,
+        "operation_id": "upsert_app_setting_api_v1_admin_app_settings__key__put",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:key"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/admin/pr-impact/backfill": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "admin_backfill_api_v1_admin_pr_impact_backfill_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "202",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/admin/pr-impact/deliveries": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "admin_list_deliveries_api_v1_admin_pr_impact_deliveries_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/admin/pr-impact/dlq/replay": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "admin_replay_dlq_api_v1_admin_pr_impact_dlq_replay_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "202",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/admin/settings/env-check": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "env_check_api_v1_admin_settings_env_check_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/agent-tokens": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_agent_tokens_api_v1_agent_tokens_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_agent_token_api_v1_agent_tokens_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/agent-tokens/personal": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_personal_tokens_api_v1_agent_tokens_personal_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_personal_token_api_v1_agent_tokens_personal_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/agent-tokens/personal/{token_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "revoke_personal_token_api_v1_agent_tokens_personal__token_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:token_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/agent-tokens/{token_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "revoke_agent_token_api_v1_agent_tokens__token_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:token_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/audit": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_audit_entries_api_v1_audit_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/auth/admin/issue-reset-token": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "issue_reset_token_api_v1_auth_admin_issue_reset_token_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "login_api_v1_auth_login_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "logout_api_v1_auth_logout_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/auth/me": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "me_api_v1_auth_me_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/auth/reset-password": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "reset_password_api_v1_auth_reset_password_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/auth/sso/callback": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "sso_callback_api_v1_auth_sso_callback_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:state"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/auth/sso/config": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "sso_config_api_v1_auth_sso_config_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/auth/sso/login": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "sso_login_api_v1_auth_sso_login_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:workspace"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/automations": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_automations_api_v1_automations_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/automations/events": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_events_api_v1_automations_events_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/automations/executions": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_executions_api_v1_automations_executions_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/automations/{workflow_id}/trigger": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "trigger_automation_api_v1_automations__workflow_id__trigger_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:workflow_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/admin/supersede-orphan-partials": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "supersede_orphan_partials_endpoint_api_v1_brain_admin_supersede_orphan_partials_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/brain/capabilities": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_capabilities_api_v1_brain_capabilities_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/brain/counters": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_counters_api_v1_brain_counters_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/cycles/{cycle_key}/recap": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_cycle_recap_api_v1_brain_cycles__cycle_key__recap_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:cycle_key"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/cycles/{cycle_key}/recompute": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "post_brain_recompute_api_v1_brain_cycles__cycle_key__recompute_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:cycle_key"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/directions/{slug}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_direction_api_v1_brain_directions__slug__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/directions/{slug}/manual": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "manual_direction_write_api_v1_brain_directions__slug__manual_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/directions/{slug}/proposed": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_proposed_direction_api_v1_brain_directions__slug__proposed_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/drift": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_drift_api_v1_brain_drift_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/drift/{signal_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_drift_signal_api_v1_brain_drift__signal_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:signal_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "patch_brain_drift_signal_api_v1_brain_drift__signal_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:signal_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/events": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_events_api_v1_brain_events_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/findings": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_findings_api_v1_brain_findings_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/findings/{finding_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_finding_api_v1_brain_findings__finding_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:finding_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "patch_brain_finding_api_v1_brain_findings__finding_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:finding_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/findings/{finding_id}/apply": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "apply_brain_finding_api_v1_brain_findings__finding_id__apply_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:finding_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/findings/{finding_id}/approve": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "approve_direction_finding_api_v1_brain_findings__finding_id__approve_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:finding_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/findings/{finding_id}/edit": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "edit_direction_finding_api_v1_brain_findings__finding_id__edit_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:finding_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/findings/{finding_id}/promote-to-task": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "promote_finding_to_task_api_v1_brain_findings__finding_id__promote_to_task_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:finding_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/findings/{finding_id}/reject": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "reject_direction_finding_api_v1_brain_findings__finding_id__reject_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:finding_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/findings:bulk": {
+      "patch": {
+        "deprecated": false,
+        "operation_id": "patch_brain_findings_bulk_api_v1_brain_findings_bulk_patch",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/journal": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_journal_api_v1_brain_journal_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/journal/polish-pending": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "polish_pending_journal_entries_api_v1_brain_journal_polish_pending_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/memory-operations": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_memory_operations_api_v1_brain_memory_operations_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/memory-operations/{operation_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_memory_operation_api_v1_brain_memory_operations__operation_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:operation_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "patch_brain_memory_operation_api_v1_brain_memory_operations__operation_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:operation_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/memory-operations/{operation_id}/apply": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "apply_brain_memory_operation_api_v1_brain_memory_operations__operation_id__apply_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:operation_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/run": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "post_brain_run_api_v1_brain_run_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "202"
+        ]
+      }
+    },
+    "/api/v1/brain/runs": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_runs_api_v1_brain_runs_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/runs/{run_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_brain_run_api_v1_brain_runs__run_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:run_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/runs/{run_id}/discard": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "post_brain_run_discard_api_v1_brain_runs__run_id__discard_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:run_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/runs/{run_id}/promote": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "post_brain_run_promote_api_v1_brain_runs__run_id__promote_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:run_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/brain/watermarks/reset": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "post_brain_watermarks_reset_api_v1_brain_watermarks_reset_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ci-checks": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_ci_checks_api_v1_ci_checks_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ci-checks/summary": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "ci_checks_summary_api_v1_ci_checks_summary_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ci-checks/{check_id}/retry": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "retry_ci_check_api_v1_ci_checks__check_id__retry_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:check_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/comments": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_comments_api_v1_comments_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:target_id",
+          "query:target_type"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_comment_api_v1_comments_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/comments/{comment_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_comment_api_v1_comments__comment_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:comment_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_comment_api_v1_comments__comment_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:comment_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/comments/{comment_id}/reactions": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "add_reaction_api_v1_comments__comment_id__reactions_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:comment_id"
+        ],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/comments/{comment_id}/reactions/{reaction}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "remove_reaction_api_v1_comments__comment_id__reactions__reaction__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:comment_id",
+          "path:reaction"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/costs/billing/{slug}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_project_billing_api_v1_costs_billing__slug__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/costs/by-project/{slug}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_project_costs_api_v1_costs_by_project__slug__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/costs/summary": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_costs_summary_api_v1_costs_summary_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/delegations": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_delegations_api_v1_delegations_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_delegation_api_v1_delegations_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/delegations/{delegation_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "revoke_delegation_api_v1_delegations__delegation_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:delegation_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/docs/coverage": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "docs_coverage_api_v1_docs_coverage_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:layer"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/docs_governance/triage": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "triage_docs_api_v1_docs_governance_triage_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/documents": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_documents_api_v1_documents_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/documents/batch-decay": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "batch_decay_api_v1_documents_batch_decay_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/documents/{doc_id}/archive": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "archive_document_api_v1_documents__doc_id__archive_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:doc_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/documents/{doc_id}/boost": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "boost_document_api_v1_documents__doc_id__boost_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:doc_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/documents/{doc_id}/salience": {
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_salience_api_v1_documents__doc_id__salience_patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:doc_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/finder/download": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "download_file_api_v1_finder_download_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:path"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/finder/file": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "read_file_api_v1_finder_file_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:path"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/finder/list": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_directory_api_v1_finder_list_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/finder/pins": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_pins_api_v1_finder_pins_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "add_pin_api_v1_finder_pins_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/finder/pins/{pin_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "remove_pin_api_v1_finder_pins__pin_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:pin_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/finder/share": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_share_link_legacy_api_v1_finder_share_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/finder/share/{token}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "revoke_share_legacy_api_v1_finder_share__token__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:token"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/finder/shares": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_shares_legacy_api_v1_finder_shares_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/finder/tree": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_tree_api_v1_finder_tree_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/branches": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_branches_api_v1_graph_branches_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/capabilities": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_capabilities_api_v1_graph_capabilities_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/graph/codex-functions": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_codex_functions_api_v1_graph_codex_functions_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:module"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/codex-modules": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_codex_modules_api_v1_graph_codex_modules_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/conflicts": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_conflicts_api_v1_graph_conflicts_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:pr_ids"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/context/{node_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_context_endpoint_api_v1_graph_context__node_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:node_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/cosmo": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_cosmo_api_v1_graph_cosmo_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/graph/edges/supersede": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "mark_edge_superseded_api_v1_graph_edges_supersede_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/function-share/{qualified_name}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "share_function_endpoint_api_v1_graph_function_share__qualified_name__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:qualified_name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/hotspots": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_hotspots_api_v1_graph_hotspots_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/impact/{node_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_impact_endpoint_api_v1_graph_impact__node_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:node_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/landing": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_landing_api_v1_graph_landing_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/graph/neighbors/{node_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_neighbors_api_v1_graph_neighbors__node_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:node_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/nodes/verify": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "mark_node_verified_api_v1_graph_nodes_verify_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/orphans": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_orphans_api_v1_graph_orphans_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:scope"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/overview": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_overview_api_v1_graph_overview_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:level"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/pattern": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_pattern_endpoint_api_v1_graph_pattern_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:scope"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/pins": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_graph_pins_api_v1_graph_pins_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_graph_pin_api_v1_graph_pins_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/pins/{node_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_graph_pin_api_v1_graph_pins__node_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:node_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/pr-impact/{pr_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_pr_impact_api_v1_graph_pr_impact__pr_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:pr_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/resolve": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_resolve_api_v1_graph_resolve_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:path"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/graph/semantic-modules": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "graph_semantic_modules_api_v1_graph_semantic_modules_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/gui/events/first-value": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "post_gui_first_value_api_v1_gui_events_first_value_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/handoffs/reindex": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "reindex_handoffs_api_v1_handoffs_reindex_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:project"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/handoffs/search": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "search_handoffs_api_v1_handoffs_search_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/handoffs/{project_slug}/{filename}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_handoff_api_v1_handoffs__project_slug___filename__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:filename",
+          "path:project_slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "health_api_v1_health_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/inbox/digest/current": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_current_digest_items_api_v1_inbox_digest_current_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/digest/overflow": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_current_digest_overflow_api_v1_inbox_digest_overflow_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/digest/recompute": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "recompute_digest_api_v1_inbox_digest_recompute_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/inbox/digest/stats": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_current_digest_stats_api_v1_inbox_digest_stats_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/inbox/gmail-sync/candidates": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_gmail_sync_candidates_api_v1_inbox_gmail_sync_candidates_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/gmail-sync/{inbox_item_id}/complete": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "complete_gmail_sync_api_v1_inbox_gmail_sync__inbox_item_id__complete_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:inbox_item_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/ingest": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "ingest_inbox_item_api_v1_inbox_ingest_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/ingest/batch": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "ingest_inbox_items_batch_api_v1_inbox_ingest_batch_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/items": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_inbox_items_api_v1_inbox_items_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/items/unread-count": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_inbox_unread_count_api_v1_inbox_items_unread_count_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/inbox/items/{inbox_item_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_inbox_item_api_v1_inbox_items__inbox_item_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:inbox_item_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/items/{inbox_item_id}/decision": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "submit_inbox_decision_api_v1_inbox_items__inbox_item_id__decision_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:inbox_item_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/items/{inbox_item_id}/deep-research": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "generate_inbox_deep_research_api_v1_inbox_items__inbox_item_id__deep_research_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:inbox_item_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/items/{inbox_item_id}/status": {
+      "patch": {
+        "deprecated": false,
+        "operation_id": "patch_inbox_status_api_v1_inbox_items__inbox_item_id__status_patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:inbox_item_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/items/{inbox_item_id}/taxonomy": {
+      "patch": {
+        "deprecated": false,
+        "operation_id": "patch_inbox_taxonomy_api_v1_inbox_items__inbox_item_id__taxonomy_patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:inbox_item_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/items/{inbox_item_id}/tldr": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "generate_inbox_tldr_api_v1_inbox_items__inbox_item_id__tldr_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:inbox_item_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/reclassify": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "reclassify_inbox_items_api_v1_inbox_reclassify_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/source-scores": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_source_scores_route_api_v1_inbox_source_scores_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/inbox/sources": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_inbox_sources_api_v1_inbox_sources_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_inbox_source_api_v1_inbox_sources_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/sources/{source_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_inbox_source_api_v1_inbox_sources__source_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:source_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      },
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_inbox_source_api_v1_inbox_sources__source_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:source_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_inbox_source_api_v1_inbox_sources__source_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:source_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/sources/{source_id}/metrics": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_inbox_source_metrics_endpoint_api_v1_inbox_sources__source_id__metrics_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:source_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/inbox/stats": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_inbox_stats_route_api_v1_inbox_stats_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "ingest_unified_api_v1_ingest_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest/counters": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_triage_counters_api_v1_ingest_counters_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest/history": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_ingest_history_api_v1_ingest_history_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest/keys": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_ingest_keys_api_v1_ingest_keys_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_ingest_key_api_v1_ingest_keys_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest/keys/{key_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "revoke_ingest_key_api_v1_ingest_keys__key_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:key_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest/pending": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_pending_ingest_api_v1_ingest_pending_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest/pending/{ingest_id}/preview.{ext}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "preview_ingest_api_v1_ingest_pending__ingest_id__preview__ext__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:ext",
+          "path:ingest_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest/preflight": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "preflight_ingest_api_v1_ingest_preflight_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:project_slug",
+          "query:sha256"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest/skipped": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_ingest_skipped_api_v1_ingest_skipped_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/ingest/webhook": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "ingest_signed_webhook_api_v1_ingest_webhook_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "202"
+        ]
+      }
+    },
+    "/api/v1/judge": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "judge_proposal_api_v1_judge_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/kg/edges/manual": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_manual_project_edge_api_v1_kg_edges_manual_delete",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "upsert_manual_project_edge_api_v1_kg_edges_manual_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/kg/rebuild": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "trigger_rebuild_api_v1_kg_rebuild_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/kg/reindex_path": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "reindex_path_api_v1_kg_reindex_path_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/kg/watcher_control": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "watcher_control_api_v1_kg_watcher_control_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/learnings": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_learnings_api_v1_learnings_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_learning_api_v1_learnings_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/learnings/check": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "check_learnings_api_v1_learnings_check_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:q"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/learnings/{learning_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_learning_api_v1_learnings__learning_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:learning_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      },
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_learning_api_v1_learnings__learning_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:learning_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_learning_api_v1_learnings__learning_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:learning_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/learnings/{learning_id}/bump": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "bump_learning_api_v1_learnings__learning_id__bump_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:learning_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/learnings/{learning_id}/history": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_learning_history_api_v1_learnings__learning_id__history_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:learning_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/llm-config": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_llm_config_api_v1_llm_config_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/llm-config/provider-keys": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_provider_keys_api_v1_llm_config_provider_keys_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_provider_key_api_v1_llm_config_provider_keys_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/llm-config/provider-keys/{key_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_provider_key_api_v1_llm_config_provider_keys__key_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:key_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/llm-config/status": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_llm_status_api_v1_llm_config_status_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/llm-config/{function_name}": {
+      "put": {
+        "deprecated": false,
+        "operation_id": "put_llm_config_api_v1_llm_config__function_name__put",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:function_name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/monitoring/current": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_current_api_v1_monitoring_current_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/monitoring/disk-tree": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_disk_tree_api_v1_monitoring_disk_tree_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/monitoring/history": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_history_api_v1_monitoring_history_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:metric"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/monitoring/security": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_security_api_v1_monitoring_security_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/monitoring/version": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_version_api_v1_monitoring_version_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/newsletter/compose": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_compose_api_v1_newsletter_compose_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/newsletter/editions": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_newsletter_editions_api_v1_newsletter_editions_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/newsletter/editions/{edition_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_newsletter_edition_api_v1_newsletter_editions__edition_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:edition_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/newsletter/preview": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "post_preview_api_v1_newsletter_preview_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/newsletter/recipients": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_recipients_api_v1_newsletter_recipients_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_recipient_api_v1_newsletter_recipients_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/newsletter/recipients/{recipient_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_recipient_api_v1_newsletter_recipients__recipient_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:recipient_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/newsletter/send": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "post_send_api_v1_newsletter_send_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/notifications": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_notifications_api_v1_notifications_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/notifications/mark-all-read": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "mark_all_read_api_v1_notifications_mark_all_read_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/notifications/unread-count": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "unread_count_api_v1_notifications_unread_count_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/notifications/{notification_id}/acted": {
+      "patch": {
+        "deprecated": false,
+        "operation_id": "mark_acted_api_v1_notifications__notification_id__acted_patch",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:notification_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/notifications/{notification_id}/read": {
+      "patch": {
+        "deprecated": false,
+        "operation_id": "mark_read_api_v1_notifications__notification_id__read_patch",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:notification_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/onboarding/demo": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "teardown_demo_api_v1_onboarding_demo_delete",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "seed_demo_api_v1_onboarding_demo_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/onboarding/scan": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "scan_workdir_api_v1_onboarding_scan_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/onboarding/setup": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "read_setup_api_v1_onboarding_setup_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "put": {
+        "deprecated": false,
+        "operation_id": "write_setup_api_v1_onboarding_setup_put",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_programs_api_v1_projects_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_project_api_v1_projects_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_project_api_v1_projects__slug__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "patch_project_api_v1_projects__slug__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/brief": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_session_brief_api_v1_projects__slug__brief_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/files/{file_path}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "read_file_api_v1_projects__slug__files__file_path__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:file_path",
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/git/branches": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_git_branches_api_v1_projects__slug__git_branches_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/git/commit/{commit_hash}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_commit_detail_api_v1_projects__slug__git_commit__commit_hash__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:commit_hash",
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/git/diff": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_git_diff_api_v1_projects__slug__git_diff_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/git/graph": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_git_graph_api_v1_projects__slug__git_graph_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/git/log": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_git_log_api_v1_projects__slug__git_log_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/handoffs": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_handoffs_api_v1_projects__slug__handoffs_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/plans": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_plans_api_v1_projects__slug__plans_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/raci": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_raci_api_v1_projects__slug__raci_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "add_raci_entry_api_v1_projects__slug__raci_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      },
+      "put": {
+        "deprecated": false,
+        "operation_id": "replace_raci_api_v1_projects__slug__raci_put",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/raci/{user_id}/{role}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "remove_raci_entry_api_v1_projects__slug__raci__user_id___role__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:role",
+          "path:slug",
+          "path:user_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/status-updates": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_project_status_updates_feed_api_v1_projects__slug__status_updates_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_project_status_update_feed_api_v1_projects__slug__status_updates_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/merge-conflicts": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_merge_conflicts_api_v1_pull_requests_merge_conflicts_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:project"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/{task_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_pull_request_api_v1_pull_requests__task_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_pull_request_api_v1_pull_requests__task_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/{task_id}/approve": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "approve_pull_request_api_v1_pull_requests__task_id__approve_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/{task_id}/branch": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_branch_api_v1_pull_requests__task_id__branch_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/{task_id}/close": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "close_pull_request_api_v1_pull_requests__task_id__close_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/{task_id}/merge": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "merge_pull_request_api_v1_pull_requests__task_id__merge_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/{task_id}/register": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "register_branch_api_v1_pull_requests__task_id__register_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/{task_id}/request-changes": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "request_pr_changes_api_v1_pull_requests__task_id__request_changes_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/{task_id}/revert": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "revert_pull_request_api_v1_pull_requests__task_id__revert_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/pull_requests/{task_id}/submit": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "submit_pull_request_api_v1_pull_requests__task_id__submit_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/push-subscriptions": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "unsubscribe_api_v1_push_subscriptions_delete",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "subscribe_api_v1_push_subscriptions_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/reddit/metrics": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_metrics_api_v1_reddit_metrics_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/reddit/queue": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_queue_api_v1_reddit_queue_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/reddit/queue/{draft_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_queue_item_api_v1_reddit_queue__draft_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:draft_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/reddit/queue/{draft_id}/approve": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "approve_draft_api_v1_reddit_queue__draft_id__approve_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:draft_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/reddit/queue/{draft_id}/edit": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "edit_draft_api_v1_reddit_queue__draft_id__edit_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:draft_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/reddit/queue/{draft_id}/reject": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "reject_draft_api_v1_reddit_queue__draft_id__reject_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:draft_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/search": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "search_api_v1_search_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "query:q"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/search/reindex": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "trigger_reindex_api_v1_search_reindex_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/search/reindex-paths": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "trigger_reindex_paths_api_v1_search_reindex_paths_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_sessions_api_v1_sessions_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_session_api_v1_sessions_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/by-name/{name}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_session_by_name_api_v1_sessions_by_name__name__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/by-uuid/{session_uuid}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_session_by_uuid_api_v1_sessions_by_uuid__session_uuid__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:session_uuid"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/catalog": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_session_catalog_api_v1_sessions_catalog_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/sessions/reorder": {
+      "put": {
+        "deprecated": false,
+        "operation_id": "reorder_sessions_api_v1_sessions_reorder_put",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{identifier}/state": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "update_session_state_api_v1_sessions__identifier__state_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:identifier"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{name}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_session_api_v1_sessions__name__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_session_api_v1_sessions__name__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{name}/complete": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "complete_session_api_v1_sessions__name__complete_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{name}/conversation": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_session_conversation_api_v1_sessions__name__conversation_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{name}/hibernate": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "hibernate_session_api_v1_sessions__name__hibernate_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{name}/metrics": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_session_metrics_api_v1_sessions__name__metrics_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{name}/restart": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "restart_session_api_v1_sessions__name__restart_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{name}/resume": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "resume_session_api_v1_sessions__name__resume_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{name}/resurrect": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "resurrect_session_api_v1_sessions__name__resurrect_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/sessions/{name}/send-message": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "send_message_to_session_api_v1_sessions__name__send_message_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:name"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/settings/project-dirs": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_project_dirs_api_v1_settings_project_dirs_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "put": {
+        "deprecated": false,
+        "operation_id": "update_project_dirs_api_v1_settings_project_dirs_put",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/share": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_share_link_api_v1_share_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/share-repo": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_repo_share_link_api_v1_share_repo_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/share/{token}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "revoke_share_api_v1_share__token__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:token"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/shared-repo/{token}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "access_shared_repo_file_api_v1_shared_repo__token__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:token"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/shared/{token}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "access_shared_file_api_v1_shared__token__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:token"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "put": {
+        "deprecated": false,
+        "operation_id": "save_shared_file_api_v1_shared__token__put",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:token"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/shares": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_shares_api_v1_shares_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/status-updates": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_status_updates_api_v1_status_updates_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_status_update_api_v1_status_updates_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/status-updates/overdue": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_overdue_projects_api_v1_status_updates_overdue_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/tags": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_tags_api_v1_tags_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/tasks": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_tasks_api_v1_tasks_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_task_api_v1_tasks_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/tasks/bulk-reject": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "bulk_reject_tasks_api_v1_tasks_bulk_reject_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/tasks/projects": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_task_projects_api_v1_tasks_projects_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/tasks/reminders/check": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "trigger_reminder_check_api_v1_tasks_reminders_check_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/tasks/stale-reset": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "reset_stale_tasks_api_v1_tasks_stale_reset_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/tasks/summary": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_tasks_summary_api_v1_tasks_summary_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/tasks/zombie-scan": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "zombie_scan_api_v1_tasks_zombie_scan_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/tasks/{task_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_task_api_v1_tasks__task_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      },
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_task_api_v1_tasks__task_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_task_api_v1_tasks__task_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/tasks/{task_id}/cost-entries": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_task_cost_entries_api_v1_tasks__task_id__cost_entries_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_human_cost_entry_api_v1_tasks__task_id__cost_entries_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:task_id"
+        ],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/teams": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_teams_api_v1_teams_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_team_api_v1_teams_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/teams/{team_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_team_api_v1_teams__team_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:team_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_team_api_v1_teams__team_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:team_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/teams/{team_id}/members": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_team_members_api_v1_teams__team_id__members_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:team_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "add_team_member_api_v1_teams__team_id__members_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:team_id"
+        ],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/teams/{team_id}/members/{user_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "remove_team_member_api_v1_teams__team_id__members__user_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:team_id",
+          "path:user_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/teams/{team_id}/projects": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_team_projects_api_v1_teams__team_id__projects_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:team_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "assign_team_project_api_v1_teams__team_id__projects_post",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:team_id"
+        ],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/teams/{team_id}/projects/{slug}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "remove_team_project_api_v1_teams__team_id__projects__slug__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:slug",
+          "path:team_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/terminal/metrics": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "terminal_metrics_snapshot_api_v1_terminal_metrics_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/api/v1/terminal/metrics-batch": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "terminal_metrics_batch_api_v1_terminal_metrics_batch_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/terminal/network-probe": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "terminal_network_probe_api_v1_terminal_network_probe_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/terminal/ticket": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "get_terminal_ticket_api_v1_terminal_ticket_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/todos": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_todos_api_v1_todos_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_todo_api_v1_todos_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/todos/{todo_id}": {
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_todo_api_v1_todos__todo_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:todo_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/todos/{todo_id}/delegate": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "delegate_todo_api_v1_todos__todo_id__delegate_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:todo_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/users": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "list_users_api_v1_users_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_user_api_v1_users_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "201",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/users/{user_id}": {
+      "delete": {
+        "deprecated": false,
+        "operation_id": "delete_user_api_v1_users__user_id__delete",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:user_id"
+        ],
+        "response_codes": [
+          "204",
+          "422"
+        ]
+      },
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_user_api_v1_users__user_id__get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:user_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      },
+      "patch": {
+        "deprecated": false,
+        "operation_id": "update_user_api_v1_users__user_id__patch",
+        "request_body_required": true,
+        "required_parameters": [
+          "path:user_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/users/{user_id}/raci": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_user_raci_api_v1_users__user_id__raci_get",
+        "request_body_required": false,
+        "required_parameters": [
+          "path:user_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/webhooks/ci": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "ci_webhook_api_v1_webhooks_ci_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "202"
+        ]
+      }
+    },
+    "/api/v1/webhooks/git/pr-pushed": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "pr_pushed_webhook_api_v1_webhooks_git_pr_pushed_post",
+        "request_body_required": false,
+        "required_parameters": [
+          "header:X-GitHub-Delivery"
+        ],
+        "response_codes": [
+          "202",
+          "422"
+        ]
+      }
+    },
+    "/api/v1/webhooks/github": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "github_webhook_api_v1_webhooks_github_post",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "202"
+        ]
+      }
+    },
+    "/bench/run": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "run_bench_bench_run_post",
+        "request_body_required": true,
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "health_check_health_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    },
+    "/health/ocr": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "health_ocr_health_ocr_get",
+        "request_body_required": false,
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ]
+      }
+    }
+  },
+  "path_count": 280,
+  "schema": "marvis-compatibility-fixture/v1",
+  "source_openapi_sha256": "0bdc79eceecc90e60f5f705afb7b698561ef1c15d13ecdd18ca013e84a9bfef8",
+  "source_ref": "5ccdd41d16e511fb22f7f25329c683ba3268f1a2"
+}

@@ -25,6 +25,7 @@ TMUX_HISTORY_LIMIT = 10_000
 SYSTEMD_RUN_BIN = "/usr/bin/systemd-run"
 TMUX_BIN = "/usr/bin/tmux"
 TMUX_PROXY_BIN = "/data/pir/tmux-proxy"
+AGENT_SESSION_SLICE = os.environ.get("MARVIS_AGENT_SESSION_SLICE", "agents.slice")
 MARVISX_TMUX_TMPDIR_NAME = "marvisx-tmux"
 RUNTIME_HOME = os.environ.get("MARVIS_RUNTIME_HOME", os.path.expanduser("~"))
 RUNTIME_PATH = (
@@ -277,10 +278,13 @@ def _scoped_tmux_new_session_command(*args: str) -> tuple[str, ...]:
     tmpdir = _marvisx_tmux_tmpdir()
     return (
         SYSTEMD_RUN_BIN,
-        "--user",
         "--scope",
         "--quiet",
         "--collect",
+        f"--slice={AGENT_SESSION_SLICE}",
+        "--property=OOMPolicy=kill",
+        "--property=MemorySwapMax=0",
+        "--property=CPUWeight=40",
         f"--setenv=HOME={RUNTIME_HOME}",
         f"--setenv=PATH={RUNTIME_PATH}",
         "--setenv=SHELL=/bin/bash",
@@ -1175,6 +1179,34 @@ async def get_cli_pid(
 
 # Backward-compatible alias
 get_claude_pid = get_cli_pid
+
+
+async def get_process_metrics(pid: int) -> tuple[float, float] | None:
+    """Return normalized CPU percent and RSS KiB for one already-owned PID."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        cpu_count = max(1, os.cpu_count() or 1)
+        proc = await asyncio.create_subprocess_exec(
+            "ps",
+            "-p",
+            str(pid),
+            "-o",
+            "%cpu=,rss=",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=SUBPROCESS_TIMEOUT
+        )
+        if proc.returncode != 0:
+            return None
+        parts = stdout.decode().strip().split()
+        if len(parts) < 2:
+            return None
+        return float(parts[0]) / cpu_count, float(parts[1])
+    except (asyncio.TimeoutError, OSError, ValueError):
+        return None
 
 
 async def get_all_process_metrics() -> dict[int, tuple[float, float]]:

@@ -10,8 +10,6 @@ from typing import Literal
 
 import aiosqlite
 
-from core.api.config import settings
-
 logger = logging.getLogger(__name__)
 
 # Fallback defaults when billing: block is absent in project.yaml
@@ -52,23 +50,50 @@ def _get_billing_config(project_slug: str) -> dict:
 
 async def _compute_agent_delta(
     db: aiosqlite.Connection,
+    workspace_id: str,
     conversation_id: str,
     current_snapshot: float,
 ) -> float:
     """
     Compute cost delta for this conversation.
     current_snapshot = session_costs.cost_usd (current cumulative value).
-    Delta = snapshot - sum(previous cost_usd_delta for this conversation).
+    Delta = snapshot - sum(previous cost_usd_delta for this conversation in
+    the same workspace. A conversation is consumed once across that
+    workspace, even if more than one task refers to it.
     """
     cursor = await db.execute(
         """SELECT COALESCE(SUM(cost_usd_delta), 0.0) AS already_tracked
-           FROM task_cost_entries
-           WHERE conversation_id = ? AND entry_type = 'agent'""",
-        (conversation_id,),
+           FROM task_cost_entries tce
+           JOIN tasks t ON t.id = tce.task_id
+           WHERE t.workspace_id = ?
+             AND tce.conversation_id = ?
+             AND tce.entry_type = 'agent'""",
+        (workspace_id, conversation_id),
     )
     row = await cursor.fetchone()
     already_tracked = float(row["already_tracked"]) if row else 0.0
     return max(0.0, current_snapshot - already_tracked)
+
+
+async def _resolve_task_workspace(
+    db: aiosqlite.Connection,
+    task_id: str,
+    project_slug: str,
+) -> str | None:
+    """Return the task's proven workspace, never a default/sentinel."""
+    cursor = await db.execute(
+        "SELECT workspace_id FROM tasks "
+        "WHERE id = ? AND project = ? "
+        "AND workspace_id IS NOT NULL AND length(trim(workspace_id)) > 0",
+        (task_id, project_slug),
+    )
+    rows = await cursor.fetchall()
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    return str(
+        row["workspace_id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
+    )
 
 
 async def create_agent_entry(
@@ -102,14 +127,25 @@ async def create_agent_entry(
     try:
         from core.api.db import write_db
         async with write_db() as db:
+            workspace_id = await _resolve_task_workspace(db, task_id, project_slug)
+            if workspace_id is None:
+                return {"skipped": True, "reason": "task workspace not found"}
             cursor = await db.execute(
-                "SELECT cost_usd FROM session_costs WHERE conversation_id = ?",
-                (conversation_id,),
+                "SELECT cost_usd FROM session_costs "
+                "WHERE workspace_id = ? AND conversation_id = ?",
+                (workspace_id, conversation_id),
             )
             row = await cursor.fetchone()
-            current_snapshot = float(row["cost_usd"]) if row else 0.0
+            if row is None:
+                return {"skipped": True, "reason": "session cost not found"}
+            current_snapshot = float(row["cost_usd"])
 
-            delta = await _compute_agent_delta(db, conversation_id, current_snapshot)
+            delta = await _compute_agent_delta(
+                db,
+                workspace_id,
+                conversation_id,
+                current_snapshot,
+            )
             if delta <= 0.001:
                 return {"skipped": True, "reason": "delta too small", "delta": delta}
 

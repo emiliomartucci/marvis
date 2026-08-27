@@ -6,14 +6,9 @@ import { AuthProvider, useAuth } from "@/lib/auth";
 import { useRouter } from "next/navigation";
 import { Suspense, useCallback, useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
-import { NotificationBell } from "@/components/notifications/NotificationBell";
-import { ActionViewIcon } from "@/components/inbox/ActionViewIcon";
-import { ActionViewModal } from "@/components/inbox/ActionViewModal";
-import { useActionView } from "@/hooks/useActionView";
 import { Logo } from "@/components/ui/Logo";
 import { ThemeToggle } from "@/components/ui/ThemeToggle";
 import { DesignV2Toggle } from "@/components/ui/DesignV2Toggle";
-import { GlobalSearch } from "@/components/GlobalSearch";
 import { PwaInstallButton } from "@/components/PwaInstallButton";
 import ProjectNavigator from "@/components/projects/local/ProjectNavigator";
 import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
@@ -135,46 +130,15 @@ interface PackageNavItem {
   children?: PackageChild[];
 }
 
+// Console slim (Fase 2): terminal-only surface. Everything else lives on
+// Marvis hosted (MCP). Retired product surfaces have no backend routes here.
 const PACKAGES: PackageNavItem[] = [
   { href: "/terminal/", label: "Terminal" },
-  { href: "/projects/", label: "Projects" },
-  { href: "/triage/", label: "Triage" },
-  {
-    href: "/brain/",
-    label: "Brain",
-    children: [
-      { href: "/brain/", label: "Oggi" },
-      { href: "/brain/diario/", label: "Diario" },
-      { href: "/brain/stride/", label: "Stride" },
-      { href: "/brain/memoria/", label: "Memoria" },
-      { href: "/brain/da-decidere/", label: "Da decidere" },
-      { href: "/brain/cronologia/", label: "Cronologia" },
-    ],
-  },
-  {
-    href: "/inbox/",
-    label: "Inbox",
-    children: [
-      { href: "/inbox/", label: "RSS" },
-      { href: "/inbox/triage/files/", label: "Ingester" },
-    ],
-  },
-  // SaaS-only nav: excluded from the OSS mirror; hosted/prod enables via env.
-  ...(process.env.NEXT_PUBLIC_ENABLE_SAAS === "true"
-    ? [
-        { href: "/newsletter/", label: "Newsletter" },
-        { href: "/automations/", label: "Automations" },
-        { href: "/reddit/", label: "Reddit" },
-      ]
-    : []),
   { href: "/monitoring/", label: "Monitoring" },
   { href: "/finder/", label: "Finder" },
-  ...(process.env.NEXT_PUBLIC_ENABLE_GRAPH_UX === "true"
-    ? [{ href: "/graph/", label: "Graph" }]
-    : []),
 ];
 
-type LocalNavKey = "diario" | "todos" | "task" | "projects" | "universe";
+type LocalNavKey = "diario" | "todos" | "task";
 
 interface LocalNavItem {
   key: LocalNavKey;
@@ -185,8 +149,6 @@ const LOCAL_NAV: LocalNavItem[] = [
   { key: "diario", href: "/diario/" },
   { key: "todos", href: "/todos/" },
   { key: "task", href: "/tasks/" },
-  { key: "projects", href: "/projects/" },
-  { key: "universe", href: "/universe/" },
 ];
 
 interface MonitoringVersion {
@@ -200,17 +162,9 @@ function isLocalMode(): boolean {
   return value === "1" || value === "true";
 }
 
-/** Labels visibili solo a admin/super_admin (RBAC gate nav).
- *
- * Operator/viewer vedono solo Terminal/Projects/Triage/Inbox/Finder/Graph —
- * gli items qui sotto sono internal-only e vengono filtrati dal render in
- * TopbarV1 + TopbarV2. Introdotto 2026-05-13 per demo Gridfield. */
-const ADMIN_ONLY_LABELS: ReadonlySet<string> = new Set([
-  "Newsletter",
-  "Automations",
-  "Reddit",
-  "Monitoring",
-]);
+/** Labels visibili solo a admin/super_admin (RBAC gate nav), filtrate dal
+ * render in TopbarV1 + TopbarV2. Introdotto 2026-05-13 per demo Gridfield. */
+const ADMIN_ONLY_LABELS: ReadonlySet<string> = new Set(["Monitoring"]);
 
 function isAdminRole(role: string | null | undefined): boolean {
   return role === "super_admin" || role === "admin";
@@ -267,7 +221,6 @@ interface TopbarV1Props {
   sidebar?: ReactNode;
   mobileSidebarOpen: boolean;
   setMobileSidebarOpen: (v: boolean) => void;
-  actionView: ReturnType<typeof useActionView>;
   permissions: { canAdmin: boolean };
   logout: () => void;
 }
@@ -277,7 +230,6 @@ function TopbarV1({
   sidebar,
   mobileSidebarOpen,
   setMobileSidebarOpen,
-  actionView,
   permissions,
   logout,
 }: TopbarV1Props) {
@@ -355,19 +307,9 @@ function TopbarV1({
           })}
         </div>
 
-        <div className="ml-4">
-          <GlobalSearch />
-        </div>
-
         <div className="ml-auto flex items-center gap-1">
           <DesignV2Toggle />
           <ThemeToggle />
-          <ActionViewIcon
-            unreadCount={actionView.unreadCount}
-            onClick={actionView.openModal}
-            isOpen={actionView.isOpen}
-          />
-          <NotificationBell />
           <PwaInstallButton />
           {permissions.canAdmin && (
             <Link
@@ -415,7 +357,6 @@ function TopbarV2Inner({
   sidebar,
   mobileSidebarOpen,
   setMobileSidebarOpen,
-  actionView,
   permissions,
   logout,
   visiblePackages,
@@ -424,7 +365,6 @@ function TopbarV2Inner({
   // the badge is omitted entirely (we never render a "0" counter).
   const [terminalSessionCount, setTerminalSessionCount] = useState<number | null>(null);
   const triageCount: number | null = null; // no hook today; future: triage unread
-  const inboxUnread = actionView.unreadCount > 0 ? actionView.unreadCount : null;
 
   useEffect(() => {
     function handleSessionCountChanged(event: Event) {
@@ -485,7 +425,6 @@ function TopbarV2Inner({
           let count: number | null = null;
           if (pkg.label === "Terminal") count = terminalSessionCount;
           else if (pkg.label === "Triage") count = triageCount;
-          else if (pkg.label === "Inbox") count = inboxUnread;
           return (
             <div key={pkg.href} className="group relative flex items-stretch">
               <Link
@@ -566,55 +505,10 @@ function TopbarV2Inner({
         })}
       </div>
 
-      {/* Utils cluster — 30x30 IconBtns, search/theme/actionview/bell + admin + logout */}
+      {/* Utils cluster — 30x30 IconBtns, theme + admin + logout */}
       <div className="flex items-center gap-1 pr-2.5">
-        <GlobalSearch />
         <DesignV2Toggle />
         <ThemeToggle />
-        {/* ActionView v2-styled wrapper — keeps hook wiring, adjusts geometry */}
-        <button
-          onClick={actionView.openModal}
-          className={`relative inline-flex items-center justify-center rounded-sm transition-colors ${
-            actionView.isOpen
-              ? "text-pir-text-primary bg-pir-surface-1"
-              : "text-pir-text-tertiary hover:text-pir-text-primary hover:bg-pir-surface-1"
-          }`}
-          style={{ width: 30, height: 30 }}
-          aria-label={`Action view${
-            actionView.unreadCount > 0 ? ` (${actionView.unreadCount} unread)` : ""
-          }`}
-        >
-          <svg
-            width="15"
-            height="15"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-          >
-            <path d="M4 4h16v12H4z" />
-            <path d="m4 4 8 6 8-6" />
-          </svg>
-          {actionView.unreadCount > 0 && (
-            <span
-              className="absolute bg-pir-accent font-mono font-bold text-center"
-              style={{
-                top: 4,
-                right: 4,
-                minWidth: 14,
-                height: 14,
-                padding: "0 3px",
-                borderRadius: 7,
-                color: "hsl(var(--pir-bone, 34 28% 88%))",
-                fontSize: 9,
-                lineHeight: "14px",
-              }}
-            >
-              {actionView.unreadCount > 99 ? "99+" : actionView.unreadCount}
-            </span>
-          )}
-        </button>
-        <NotificationBell />
         <PwaInstallButton />
         {permissions.canAdmin && (
           <Link
@@ -653,8 +547,6 @@ function TopbarV2Inner({
 function localRouteKey(pathname: string): LocalNavKey {
   if (isNavHrefActive(pathname, "/todos/")) return "todos";
   if (isNavHrefActive(pathname, "/tasks/")) return "task";
-  if (isNavHrefActive(pathname, "/projects/")) return "projects";
-  if (isNavHrefActive(pathname, "/universe/")) return "universe";
   return "diario";
 }
 
@@ -745,8 +637,6 @@ function LocalSidebar({
     diario: t.appShell.nav.diario,
     todos: t.appShell.nav.todos,
     task: t.appShell.nav.task,
-    projects: t.appShell.nav.projects,
-    universe: t.appShell.nav.universe,
   };
 
   return (
@@ -760,7 +650,7 @@ function LocalSidebar({
             "CONSOLE". logo-lockup.svg is the OLD "marvisx · CONSOLE PIR"
             brand and embeds its own bot, which doubled the mark in the beta. */}
         <Link
-          href="/brain/diario/"
+          href="/diario/"
           className="flex items-center gap-2.5 text-pir-text-primary transition-opacity hover:opacity-80"
           aria-label={t.appShell.logoAlt}
         >
@@ -1065,7 +955,6 @@ function AppShellContent({ children, sidebar }: AppShellProps) {
   const router = useRouter();
   const pathname = usePathname();
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const actionView = useActionView();
   const v2 = useDesignV2();
 
   useEffect(() => {
@@ -1096,7 +985,6 @@ function AppShellContent({ children, sidebar }: AppShellProps) {
           sidebar={sidebar}
           mobileSidebarOpen={mobileSidebarOpen}
           setMobileSidebarOpen={setMobileSidebarOpen}
-          actionView={actionView}
           permissions={permissions}
           logout={logout}
         />
@@ -1106,7 +994,6 @@ function AppShellContent({ children, sidebar }: AppShellProps) {
           sidebar={sidebar}
           mobileSidebarOpen={mobileSidebarOpen}
           setMobileSidebarOpen={setMobileSidebarOpen}
-          actionView={actionView}
           permissions={permissions}
           logout={logout}
         />
@@ -1143,31 +1030,6 @@ function AppShellContent({ children, sidebar }: AppShellProps) {
         </main>
       </div>
 
-      {/* Action View modal */}
-      {actionView.isOpen && (
-        <ActionViewModal
-          currentItem={actionView.currentItem}
-          currentIndex={actionView.currentIndex}
-          totalItems={actionView.totalItems}
-          isExhausted={actionView.isExhausted}
-          loading={actionView.loading}
-          error={actionView.error}
-          toastMessage={actionView.toastMessage}
-          content={actionView.currentDetail?.content ?? null}
-          tldr={actionView.tldr}
-          tldrLoading={actionView.tldrLoading}
-          deepResearch={actionView.deepResearch}
-          deepResearchLoading={actionView.deepResearchLoading}
-          sourceScores={actionView.sourceScores}
-          onDecide={actionView.decide}
-          onUndo={actionView.undo}
-          onClose={actionView.closeModal}
-          onClearError={actionView.clearError}
-          onRequestTldr={actionView.requestTldr}
-          onRequestDeepResearch={actionView.requestDeepResearch}
-          onSaveInPlace={actionView.saveInPlace}
-        />
-      )}
     </div>
   );
 }

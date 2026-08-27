@@ -30,7 +30,6 @@ import hashlib
 import json
 import logging
 import uuid
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -1250,6 +1249,7 @@ async def emit_finding_dedup(
     program_key: str | None = None,
     approval_state_new: FindingApprovalState = "open",
     expires_at: datetime | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> tuple[str, bool]:
     """Check-then-boost dedup helper for direction_* findings.
 
@@ -1324,12 +1324,13 @@ async def emit_finding_dedup(
             " finding_id, run_id, cycle_key, detected_at, finding_type,"
             " scope_type, scope_key, program_key, title, summary, why_now,"
             " evidence_hash, suggested_artifact, closure_condition_kind,"
+            " closure_condition_json,"
             " severity, confidence, approval_state,"
             " proposal_fingerprint, recurrence_count, first_seen_cycle_key,"
             " last_seen_cycle_key, expires_at,"
             " urgency_score, entity_ref, proposed_payload_json"
             ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual_attest',"
-            " ?, ?, ?, ?, 1, ?, ?, ?, 1, ?, ?)",
+            " ?, ?, ?, ?, ?, 1, ?, ?, ?, 1, ?, ?)",
             (
                 finding_id,
                 run_id,
@@ -1344,6 +1345,19 @@ async def emit_finding_dedup(
                 why_now[:500],
                 ev_hash,
                 suggested_artifact,
+                # ClosureManualAttest requires instruction (10..500 chars);
+                # a kind persisted without its JSON body is unreadable by
+                # _load_closure and surfaces as "legacy closure (parse error)".
+                json.dumps(
+                    {
+                        "kind": "manual_attest",
+                        "instruction": (
+                            "Verify the underlying state, then resolve with"
+                            " attestation or dismiss this finding."
+                        ),
+                    },
+                    sort_keys=True,
+                ),
                 severity,
                 confidence_tier,
                 approval_state_new,
@@ -1361,6 +1375,22 @@ async def emit_finding_dedup(
             ") VALUES (?, ?, NULL, ?, NULL, NULL)",
             (uuid.uuid4().hex, finding_id, approval_state_new),
         )
+
+        # Finding.evidence requires >=1 item (models.brain.Finding): a
+        # finding with 0 brain_finding_evidence rows 500s the strict model
+        # on read/patch. Mirror _persist_findings: derive rows from the
+        # drift-signal refs, falling back to entity_ref so the invariant
+        # always holds.
+        refs = evidence_refs or [entity_ref]
+        for pos, ev in enumerate(refs):
+            kind, ref = _evidence_kind_for(ev)
+            await db.execute(
+                "INSERT OR IGNORE INTO brain_finding_evidence ("
+                " finding_id, position, evidence_kind, evidence_ref,"
+                " weight, cycle_key"
+                ") VALUES (?, ?, ?, ?, 1.0, ?)",
+                (finding_id, pos, kind, ref, cycle_key),
+            )
 
     return (finding_id, True)
 

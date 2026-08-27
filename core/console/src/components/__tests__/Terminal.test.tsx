@@ -4,7 +4,6 @@ import { act, render } from "@testing-library/react";
 const moduleMocks = vi.hoisted(() => ({
   recordCounterSample: vi.fn(),
   recordTerminalDiagnosticEvent: vi.fn(),
-  uploadFile: vi.fn(),
   mockUseTheme: vi.fn(),
 }));
 
@@ -244,9 +243,7 @@ vi.mock("@/lib/ws", () => ({
   ReconnectingTerminalWS: terminalState.MockTerminalWS,
 }));
 
-vi.mock("@/lib/api", () => ({
-  uploadFile: moduleMocks.uploadFile,
-}));
+vi.mock("@/lib/api", () => ({}));
 
 vi.mock("@/lib/terminalDiagnostics", () => ({
   recordCounterSample: moduleMocks.recordCounterSample,
@@ -261,7 +258,6 @@ describe("Terminal", () => {
     vi.clearAllMocks();
     terminalState.reset();
     moduleMocks.mockUseTheme.mockReturnValue({ resolvedTheme: "dark" });
-    moduleMocks.uploadFile.mockResolvedValue({});
 
     Object.defineProperty(document, "hidden", {
       configurable: true,

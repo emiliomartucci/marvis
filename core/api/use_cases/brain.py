@@ -525,6 +525,7 @@ async def list_findings(
     owner_user_id: str | None = None,
     cursor: str | None = None,
     limit: int,
+    backlog: bool = False,
     user: "UserInfo | None" = None,
 ) -> "FindingsListResponse":
     """List Learn findings (any auth caller), with LLM polish applied to items.
@@ -571,6 +572,7 @@ async def list_findings(
         owner_user_id=owner_user_id,
         cursor=cursor,
         limit=limit,
+        backlog=backlog,
         user=user,
         workspace_id=ctx.workspace_id or "ws_default",
     )
@@ -813,6 +815,26 @@ async def list_journal(
         workspace_id=ctx.workspace_id or "ws_default",
         limit=limit,
     )
+    # Brain RBAC (2026-07-03 plan Cross-Review §2): unlike the other readers
+    # (events/drift/findings/memory_ops thread ``user`` into their service),
+    # ``list_entries_for_cycle`` has no visibility param — so filter here. A
+    # non-admin caller sees ONLY project-scoped entries for projects they can
+    # see; the company/program aggregate narrative stays admin-only (mirrors the
+    # write gate). ``user is None`` (admin/bearer/local) keeps the full set.
+    if user is not None:
+        from core.api.db import acquire_db
+        from core.api.visibility import get_visible_projects
+
+        async with acquire_db() as _vis_db:
+            visible = await get_visible_projects(
+                _vis_db, user, ctx.workspace_id or "ws_default"
+            )
+        if visible is not None:
+            entries = [
+                e
+                for e in entries
+                if e.scope_type == "project" and e.scope_key in visible
+            ]
     resolved_cycle = entries[0].cycle_key if entries else (
         cycle_key if cycle_key not in (None, "latest") else None
     )
@@ -824,6 +846,177 @@ async def list_journal(
         cycle_key=resolved_cycle,
         run_id=resolved_run,
         total_returned=len(polished_entries),
+    )
+
+
+async def _authorize_brain_write_scope(
+    user: "UserInfo | None",
+    *,
+    scope_type: str,
+    scope_key: str,
+    involved_projects: list[str] | None = None,
+) -> None:
+    """Gate an agent-native brain write by the caller's project visibility.
+
+    Brain RBAC fix (2026-07-03 plan Cross-Review §1): the agent-native writes
+    (``write_journal_narrative`` / ``write_finding``) previously performed no
+    scope check — any authenticated caller could write the narrative of company
+    or of projects that are not theirs, later read by everyone's LLMs. Gate:
+
+    - ``user is None`` (admin / super_admin / static bearer / local single-user)
+      -> unrestricted, unchanged.
+    - non-admin caller: ``company`` / ``program`` scope is admin-only; ``project``
+      (and each ``involved_projects`` entry, and an ``artifact`` scope's declared
+      projects) must be inside the caller's visible set.
+
+    Raises :class:`AuthorizationError` (403) when the scope is not permitted.
+    """
+    if user is None:
+        return
+    from core.api.db import acquire_db
+    from core.api.use_cases._errors import AuthorizationError
+    from core.api.visibility import get_visible_projects
+
+    async with acquire_db() as _vis_db:
+        visible = await get_visible_projects(_vis_db, user)
+    if visible is None:
+        # admin / super_admin / agent-bypass resolve unrestricted downstream.
+        return
+    if scope_type in ("company", "program"):
+        raise AuthorizationError(
+            code="forbidden_brain_scope",
+            message="company/program brain writes are admin-only",
+        )
+    targets: set[str] = set()
+    if scope_type == "project":
+        targets.add(scope_key)
+    for project in involved_projects or ():
+        if project:
+            targets.add(project)
+    if not targets:
+        # artifact scope with no declared project cannot be attributed to a
+        # visible project -> deny for a non-admin caller (least privilege).
+        raise AuthorizationError(
+            code="forbidden_brain_scope",
+            message="brain write scope not attributable to a visible project",
+        )
+    hidden = targets - visible
+    if hidden:
+        raise AuthorizationError(
+            code="forbidden_brain_scope",
+            message="brain write scope not visible to caller",
+        )
+
+
+async def write_journal_narrative(
+    ctx: CallerContext,
+    *,
+    cycle_key: str,
+    scope_type: str,
+    scope_key: str,
+    narrative: str,
+    user: "UserInfo | None" = None,
+) -> dict[str, Any]:
+    """Agent-native: persist the agent's narrative synthesis onto a journal entry.
+
+    The platform runs no synthesis LLM (decision 2026-07-01-brain-agent-native);
+    the caller's own agent writes the narrative it produced for a cycle+scope.
+    Provenance is kept separate from the cycle's narrative_polished (migration
+    158). Operator+ gate. Also records brain_last_synthesis_at (see get_brain_staleness).
+    """
+    require_role_ctx(ctx, "operator", "admin", "super_admin")
+    await _authorize_brain_write_scope(
+        user, scope_type=scope_type, scope_key=scope_key
+    )
+    from core.api.services.brain.agent_synthesis import persist_journal_narrative
+
+    updated = await persist_journal_narrative(
+        cycle_key=cycle_key,
+        scope_type=scope_type,
+        scope_key=scope_key,
+        narrative=narrative,
+        agent_by=(ctx.user_id or ctx.username or "agent"),
+        workspace_id=ctx.workspace_id or "ws_default",
+    )
+    if not updated:
+        raise ServiceError(
+            code="journal_entry_not_found",
+            message="no published journal entry for that cycle_key/scope",
+        )
+    return {
+        "written": True,
+        "cycle_key": cycle_key,
+        "scope_type": scope_type,
+        "scope_key": scope_key,
+    }
+
+
+async def get_brain_staleness(
+    ctx: CallerContext,
+    *,
+    user: "UserInfo | None" = None,
+) -> dict[str, Any]:
+    """Agent-native: freshness of the agent synthesis vs the mechanical cycle.
+
+    Mechanical (no LLM). ``last_synthesis_at`` = last agent write; ``last_cycle_key``
+    = last mechanical cycle. An agent reads this on connect to decide whether to
+    re-synthesize before answering.
+    """
+    from core.api.services.brain.agent_synthesis import get_staleness
+
+    return await get_staleness(workspace_id=ctx.workspace_id or "ws_default")
+
+
+async def write_finding(
+    ctx: CallerContext,
+    *,
+    finding_type: str,
+    scope_type: str,
+    scope_key: str,
+    title: str,
+    summary: str,
+    why_now: str,
+    severity: str,
+    confidence: str,
+    suggested_artifact: str = "none",
+    program_key: str | None = None,
+    involved_projects: list[str] | None = None,
+    closure_instruction: str | None = None,
+    user: "UserInfo | None" = None,
+) -> dict[str, Any]:
+    """Agent-native: persist an agent-authored finding into the Triage queue.
+
+    The platform runs no synthesis LLM (decision 2026-07-01-brain-agent-native);
+    the caller's own agent writes the finding (its conclusion). Provenance is kept
+    separate from cycle findings via authored_by_agent (migration 159). Lands as
+    approval_state='open' so the existing Triage/patch flow applies — re-read via
+    list_findings, patch via patch_finding. Operator+ gate. Returns written=False
+    with a reason when there is no run to attach to or the content dedups.
+    """
+    require_role_ctx(ctx, "operator", "admin", "super_admin")
+    await _authorize_brain_write_scope(
+        user,
+        scope_type=scope_type,
+        scope_key=scope_key,
+        involved_projects=involved_projects,
+    )
+    from core.api.services.brain.agent_synthesis import persist_agent_finding
+
+    return await persist_agent_finding(
+        finding_type=finding_type,
+        scope_type=scope_type,
+        scope_key=scope_key,
+        title=title,
+        summary=summary,
+        why_now=why_now,
+        severity=severity,
+        confidence=confidence,
+        suggested_artifact=suggested_artifact,
+        program_key=program_key,
+        involved_projects=involved_projects,
+        closure_instruction=closure_instruction,
+        agent_by=(ctx.user_id or ctx.username or "agent"),
+        workspace_id=ctx.workspace_id or "ws_default",
     )
 
 

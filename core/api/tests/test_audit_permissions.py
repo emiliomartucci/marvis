@@ -47,18 +47,35 @@ def tmp_db(tmp_path: Path) -> str:
         "user TEXT NOT NULL, "
         "resource_type TEXT NOT NULL, "
         "resource_id TEXT NOT NULL, "
-        "details_json TEXT)"
+        "details_json TEXT, "
+        "workspace_id TEXT NOT NULL)"
     )
 
     conn.execute(
-        "INSERT INTO audit_log (id, action, user, resource_type, resource_id, details_json) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("a1", "check_learnings", "agent:rem", "learning", "l1,l2", '{"query":"worktree"}'),
+        "INSERT INTO audit_log (id, action, user, resource_type, resource_id, details_json, "
+        "workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "a1",
+            "check_learnings",
+            "agent:rem",
+            "learning",
+            "l1,l2",
+            '{"query":"worktree"}',
+            "ws_default",
+        ),
     )
     conn.execute(
-        "INSERT INTO audit_log (id, action, user, resource_type, resource_id, details_json) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("a2", "task.approve", "emilio", "task", "t1", '{"status":"approved"}'),
+        "INSERT INTO audit_log (id, action, user, resource_type, resource_id, details_json, "
+        "workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "a2",
+            "task.approve",
+            "emilio",
+            "task",
+            "t1",
+            '{"status":"approved"}',
+            "ws_default",
+        ),
     )
     conn.commit()
     conn.close()

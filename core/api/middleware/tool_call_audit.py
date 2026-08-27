@@ -84,7 +84,13 @@ class MCPToolCallAuditMiddleware(BaseHTTPMiddleware):
         response: Response,
         elapsed_ms: int,
     ) -> None:
-        agent = request.headers.get("x-agent-name") or "anonymous"
+        agent = getattr(request.state, "auth_username", "anonymous")
+        workspace_id = getattr(request.state, "auth_workspace_id", None)
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            # An unauthenticated/failed request has no tenant chain. Never
+            # misattribute it to the default workspace; a separate global
+            # security sink may record it at the ingress boundary.
+            return
         path = request.url.path
         # Extract the first segment after /api/v1/ for resource_type.
         tail = path.removeprefix("/api/v1/")
@@ -94,6 +100,7 @@ class MCPToolCallAuditMiddleware(BaseHTTPMiddleware):
 
         db = await aiosqlite.connect(settings.db_path)
         try:
+            await db.execute("BEGIN IMMEDIATE")
             await log_audit(
                 db,
                 action="tool_call",
@@ -104,8 +111,13 @@ class MCPToolCallAuditMiddleware(BaseHTTPMiddleware):
                     "method": request.method,
                     "status": response.status_code,
                     "elapsed_ms": elapsed_ms,
-                    "query": request.url.query or None,
+                    "has_query": bool(request.url.query),
                 },
+                workspace_id=workspace_id,
             )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
         finally:
             await db.close()

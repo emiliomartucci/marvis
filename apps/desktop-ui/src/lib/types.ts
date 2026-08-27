@@ -884,37 +884,6 @@ export interface TaskCostSummary {
   created_entry_id: string | null;
 }
 
-// --- Automations (n8n) ---
-
-export interface N8nWorkflow {
-  id: string;
-  name: string;
-  active: boolean;
-  createdAt?: string;
-  updatedAt?: string;
-}
-
-export interface N8nExecution {
-  id: string;
-  workflowId?: string;
-  status: string;
-  startedAt?: string;
-  stoppedAt?: string;
-  finished?: boolean;
-}
-
-export interface OutboxEvent {
-  id: number;
-  event_type: string;
-  project: string | null;
-  actor_id: string | null;
-  target_type: string | null;
-  target_id: string | null;
-  dispatched_at: string | null;
-  retry_count: number;
-  created_at: string;
-}
-
 // --- Notifications ---
 
 export type NotificationType =

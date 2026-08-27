@@ -83,7 +83,7 @@ router = APIRouter(prefix="/api/v1/inbox", tags=["inbox"])
 # Rate limit on POST /inbox/ingest (PR B)
 # ---------------------------------------------------------------------------
 # In-memory sliding window, per-process. 1000 req / 60s per identity — tuned
-# for n8n RSS batch bursts (hundreds of articles per poll cycle) while still
+# for external RSS batch bursts (hundreds of articles per poll cycle) while still
 # providing an emergency cap against runaway cost attacks. At higher sustained
 # rates the LLM cost guard (app_settings daily cap) becomes the binding limit.
 # Good enough for a single-worker FastAPI deployment; swap to Redis if we go

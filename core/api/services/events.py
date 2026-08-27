@@ -28,7 +28,7 @@ async def emit_event(
 
     IMPORTANT: workspace_id must be passed explicitly. Do NOT use ContextVar —
     it doesn't propagate to BackgroundTasks, asyncio.create_task(), or
-    event_dispatcher handlers. Always pass workspace_id from the request scope.
+    other asynchronous handlers. Always pass workspace_id from the request scope.
 
     NOTE: if used inside a FastAPI BackgroundTask, `db` must be a fresh connection
     opened with aiosqlite.connect(settings.db_path) — never pass the request-scoped

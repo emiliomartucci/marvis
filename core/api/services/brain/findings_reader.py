@@ -22,9 +22,10 @@ import logging
 import math
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any
 
 import aiosqlite
+from pydantic import ValidationError
 
 from core.api.db import acquire_db, write_db
 from core.api.models import UserInfo
@@ -35,7 +36,6 @@ from core.api.models.brain import (
     ClosureDriftSignalClears,
     ClosureManualAttest,
     ClosureMemoryOpApplied,
-    ConfidenceTier,
     Finding,
     FindingApprovalState,
     FindingBulkPatchResponse,
@@ -44,7 +44,6 @@ from core.api.models.brain import (
     FindingRedacted,
     FindingsListResponse,
     OwnerHint,
-    Severity,
 )
 from core.api.visibility import get_visible_projects
 
@@ -188,6 +187,11 @@ def _load_closure(kind: str, raw_json: str | None) -> ClosureCondition:
                 selector=ArtifactSelector(),
             )
         if cls is ClosureManualAttest:
+            # Salvage a readable instruction when present but schema-invalid
+            # (e.g. extra keys, over-length); placeholder only as last resort.
+            instruction = data.get("instruction")
+            if isinstance(instruction, str) and len(instruction.strip()) >= 10:
+                return ClosureManualAttest(instruction=instruction.strip()[:500])
             return ClosureManualAttest(instruction="legacy closure (parse error)")
         if cls is ClosureMemoryOpApplied:
             return ClosureMemoryOpApplied(memory_operation_id="unknown")
@@ -202,6 +206,29 @@ def _load_owner_hint(raw_json: str | None) -> OwnerHint | None:
         return OwnerHint.model_validate(data)
     except Exception:
         return None
+
+
+def _finding_id_is_wellformed(value: Any) -> bool:
+    """The read contract requires finding_id to be a 32-char string (BLAKE2b-16
+    hex, or ``fnd_`` + 28 hex). The DB PK column carries no type/length CHECK, so
+    a NULL / BLOB / wrong-length value can persist — and a non-str value poisons
+    the sort key (``materialized.sort()`` raises ``TypeError`` before any
+    ``Finding`` is built). Screen it out at the earliest point."""
+    return isinstance(value, str) and len(value) == 32
+
+
+def _validation_error_locs(exc: ValidationError) -> str:
+    """Compact ``loc:type`` summary for logs — NEVER the offending input value.
+
+    pydantic embeds input snippets in ``str(exc)``; logging that could copy
+    evidence refs or other project content into central logs. We read only the
+    field path + error kind from ``exc.errors()``.
+    """
+    parts: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()))
+        parts.append(f"{loc or '?'}:{err.get('type', 'invalid')}")
+    return ", ".join(parts[:10]) or "unknown"
 
 
 def _row_to_finding(
@@ -244,6 +271,9 @@ def _row_to_finding(
         applied_by_user_id=row["applied_by_user_id"],
         expires_at=_parse_iso(row["expires_at"]) or datetime.now(timezone.utc),
         superseded_by_finding_id=row["superseded_by_finding_id"],
+        authored_by_agent=(
+            row["authored_by_agent"] if "authored_by_agent" in row.keys() else None
+        ),
         recency_factor=None,
     )
 
@@ -316,8 +346,9 @@ async def _resolve_run(
     if run_id:
         row = await (
             await db.execute(
-                "SELECT run_id, cycle_key FROM brain_runs WHERE run_id = ?",
-                (run_id,),
+                "SELECT run_id, cycle_key FROM brain_runs "
+                "WHERE run_id = ? AND workspace_id = ?",
+                (run_id, workspace_id),
             )
         ).fetchone()
         if row is None:
@@ -455,6 +486,7 @@ async def list_findings(
     owner_user_id: str | None = None,
     cursor: str | None = None,
     limit: int = DEFAULT_LIMIT,
+    backlog: bool = False,
     user: UserInfo | None = None,
     workspace_id: str = "ws_default",
     now: datetime | None = None,
@@ -482,14 +514,27 @@ async def list_findings(
         run = await _resolve_run(
             db, cycle_key=cycle_key, run_id=run_id, workspace_id=workspace_id
         )
-        if run is None:
+        if run is None and not backlog:
             return FindingsListResponse(items=[], total_returned=0)
 
         decay_enabled, half_life_days = await load_decay_settings(db)
         visible = await get_visible_projects(db, user, workspace_id) if user else None
 
-        where = ["f.run_id = ?"]
-        params: list[Any] = [run["run_id"]]
+        where: list[str]
+        params: list[Any]
+        if backlog:
+            # Cross-cycle drain view: open findings outlive their origin run,
+            # so the run-scoped filter below hides anything born in an earlier
+            # cycle (audit 2026-08-03: a recurrence_count=12 open finding was
+            # invisible to the documented cycle_key='latest' query).
+            where = [
+                "r.workspace_id = ?",
+                "f.superseded_by_finding_id IS NULL",
+            ]
+            params = [workspace_id]
+        else:
+            where = ["r.workspace_id = ?", "f.run_id = ?"]
+            params = [workspace_id, run["run_id"]]
         if scope_type:
             where.append("f.scope_type = ?")
             params.append(scope_type)
@@ -528,6 +573,7 @@ async def list_findings(
         sql_limit = min(1000, over_fetch * 4 + 50)
         query = (
             "SELECT f.* FROM brain_findings f "
+            "JOIN brain_runs r ON r.run_id = f.run_id "
             f"WHERE {' AND '.join(where)} "
             "ORDER BY f.created_at DESC, f.finding_id ASC "
             "LIMIT ?"
@@ -536,8 +582,29 @@ async def list_findings(
         rows = await (await db.execute(query, params)).fetchall()
 
         # Build ranked rows.
+        malformed_count = 0
         materialized: list[tuple[tuple, Finding | None, aiosqlite.Row]] = []
         for row in rows:
+            fid = row["finding_id"]
+            if not _finding_id_is_wellformed(fid):
+                # Poison row (data-integrity guard, audit 2026-08-14): the DB PK
+                # has no type/length CHECK, so a NULL / BLOB / wrong-length
+                # finding_id can persist. A non-str value makes the sort key
+                # non-comparable and would crash materialized.sort() with
+                # TypeError *before* any Finding is built — no downstream
+                # try/except can catch that — and it fails the Finding contract
+                # regardless. Drop it here, count it, and log its shape so the
+                # corrupt row stays discoverable/repairable (raw value logged
+                # only when it is a short string, never a BLOB).
+                malformed_count += 1
+                logger.warning(
+                    "brain_findings: skipping row with malformed finding_id"
+                    " (type=%s, len=%s, value=%s) — not a 32-char id",
+                    type(fid).__name__,
+                    len(fid) if isinstance(fid, (str, bytes)) else "n/a",
+                    fid if isinstance(fid, str) else "<non-str>",
+                )
+                continue
             if _SEVERITY_RANK.get(row["severity"], 0) < sev_threshold:
                 continue
             if _CONFIDENCE_RANK.get(row["confidence"], 0) < conf_threshold:
@@ -550,7 +617,7 @@ async def list_findings(
                 recurrence_count=row["recurrence_count"] or 1,
                 recency_factor=rf,
                 detected_at=detected,
-                finding_id=row["finding_id"],
+                finding_id=fid,
                 decay_enabled=decay_enabled,
             )
             materialized.append((key, None, row))
@@ -585,7 +652,27 @@ async def list_findings(
                 continue
             used += 1
             evidence = await _fetch_evidence(db, row["finding_id"])
-            finding = _row_to_finding(row, evidence)
+            try:
+                finding = _row_to_finding(row, evidence)
+            except ValidationError as exc:
+                # Data-integrity guard (audit 2026-08-14): a row whose *content*
+                # violates the Finding contract (bad evidence_hash length, empty
+                # evidence, etc.) must NOT raise a 500 that hard-stops the whole
+                # backlog drain. Skip it, count it (surfaced as malformed_count),
+                # and log the id + failing field paths so the corrupt row stays
+                # discoverable and repairable. Only ValidationError is caught: a
+                # structural/programming error (e.g. a missing DB column) MUST
+                # propagate, never be masked as "malformed data". Mirrors the
+                # graceful degradation already applied to _load_closure /
+                # _load_owner_hint above.
+                malformed_count += 1
+                logger.warning(
+                    "brain_findings: skipping malformed row finding_id=%s"
+                    " (fails Finding contract at %s)",
+                    row["finding_id"],
+                    _validation_error_locs(exc),
+                )
+                continue
             detected_for_factor = finding.detected_at or now
             rf = _recency_factor(detected_for_factor, now, half_life_days)
             if decay_enabled:
@@ -617,10 +704,11 @@ async def list_findings(
     return FindingsListResponse(
         items=page,
         next_cursor=next_cursor,
-        cycle_key=run["cycle_key"],
-        run_id=run["run_id"],
+        cycle_key=run["cycle_key"] if run else None,
+        run_id=run["run_id"] if run else None,
         redacted_count=redacted_count,
         redacted_evidence_count=redacted_evidence_count,
+        malformed_count=malformed_count,
         total_returned=len(page),
     )
 
@@ -636,8 +724,10 @@ async def fetch_single_finding(
         db.row_factory = aiosqlite.Row
         row = await (
             await db.execute(
-                "SELECT * FROM brain_findings WHERE finding_id = ?",
-                (finding_id,),
+                "SELECT f.* FROM brain_findings f "
+                "JOIN brain_runs r ON r.run_id = f.run_id "
+                "WHERE f.finding_id = ? AND r.workspace_id = ?",
+                (finding_id, workspace_id),
             )
         ).fetchone()
         if row is None:
@@ -645,7 +735,21 @@ async def fetch_single_finding(
         evidence = await _fetch_evidence(db, finding_id)
         visible = await get_visible_projects(db, user, workspace_id) if user else None
         decay_enabled, half_life_days = await load_decay_settings(db)
-    finding = _row_to_finding(row, evidence)
+    try:
+        finding = _row_to_finding(row, evidence)
+    except ValidationError as exc:
+        # Same data-integrity guard as list_findings: a row whose content
+        # violates the Finding contract degrades to a clean 404 (None), never a
+        # 500 (audit 2026-08-14). Only ValidationError is caught so structural
+        # errors still surface; the failing field paths are logged, never the
+        # offending input values.
+        logger.warning(
+            "brain_findings: fetch_single skipping malformed finding_id=%s"
+            " (fails Finding contract at %s)",
+            finding_id,
+            _validation_error_locs(exc),
+        )
+        return None
     if not _is_visible(visible, finding.involved_projects):
         return None
     if decay_enabled:
@@ -700,7 +804,7 @@ async def apply_lifecycle_patch(
     action: FindingPatchAction,
     reason: str | None,
     applied_artifact_ref: str | None,
-    user: UserInfo,
+    user: UserInfo | None,
     workspace_id: str = "ws_default",
     now: datetime,
     idempotency_key: str | None = None,
@@ -736,6 +840,10 @@ async def apply_lifecycle_patch(
         raise LifecycleConflict(current=current, attempted=target_state)
 
     iso_now = _utc_iso(now)
+    # user is None for MCP-driven patches (tenant bearer / agent):
+    # record a NULL actor like the initial 'open' state instead of
+    # dereferencing None.user_id (bug: findings_patch 500 on every call).
+    actor_user_id = user.user_id if user is not None else None
     async with write_db() as db:
         await db.execute(
             "UPDATE brain_findings SET approval_state = ?,"
@@ -749,7 +857,7 @@ async def apply_lifecycle_patch(
                 applied_artifact_ref,
                 iso_now,
                 applied_artifact_ref,
-                user.user_id,
+                actor_user_id,
                 finding_id,
             ),
         )
@@ -763,7 +871,7 @@ async def apply_lifecycle_patch(
                 finding_id,
                 current,
                 target_state,
-                user.user_id,
+                actor_user_id,
                 reason,
                 applied_artifact_ref,
             ),
@@ -778,7 +886,7 @@ async def apply_bulk_patch(
     finding_ids: list[str],
     action: FindingPatchAction,
     reason: str | None,
-    user: UserInfo,
+    user: UserInfo | None,
     workspace_id: str = "ws_default",
     now: datetime,
     idempotency_key: str | None = None,

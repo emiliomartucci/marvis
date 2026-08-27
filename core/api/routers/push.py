@@ -5,7 +5,7 @@ import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from core.api.db import get_db, get_write_db
+from core.api.db import get_write_db
 from core.api.models import UserInfo
 from core.api.rbac import require_role
 from core.api.services.push_service import MAX_SUBSCRIPTIONS_PER_USER, validate_push_endpoint

@@ -66,6 +66,14 @@ from typing import Any
 
 import yaml
 
+from core.api.services.ingest.parsers.xlsx_parser import parse_xlsx
+from core.api.services.ingest.xlsx_privacy import (
+    PROPRIETARY_DETECTOR,
+    is_proprietary_workbook,
+    neutral_xlsx_filename,
+    neutral_xlsx_filenames,
+    neutral_xlsx_qualified_name,
+)
 from core.scripts._frontmatter import parse_frontmatter
 from core.scripts._graph_writer import (
     chunked_upsert_edges,
@@ -75,7 +83,6 @@ from core.scripts._projects_root import (
     LEGACY_MANAGED_PROJECTS_ROOT,
     resolve_projects_root,
 )
-from core.api.services.ingest.parsers.xlsx_parser import parse_xlsx
 
 logger = logging.getLogger("populate_artifacts")
 
@@ -225,9 +232,8 @@ def _xlsx_workbook_id(sha256: str) -> str:
     return f"xlsx:artifact:{_safe_slug(sha256)}"
 
 
-def _xlsx_sheet_id(sha256: str, sheet_index: int, sheet_name: str) -> str:
-    sheet_slug = _safe_slug(sheet_name)[:80]
-    return f"xlsx:sheet:{_safe_slug(sha256)}.{sheet_index:03d}.{sheet_slug}"
+def _xlsx_sheet_id(sha256: str, sheet_index: int) -> str:
+    return f"xlsx:sheet:{_safe_slug(sha256)}.{sheet_index:03d}"
 
 
 # ---- 1. populate_commits ----------------------------------------------------
@@ -1476,77 +1482,87 @@ def _build_xlsx_artifact_nodes(
     path: Path,
     project: str,
     metadata_path: Path,
-) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
-    """Build workbook + sheet KG nodes for one `.xlsx` file."""
-    sha = _file_sha256(path)
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Build privacy-safe KG nodes for one `.xlsx` file.
+
+    Workbook labels are content-addressed. Multi-sheet workbooks are classified
+    as proprietary by the declared structural detector and emit only a parent
+    node, so worksheet topology never becomes graph payload.
+    """
     parsed = parse_xlsx(path)
     structure = parsed.get("structure") or {}
+    sha = str(structure.get("sha256") or "").lower()
     sheets = structure.get("sheets") or []
+    proprietary = is_proprietary_workbook(structure)
     rel_path = _rel_file_path(path, metadata_path)
     parent_id = _xlsx_workbook_id(sha)
+    neutral_filename = path.name
+    neutral_qualified_name = neutral_xlsx_qualified_name(sha)
 
-    nodes: list[dict[str, Any]] = [{
-        "id": parent_id,
-        "type": "file",
-        "name": path.name[:120],
-        "qualified_name": f"xlsx.{path.stem}",
-        "file_path": rel_path,
-        "line_number": None,
-        "metadata": {
-            "artifact_kind": "xlsx_workbook",
-            "filename": path.name,
-            "sha256": sha,
-            "bytes": structure.get("bytes"),
-            "sheet_count": structure.get("sheet_count", len(sheets)),
-            "streaming": structure.get("streaming"),
-            "data_only": structure.get("data_only"),
-            "keep_links": structure.get("keep_links"),
-            "project": project,
-        },
-        "project_id": project,
-    }]
-    edges: list[dict[str, Any]] = []
-
-    for sheet in sheets:
-        index = int(sheet.get("index") or len(nodes))
-        sheet_name = str(sheet.get("name") or f"Sheet {index}")
-        sheet_id = _xlsx_sheet_id(sha, index, sheet_name)
-        nodes.append({
-            "id": sheet_id,
+    nodes: list[dict[str, Any]] = [
+        {
+            "id": parent_id,
             "type": "file",
-            "name": sheet_name[:120],
-            "qualified_name": f"xlsx.{path.stem}.{_safe_slug(sheet_name)}",
+            "name": neutral_filename,
+            "qualified_name": neutral_qualified_name,
             "file_path": rel_path,
             "line_number": None,
             "metadata": {
-                "artifact_kind": "xlsx_sheet",
-                "filename": path.name,
+                "artifact_kind": "xlsx_workbook",
+                "filename": neutral_filename,
                 "sha256": sha,
-                "sheet_name": sheet_name,
-                "sheet_index": index,
-                "row_count": sheet.get("row_count"),
-                "column_count": sheet.get("column_count"),
-                "truncated": sheet.get("truncated"),
+                "bytes": structure.get("bytes"),
                 "project": project,
+                "proprietary": proprietary,
+                "proprietary_detector": PROPRIETARY_DETECTOR,
             },
             "project_id": project,
-        })
-        edges.append({
-            "source_id": parent_id,
-            "target_id": sheet_id,
-            "relation": "contains",
-            "confidence": 1.0,
-            "source": "db",
-            "source_file": rel_path,
-            "metadata": {
-                "artifact_kind": "xlsx_sheet",
-                "sheet_name": sheet_name,
-                "sheet_index": index,
-            },
-            "project_id": project,
-        })
+        }
+    ]
+    edges: list[dict[str, Any]] = []
 
-    return sha, nodes, edges
+    if proprietary:
+        return sha, nodes, edges, True
+
+    for sheet in sheets:
+        index = int(sheet.get("index") or len(nodes))
+        sheet_id = _xlsx_sheet_id(sha, index)
+        sheet_label = f"sheet-{index:03d}"
+        nodes.append(
+            {
+                "id": sheet_id,
+                "type": "file",
+                "name": sheet_label,
+                "qualified_name": f"{neutral_qualified_name}.sheet.{index:03d}",
+                "file_path": rel_path,
+                "line_number": None,
+                "metadata": {
+                    "artifact_kind": "xlsx_sheet",
+                    "filename": neutral_filename,
+                    "sha256": sha,
+                    "sheet_index": index,
+                    "project": project,
+                },
+                "project_id": project,
+            }
+        )
+        edges.append(
+            {
+                "source_id": parent_id,
+                "target_id": sheet_id,
+                "relation": "contains",
+                "confidence": 1.0,
+                "source": "db",
+                "source_file": rel_path,
+                "metadata": {
+                    "artifact_kind": "xlsx_sheet",
+                    "sheet_index": index,
+                },
+                "project_id": project,
+            }
+        )
+
+    return sha, nodes, edges, False
 
 
 def _retire_stale_xlsx_nodes_for_path(
@@ -1619,26 +1635,68 @@ def _refresh_xlsx_edges(conn: sqlite3.Connection, node_ids: set[str]) -> int:
     return edges_deleted
 
 
+def _xlsx_read_error_skip(exc: OSError) -> dict[str, str]:
+    return {
+        "file": "workbook-unavailable.xlsx",
+        "kind": "xlsx",
+        "reason": f"xlsx_read_error:{type(exc).__name__}",
+        "fix_hint": "retry after the workbook path is stable and readable",
+    }
+
+
 def _index_xlsx(
     conn: sqlite3.Connection,
     path: Path,
     project: str,
     metadata_path: Path,
 ) -> dict[str, Any]:
-    """Index one `.xlsx` workbook as parent + sheet artifact nodes."""
+    """Index one `.xlsx` workbook with privacy-safe labels and topology."""
     try:
-        _sha, nodes, edges = _build_xlsx_artifact_nodes(path, project, metadata_path)
+        sha = _file_sha256(path)
+    except OSError as exc:
+        return {"skipped": _xlsx_read_error_skip(exc)}
+    expected_filename = neutral_xlsx_filename(sha)
+    if path.name not in neutral_xlsx_filenames(sha):
+        return {
+            "skipped": {
+                "file": expected_filename,
+                "kind": "xlsx",
+                "reason": "xlsx_non_neutral_filename",
+                "fix_hint": "rename the workbook to its content-addressed neutral filename",
+            }
+        }
+    try:
+        _sha, nodes, edges, proprietary = _build_xlsx_artifact_nodes(
+            path,
+            project,
+            metadata_path,
+        )
+        if _sha != sha or path.name not in neutral_xlsx_filenames(_sha):
+            raise ValueError("xlsx_source_changed")
     except Exception as exc:
-        return {"skipped": {
-            "file": str(path),
-            "kind": "xlsx",
-            "reason": f"xlsx_parse_error: {str(exc)[:160]}",
-            "fix_hint": "verify the workbook is a non-macro .xlsx file readable by openpyxl",
-        }}
+        return {
+            "skipped": {
+                "file": expected_filename,
+                "kind": "xlsx",
+                "reason": f"xlsx_parse_error:{type(exc).__name__}",
+                "fix_hint": "verify the workbook is a non-macro .xlsx file readable by openpyxl",
+            }
+        }
 
     active_ids = {node["id"] for node in nodes}
-    retired = _retire_stale_xlsx_nodes_for_path(conn, path, metadata_path, active_ids)
-    _refresh_xlsx_edges(conn, active_ids)
+    if proprietary:
+        # Legacy sheet nodes require an explicitly checkpointed targeted
+        # cleanup. Do not retire them here: retirement deletes incident edges
+        # and would violate the retroactive no-edge-loss invariant.
+        retired = {"nodes_marked": 0, "edges_deleted": 0}
+    else:
+        retired = _retire_stale_xlsx_nodes_for_path(
+            conn,
+            path,
+            metadata_path,
+            active_ids,
+        )
+        _refresh_xlsx_edges(conn, active_ids)
     n_nodes = chunked_upsert_nodes(conn, nodes)
     n_edges = chunked_upsert_edges(conn, edges)
     return {
@@ -1654,7 +1712,7 @@ def populate_xlsx_artifacts(
     metadata_path: Path | None = None,
     project: str = DEFAULT_PROJECT,
 ) -> dict[str, int]:
-    """Scan docs/ for `.xlsx` files and emit workbook + sheet artifact nodes."""
+    """Scan docs/ and emit privacy-safe XLSX artifact nodes."""
     base = metadata_path or _default_metadata_path()
     docs_root = Path(base) / "docs"
     if not docs_root.exists():
@@ -2046,12 +2104,16 @@ def populate_artifacts_incremental(
                 continue
 
             # Hash gate (skip if content unchanged)
-            sha: str | None = None
-            if not skip_hash_gate:
+            try:
                 sha = _file_sha256(p)
-                if _file_state_unchanged(conn, str(p), sha):
-                    results["files_skipped_hash_unchanged"] += 1
-                    continue
+            except OSError as exc:
+                if kind != "xlsx":
+                    raise
+                results["skipped"].append(_xlsx_read_error_skip(exc))
+                continue
+            if not skip_hash_gate and _file_state_unchanged(conn, str(p), sha):
+                results["files_skipped_hash_unchanged"] += 1
+                continue
 
             # Process by kind
             if kind == "handoff":
@@ -2074,8 +2136,7 @@ def populate_artifacts_incremental(
             results["nodes_written"] += out.get("nodes_written", 0)
             results["edges_written"] += out.get("edges_written", 0)
 
-            if sha is not None:
-                _file_state_record(conn, str(p), sha)
+            _file_state_record(conn, str(p), sha)
 
     finally:
         conn.close()

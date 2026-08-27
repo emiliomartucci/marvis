@@ -71,7 +71,7 @@ async def require_docs_coverage_read(
        get_current_user_or_agent (existing behaviour, no breaking change).
     2. Else, if X-Agent-Name maps to a known agent user with role >= operator,
        authenticate as that agent (read-only, attribution-only). This unblocks
-       internal Monitors (e.g. n8n "controllo deriva") that cannot carry a
+       trusted internal monitors that cannot carry a
        cookie/token but run on a trusted host.
 
     Operator agents reaching this endpoint via path (2) get read-only access by

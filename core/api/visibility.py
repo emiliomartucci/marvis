@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from typing import Final
 
@@ -13,9 +12,14 @@ from fastapi import HTTPException
 
 from core.api.models import UserInfo
 
-# H3: agent visibility bypass — controlled via MARVIS_AGENT_VISIBILITY_BYPASS env var.
-# Default true for backward compat. Set false once agent tokens have team membership configured.
-_AGENT_BYPASS = os.getenv("MARVIS_AGENT_VISIBILITY_BYPASS", "true").lower() == "true"
+# H3/U1: agent visibility bypass.
+#
+# Backward compat stays intact for single-user/local tenants. Multi-user hosted
+# tenants opt in with MARVIS_TENANT_MULTI_USER=1 and default to bypass OFF unless
+# MARVIS_AGENT_VISIBILITY_BYPASS is explicitly set.
+from core.api.services import access_grants
+
+_AGENT_BYPASS = access_grants.agent_visibility_bypass_enabled()
 
 _cache_lock = asyncio.Lock()
 # Cache key: (user_id, workspace_id) → (timestamp, visible_slugs | None)
@@ -35,12 +39,6 @@ async def get_visible_projects(
 
     When workspace_id is provided, results are scoped to that workspace.
     """
-    if current_user.system_role in ("admin", "super_admin"):
-        return None
-    # H3: agent visibility bypass — controlled via MARVIS_AGENT_VISIBILITY_BYPASS env var.
-    # Default true for backward compat. Set false once agent tokens have team membership configured.
-    if getattr(current_user, "user_type", "human") == "agent" and _AGENT_BYPASS:
-        return None
     # OSS local single-user (gh #18/#20): the loopback-only Local Operator
     # (security._local_single_user_info, user_id "local") owns the whole brain
     # by design — there is no second user to hide anything from. Without this
@@ -49,6 +47,24 @@ async def get_visible_projects(
     # have usr_* ids, so this cannot match a hosted account.
     if current_user.user_id == "local" and getattr(current_user, "user_type", "human") == "human":
         return None
+
+    # Migration 179 makes workspace ownership canonical. From that point even
+    # admins and legacy agent-bypass identities are limited to projects with
+    # durable evidence in their authenticated workspace.
+    if await access_grants.workspace_isolation_enabled(db):
+        actor = access_grants.actor_from_user_info(current_user)
+        return await access_grants.visible_projects_for_actor(db, actor)
+
+    if current_user.system_role in ("admin", "super_admin"):
+        return None
+    # H3: agent visibility bypass — controlled via MARVIS_AGENT_VISIBILITY_BYPASS env var.
+    # Default true for backward compat. Set false once agent tokens have team membership configured.
+    if getattr(current_user, "user_type", "human") == "agent" and _AGENT_BYPASS:
+        return None
+
+    if access_grants.tenant_multi_user_enabled():
+        actor = access_grants.actor_from_user_info(current_user)
+        return await access_grants.visible_projects_for_actor(db, actor)
 
     ws = workspace_id or current_user.workspace_id or "ws_default"
     cache_key = (current_user.user_id, ws)
@@ -131,19 +147,5 @@ async def filter_visible_edges(
 
     Admin / agent with bypass active → all edges kept (hidden_count = 0).
     """
-    visible = await get_visible_projects(db, user)
-    if visible is None:
-        # Admin or agent bypass: unrestricted
-        return edges, 0
-
-    kept: list[dict] = []
-    for e in edges:
-        src_proj = e.get("source_project")
-        tgt_proj = e.get("target_project")
-        # If project info is absent on either side, keep the edge (conservative)
-        if (src_proj is None or src_proj in visible) and (
-            tgt_proj is None or tgt_proj in visible
-        ):
-            kept.append(e)
-
-    return kept, len(edges) - len(kept)
+    actor = access_grants.actor_from_user_info(user)
+    return await access_grants.filter_visible_edges_for_actor(db, actor, edges)

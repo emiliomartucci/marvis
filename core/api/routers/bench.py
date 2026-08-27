@@ -11,13 +11,29 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from core.api.security import get_current_user
+from core.api.security import (
+    get_current_user,
+    is_local_single_user_mode,
+    is_loopback_request,
+)
 from core.api.services.model_router import estimate_cost
 
 router = APIRouter(prefix="/bench", tags=["bench"])
+
+_LOCAL_HOST_DETAIL = (
+    "This host-global benchmark operation is available only to the trusted "
+    "local OSS loopback runtime."
+)
+
+
+def _require_local_host_request(request: Request) -> None:
+    if is_local_single_user_mode() and is_loopback_request(request):
+        return
+    raise HTTPException(status_code=403, detail=_LOCAL_HOST_DETAIL)
+
 
 _DEFAULT_CWD = os.environ.get("MARVIS_WORKSPACE_ROOT", str(Path.home() / "workspace"))
 
@@ -122,7 +138,11 @@ async def _run_single_model(
         )
 
 
-@router.post("/run", response_model=BenchResponse)
+@router.post(
+    "/run",
+    response_model=BenchResponse,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def run_bench(
     req: BenchRequest,
     user=Depends(get_current_user),

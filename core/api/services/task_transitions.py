@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -12,6 +12,37 @@ from core.api.models import VALID_TRANSITIONS
 logger = logging.getLogger(__name__)
 
 
+class TaskTransitionConflict(ValueError):
+    """The task changed after the transition's expected version was read."""
+
+    def __init__(self, task_id: str, status: str | None, updated_at: str | None):
+        self.task_id = task_id
+        self.status = status
+        self.updated_at = updated_at
+        super().__init__(
+            f"Task transition conflict: task={task_id}, "
+            f"current_status={status!r}, current_updated_at={updated_at!r}"
+        )
+
+
+def _next_mutation_version(current: str | None) -> str:
+    """Return a wall-clock version strictly newer than the persisted token."""
+    now = datetime.now(timezone.utc)
+    previous: datetime | None = None
+    if current:
+        try:
+            previous = datetime.fromisoformat(current.replace("Z", "+00:00"))
+            if previous.tzinfo is None:
+                previous = previous.replace(tzinfo=timezone.utc)
+            else:
+                previous = previous.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            previous = None
+    if previous is not None and now <= previous:
+        now = previous + timedelta(microseconds=1)
+    return now.isoformat(timespec="microseconds")
+
+
 async def validate_and_transition_task(
     db: aiosqlite.Connection,
     task_id: str,
@@ -19,6 +50,9 @@ async def validate_and_transition_task(
     *,
     trigger: str = "manual",
     auto_commit: bool = True,
+    expected_updated_at: str | None = None,
+    actor: str | None = None,
+    workspace_id: str,
 ) -> None:
     """Validate and apply a task status transition.
 
@@ -32,14 +66,18 @@ async def validate_and_transition_task(
     expected to be closed by the agent/human once the doc/handoff exists.
     """
     cursor = await db.execute(
-        "SELECT id, status, completion_mode FROM tasks WHERE id = ? AND deleted_at IS NULL",
-        (task_id,),
+        "SELECT id, status, completion_mode, updated_at, workspace_id "
+        "FROM tasks WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL",
+        (task_id, workspace_id),
     )
     row = await cursor.fetchone()
     if not row:
         raise ValueError(f"Task not found: {task_id}")
 
     current = row["status"]
+    mutation_version = row["updated_at"]
+    if expected_updated_at is not None and expected_updated_at != mutation_version:
+        raise TaskTransitionConflict(task_id, current, mutation_version)
     # completion_mode may be None on rows predating migration 063; treat as "pr" (strict default).
     try:
         completion_mode = row["completion_mode"] or "pr"
@@ -61,16 +99,17 @@ async def validate_and_transition_task(
     # doc/none completion_mode tasks count as 0.5 WIP slots.
     if new_status == "in_progress" and current == "approved":
         proj_cursor = await db.execute(
-            "SELECT project FROM tasks WHERE id = ?", (task_id,)
+            "SELECT project FROM tasks WHERE id = ? AND workspace_id = ?",
+            (task_id, workspace_id),
         )
         proj_row = await proj_cursor.fetchone()
         if proj_row and proj_row["project"]:
             project_slug = proj_row["project"]
             wip_cursor = await db.execute(
                 "SELECT completion_mode FROM tasks "
-                "WHERE project = ? AND status = 'in_progress' "
+                "WHERE project = ? AND workspace_id = ? AND status = 'in_progress' "
                 "AND deleted_at IS NULL AND id != ?",
-                (project_slug, task_id),
+                (project_slug, workspace_id, task_id),
             )
             wip_rows = await wip_cursor.fetchall()
             wip_count = 0.0
@@ -95,8 +134,9 @@ async def validate_and_transition_task(
     if new_status == "completed" and trigger != "pr_merge":
         pr_cursor = await db.execute(
             "SELECT id FROM pull_requests"
-            " WHERE task_id = ? AND status IN ('draft', 'open', 'merging') LIMIT 1",
-            (task_id,),
+            " WHERE task_id = ? AND workspace_id = ? "
+            "AND status IN ('draft', 'open', 'merging') LIMIT 1",
+            (task_id, workspace_id),
         )
         if await pr_cursor.fetchone():
             raise ValueError(
@@ -117,29 +157,85 @@ async def validate_and_transition_task(
         from core.api.routers.projects import _find_git_path
         # Get project slug for this task
         proj_cursor = await db.execute(
-            "SELECT project FROM tasks WHERE id = ?", (task_id,)
+            "SELECT project FROM tasks WHERE id = ? AND workspace_id = ?",
+            (task_id, workspace_id),
         )
         proj_row = await proj_cursor.fetchone()
         if proj_row and _find_git_path(proj_row["project"]):
             # Project has git repo — require merged PR
             merged_cursor = await db.execute(
-                "SELECT id FROM pull_requests WHERE task_id = ? AND status = 'merged' LIMIT 1",
-                (task_id,),
+                "SELECT id FROM pull_requests WHERE task_id = ? AND workspace_id = ? "
+                "AND status = 'merged' LIMIT 1",
+                (task_id, workspace_id),
             )
             if not await merged_cursor.fetchone():
                 raise ValueError(
-                    f"Code/system projects with completion_mode='pr' require a merged PR. "
-                    f"Use the PR workflow, set trigger='pr_merge', or create the task with "
-                    f"completion_mode='doc' (research/plan) or 'none' (verify/diagnose)."
+                    "Code/system projects with completion_mode='pr' require a merged PR. "
+                    "Use the PR workflow, set trigger='pr_merge', or create the task with "
+                    "completion_mode='doc' (research/plan) or 'none' (verify/diagnose)."
                 )
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    await db.execute(
-        "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-        (new_status, now, task_id),
-    )
-    if auto_commit:
-        await db.commit()
+    now = _next_mutation_version(mutation_version)
+    try:
+        mutation = await db.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? "
+            "AND workspace_id = ? AND status = ? AND updated_at = ?",
+            (new_status, now, task_id, workspace_id, current, mutation_version),
+        )
+        if mutation.rowcount != 1:
+            latest = await (
+                await db.execute(
+                    "SELECT status,updated_at FROM tasks WHERE id=? "
+                    "AND workspace_id=? AND deleted_at IS NULL",
+                    (task_id, workspace_id),
+                )
+            ).fetchone()
+            raise TaskTransitionConflict(
+                task_id,
+                latest["status"] if latest else None,
+                latest["updated_at"] if latest else None,
+            )
+
+        from core.api.services.audit import log_audit
+
+        await log_audit(
+            db,
+            action=f"task.{new_status}",
+            user=actor or f"system:{trigger}",
+            resource_type="task",
+            resource_id=task_id,
+            details={
+                "old_status": current,
+                "new_status": new_status,
+                "trigger": trigger,
+                "expected_updated_at": mutation_version,
+                "committed_updated_at": now,
+            },
+            workspace_id=workspace_id,
+        )
+        if auto_commit:
+            await db.commit()
+    except aiosqlite.OperationalError as exc:
+        if auto_commit:
+            await db.rollback()
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            latest = await (
+                await db.execute(
+                    "SELECT status,updated_at FROM tasks WHERE id=? "
+                    "AND workspace_id=? AND deleted_at IS NULL",
+                    (task_id, workspace_id),
+                )
+            ).fetchone()
+            raise TaskTransitionConflict(
+                task_id,
+                latest["status"] if latest else None,
+                latest["updated_at"] if latest else None,
+            ) from exc
+        raise
+    except Exception:
+        if auto_commit:
+            await db.rollback()
+        raise
     logger.info(
         "Task %s: %s → %s (trigger=%s, completion_mode=%s)",
         task_id, current, new_status, trigger, completion_mode,

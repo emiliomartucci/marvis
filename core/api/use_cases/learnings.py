@@ -42,6 +42,7 @@ everything ``deep``-related (guard + rate-limit + enrichment) stays in the adapt
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
@@ -50,12 +51,18 @@ import aiosqlite
 from pydantic import BaseModel
 
 from core.api.config import settings
-from core.api.use_cases._context import CallerContext, require_role_ctx
+from core.api.use_cases._context import (
+    CallerContext,
+    require_role_ctx,
+    require_workspace_ctx,
+)
 from core.api.use_cases._errors import (
     AuthorizationError,
     NotFoundError,
     ValidationError,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Domain constants
@@ -271,7 +278,7 @@ async def _search_learning_rows(
     temporal_sql, temporal_params = _temporal_filter(as_of)
 
     def _base_params(patterns: list[str]) -> tuple[str, list[str]]:
-        conditions: list[str] = ["COALESCE(workspace_id, 'ws_default') = ?"]
+        conditions: list[str] = ["workspace_id = ?"]
         params: list[str] = [workspace_id]
 
         if module:
@@ -356,6 +363,7 @@ async def check_learnings(
     query: str,
     module: str | None = None,
     as_of: str | None = None,
+    visible_projects: set[str] | None = None,
 ) -> LearningCheckResponse:
     """Search learnings relevant to a keyword/module (any authenticated caller).
 
@@ -366,7 +374,14 @@ async def check_learnings(
     are excluded by default (``invalid_at IS NULL``); ``as_of=<ISO>`` reconstructs
     the point-in-time view. Flag OFF → unchanged.
     """
-    rows = await _search_learning_rows(db, ctx.workspace_id, query, module, as_of)
+    workspace_id = require_workspace_ctx(ctx)
+    rows = await _search_learning_rows(db, workspace_id, query, module, as_of)
+    if visible_projects is not None:
+        rows = [
+            row
+            for row in rows
+            if row["project"] is None or row["project"] in visible_projects
+        ]
     results = [_row_to_learning(row) for row in rows]
     return LearningCheckResponse(
         query=query,
@@ -401,6 +416,7 @@ async def list_learnings(
     are excluded by default; ``as_of=<ISO>`` relaxes to the point-in-time window.
     Flag OFF → unchanged.
     """
+    workspace_id = require_workspace_ctx(ctx)
     if project and visible_projects is not None and project not in visible_projects:
         raise AuthorizationError(
             code="project_not_accessible",
@@ -411,8 +427,8 @@ async def list_learnings(
     params: list[str] = []
 
     # Workspace isolation
-    conditions.append("COALESCE(workspace_id, 'ws_default') = ?")
-    params.append(ctx.workspace_id)
+    conditions.append("workspace_id = ?")
+    params.append(workspace_id)
 
     if category:
         conditions.append("category = ?")
@@ -466,6 +482,7 @@ async def get_learning(
     *,
     learning_id: str,
     as_of: str | None = None,
+    visible_projects: set[str] | None = None,
 ) -> LearningResponse:
     """Get a single learning by ID, scoped to the caller's workspace.
 
@@ -477,18 +494,25 @@ async def get_learning(
     returns the row regardless of ``invalid_at``). ``get_learning_history`` is the
     explicit audit surface that always walks the chain irrespective of liveness.
     """
+    workspace_id = require_workspace_ctx(ctx)
     temporal_sql, temporal_params = _temporal_filter(as_of)
     sql = (
         "SELECT * FROM learnings WHERE id = ? "
-        "AND COALESCE(workspace_id, 'ws_default') = ? "
+        "AND workspace_id = ? "
         f"{temporal_sql}"
     )
     cursor = await db.execute(
         sql,
-        (learning_id, ctx.workspace_id, *temporal_params),
+        (learning_id, workspace_id, *temporal_params),
     )
     row = await cursor.fetchone()
     if not row:
+        raise NotFoundError(code="learning_not_found", message="Learning not found")
+    if (
+        visible_projects is not None
+        and row["project"] is not None
+        and row["project"] not in visible_projects
+    ):
         raise NotFoundError(code="learning_not_found", message="Learning not found")
     return _row_to_learning(row)
 
@@ -511,6 +535,7 @@ async def get_learning_history(
     workspace-scoped. Raises :class:`NotFoundError` if the head row is absent.
     Never writes.
     """
+    workspace_id = require_workspace_ctx(ctx)
     chain: list[LearningHistoryLink] = []
     visited: set[str] = set()
     cur_id: str | None = learning_id
@@ -519,8 +544,8 @@ async def get_learning_history(
         visited.add(cur_id)
         cursor = await db.execute(
             "SELECT id, title, valid_from, invalid_at, superseded_by, supersede_reason "
-            "FROM learnings WHERE id = ? AND COALESCE(workspace_id, 'ws_default') = ?",
-            (cur_id, ctx.workspace_id),
+            "FROM learnings WHERE id = ? AND workspace_id = ?",
+            (cur_id, workspace_id),
         )
         row = await cursor.fetchone()
         if row is None:
@@ -561,6 +586,7 @@ async def create_learning(
     prevention: str | None = None,
     session: int | None = None,
     project: str | None = None,
+    visible_projects: set[str] | None = None,
 ) -> LearningResponse:
     """Create a new learning (operator+).
 
@@ -575,6 +601,13 @@ async def create_learning(
     the old behaviour: NO neighbour fetch, NO decision, always a plain insert.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
+    if (
+        visible_projects is not None
+        and project is not None
+        and project not in visible_projects
+    ):
+        raise NotFoundError(code="learning_not_found", message="Learning not found")
     _validate_category(category)
     _validate_severity(severity)
 
@@ -589,9 +622,10 @@ async def create_learning(
     # columns. (#12)
     cols = (
         "id, title, category, description, tags, module, severity, frequency, "
-        "last_occurrence, prevention, session, project, created_at, updated_at"
+        "last_occurrence, prevention, session, project, created_at, updated_at, "
+        "workspace_id"
     )
-    placeholders = "?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?"
+    placeholders = "?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?"
     values = [
         learning_id,
         title,
@@ -606,6 +640,7 @@ async def create_learning(
         project,
         now,
         now,
+        workspace_id,
     ]
     if settings.temporal_memory_enabled:
         cols += ", valid_from"
@@ -624,9 +659,13 @@ async def create_learning(
     # missing embedding mirror (embed still in flight) or any error falls back to
     # the plain ADD already performed above; the dream cycle catches misses later.
     if settings.temporal_memory_enabled:
-        await _decide_write_time(db, ctx.workspace_id, learning_id, title, project)
+        await _decide_write_time(db, workspace_id, learning_id, title, project)
 
-    cursor = await db.execute("SELECT * FROM learnings WHERE id = ?", (learning_id,))
+    cursor = await db.execute(
+        "SELECT * FROM learnings WHERE id = ? "
+        "AND workspace_id = ?",
+        (learning_id, workspace_id),
+    )
     row = await cursor.fetchone()
     return _row_to_learning(row)
 
@@ -656,7 +695,9 @@ async def _decide_write_time(
     from core.api.services import temporal_write as tw
 
     try:
-        new_vec = await tw.fetch_learning_vector(db, learning_id)
+        new_vec = await tw.fetch_learning_vector(
+            db, learning_id, workspace_id=workspace_id
+        )
         if new_vec is None:
             return  # embedding mirror not present yet → stay ADD
         neighbors = await tw.fetch_live_neighbor_vectors(
@@ -673,15 +714,21 @@ async def _decide_write_time(
             # downstream references; this is NOT a supersede/soft-invalidate).
             await db.execute(
                 "UPDATE learnings SET frequency = frequency + 1, last_occurrence = ?, "
-                "updated_at = ? WHERE id = ?",
+                "updated_at = ? WHERE id = ? "
+                "AND workspace_id = ?",
                 (
                     datetime.now(timezone.utc).isoformat(),
                     datetime.now(timezone.utc).isoformat(),
                     decision.neighbor_id,
+                    workspace_id,
                 ),
             )
-            await _prune_search_index(db, learning_id)
-            await db.execute("DELETE FROM learnings WHERE id = ?", (learning_id,))
+            await _prune_search_index(db, learning_id, workspace_id)
+            await db.execute(
+                "DELETE FROM learnings WHERE id = ? "
+                "AND workspace_id = ?",
+                (learning_id, workspace_id),
+            )
             await db.commit()
             return
 
@@ -695,7 +742,9 @@ async def _decide_write_time(
 
         score = decision.score if decision.score is not None else 0.0
         new_text = title
-        neighbor_text = await _fetch_learning_title(db, decision.neighbor_id)
+        neighbor_text = await _fetch_learning_title(
+            db, decision.neighbor_id, workspace_id
+        )
         resolver = tb.get_tiebreak_resolver()
         verdict = resolver.resolve(new_text, neighbor_text, score)
 
@@ -710,6 +759,7 @@ async def _decide_write_time(
                     f"write-time auto-supersede (cosine={score:.4f}, "
                     f"confidence={verdict.confidence:.2f})"
                 ),
+                workspace_id=workspace_id,
             )
             await db.commit()
             return
@@ -724,6 +774,7 @@ async def _decide_write_time(
                 f"Write-time near-match for learning '{title[:80]}' "
                 f"(cosine={score:.4f}) — confirm supersede or keep both."
             ),
+            workspace_id=workspace_id,
             project=project,
         )
         await db.commit()
@@ -733,14 +784,18 @@ async def _decide_write_time(
 
 
 async def _fetch_learning_title(
-    db: aiosqlite.Connection, learning_id: str
+    db: aiosqlite.Connection, learning_id: str, workspace_id: str
 ) -> str:
     """Read a learning's title (the text the tiebreak resolver compares against).
 
     Returns ``""`` if the row is gone — the DEFAULT NoopResolver ignores its inputs,
     so this only matters once a real off-host resolver is wired in.
     """
-    cur = await db.execute("SELECT title FROM learnings WHERE id = ?", (learning_id,))
+    cur = await db.execute(
+        "SELECT title FROM learnings WHERE id = ? "
+        "AND workspace_id = ?",
+        (learning_id, workspace_id),
+    )
     row = await cur.fetchone()
     if row is None:
         return ""
@@ -753,6 +808,7 @@ async def update_learning(
     *,
     learning_id: str,
     fields: dict,
+    visible_projects: set[str] | None = None,
 ) -> LearningResponse:
     """Update a learning (operator+).
 
@@ -761,13 +817,27 @@ async def update_learning(
     where omitting a field leaves it unchanged and passing ``None`` clears it.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     cursor = await db.execute(
-        "SELECT * FROM learnings WHERE id = ? AND COALESCE(workspace_id, 'ws_default') = ?",
-        (learning_id, ctx.workspace_id),
+        "SELECT * FROM learnings WHERE id = ? AND workspace_id = ?",
+        (learning_id, workspace_id),
     )
     row = await cursor.fetchone()
     if not row:
+        raise NotFoundError(code="learning_not_found", message="Learning not found")
+    if (
+        visible_projects is not None
+        and row["project"] is not None
+        and row["project"] not in visible_projects
+    ):
+        raise NotFoundError(code="learning_not_found", message="Learning not found")
+    target_project = fields.get("project", row["project"])
+    if (
+        visible_projects is not None
+        and target_project is not None
+        and target_project not in visible_projects
+    ):
         raise NotFoundError(code="learning_not_found", message="Learning not found")
 
     updates: dict[str, str | int | None] = {}
@@ -800,17 +870,27 @@ async def update_learning(
     updates["updated_at"] = now
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
-    values = list(updates.values()) + [learning_id]
+    values = list(updates.values()) + [learning_id, workspace_id]
 
-    await db.execute(f"UPDATE learnings SET {set_clause} WHERE id = ?", values)
+    await db.execute(
+        f"UPDATE learnings SET {set_clause} WHERE id = ? "
+        "AND workspace_id = ?",
+        values,
+    )
     await db.commit()
 
-    cursor = await db.execute("SELECT * FROM learnings WHERE id = ?", (learning_id,))
+    cursor = await db.execute(
+        "SELECT * FROM learnings WHERE id = ? "
+        "AND workspace_id = ?",
+        (learning_id, workspace_id),
+    )
     row = await cursor.fetchone()
     return _row_to_learning(row)
 
 
-async def _prune_search_index(db: aiosqlite.Connection, learning_id: str) -> None:
+async def _prune_search_index(
+    db: aiosqlite.Connection, learning_id: str, workspace_id: str
+) -> None:
     """Remove a learning's mirror from the search index, ON THE PASSED WRITE CONNECTION.
 
     A learning is mirrored into the search index keyed by ``file_path =
@@ -827,8 +907,9 @@ async def _prune_search_index(db: aiosqlite.Connection, learning_id: str) -> Non
     """
     file_path = f"learning:{learning_id}"
     cur = await db.execute(
-        "SELECT id FROM documents WHERE file_path = ?",
-        [file_path],
+        "SELECT id FROM documents WHERE file_path = ? "
+        "AND workspace_id = ?",
+        [file_path, workspace_id],
     )
     doc_row = await cur.fetchone()
     if doc_row is None:
@@ -845,8 +926,24 @@ async def _prune_search_index(db: aiosqlite.Connection, learning_id: str) -> Non
     if await ensure_vec_documents(db):
         await db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
 
+    # Reinforcement ledger cascade (mig 174, plan Fase 2 mielinizzazione R1):
+    # the learning's document mirror may carry salience boosts — drop them in
+    # the same writer tx so no orphan ledger rows reference a deleted doc.
+    # Fail-soft ONLY on a pre-mig-174 schema (no such table) — mirrors the
+    # vec_documents guard above; every other error still propagates.
+    try:
+        await db.execute("DELETE FROM salience_boosts WHERE doc_id = ?", [doc_id])
+    except aiosqlite.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        logger.debug("salience_boosts cascade skipped for doc %s: %s", doc_id, exc)
+
     # Deleting the documents row fires documents_fts_delete (migration 136) automatically.
-    await db.execute("DELETE FROM documents WHERE id = ?", [doc_id])
+    await db.execute(
+        "DELETE FROM documents WHERE id = ? "
+        "AND workspace_id = ?",
+        [doc_id, workspace_id],
+    )
 
 
 async def delete_learning(
@@ -854,6 +951,7 @@ async def delete_learning(
     db: aiosqlite.Connection,
     *,
     learning_id: str,
+    visible_projects: set[str] | None = None,
 ) -> None:
     """Permanently delete a learning + prune its search index mirror (operator+).
 
@@ -867,22 +965,29 @@ async def delete_learning(
     it never re-acquires the non-reentrant single-writer lock.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     cursor = await db.execute(
-        "SELECT id FROM learnings WHERE id = ? AND COALESCE(workspace_id, 'ws_default') = ?",
-        (learning_id, ctx.workspace_id),
+        "SELECT id, project FROM learnings WHERE id = ? AND workspace_id = ?",
+        (learning_id, workspace_id),
     )
     row = await cursor.fetchone()
     if not row:
         raise NotFoundError(code="learning_not_found", message="Learning not found")
+    if (
+        visible_projects is not None
+        and row["project"] is not None
+        and row["project"] not in visible_projects
+    ):
+        raise NotFoundError(code="learning_not_found", message="Learning not found")
 
     # 1. Prune the search-index mirror (documents + vec_documents; FTS via trigger).
-    await _prune_search_index(db, learning_id)
+    await _prune_search_index(db, learning_id, workspace_id)
 
     # 2. Delete the learning itself (workspace-scoped, mirroring the other use_cases).
     await db.execute(
-        "DELETE FROM learnings WHERE id = ? AND COALESCE(workspace_id, 'ws_default') = ?",
-        (learning_id, ctx.workspace_id),
+        "DELETE FROM learnings WHERE id = ? AND workspace_id = ?",
+        (learning_id, workspace_id),
     )
     await db.commit()
 
@@ -895,10 +1000,11 @@ async def bump_learning(
 ) -> LearningResponse:
     """Increment frequency + refresh last_occurrence when an issue recurs (operator+)."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     cursor = await db.execute(
-        "SELECT * FROM learnings WHERE id = ? AND COALESCE(workspace_id, 'ws_default') = ?",
-        (learning_id, ctx.workspace_id),
+        "SELECT * FROM learnings WHERE id = ? AND workspace_id = ?",
+        (learning_id, workspace_id),
     )
     row = await cursor.fetchone()
     if not row:
@@ -908,11 +1014,16 @@ async def bump_learning(
     new_frequency = (row["frequency"] or 0) + 1
 
     await db.execute(
-        "UPDATE learnings SET frequency = ?, last_occurrence = ?, updated_at = ? WHERE id = ?",
-        (new_frequency, now, now, learning_id),
+        "UPDATE learnings SET frequency = ?, last_occurrence = ?, updated_at = ? "
+        "WHERE id = ? AND workspace_id = ?",
+        (new_frequency, now, now, learning_id, workspace_id),
     )
     await db.commit()
 
-    cursor = await db.execute("SELECT * FROM learnings WHERE id = ?", (learning_id,))
+    cursor = await db.execute(
+        "SELECT * FROM learnings WHERE id = ? "
+        "AND workspace_id = ?",
+        (learning_id, workspace_id),
+    )
     row = await cursor.fetchone()
     return _row_to_learning(row)

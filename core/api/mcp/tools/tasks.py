@@ -2,7 +2,7 @@
 """Tasks MCP tools — port of the Node ``tasks`` group, calling use_cases DIRECTLY.
 
 Replaces the Node proxy (``get``/``post``/``patch``/``del`` -> HTTP ``:8100``) with
-an in-process ``await tasks_uc.<action>(LOCAL_CTX, db, ...)``. No uvicorn,
+an in-process ``await tasks_uc.<action>(current_mcp_context(), db, ...)``. No uvicorn,
 no fetch. Docstrings are copied VERBATIM from ``core/mcp-pir/index.mjs`` (they are
 curated, carry the QUANDO USARLO / QUANDO NON USARLO / RESTITUISCE blocks).
 
@@ -35,19 +35,22 @@ for the KG node emit. This keeps the collapse honest: zero fastapi in the MCP pa
 """
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
 from core.api.mcp._adapter import (
-    LOCAL_CTX,
     acquire_db,
     acquire_write_db,
+    attach_notices,
+    current_mcp_context,
+    current_visible_projects,
     dump,
     mcp_requires_pr_gate,
     mcp_schedule_embed,
+    no_grants_notice,
     raise_mcp_error,
+    require_any_grant,
 )
 from core.api.models.tasks import TaskCreateRequest, TaskUpdateRequest
 from core.api.use_cases import tasks as tasks_uc
@@ -81,11 +84,6 @@ def _resolve_task_id(*, id: str | None = None, task_id: str | None = None) -> st
     return resolved
 
 
-def _explicit_mcp_triage_ctx(action: str):
-    """Return LOCAL_CTX with an explicit MCP triage grant for approval-gated writes."""
-    return replace(LOCAL_CTX, delegation_grant_id=f"mcp:{action}")
-
-
 def register(mcp) -> None:
     """Register the tasks tool group on the shared FastMCP instance."""
 
@@ -101,23 +99,26 @@ def register(mcp) -> None:
         """Task rows with exact filters.
 
         QUANDO USARLO: ti servono titoli/status/PR state per project/status/priority/kind.
-        QUANDO NON USARLO: conteggi -> tasks_summary; discovery semantica -> search; ID noto -> get_task.
+        QUANDO NON USARLO: conteggi -> tasks_summary; discovery semantica -> search; ID noto -> get_task. Il filtro `program` NON e' applicato qui (accettato ma ignorato) -> usa list_projects(program=...) per filtrare per programma.
         RESTITUISCE: list of {id, title, description, status, priority, project, ICE-D, tags, pr_state} paginato."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                require_any_grant(visible_projects)
                 # `program` is a Node-side filter not carried by the use_case
                 # signature; preserved in the surface for parity, ignored here
                 # (the Node proxy forwarded it as a query param the API also
                 # ignored at this layer). visible_projects=None -> local sees all.
                 result = await tasks_uc.list_tasks(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     project=project,
                     status=status,
                     kind=kind,
                     priority=priority,
                     limit=limit,
-                    visible_projects=None,
+                    visible_projects=visible_projects,
                 )
                 return dump(result)
         except ServiceError as e:
@@ -131,19 +132,24 @@ def register(mcp) -> None:
     ) -> dict[str, Any]:
         """Get full detail of a single task by UUID.
 
-        QUANDO USARLO: hai un task UUID (da list_tasks o da .task-style ref) e vuoi title/description/ICE-D/tags/PR linked. Usa ?deep=true per includere kg_context inline (neighbors, context_chain, applicable_learnings) — risparmia 2-3 tool call aggiuntivi. BOUNDARY: search vs get_task = NOT usare search per singolo artifact noto per ID -> usa get_task.
+        QUANDO USARLO: hai un task UUID (da list_tasks o da .task-style ref) e vuoi title/description/ICE-D (impact/confidence/ease/delegation)/tags/PR linked. BOUNDARY: search vs get_task = NOT usare search per singolo artifact noto per ID -> usa get_task.
         QUANDO NON USARLO: NOT se hai solo filtri (project/status) -> usa list_tasks. NOT per ricerca semantica -> usa search.
-        RESTITUISCE: {id, title, description, status, priority, project, ice_d, tags, pr_task_id} + kg_context se deep=true."""
+        NOTA: `deep` e' attualmente ignorato su questa superficie (kg_context non ancora popolato: deep-attach in un incremento futuro).
+        RESTITUISCE: {id, title, description, status, priority, project, ice_d, tags, pr_task_id, notices}."""
         try:
             resolved_task_id = _resolve_task_id(id=id, task_id=task_id)
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 # DECISION 2: `deep` KG enrichment is an adapter concern; the
                 # use_case returns kg_context=None. F3.0 ships the core fetch; the
                 # deep-attach (build_kg_context_for_task) is a later F3 increment.
                 result = await tasks_uc.get_task(
-                    LOCAL_CTX, db, task_id=resolved_task_id, visible_projects=None
+                    ctx, db, task_id=resolved_task_id, visible_projects=visible_projects
                 )
-                return dump(result)
+                return await attach_notices(
+                    db, dump(result), ctx, visible_projects=visible_projects, task=resolved_task_id
+                )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -190,11 +196,12 @@ def register(mcp) -> None:
         embed_jobs: list[dict[str, Any]] = []
         try:
             async with acquire_write_db(label="mcp.create_task") as db:
+                ctx = current_mcp_context()
                 result = await tasks_uc.create_task(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     body=body,
-                    created_by=LOCAL_CTX.username,
+                    created_by=ctx.username,
                     sync_graph=sync_task_to_graph,
                     schedule_embed=lambda **kw: embed_jobs.append(kw),
                 )
@@ -218,18 +225,20 @@ def register(mcp) -> None:
         ease: Annotated[int, Field(ge=1, le=10)] | None = None,
         delegation: TaskDelegation | None = None,
         completion_mode: TaskCompletionMode | None = None,
+        expected_updated_at: str | None = None,
     ) -> dict[str, Any]:
         """Mutate an existing Marvis task (status, priority, description, tags, ICE-D, completion_mode).
 
         QUANDO USARLO: transizioni di stato lungo il lifecycle dopo approval (approved -> in_progress -> review -> completed) o rifinitura scoring/description dopo creazione.
         QUANDO NON USARLO: NOT per creare un nuovo task -> usa create_task. NOT per delete permanente -> usa delete_task. NOT per approvare: update_task(status='approved') e' BLOCCATO; usa approve_task per il flusso hosted/MCP.
-        PROVA: record task aggiornato; usa get_task/get_pr per verificare stato e PR collegata.
+        PROVA: record task aggiornato; usa get_task per il task e verifica separatamente la PR su GitHub.
         RESTITUISCE: task record aggiornato {id, title, status, ...}."""
         # Mirror the Node proxy: forward only the fields the caller actually set,
         # so TaskUpdateRequest.model_fields_set drives the "not sent vs sent null"
         # semantics the use_case relies on (it reads body.model_fields_set).
         provided: dict[str, Any] = {}
         for name, value in (
+            ("expected_updated_at", expected_updated_at),
             ("status", status),
             ("kind", kind),
             ("priority", priority),
@@ -248,8 +257,9 @@ def register(mcp) -> None:
         try:
             resolved_task_id = _resolve_task_id(id=id, task_id=task_id)
             async with acquire_write_db(label="mcp.update_task") as db:
+                ctx = current_mcp_context()
                 result = await tasks_uc.update_task(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     task_id=resolved_task_id,
                     body=body,
@@ -266,20 +276,24 @@ def register(mcp) -> None:
     async def approve_task(
         task_id: TaskIdArg | None = None,
         id: TaskIdArg | None = None,
+        expected_updated_at: str | None = None,
     ) -> dict[str, Any]:
-        """Approve a pending task through explicit MCP triage.
+        """Approve a pending task through validated MCP authority.
 
-        QUANDO USARLO: hosted/non-Console flow quando Emilio ha deciso di approvare un task pending e serve sbloccare in_progress/create_branch/register_branch. Questo tool usa una delegation grant MCP esplicita, quindi non richiede MARVIS_MCP_HUMAN_SESSION globale.
+        QUANDO USARLO: hosted/non-Console flow quando un principal umano validato o un agente con delega persistita attiva deve approvare un task pending e sbloccare in_progress.
         QUANDO NON USARLO: NOT per modifiche ordinarie (priority/tags/description) -> usa update_task. NOT per task da scartare -> usa reject_task.
-        PROVA: status='approved'; NEXT: update_task(in_progress) o create_branch.
+        PROVA: status='approved'; NEXT: update_task(in_progress), poi usa Git/GitHub per branch e PR.
         RESTITUISCE: task record aggiornato con status='approved'."""
-        body = TaskUpdateRequest(status="approved")
+        body = TaskUpdateRequest(
+            status="approved", expected_updated_at=expected_updated_at
+        )
         embed_jobs: list[dict[str, Any]] = []
         try:
             resolved_task_id = _resolve_task_id(id=id, task_id=task_id)
             async with acquire_write_db(label="mcp.approve_task") as db:
+                ctx = current_mcp_context()
                 result = await tasks_uc.update_task(
-                    _explicit_mcp_triage_ctx("approve_task"),
+                    ctx,
                     db,
                     task_id=resolved_task_id,
                     body=body,
@@ -296,19 +310,23 @@ def register(mcp) -> None:
     async def reject_task(
         task_id: TaskIdArg | None = None,
         id: TaskIdArg | None = None,
+        expected_updated_at: str | None = None,
     ) -> dict[str, Any]:
-        """Reject a pending task through explicit MCP triage.
+        """Reject a pending task through the current validated MCP principal.
 
         QUANDO USARLO: hosted/non-Console flow quando un task pending e' duplicato, rumore o non va lavorato. Preserva audit/history, a differenza di delete_task.
         QUANDO NON USARLO: NOT per approvare -> usa approve_task. NOT per cancellazione irreversibile di spam puro -> usa delete_task.
         RESTITUISCE: task record aggiornato con status='rejected'."""
-        body = TaskUpdateRequest(status="rejected")
+        body = TaskUpdateRequest(
+            status="rejected", expected_updated_at=expected_updated_at
+        )
         embed_jobs: list[dict[str, Any]] = []
         try:
             resolved_task_id = _resolve_task_id(id=id, task_id=task_id)
             async with acquire_write_db(label="mcp.reject_task") as db:
+                ctx = current_mcp_context()
                 result = await tasks_uc.update_task(
-                    _explicit_mcp_triage_ctx("reject_task"),
+                    ctx,
                     db,
                     task_id=resolved_task_id,
                     body=body,
@@ -334,7 +352,8 @@ def register(mcp) -> None:
         try:
             resolved_task_id = _resolve_task_id(id=id, task_id=task_id)
             async with acquire_write_db(label="mcp.delete_task") as db:
-                await tasks_uc.delete_task(LOCAL_CTX, db, task_id=resolved_task_id)
+                ctx = current_mcp_context()
+                await tasks_uc.delete_task(ctx, db, task_id=resolved_task_id)
                 return {"deleted": True}
         except ServiceError as e:
             raise_mcp_error(e)
@@ -348,7 +367,15 @@ def register(mcp) -> None:
         RESTITUISCE: {by_status:{pending:N,...}, by_project:{slug:{pending:N,...}}}."""
         try:
             async with acquire_db() as db:
-                result = await tasks_uc.get_tasks_summary(LOCAL_CTX, db)
-                return dump(result)
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                result = await tasks_uc.get_tasks_summary(
+                    ctx, db, visible_projects=visible_projects
+                )
+                payload = dump(result)
+                notice = no_grants_notice(visible_projects)
+                if notice:
+                    payload.update(notice)
+                return payload
         except ServiceError as e:
             raise_mcp_error(e)

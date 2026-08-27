@@ -1,21 +1,25 @@
 # v1.5.0 - 2026-05-16 - KG PR-Impact sub-01 D3: /webhooks/git/pr-pushed endpoint
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Annotated, Literal
+from typing import Annotated, AsyncGenerator, Literal
 
 import aiosqlite
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError
 
 from core.api.config import settings
-from core.api.db import get_db, get_write_db
-from core.api.services.ci_service import handle_github_ci_event, verify_github_signature
+from core.api.db import (
+    WriterLockTimeout,
+    acquire_write_db,
+)
+from core.api.services.ci_service import handle_github_ci_event
 from core.api.services.pr_impact_pipeline.dispatcher import dispatch_job, enqueue_job
 from core.api.services.webhook_service import process_webhook_event
 
@@ -52,12 +56,87 @@ def verify_signature(raw_body: bytes, sig_header: str) -> None:
         raise HTTPException(status_code=403, detail="Signature mismatch")
 
 
+# GitHub gives a delivery 10 seconds; anything slower is recorded as failed.
+# The lock wait must resolve inside that budget so a stuck writer produces a
+# clean 503 (GitHub can redeliver) instead of a timeout pile-up.
+_WEBHOOK_WRITER_TIMEOUT_SECONDS = 8.0
+_background_webhook_tasks: set[asyncio.Task[None]] = set()
+
+
+def _finish_background_webhook(task: asyncio.Task[None]) -> None:
+    _background_webhook_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Unhandled GitHub webhook background failure: %s",
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
+def _schedule_webhook_event(
+    *, event: str, delivery_id: str, payload: dict
+) -> None:
+    """Start generic processing without retaining the request's writer lock.
+
+    Starlette runs ``BackgroundTasks`` before yield-dependency cleanup.  The
+    verified webhook dependency owns the global writer for the request, while
+    ``process_webhook_event`` acquires that same writer.  Scheduling an
+    independent task lets the response complete and the dependency release the
+    lock first; the module-level set keeps a strong reference until completion.
+    """
+    task = asyncio.create_task(
+        process_webhook_event(
+            event=event,
+            delivery_id=delivery_id,
+            payload=payload,
+        ),
+        name=f"github-webhook:{delivery_id or 'unknown'}",
+    )
+    _background_webhook_tasks.add(task)
+    task.add_done_callback(_finish_background_webhook)
+
+
+async def get_verified_webhook_write_db(
+    request: Request,
+) -> "AsyncGenerator[aiosqlite.Connection, None]":
+    """Writer for webhook endpoints: signature first, bounded lock wait.
+
+    Depends(get_write_db) acquired the writer lock before the handler could
+    verify the signature, and the lock has no deadline. On 2026-08-04 a burst
+    of four concurrent check_run deliveries queued behind a stuck holder and
+    wedged the tenant's entire write path; even unsigned requests joined the
+    queue. This dependency refuses forgeries before touching the writer and
+    turns a stuck lock into a fast 503 so GitHub redelivers later instead of
+    piling on.
+    """
+    raw_body = await request.body()  # cached; handlers re-read the same bytes
+    verify_signature(raw_body, request.headers.get("X-Hub-Signature-256", ""))
+    try:
+        async with acquire_write_db(
+            label=f"{request.method} {request.url.path} (webhook)",
+            timeout=_WEBHOOK_WRITER_TIMEOUT_SECONDS,
+        ) as w:
+            yield w
+    except WriterLockTimeout as exc:
+        logger.warning("webhook writer busy, refusing delivery: %s", exc)
+        raise HTTPException(status_code=503, detail="writer busy; retry delivery")
+
+
 @router.post("/api/v1/webhooks/github", status_code=202)
 async def github_webhook(
     request: Request,
-    background_tasks: BackgroundTasks,
+    db: aiosqlite.Connection = Depends(get_verified_webhook_write_db),
 ) -> dict:
-    """Receive GitHub webhook events. Responds 202 immediately; processing runs in background."""
+    """Receive GitHub events and persist CI state before background processing.
+
+    The repository has one existing signed webhook. Hosted task branches do not
+    open GitHub PRs, so ``workflow_run`` is the only event that can attribute
+    their branch CI to a Marvis task. Persist that small CI record synchronously;
+    keep the generic, potentially heavier webhook pipeline in the background.
+    """
     # CRITICAL: read raw bytes BEFORE any JSON parsing (stream is consumed on first read)
     raw_body = await request.body()
 
@@ -78,21 +157,24 @@ async def github_webhook(
         event, delivery_id, payload.get("action"),
     )
 
-    background_tasks.add_task(
-        process_webhook_event,
+    ci_result: dict = {}
+    if event in ("check_run", "workflow_run"):
+        ci_result = await handle_github_ci_event(payload, delivery_id, db)
+
+    _schedule_webhook_event(
         event=event,
         delivery_id=delivery_id,
         payload=payload,
     )
 
-    return {"accepted": True}
+    return {"accepted": True, **ci_result}
 
 
 @router.post("/api/v1/webhooks/ci", status_code=202)
 async def ci_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
-    db: aiosqlite.Connection = Depends(get_write_db),
+    db: aiosqlite.Connection = Depends(get_verified_webhook_write_db),
 ) -> dict:
     """Receive GitHub CI webhook events (check_run, workflow_run).
 
@@ -192,7 +274,7 @@ async def pr_pushed_webhook(
     delivery_id: str = Header(alias="X-GitHub-Delivery"),
     signature: str = Header(default="", alias="X-Hub-Signature-256"),
     delivery_ts: str | None = Header(default=None, alias="X-GitHub-Delivery-Timestamp"),
-    db: aiosqlite.Connection = Depends(get_write_db),
+    db: aiosqlite.Connection = Depends(get_verified_webhook_write_db),
 ) -> dict:
     """Receive a PR-push event and queue a populator job.
 

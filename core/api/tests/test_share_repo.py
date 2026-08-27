@@ -13,31 +13,13 @@ API_TOKEN = "test-api-token-share"
 
 @pytest.fixture
 def tmp_db(tmp_path: Path) -> str:
-    from core.api.db import MIGRATIONS_DIR
+    from core.api.tests._db_fixture import apply_migrations
 
     db_path = str(tmp_path / "test.db")
+    apply_migrations(db_path)
+
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_versions "
-        "(version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
-    )
-
-    migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
-    for migration in migration_files:
-        if migration.stem.endswith("_down"):
-            continue
-        version = int(migration.stem.split("_")[0])
-        conn.executescript(migration.read_text())
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_versions (version) VALUES (?)",
-            (version,),
-        )
-        conn.commit()
-
     conn.execute(
         "INSERT OR IGNORE INTO users (id, slug, display_name, type, system_role, created_at, updated_at) "
         "VALUES ('usr_marvisx', 'marvisx', 'MarvisX', 'agent', 'operator', datetime('now'), datetime('now'))"

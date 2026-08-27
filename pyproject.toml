@@ -103,7 +103,7 @@ dependencies = [
     "openpyxl>=3.1.0",
     # The single-process MCP server (stdio) + remote streamable-http endpoint.
     "mcp>=1.27.0",
-    "fastmcp>=2",
+    "fastmcp>=3.4.2,<3.5",
     # --- default search-by-meaning engine (Granite, no API key) ---
     # Granite is the OSS default semantic engine: it must work on a plain
     # `uv tool install marvisx-cli`, not as an exotic extra. The model ships a
@@ -142,6 +142,9 @@ keyring = ["keyring>=24"]
 marvis = "core.cli.marvis_init:main"
 marvis-init = "core.cli.marvis_init:main"
 marvis-mcp = "core.api.mcp.stdio:main"
+# Plan 2 U3: parse a repo locally / in CI and send its code graph (never the
+# source) to a Marvis tenant. Used by the marvis-index-action GitHub Action.
+marvis-graph-export = "core.scripts.graph_export_client:main"
 
 [project.urls]
 Homepage = "https://justaskmarvis.com"
@@ -184,6 +187,7 @@ py-modules = [
     "core.scripts.populate_project_nodes",
     "core.scripts.populate_cross_project",
     "core.scripts.populate_touch_counter",
+    "core.scripts.graph_export_client",
 ]
 
 [tool.setuptools.packages.find]

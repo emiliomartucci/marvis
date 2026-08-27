@@ -9,6 +9,7 @@ import re
 import time as _time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from time import monotonic
 
 import aiosqlite
@@ -16,7 +17,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi import Path as PathParam
 
 from core.api.config import settings
-from core.api.db import get_db, get_write_db
+from core.api.db import acquire_db, get_db, get_write_db, write_db
 from core.api.models import (
     AgentSessionUpdate,
     AgentSessionView,
@@ -27,6 +28,10 @@ from core.api.models import (
 )
 from core.api.security import get_agent_user
 from core.api.services import claude_metrics, opencode_sessions, tmux
+from core.api.services.access_grants import (
+    actor_from_user_info,
+    require_unique_project_for_actor,
+)
 from core.api.services.project_paths import candidate_project_paths, resolve_project_path
 from core.api.services.providers import build_start_command, get_provider
 from core.api.services.session_ops import (
@@ -35,6 +40,14 @@ from core.api.services.session_ops import (
     get_session_row_by_uuid,
     hibernate_session_core,
 )
+from core.api.services.session_operation_leases import (
+    SessionOperationBusy,
+    SessionOperationMissing,
+    acquire_session_operation_lease,
+    release_session_operation_lease,
+    session_operation_lease,
+)
+from core.api.use_cases._errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -50,26 +63,27 @@ _CONVERSATION_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 
-# --- Rate limiter (in-memory sliding window, 30 req/min per agent_name) ---
+# --- Rate limiter (in-memory sliding window, 30 req/min per tenant + agent) ---
 # IMPORTANT: Single-process only. Not shared across uvicorn workers.
 # Safe for single-worker deployment (current production setup).
 # /exec uses cost=2 (counts double against the limit).
 _RATE_WINDOW = 60.0
 _RATE_LIMIT = 30
-_rate_store: dict[str, list[float]] = defaultdict(list)
+_rate_store: dict[tuple[str, str], list[float]] = defaultdict(list)
 
 
-def _rate_check(agent_name: str, cost: int = 1) -> None:
+def _rate_check(workspace_id: str, agent_name: str, cost: int = 1) -> None:
     """Raise 429 if the agent exceeds 30 tokens/min."""
+    bucket_key = (workspace_id, agent_name)
     now = monotonic()
-    filtered = [t for t in _rate_store[agent_name] if now - t < _RATE_WINDOW]
+    filtered = [t for t in _rate_store[bucket_key] if now - t < _RATE_WINDOW]
     if filtered:
-        _rate_store[agent_name] = filtered
+        _rate_store[bucket_key] = filtered
     else:
-        _rate_store.pop(agent_name, None)  # cleanup stale keys
-    if len(_rate_store.get(agent_name, [])) + cost > _RATE_LIMIT:
+        _rate_store.pop(bucket_key, None)  # cleanup stale keys
+    if len(_rate_store.get(bucket_key, [])) + cost > _RATE_LIMIT:
         raise HTTPException(status_code=429, detail="Rate limit exceeded (30 req/min)")
-    bucket = _rate_store[agent_name]
+    bucket = _rate_store[bucket_key]
     for _ in range(cost):
         bucket.append(now)
 
@@ -116,11 +130,118 @@ async def _circuit_breaker_check(
 
 
 # --- Helper: resolve UUID -> tmux name ---
-async def _resolve_uuid(session_uuid: str, db: aiosqlite.Connection) -> str:
+def _workspace_for_agent(user: UserInfo) -> str:
+    workspace_id = (user.workspace_id or "").strip()
+    if not workspace_id:
+        raise HTTPException(status_code=403, detail="Session not found")
+    return workspace_id
+
+
+def _agent_request_scope(user: UserInfo, *, cost: int = 1) -> tuple[str, str]:
+    """Return authenticated agent/workspace and charge its isolated rate bucket."""
+    workspace_id = _workspace_for_agent(user)
+    agent_name = user.username.removeprefix("agent:")
+    _rate_check(workspace_id, agent_name, cost=cost)
+    return agent_name, workspace_id
+
+
+async def _require_agent_project_path(
+    db: aiosqlite.Connection,
+    user: UserInfo,
+    project_slug: str | None,
+) -> None:
+    """Fail closed before a remote session can resolve a shared project path."""
+    project = (project_slug or "").strip()
+    if not project:
+        return
+    try:
+        await require_unique_project_for_actor(
+            db,
+            actor_from_user_info(user),
+            project,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+def _agent_session_operation(operation: str):
+    """Serialize one agent lifecycle endpoint across processes and tmux I/O."""
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapped(*args, **kwargs):
+            user: UserInfo = kwargs["user"]
+            session_uuid: str = kwargs["uuid"]
+            workspace_id = _workspace_for_agent(user)
+            route_db = kwargs.get("db")
+
+            if route_db is None:
+                async with acquire_db() as read_db:
+                    name = await _resolve_uuid(
+                        session_uuid,
+                        read_db,
+                        workspace_id,
+                    )
+                try:
+                    async with session_operation_lease(
+                        workspace_id=workspace_id,
+                        session_name=name,
+                        session_uuid=session_uuid,
+                        operation=operation,
+                    ):
+                        return await func(*args, **kwargs)
+                except SessionOperationMissing as exc:
+                    raise HTTPException(404, "Session not found") from exc
+                except SessionOperationBusy as exc:
+                    raise HTTPException(
+                        409,
+                        "Session lifecycle operation already in progress",
+                    ) from exc
+
+            name = await _resolve_uuid(session_uuid, route_db, workspace_id)
+            try:
+                lease = await acquire_session_operation_lease(
+                    route_db,
+                    workspace_id=workspace_id,
+                    session_name=name,
+                    session_uuid=session_uuid,
+                    operation=operation,
+                )
+                await route_db.commit()
+            except SessionOperationMissing as exc:
+                raise HTTPException(404, "Session not found") from exc
+            except SessionOperationBusy as exc:
+                raise HTTPException(
+                    409,
+                    "Session lifecycle operation already in progress",
+                ) from exc
+
+            try:
+                result = await func(*args, **kwargs)
+            except BaseException:
+                await route_db.rollback()
+                await release_session_operation_lease(route_db, lease)
+                await route_db.commit()
+                raise
+            await release_session_operation_lease(route_db, lease)
+            await route_db.commit()
+            return result
+
+        return wrapped
+
+    return decorator
+
+
+async def _resolve_uuid(
+    session_uuid: str,
+    db: aiosqlite.Connection,
+    workspace_id: str,
+) -> str:
     """Convert session_uuid to tmux name. Raises 404 if not found."""
     cursor = await db.execute(
-        "SELECT name FROM sessions_meta WHERE session_uuid = ?",
-        (session_uuid,),
+        "SELECT name FROM sessions_meta "
+        "WHERE session_uuid = ? AND workspace_id = ?",
+        (session_uuid, workspace_id),
     )
     row = await cursor.fetchone()
     if not row:
@@ -238,12 +359,11 @@ async def list_sessions(
     Per single-session lookup usare GET /sessions/{uuid} (targeted, no full sync).
     agent_managed=true: filtra solo sessioni monitorate da DevX.
     """
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
     from core.api.routers.sessions import _sync_sessions
 
-    sessions = await _sync_sessions(db)
+    sessions = await _sync_sessions(db, workspace_id=workspace_id)
 
     if agent_managed is not None:
         sessions = [s for s in sessions if s.agent_managed == agent_managed]
@@ -292,10 +412,11 @@ async def get_session(
     db: aiosqlite.Connection = Depends(get_db),
 ) -> AgentSessionView:
     """Singola sessione per UUID. Targeted O(1) — NON chiama _sync_sessions."""
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
-    result = await get_session_row_by_uuid(uuid, db)
+    result = await get_session_row_by_uuid(
+        uuid, db, workspace_id=workspace_id
+    )
     if not result:
         raise HTTPException(status_code=404, detail="Session not found")
     name, row = result
@@ -317,10 +438,9 @@ async def update_session(
     Usa model_fields_set per distinguere 'campo non inviato' da 'campo inviato come null'.
     Inviare {"project_slug": null} rimuove il collegamento progetto.
     """
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
-    name = await _resolve_uuid(uuid, db)
+    name = await _resolve_uuid(uuid, db, workspace_id)
     try:
         tmux.validate_session_name(name)
     except ValueError as e:
@@ -328,6 +448,7 @@ async def update_session(
 
     updates, params = [], []
     if "project_slug" in body.model_fields_set:
+        await _require_agent_project_path(db, user, body.project_slug)
         updates.append("project_slug = ?")
         params.append(body.project_slug or None)
     if "display_name" in body.model_fields_set:
@@ -336,7 +457,9 @@ async def update_session(
     if "agent_managed" in body.model_fields_set and body.agent_managed is not None:
         # Agents can set agent_managed only on sessions they own (by session_uuid owner check)
         # Re-fetch row to check ownership context — use get_session_row_by_uuid result
-        session_result = await get_session_row_by_uuid(uuid, db)
+        session_result = await get_session_row_by_uuid(
+            uuid, db, workspace_id=workspace_id
+        )
         if session_result:
             _, session_row = session_result
             # No owner_id on sessions_meta — agents manage their own sessions via UUID
@@ -345,12 +468,11 @@ async def update_session(
         params.append(1 if body.agent_managed else 0)
 
     if updates:
-        params.append(name)
+        params.extend((name, workspace_id))
         await db.execute(
-            "INSERT OR IGNORE INTO sessions_meta (name) VALUES (?)", (name,)
-        )
-        await db.execute(
-            f"UPDATE sessions_meta SET {', '.join(updates)} WHERE name = ?", params
+            f"UPDATE sessions_meta SET {', '.join(updates)} "
+            "WHERE name = ? AND workspace_id = ?",
+            params,
         )
         await db.commit()
 
@@ -360,7 +482,9 @@ async def update_session(
     )
 
     # Re-fetch targeted (no _sync_sessions)
-    result = await get_session_row_by_uuid(uuid, db)
+    result = await get_session_row_by_uuid(
+        uuid, db, workspace_id=workspace_id
+    )
     if not result:
         raise HTTPException(status_code=404, detail="Session not found after update")
     _, row = result
@@ -369,6 +493,7 @@ async def update_session(
 
 
 @router.delete("/sessions/{uuid}", status_code=204)
+@_agent_session_operation("delete")
 async def delete_session(
     uuid: str = PathParam(..., pattern=_UUID_V4_PATTERN),
     user: UserInfo = Depends(get_agent_user),
@@ -379,10 +504,9 @@ async def delete_session(
     Ordine operazioni: audit PRIMA del delete (garantisce trace anche su crash).
     Pulisce session_costs per evitare orphan rows con cost data corrotto.
     """
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
-    name = await _resolve_uuid(uuid, db)
+    name = await _resolve_uuid(uuid, db, workspace_id)
     try:
         tmux.validate_session_name(name)
     except ValueError as e:
@@ -405,9 +529,14 @@ async def delete_session(
 
     # Null out session_name in session_costs (preserve cost history by conversation_id)
     await db.execute(
-        "UPDATE session_costs SET session_name = NULL WHERE session_name = ?", (name,)
+        "UPDATE session_costs SET session_name = NULL "
+        "WHERE workspace_id = ? AND session_name = ?",
+        (workspace_id, name),
     )
-    await db.execute("DELETE FROM sessions_meta WHERE name = ?", (name,))
+    await db.execute(
+        "DELETE FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+        (name, workspace_id),
+    )
     await db.commit()
 
     logger.info("Agent %s killed session %s (uuid=%s)", agent_name, name, uuid)
@@ -418,17 +547,16 @@ async def hibernate_session(
     uuid: str = PathParam(..., pattern=_UUID_V4_PATTERN),
     background_tasks: BackgroundTasks = None,
     user: UserInfo = Depends(get_agent_user),
-    db: aiosqlite.Connection = Depends(get_write_db),
+    db: aiosqlite.Connection = Depends(get_db),
 ) -> dict:
     """Iberna sessione. Risposta 202 immediata — sleep sequence in background task.
 
     Polling GET /sessions/{uuid} per rilevare quando hibernated=true.
     Usa hibernate_session_core() condiviso con sessions router.
     """
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
-    name = await _resolve_uuid(uuid, db)
+    name = await _resolve_uuid(uuid, db, workspace_id)
     try:
         tmux.validate_session_name(name)
     except ValueError as e:
@@ -436,8 +564,8 @@ async def hibernate_session(
 
     cursor = await db.execute(
         "SELECT hibernated, conversation_id, provider, project_slug, launch_model, permission_preset, bootstrap_message, created_at "
-        "FROM sessions_meta WHERE name = ?",
-        (name,),
+        "FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+        (name, workspace_id),
     )
     row = await cursor.fetchone()
     if row and row["hibernated"]:
@@ -446,19 +574,40 @@ async def hibernate_session(
     conv_id = row["conversation_id"] if row else None
     session_provider = row["provider"] if row and row["provider"] else "claude"
     project_slug = row["project_slug"] if row else None
+    await _require_agent_project_path(db, user, project_slug)
+
+    try:
+        async with write_db(label="agent.hibernate.acquire_lease") as lease_db:
+            lease = await acquire_session_operation_lease(
+                lease_db,
+                workspace_id=workspace_id,
+                session_name=name,
+                session_uuid=uuid,
+                operation="hibernate",
+            )
+    except SessionOperationMissing as exc:
+        raise HTTPException(404, "Session not found") from exc
+    except SessionOperationBusy as exc:
+        raise HTTPException(
+            409,
+            "Session lifecycle operation already in progress",
+        ) from exc
 
     # Background task opens its own DB connection to avoid holding request connection
     # through the ~4s sleep sequence in hibernate_session_core
     async def _do_hibernate_bg() -> None:
-        from core.api.db import write_db
-        async with write_db() as bg_db:
+        try:
             await hibernate_session_core(
                 name,
-                bg_db,
                 conv_id=conv_id,
                 provider=session_provider,
                 project_slug=project_slug,
+                workspace_id=workspace_id,
+                session_uuid=uuid,
             )
+        finally:
+            async with write_db(label="agent.hibernate.release_lease") as lease_db:
+                await release_session_operation_lease(lease_db, lease)
 
     if background_tasks is not None:
         background_tasks.add_task(_do_hibernate_bg)
@@ -471,16 +620,16 @@ async def hibernate_session(
 
 
 @router.post("/sessions/{uuid}/resume", status_code=200)
+@_agent_session_operation("resume")
 async def resume_session(
     uuid: str = PathParam(..., pattern=_UUID_V4_PATTERN),
     user: UserInfo = Depends(get_agent_user),
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> dict:
     """Riprende sessione ibernata con --resume <conversation_id>."""
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
-    name = await _resolve_uuid(uuid, db)
+    name = await _resolve_uuid(uuid, db, workspace_id)
     try:
         tmux.validate_session_name(name)
     except ValueError as e:
@@ -488,8 +637,8 @@ async def resume_session(
 
     cursor = await db.execute(
         "SELECT hibernated, conversation_id, provider, project_slug, launch_model, permission_preset, theme_mode, bootstrap_message, created_at "
-        "FROM sessions_meta WHERE name = ?",
-        (name,),
+        "FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+        (name, workspace_id),
     )
     row = await cursor.fetchone()
     if not row or not row["hibernated"]:
@@ -500,6 +649,7 @@ async def resume_session(
     is_claude = session_provider == "claude"
     conv_id = row["conversation_id"]
     project_slug = row["project_slug"] if row else None
+    await _require_agent_project_path(db, user, project_slug)
     project_path = resolve_project_path(project_slug)
     launch_model = row["launch_model"] if row else None
     permission_preset = row["permission_preset"] if row else None
@@ -523,8 +673,9 @@ async def resume_session(
         else:
             conv_id = None
             await db.execute(
-                "UPDATE sessions_meta SET conversation_id = NULL WHERE name = ?",
-                (name,),
+                "UPDATE sessions_meta SET conversation_id = NULL "
+                "WHERE name = ? AND workspace_id = ?",
+                (name, workspace_id),
             )
             cmd = build_start_command(
                 provider_config, project_path, model=launch_model
@@ -556,8 +707,9 @@ async def resume_session(
             )
             if conv_id:
                 await db.execute(
-                    "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-                    (conv_id, name),
+                    "UPDATE sessions_meta SET conversation_id = ? "
+                    "WHERE name = ? AND workspace_id = ?",
+                    (conv_id, name, workspace_id),
                 )
         cmd = build_session_start_spec(
             session_provider,
@@ -601,16 +753,18 @@ async def resume_session(
             )
             if conv_id:
                 await db.execute(
-                    "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-                    (conv_id, name),
+                    "UPDATE sessions_meta SET conversation_id = ? "
+                    "WHERE name = ? AND workspace_id = ?",
+                    (conv_id, name, workspace_id),
                 )
     else:
         await tmux.send_keys(
             name, cmd, double_enter=provider_config.submit_with_double_enter
         )
     await db.execute(
-        "UPDATE sessions_meta SET hibernated = 0, hibernated_at = NULL WHERE name = ?",
-        (name,),
+        "UPDATE sessions_meta SET hibernated = 0, hibernated_at = NULL "
+        "WHERE name = ? AND workspace_id = ?",
+        (name, workspace_id),
     )
     await db.commit()
 
@@ -629,10 +783,9 @@ async def get_pane(
     db: aiosqlite.Connection = Depends(get_db),
 ) -> PaneResponse:
     """Legge contenuto pane tmux. Rileva activity state e input prompt."""
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
-    name = await _resolve_uuid(uuid, db)
+    name = await _resolve_uuid(uuid, db, workspace_id)
 
     status = await tmux.get_session_status(name)
     pane_text = await tmux.capture_pane(name, last_lines=lines) if status else None
@@ -668,10 +821,11 @@ async def get_agent_session_conversation(
     """Read conversation messages for a CC session. RBAC: viewer+."""
     from core.api.services.conversation_reader import read_conversation
 
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
-    result = await get_session_row_by_uuid(uuid, db)
+    result = await get_session_row_by_uuid(
+        uuid, db, workspace_id=workspace_id
+    )
     if not result:
         raise HTTPException(status_code=404, detail="Session not found")
     _, row = result
@@ -707,10 +861,11 @@ async def get_session_cc_tasks(
     """
     from core.api.services.cc_tasks_reader import read_cc_tasks
 
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
-    result = await get_session_row_by_uuid(uuid, db)
+    result = await get_session_row_by_uuid(
+        uuid, db, workspace_id=workspace_id
+    )
     if not result:
         raise HTTPException(status_code=404, detail="Session not found")
     _, row = result
@@ -740,10 +895,9 @@ async def send_input(
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> dict:
     """Invia risposta safe a prompt di approvazione (whitelist: y/n/Allow/Deny/Enter/Escape)."""
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
-    name = await _resolve_uuid(uuid, db)
+    name = await _resolve_uuid(uuid, db, workspace_id)
 
     # Enter and Escape are special tmux keys — use send_keys_raw (no added Enter)
     if body.response in ("Escape", "Enter"):
@@ -785,13 +939,14 @@ async def exec_input(
     Circuit breaker: DevX limited to 10 exec actions per session per hour (429 if exceeded).
     Newline strippati per prevenire command splitting in tmux.
     """
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name, cost=2)
+    agent_name, workspace_id = _agent_request_scope(user, cost=2)
+
+    # Resolve ownership before reading the global audit log. Otherwise a foreign
+    # session UUID could be distinguished through the circuit-breaker response.
+    name = await _resolve_uuid(uuid, db, workspace_id)
 
     # Circuit breaker: block DevX auto-response loops (10 exec/session/hour)
     await _circuit_breaker_check(agent_name, uuid, db)
-
-    name = await _resolve_uuid(uuid, db)
 
     # Strip newlines — in tmux, \\n acts as Enter, splitting the command (security risk)
     safe_text = body.text.replace("\n", "").replace("\r", "")
@@ -830,35 +985,48 @@ async def exec_input(
 
 
 @router.post("/sessions/{uuid}/complete", status_code=200)
+@_agent_session_operation("complete")
 async def complete_session(
     uuid: str = PathParam(..., pattern=_UUID_V4_PATTERN),
     user: UserInfo = Depends(get_agent_user),
-    db: aiosqlite.Connection = Depends(get_write_db),
 ) -> dict:
     """Completa sessione: stampa completed_at, esce da Claude Code, killa tmux.
 
     Preserva session_costs history (a differenza di DELETE che rimuove tutto).
     Restituisce recap (cost_usd, tokens, working_seconds).
     """
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name, cost=2)  # destructive — same cost as exec
+    # Destructive action: same double charge as arbitrary terminal input.
+    agent_name, workspace_id = _agent_request_scope(user, cost=2)
 
-    name = await _resolve_uuid(uuid, db)
+    # Resolve the tenant-owned row on a read connection. Never hold the single
+    # SQLite writer while tmux/provider shutdown performs external I/O.
+    async with acquire_db() as db:
+        name = await _resolve_uuid(uuid, db, workspace_id)
+        cursor = await db.execute(
+            "SELECT conversation_id, working_seconds, project_slug, provider "
+            "FROM sessions_meta "
+            "WHERE name = ? AND session_uuid = ? AND workspace_id = ?",
+            (name, uuid, workspace_id),
+        )
+        row = await cursor.fetchone()
+        if row is not None:
+            await _require_agent_project_path(db, user, row["project_slug"])
+    if row is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
     try:
         tmux.validate_session_name(name)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    # Resolve conversation_id for stamping completed_at
-    cursor = await db.execute(
-        "SELECT conversation_id, working_seconds, project_slug FROM sessions_meta WHERE name = ?",
-        (name,),
-    )
-    row = await cursor.fetchone()
-    conv_id = row["conversation_id"] if row else None
+    conv_id = row["conversation_id"]
+    session_provider = row["provider"] or "claude"
+    provider_config = get_provider(session_provider)
 
-    if not conv_id:
-        claude_pid = await tmux.get_claude_pid(name)
+    if session_provider == "claude" and not conv_id:
+        claude_pid = await tmux.get_cli_pid(
+            name, process_names=provider_config.process_names
+        )
         if claude_pid:
             conv_id = claude_metrics.detect_conversation_by_pid(claude_pid)
         if not conv_id:
@@ -869,65 +1037,79 @@ async def complete_session(
                     cwd=resolve_project_path(row["project_slug"] if row else None),
                 )
 
-    from datetime import datetime, timezone as _tz
-
-    now = datetime.now(_tz.utc).isoformat()
-
-    # Stamp completed_at on session_costs
-    if conv_id:
-        from core.api.db import write_db
-        async with write_db() as stamp_db:
-            await stamp_db.execute(
-                "UPDATE session_costs SET completed_at = ? WHERE conversation_id = ?",
-                (now, conv_id),
-            )
+    now = datetime.now(timezone.utc).isoformat()
 
     # Audit BEFORE destructive ops
     _log_action(agent_name, "complete", session_uuid=uuid, session_name=name)
 
     # Exit Claude Code gracefully if running
     status = await tmux.get_session_status(name)
-    if status and status in ("claude", "node"):
-        import asyncio as _asyncio
+    if status in provider_config.process_names:
+        for step in provider_config.exit_sequence:
+            await tmux.send_keys_raw(name, step.key)
+            await asyncio.sleep(step.delay_after)
 
-        await tmux.send_keys_raw(name, "C-c")
-        await _asyncio.sleep(1.0)
-        await tmux.send_keys_raw(name, "C-u")
-        await _asyncio.sleep(0.3)
-        await tmux.send_keys_raw(name, "/exit")
-        await _asyncio.sleep(0.5)
-        await tmux.send_keys_raw(name, "Escape")
-        await _asyncio.sleep(0.3)
-        await tmux.send_keys_raw(name, "Enter")
-        await _asyncio.sleep(2.0)
-
-    await tmux.kill_session(name)
-
-    await db.execute(
-        "UPDATE session_costs SET session_name = NULL WHERE session_name = ? AND completed_at IS NOT NULL",
-        (name,),
-    )
-    await db.execute("DELETE FROM sessions_meta WHERE name = ?", (name,))
-    await db.commit()
-
-    # Build recap
-    recap: dict = {"conversation_id": conv_id, "completed_at": now}
-    if conv_id:
-        cursor = await db.execute(
-            "SELECT cost_usd, input_tokens, output_tokens, message_count FROM session_costs WHERE conversation_id = ?",
-            (conv_id,),
+    if not await tmux.kill_session(name):
+        _log_action(
+            agent_name,
+            "complete",
+            session_uuid=uuid,
+            session_name=name,
+            result="error",
+            detail="tmux kill failed",
         )
-        cost_row = await cursor.fetchone()
-        if cost_row:
-            recap.update(
-                {
-                    "cost_usd": round(cost_row["cost_usd"], 4),
-                    "input_tokens": cost_row["input_tokens"] or 0,
-                    "output_tokens": cost_row["output_tokens"] or 0,
-                    "message_count": cost_row["message_count"],
-                    "working_seconds": row["working_seconds"] if row else 0,
-                }
+        raise HTTPException(status_code=500, detail="Failed to kill session")
+
+    cost_row = None
+    async with write_db(label="agent.complete_session") as db:
+        current = await (
+            await db.execute(
+                "SELECT 1 FROM sessions_meta "
+                "WHERE name = ? AND session_uuid = ? AND workspace_id = ?",
+                (name, uuid, workspace_id),
             )
+        ).fetchone()
+        if current is None:
+            raise HTTPException(status_code=409, detail="Session changed during completion")
+
+        if conv_id:
+            await db.execute(
+                "UPDATE session_costs SET completed_at = ? "
+                "WHERE workspace_id = ? AND conversation_id = ? AND session_name = ?",
+                (now, workspace_id, conv_id, name),
+            )
+            cursor = await db.execute(
+                "SELECT cost_usd, input_tokens, output_tokens, message_count "
+                "FROM session_costs "
+                "WHERE workspace_id = ? AND conversation_id = ? AND session_name = ?",
+                (workspace_id, conv_id, name),
+            )
+            cost_row = await cursor.fetchone()
+            await db.execute(
+                "UPDATE session_costs SET session_name = NULL "
+                "WHERE workspace_id = ? AND conversation_id = ? "
+                "AND session_name = ? AND completed_at IS NOT NULL",
+                (workspace_id, conv_id, name),
+            )
+
+        await db.execute(
+            "DELETE FROM sessions_meta "
+            "WHERE name = ? AND session_uuid = ? AND workspace_id = ?",
+            (name, uuid, workspace_id),
+        )
+
+    # Build recap from the row read before it was detached.
+    recap: dict = {"conversation_id": conv_id, "completed_at": now}
+    if cost_row:
+        recap.update(
+            {
+                "cost_usd": round(cost_row["cost_usd"], 4),
+                "input_tokens": cost_row["input_tokens"] or 0,
+                "output_tokens": cost_row["output_tokens"] or 0,
+                "message_count": cost_row["message_count"],
+                "working_seconds": row["working_seconds"] or 0,
+            }
+        )
 
     logger.info(
         "Agent %s completed session %s (uuid=%s, conv=%s)",
@@ -959,11 +1141,12 @@ async def agent_start_branch(
     from core.api.services import pr_service
     from core.api.services.git_ops import GitOpsError
 
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
     try:
-        result = await pr_service.start_branch_short_write(task_id, db)
+        result = await pr_service.start_branch_short_write(
+            task_id, db, workspace_id=workspace_id
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except GitOpsError as exc:
@@ -988,8 +1171,7 @@ async def agent_submit_pr(
     from core.api.services import pr_service
     from core.api.services.git_ops import GitOpsError
 
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
     title = body.get("title")
     if not title:
@@ -997,7 +1179,14 @@ async def agent_submit_pr(
     pr_body = body.get("body", "")
 
     try:
-        result = await pr_service.submit_pr(task_id, title, pr_body, db)
+        result = await pr_service.submit_pr(
+            task_id,
+            title,
+            pr_body,
+            db,
+            submitted_by=user.user_id,
+            workspace_id=workspace_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except GitOpsError as exc:
@@ -1016,11 +1205,12 @@ async def agent_get_pr_status(
     """Get current PR status including diff_summary and worktree_path."""
     from core.api.services import pr_service
 
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
     try:
-        result = await pr_service.get_pr_status(task_id, db)
+        result = await pr_service.get_pr_status(
+            task_id, db, workspace_id=workspace_id
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -1037,11 +1227,15 @@ async def agent_abandon_pr(
     """Close PR without merge. Task returns to in_progress for rework."""
     from core.api.services import pr_service
 
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
     try:
-        result = await pr_service.close_pr(task_id, "abandoned by agent", db)
+        result = await pr_service.close_pr(
+            task_id,
+            "abandoned by agent",
+            db,
+            workspace_id=workspace_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -1062,8 +1256,7 @@ async def agent_update_pr(
     """
     from core.api.services import pr_service
 
-    agent_name = user.username.removeprefix("agent:")
-    _rate_check(agent_name)
+    agent_name, workspace_id = _agent_request_scope(user)
 
     try:
         result = await pr_service.update_pr(
@@ -1071,6 +1264,7 @@ async def agent_update_pr(
             db,
             title=body.get("title"),
             body=body.get("body"),
+            workspace_id=workspace_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))

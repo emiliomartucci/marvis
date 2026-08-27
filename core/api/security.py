@@ -8,6 +8,7 @@ import logging
 import secrets
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -18,9 +19,10 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.responses import Response
 
 from core.api.config import settings
-from core.api.db import get_db
+from core.api.db import get_db, get_write_db
 from core.api.models import UserInfo
-from core.api.use_cases._context import CallerContext
+from core.api.models.auth import AuthMechanism
+from core.api.use_cases._context import CallerContext, find_active_delegation
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,28 @@ def _local_single_user_info(request: Request) -> UserInfo:
         workspace_id=ctx.workspace_id,
         scopes=list(ctx.scopes),
     )
+
+
+def _bind_authenticated_request(
+    request: Request,
+    user: UserInfo,
+    *,
+    auth_mechanism: AuthMechanism,
+) -> UserInfo:
+    """Expose only the validated principal to post-response middleware."""
+    workspace_id = (user.workspace_id or "").strip()
+    if not workspace_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Authenticated principal has no workspace context.",
+        )
+    if workspace_id != user.workspace_id:
+        user = user.model_copy(update={"workspace_id": workspace_id})
+    user = user.with_auth_mechanism(auth_mechanism)
+    request.state.user = user
+    request.state.auth_username = user.username
+    request.state.auth_workspace_id = workspace_id
+    return user
 
 
 def _valid_static_agent_names() -> set[str]:
@@ -155,12 +179,29 @@ async def is_token_blacklisted(jti: str, db: aiosqlite.Connection) -> bool:
 async def blacklist_token(
     jti: str, expires_at: datetime, db: aiosqlite.Connection
 ) -> None:
-    """Add token to persistent blacklist."""
+    """Add a token to the blacklist and commit the standalone logout write."""
+    await persist_token_blacklist_entry(jti, expires_at, db)
+    await db.commit()
+
+
+async def persist_token_blacklist_entry(
+    jti: str, expires_at: datetime, db: aiosqlite.Connection
+) -> None:
+    """Add a token inside a caller-owned transaction without committing it."""
     await db.execute(
         "INSERT OR IGNORE INTO token_blacklist (jti, expires_at) VALUES (?, ?)",
         (jti, expires_at.isoformat()),
     )
-    await db.commit()
+
+
+async def consume_token_proof_in_transaction(
+    jti: str, expires_at: datetime, db: aiosqlite.Connection
+) -> None:
+    """Burn a one-use proof, failing on replay, without committing the caller."""
+    await db.execute(
+        "INSERT INTO token_blacklist (jti, expires_at) VALUES (?, ?)",
+        (jti, expires_at.isoformat()),
+    )
 
 
 def set_auth_cookie(response: Response, token: str) -> None:
@@ -189,6 +230,38 @@ def clear_auth_cookie(response: Response) -> None:
     )
 
 
+SIGNED_IN_COOKIE = "marvis_signed_in"
+
+
+def set_signed_in_bit(response: Response) -> None:
+    """Set a non-identifying "an app session exists" bit on the parent domain so
+    the static marketing site can paint a signed-in header. One bit, no identity;
+    the real session cookie stays HttpOnly. NOT HttpOnly, because the static site
+    reads it from document.cookie on .justaskmarvis.com."""
+    response.set_cookie(
+        key=SIGNED_IN_COOKIE,
+        value="1",
+        httponly=False,
+        secure=True,
+        samesite="lax",
+        domain=settings.cookie_domain if settings.is_production else None,
+        path="/",
+        max_age=settings.jwt_expiry_hours * 3600,
+    )
+
+
+def clear_signed_in_bit(response: Response) -> None:
+    """Delete the marvis_signed_in hint on logout, mirroring set_signed_in_bit."""
+    response.delete_cookie(
+        key=SIGNED_IN_COOKIE,
+        httponly=False,
+        secure=True,
+        samesite="lax",
+        domain=settings.cookie_domain if settings.is_production else None,
+        path="/",
+    )
+
+
 # In-memory WS ticket store (single-worker pir-api). Tickets are ephemeral
 # (30s TTL, single-use), so they do NOT need the transactional main DB — and
 # more importantly must NOT go through the shared _write_lock, whose contention
@@ -198,6 +271,16 @@ def clear_auth_cookie(response: Response) -> None:
 # Atomicity note: the asyncio event loop is single-threaded, so the check-then-set
 # in consume (used flag) is atomic as long as there is no `await` between them.
 _ws_tickets: dict[str, dict[str, Any]] = {}
+
+
+@dataclass(frozen=True)
+class TerminalTicketPrincipal:
+    """Identity bound to a single terminal session and workspace."""
+
+    username: str
+    user_id: str
+    session_name: str
+    workspace_id: str
 
 
 def _purge_expired_ws_tickets(now: datetime | None = None) -> None:
@@ -218,18 +301,29 @@ def cleanup_expired_ws_tickets() -> int:
 async def create_ws_ticket(
     username: str,
     session_name: str,
+    _legacy_db: Any | None = None,
     *,
+    workspace_id: str = "ws_default",
+    user_id: str | None = None,
     timings: dict[str, float | str] | None = None,
 ) -> str:
     """Create opaque WS ticket. 30s TTL, single-use. In-memory (no DB write_lock)."""
+    bound_workspace = workspace_id.strip()
+    if not bound_workspace:
+        raise ValueError("terminal ticket workspace_id is required")
+    bound_user_id = (user_id or username).strip()
+    if not bound_user_id:
+        raise ValueError("terminal ticket user identity is required")
     ticket = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(
         seconds=settings.ws_ticket_ttl_seconds
     )
     _purge_expired_ws_tickets()
     _ws_tickets[ticket] = {
-        "user_id": username,
+        "username": username,
+        "user_id": bound_user_id,
         "session_name": session_name,
+        "workspace_id": bound_workspace,
         "expires_at": expires_at,
         "used": False,
     }
@@ -242,11 +336,30 @@ async def create_ws_ticket(
 async def consume_ws_ticket(
     ticket: str,
     session_name: str,
+    _legacy_db: Any | None = None,
     *,
+    workspace_id: str | None = None,
     timings: dict[str, float | str] | None = None,
 ) -> str | None:
     """Consume WS ticket. Returns username if valid, None otherwise. Single-use."""
-    logger.info("consume_ws_ticket: ticket=%s... session=%s", ticket[:15], session_name)
+    principal = await consume_ws_ticket_principal(
+        ticket,
+        session_name,
+        workspace_id=workspace_id,
+        timings=timings,
+    )
+    return principal.username if principal is not None else None
+
+
+async def consume_ws_ticket_principal(
+    ticket: str,
+    session_name: str,
+    *,
+    workspace_id: str | None = None,
+    timings: dict[str, float | str] | None = None,
+) -> TerminalTicketPrincipal | None:
+    """Consume a ticket and return its exact user/session/workspace binding."""
+    logger.info("consume_ws_ticket: session=%s", session_name)
     if timings is not None:
         timings["lookup_ms"] = 0.0
 
@@ -273,6 +386,12 @@ async def consume_ws_ticket(
             timings["outcome"] = "session_mismatch"
         return None
 
+    if workspace_id is not None and rec["workspace_id"] != workspace_id:
+        logger.warning("consume_ws_ticket: workspace mismatch")
+        if timings is not None:
+            timings["outcome"] = "workspace_mismatch"
+        return None
+
     expires_at = rec["expires_at"]
     if datetime.now(timezone.utc) > expires_at:
         logger.warning("consume_ws_ticket: ticket expired at %s", expires_at)
@@ -288,7 +407,12 @@ async def consume_ws_ticket(
         timings["update_ms"] = 0.0
         timings["commit_ms"] = 0.0
         timings["outcome"] = "ok"
-    return rec["user_id"]
+    return TerminalTicketPrincipal(
+        username=rec["username"],
+        user_id=rec["user_id"],
+        session_name=rec["session_name"],
+        workspace_id=rec["workspace_id"],
+    )
 
 
 async def get_current_user(
@@ -296,7 +420,11 @@ async def get_current_user(
 ) -> UserInfo:
     """FastAPI dependency: extract and verify user from httpOnly cookie."""
     if is_local_single_user_mode():
-        return _local_single_user_info(request)
+        return _bind_authenticated_request(
+            request,
+            _local_single_user_info(request),
+            auth_mechanism="local",
+        )
 
     token = request.cookies.get("pir_session")
     if not token:
@@ -370,19 +498,32 @@ async def get_current_user(
             ),
         )
 
-    # workspace_id from JWT claim (future SSO) or from users table, fallback ws_default
-    ws_id = (
-        payload.get("workspace_id")
-        or (row["workspace_id"] if "workspace_id" in row.keys() else None)
-        or "ws_default"
-    )
+    # The persisted user row is authoritative.  A claim may repeat it, but it
+    # may never select a different workspace and a hosted identity is never
+    # silently assigned to the OSS compatibility workspace.
+    ws_id = str(row["workspace_id"] or "").strip()
+    if not ws_id:
+        raise HTTPException(
+            status_code=401,
+            detail="User has no authenticated workspace assignment.",
+        )
+    claimed_workspace = str(payload.get("workspace_id") or "").strip()
+    if claimed_workspace and claimed_workspace != ws_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Session workspace does not match the current user assignment.",
+        )
 
-    return UserInfo(
-        username=slug,
-        user_id=row["id"],
-        system_role=row["system_role"],
-        display_name=row["display_name"],
-        workspace_id=ws_id,
+    return _bind_authenticated_request(
+        request,
+        UserInfo(
+            username=slug,
+            user_id=row["id"],
+            system_role=row["system_role"],
+            display_name=row["display_name"],
+            workspace_id=ws_id,
+        ),
+        auth_mechanism="session",
     )
 
 
@@ -391,35 +532,167 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+class TokenStoreUnavailable(RuntimeError):
+    """The credential registry could not prove an authentication decision."""
+
+
+class TokenPrincipalInvalid(RuntimeError):
+    """A token's persisted principal no longer resolves exactly."""
+
+
+@dataclass(frozen=True)
+class AgentTokenPrincipal:
+    token_id: str
+    principal_id: str
+    principal_type: str
+    agent_name: str
+    scopes: tuple[str, ...]
+    workspace_id: str
+    issued_at: str | None
+    expires_at: str | None
+    rotation_family_id: str
+    credential_kind: str
+
+
+def _parse_lifecycle_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _legacy_shared_token_enabled() -> bool:
+    return settings.agent_token_auth_mode == "compatibility"
+
+
 async def _lookup_agent_token(
     bearer_token: str, db: aiosqlite.Connection
-) -> tuple[str, list[str], str] | None:
-    """Check agent_tokens table for a matching active token.
-
-    Returns (agent_name, scopes, workspace_id) if found and active, else None.
-    Uses constant-time comparison via secrets.compare_digest on the hash.
-    """
+) -> AgentTokenPrincipal | None:
+    """Resolve one live token, failing closed if its registry is unavailable."""
     token_hash = _hash_token(bearer_token)
     try:
         async with db.execute(
-            "SELECT id, agent_name, scopes, workspace_id FROM agent_tokens WHERE token_hash = ? AND is_active = 1",
+            "SELECT id, agent_name, token_hash, scopes, is_active, workspace_id, "
+            "principal_id, principal_type, issued_at, expires_at, revoked_at, "
+            "rotation_family_id, overlap_until, credential_kind "
+            "FROM agent_tokens WHERE token_hash = ?",
             (token_hash,),
         ) as cursor:
             row = await cursor.fetchone()
-    except Exception:
-        # agent_tokens table not yet migrated — fall through to legacy token fallback
-        return None
+    except Exception as exc:
+        # A missing table/column, locked DB, or other lookup failure is not
+        # evidence that the presented bearer belongs to the global fallback.
+        raise TokenStoreUnavailable("agent token registry unavailable") from exc
     if row is None:
         return None
-    # Auth read paths use a read-only DB pool under single-writer mode, so
-    # best-effort telemetry updates must not happen inline here.
+    if not secrets.compare_digest(str(row["token_hash"]), token_hash):
+        return None
+    if not bool(row["is_active"]) or row["revoked_at"]:
+        return None
+
+    now = datetime.now(timezone.utc)
+    overlap_until = _parse_lifecycle_time(row["overlap_until"])
+    if row["overlap_until"] is not None and (
+        overlap_until is None or overlap_until <= now
+    ):
+        return None
+
+    credential_kind = row["credential_kind"] or "legacy_individual"
+    workspace_value = str(row["workspace_id"] or "").strip()
+    principal_id = row["principal_id"] or ""
+    principal_type = row["principal_type"] or ""
+    issued_at = _parse_lifecycle_time(row["issued_at"])
+    expires_at = _parse_lifecycle_time(row["expires_at"])
+    rotation_family_id = row["rotation_family_id"] or ""
+
+    if credential_kind == "individual":
+        if (
+            not workspace_value
+            or not principal_id
+            or principal_type not in {"human", "agent"}
+            or issued_at is None
+            or expires_at is None
+            or not rotation_family_id
+            or issued_at > now
+            or expires_at <= now
+        ):
+            return None
+    elif credential_kind == "legacy_individual":
+        if settings.agent_token_auth_mode == "strict":
+            return None
+    else:
+        return None
+    # Only the explicitly temporary legacy-individual compatibility path may
+    # map a pre-workspace token row to ws_default.  New individual credentials
+    # above require a non-empty persisted workspace.
+    workspace_id = workspace_value
+    if credential_kind == "legacy_individual" and not workspace_id:
+        workspace_id = "ws_default"
+
     scopes_raw = row["scopes"] or "[]"
     try:
         scopes = json.loads(scopes_raw)
     except (json.JSONDecodeError, TypeError):
         scopes = []
-    ws_id = row["workspace_id"] or "ws_default"
-    return row["agent_name"], scopes, ws_id
+    if not isinstance(scopes, list) or any(
+        not isinstance(scope, str) for scope in scopes
+    ):
+        scopes = []
+
+    # Recheck the live principal on every use. Only a legacy-individual token
+    # may match a pre-workspace user row; individual credentials require an
+    # exact persisted workspace on both the credential and principal.
+    principal_workspace_predicate = (
+        "COALESCE(workspace_id, 'ws_default') = ?"
+        if credential_kind == "legacy_individual"
+        else "workspace_id = ?"
+    )
+    try:
+        if principal_id:
+            cursor = await db.execute(
+                "SELECT id, slug, type FROM users WHERE id = ? "
+                "AND deleted_at IS NULL "
+                f"AND {principal_workspace_predicate}",
+                (principal_id, workspace_id),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT id, slug, type FROM users WHERE slug = ? "
+                "AND deleted_at IS NULL "
+                f"AND {principal_workspace_predicate}",
+                (row["agent_name"], workspace_id),
+            )
+        principal_rows = await cursor.fetchall()
+    except Exception as exc:
+        raise TokenStoreUnavailable("agent principal registry unavailable") from exc
+    if len(principal_rows) != 1:
+        return None
+    principal = principal_rows[0]
+    actual_type = principal["type"] or "human"
+    if principal["slug"] != row["agent_name"]:
+        return None
+    if principal_type and actual_type != principal_type:
+        return None
+    if credential_kind == "individual" and principal["id"] != principal_id:
+        return None
+
+    return AgentTokenPrincipal(
+        token_id=row["id"],
+        principal_id=principal["id"],
+        principal_type=actual_type,
+        agent_name=row["agent_name"],
+        scopes=tuple(scopes),
+        workspace_id=workspace_id,
+        issued_at=row["issued_at"],
+        expires_at=row["expires_at"],
+        rotation_family_id=rotation_family_id or row["id"],
+        credential_kind=credential_kind,
+    )
 
 
 async def _resolve_agent_userinfo(
@@ -427,6 +700,9 @@ async def _resolve_agent_userinfo(
     db: aiosqlite.Connection,
     scopes: list[str] | None = None,
     workspace_id: str = "ws_default",
+    principal_id: str | None = None,
+    *,
+    allow_legacy_workspace_null: bool = False,
 ) -> UserInfo:
     """Resolve agent_name to UserInfo via DB lookup (users table).
 
@@ -434,15 +710,32 @@ async def _resolve_agent_userinfo(
     workspace_id comes from the token lookup (authoritative), not from users table.
     scopes propagated for downstream scope enforcement via require_scope().
     """
-    valid_names = await get_valid_agent_names(db)
-    if agent_name not in valid_names and agent_name not in _valid_static_agent_names():
-        agent_name = "agent"
-
-    async with db.execute(
-        "SELECT id, system_role, display_name, type FROM users WHERE slug = ? AND deleted_at IS NULL",
-        (agent_name,),
-    ) as cursor:
-        row = await cursor.fetchone()
+    workspace_predicate = (
+        "COALESCE(workspace_id, 'ws_default') = ?"
+        if allow_legacy_workspace_null
+        else "workspace_id = ?"
+    )
+    if principal_id:
+        async with db.execute(
+            "SELECT id, slug, system_role, display_name, type FROM users "
+            "WHERE id = ? AND slug = ? AND deleted_at IS NULL "
+            f"AND {workspace_predicate}",
+            (principal_id, agent_name, workspace_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise TokenPrincipalInvalid("token principal no longer resolves")
+    else:
+        valid_names = await get_valid_agent_names(db)
+        if agent_name not in valid_names and agent_name not in _valid_static_agent_names():
+            agent_name = "agent"
+        async with db.execute(
+            "SELECT id, slug, system_role, display_name, type FROM users "
+            "WHERE slug = ? AND deleted_at IS NULL "
+            f"AND {workspace_predicate}",
+            (agent_name, workspace_id),
+        ) as cursor:
+            row = await cursor.fetchone()
 
     if row is None:
         return UserInfo(
@@ -466,6 +759,45 @@ async def _resolve_agent_userinfo(
     )
 
 
+async def _bind_agent_token_principal(
+    request: Request,
+    principal: AgentTokenPrincipal,
+    db: aiosqlite.Connection,
+) -> UserInfo:
+    """Bind verified token identity and its non-secret lifecycle reference."""
+    request.state.agent_token_id = principal.token_id
+    request.state.agent_token_rotation_family_id = principal.rotation_family_id
+    try:
+        user = await _resolve_agent_userinfo(
+            principal.agent_name,
+            db,
+            list(principal.scopes),
+            principal.workspace_id,
+            principal.principal_id,
+            allow_legacy_workspace_null=(
+                principal.credential_kind == "legacy_individual"
+            ),
+        )
+    except TokenPrincipalInvalid as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="The token principal is no longer active in this workspace.",
+        ) from exc
+    return _bind_authenticated_request(
+        request,
+        user,
+        auth_mechanism="agent_token",
+    )
+
+
+def _token_store_http_error(exc: TokenStoreUnavailable) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Token authentication is temporarily unavailable; retry later.",
+        headers={"Retry-After": "5"},
+    )
+
+
 async def get_current_user_or_agent(
     request: Request, db: aiosqlite.Connection = Depends(get_db)
 ) -> UserInfo:
@@ -481,7 +813,11 @@ async def get_current_user_or_agent(
     Strict X-Agent-Name enforcement is reserved for get_agent_user (operator endpoints).
     """
     if is_local_single_user_mode():
-        return _local_single_user_info(request)
+        return _bind_authenticated_request(
+            request,
+            _local_single_user_info(request),
+            auth_mechanism="local",
+        )
 
     # Path 1 & 2: Bearer token for agents
     auth_header = request.headers.get("authorization", "")
@@ -489,33 +825,34 @@ async def get_current_user_or_agent(
         bearer_token = auth_header[7:]
 
         # 1. Per-agent token lookup (DB)
-        result = await _lookup_agent_token(bearer_token, db)
+        try:
+            result = await _lookup_agent_token(bearer_token, db)
+        except TokenStoreUnavailable as exc:
+            raise _token_store_http_error(exc) from exc
         if result is not None:
-            agent_name, scopes, ws_id = result
             # X-Agent-Name is attribution-only for read endpoints — no mismatch check.
             # Strict verification is in get_agent_user (operator-level write endpoints).
-            return await _resolve_agent_userinfo(agent_name, db, scopes, ws_id)
+            return await _bind_agent_token_principal(request, result, db)
 
         # 2. Legacy single shared token fallback — bound to ws_default (P1-3 review fix)
-        if settings.tasks_api_token and secrets.compare_digest(
+        if _legacy_shared_token_enabled() and settings.tasks_api_token and secrets.compare_digest(
             bearer_token, settings.tasks_api_token
         ):
             agent_name = request.headers.get("x-agent-name", "agent")
-            return await _resolve_agent_userinfo(
-                agent_name, db, workspace_id="ws_default"
+            return _bind_authenticated_request(
+                request,
+                await _resolve_agent_userinfo(
+                    agent_name,
+                    db,
+                    workspace_id="ws_default",
+                    allow_legacy_workspace_null=True,
+                ),
+                auth_mechanism="legacy_shared_token",
             )
 
         raise HTTPException(
             status_code=401,
-            detail=(
-                "Invalid API token. "
-                "Reason: Bearer token in Authorization header not found in agent_tokens DB "
-                "and does not match legacy TASKS_API_TOKEN. "
-                "Fix: (1) verify the token in Authorization: Bearer <token> is correct; "
-                "(2) check TASKS_API_TOKEN env is set and matches in /data/pir/.env for the legacy fallback; "
-                "(3) if using a per-agent token, rotate via POST /api/v1/agent-tokens (must include agent_name + scopes). "
-                "Docs: api/security.py::get_current_user_or_agent for resolution order."
-            ),
+            detail="Invalid or inactive API token.",
         )
 
     # Path 3: Cookie for Console Marvis web
@@ -526,22 +863,16 @@ async def get_current_user_or_agent(
 
 
 async def get_active_delegation(
-    agent_username: str, db: aiosqlite.Connection
+    agent_username: str,
+    workspace_id: str,
+    db: aiosqlite.Connection,
 ) -> aiosqlite.Row | None:
-    """Newest live delegation for an agent identity (unrevoked, unexpired)."""
-    now = datetime.now(timezone.utc).isoformat()
-    async with db.execute(
-        "SELECT id, granted_by, granted_by_user_id, granted_by_role, expires_at "
-        "FROM delegations "
-        "WHERE agent_username = ? AND revoked_at IS NULL AND expires_at > ? "
-        "ORDER BY expires_at DESC LIMIT 1",
-        (agent_username, now),
-    ) as cursor:
-        return await cursor.fetchone()
+    """Newest persisted, active, bounded delegation for an agent identity."""
+    return await find_active_delegation(agent_username, workspace_id, db)
 
 
 async def get_current_user_or_delegated_agent(
-    request: Request, db: aiosqlite.Connection = Depends(get_db)
+    request: Request, db: aiosqlite.Connection = Depends(get_write_db)
 ) -> UserInfo:
     """Human-only dependency that ALSO honors an active super-session grant.
 
@@ -558,7 +889,11 @@ async def get_current_user_or_delegated_agent(
     3. Anything else -> the same 401 guidance as :func:`get_current_user`.
     """
     if is_local_single_user_mode():
-        return _local_single_user_info(request)
+        return _bind_authenticated_request(
+            request,
+            _local_single_user_info(request),
+            auth_mechanism="local",
+        )
 
     if request.cookies.get("pir_session"):
         return await get_current_user(request, db)
@@ -577,7 +912,13 @@ async def get_current_user_or_delegated_agent(
                     "pir_session cookie. Fix: POST /api/v1/auth/login."
                 ),
             )
-        grant = await get_active_delegation(user.username, db)
+        ws = (user.workspace_id or "").strip()
+        if not ws:
+            raise HTTPException(
+                status_code=403,
+                detail="Delegated agent has no authenticated workspace context.",
+            )
+        grant = await get_active_delegation(user.username, ws, db)
         if grant is None:
             raise HTTPException(
                 status_code=403,
@@ -593,6 +934,8 @@ async def get_current_user_or_delegated_agent(
         request.state.delegation_granted_by = grant["granted_by"]
         from core.api.services.audit import log_audit  # local: avoid import cycle
 
+        if not db.in_transaction:
+            await db.execute("BEGIN IMMEDIATE")
         await log_audit(
             db,
             action="delegation.exercise",
@@ -604,9 +947,16 @@ async def get_current_user_or_delegated_agent(
                 "grant_id": grant["id"],
                 "granted_by": grant["granted_by"],
                 "effective_role": grant["granted_by_role"],
+                "stage": "authorization_gate",
             },
+            workspace_id=ws,
         )
-        return user.model_copy(update={"system_role": grant["granted_by_role"]})
+        await db.commit()
+        return _bind_authenticated_request(
+            request,
+            user.model_copy(update={"system_role": grant["granted_by_role"]}),
+            auth_mechanism="delegated_agent_token",
+        )
 
     return await get_current_user(request, db)
 
@@ -641,9 +991,12 @@ async def get_agent_user(
     bearer_token = auth_header[7:]
 
     # 1. Per-agent token lookup
-    result = await _lookup_agent_token(bearer_token, db)
+    try:
+        result = await _lookup_agent_token(bearer_token, db)
+    except TokenStoreUnavailable as exc:
+        raise _token_store_http_error(exc) from exc
     if result is not None:
-        agent_name, scopes, ws_id = result
+        agent_name = result.agent_name
         # Verify X-Agent-Name header matches the token owner when present
         claimed_name = request.headers.get("x-agent-name", "").strip()
         if claimed_name and claimed_name != agent_name:
@@ -657,7 +1010,7 @@ async def get_agent_user(
                     f"or set it exactly to '{agent_name}', or use a token issued for '{claimed_name}'."
                 ),
             )
-        return await _resolve_agent_userinfo(agent_name, db, scopes, ws_id)
+        return await _bind_agent_token_principal(request, result, db)
 
     # 2. Legacy single shared token — bound to ws_default (P1-3 review fix).
     #    Resolve via _resolve_agent_userinfo, identical to get_current_user_or_agent:
@@ -666,22 +1019,24 @@ async def get_agent_user(
     #    "agent:"-prefixed username that diverged from the exercise path
     #    (get_active_delegation lookup would miss). The shared resolver gives a
     #    DB-backed identity with user_type="agent" and the bare agent slug.
-    if settings.tasks_api_token and secrets.compare_digest(
+    if _legacy_shared_token_enabled() and settings.tasks_api_token and secrets.compare_digest(
         bearer_token, settings.tasks_api_token
     ):
         agent_name = request.headers.get("x-agent-name", "agent")
-        return await _resolve_agent_userinfo(agent_name, db, workspace_id="ws_default")
+        return _bind_authenticated_request(
+            request,
+            await _resolve_agent_userinfo(
+                agent_name,
+                db,
+                workspace_id="ws_default",
+                allow_legacy_workspace_null=True,
+            ),
+            auth_mechanism="legacy_shared_token",
+        )
 
     raise HTTPException(
         status_code=401,
-        detail=(
-            "Invalid API token. "
-            "Reason: Bearer token in Authorization header not found in agent_tokens DB "
-            "and does not match legacy TASKS_API_TOKEN. This endpoint is agent-only (no cookie fallback). "
-            "Fix: (1) verify the token is correct; (2) check TASKS_API_TOKEN env in /data/pir/.env matches; "
-            "(3) rotate a per-agent token via POST /api/v1/agent-tokens (admin). "
-            "Docs: api/security.py::get_agent_user for resolution order."
-        ),
+        detail="Invalid or inactive API token.",
     )
 
 
@@ -711,7 +1066,10 @@ def require_agent_token_scope(*required_scopes: str):
             )
 
         bearer_token = auth_header[7:]
-        result = await _lookup_agent_token(bearer_token, db)
+        try:
+            result = await _lookup_agent_token(bearer_token, db)
+        except TokenStoreUnavailable as exc:
+            raise _token_store_http_error(exc) from exc
         if result is None:
             raise HTTPException(
                 status_code=401,
@@ -723,7 +1081,8 @@ def require_agent_token_scope(*required_scopes: str):
                 ),
             )
 
-        agent_name, scopes, ws_id = result
+        agent_name = result.agent_name
+        scopes = list(result.scopes)
         claimed_name = request.headers.get("x-agent-name", "").strip()
         if claimed_name and claimed_name != agent_name:
             raise HTTPException(
@@ -747,7 +1106,7 @@ def require_agent_token_scope(*required_scopes: str):
                 ),
             )
 
-        return await _resolve_agent_userinfo(agent_name, db, scopes, ws_id)
+        return await _bind_agent_token_principal(request, result, db)
 
     return check
 

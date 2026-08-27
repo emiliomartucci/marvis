@@ -10,6 +10,8 @@ from typing import Literal
 
 import aiosqlite
 
+from core.api.db import acquire_db, write_db
+from core.api.services.access_grants import require_unique_project_workspace
 from core.api.services import claude_metrics, opencode_sessions, tmux
 from core.api.services.project_paths import (
     candidate_project_paths,
@@ -32,11 +34,12 @@ logger = logging.getLogger(__name__)
 
 # Columns needed for AgentSessionView construction — matches DB_COLUMNS in sessions.py
 _SESSION_COLUMNS = (
-    "name, display_name, pinned, sort_order, group_name, project_slug, session_uuid, "
+    "name, workspace_id, display_name, pinned, sort_order, group_name, project_slug, session_uuid, "
     "created_at, last_active, conversation_id, hibernated, model, launch_model, "
     # PR3: rename 088 — source last_context_pct from last_context_pct_real (true ratio)
     "permission_preset, bootstrap_message, last_context_pct_real AS last_context_pct, "
-    "last_cost_usd, last_message_count, auto_hibernate_minutes, working_seconds, provider"
+    "last_cost_usd, last_message_count, auto_hibernate_minutes, working_seconds, "
+    "provider, agent_managed"
 )
 
 
@@ -120,15 +123,19 @@ def build_session_start_spec(
 
 
 async def get_session_row_by_uuid(
-    session_uuid: str, db: aiosqlite.Connection
+    session_uuid: str,
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
 ) -> tuple[str, dict] | None:
     """Return (name, row_dict) for a session UUID, or None if not found.
 
     Targeted O(1) lookup — does NOT call _sync_sessions.
     """
     cursor = await db.execute(
-        f"SELECT {_SESSION_COLUMNS} FROM sessions_meta WHERE session_uuid = ?",
-        (session_uuid,),
+        f"SELECT {_SESSION_COLUMNS} FROM sessions_meta "
+        "WHERE session_uuid = ? AND workspace_id = ?",
+        (session_uuid, workspace_id),
     )
     row = await cursor.fetchone()
     if not row:
@@ -156,9 +163,9 @@ async def get_live_session_data(name: str, provider: str | None = None) -> dict:
     if is_cli_active:
         pid = await tmux.get_cli_pid(name, process_names=provider_config.process_names)
         if pid:
-            all_metrics = await tmux.get_all_process_metrics()
-            if pid in all_metrics:
-                cpu_raw, rss_kb = all_metrics[pid]
+            process_metrics = await tmux.get_process_metrics(pid)
+            if process_metrics is not None:
+                cpu_raw, rss_kb = process_metrics
                 cpu_pct = round(cpu_raw, 1)
                 ram_mb = round(rss_kb / 1024, 1)
 
@@ -172,16 +179,28 @@ async def get_live_session_data(name: str, provider: str | None = None) -> dict:
 
 async def hibernate_session_core(
     name: str,
-    db: aiosqlite.Connection,
     conv_id: str | None = None,
     provider: str | None = None,
     project_slug: str | None = None,
+    *,
+    workspace_id: str,
+    session_uuid: str,
 ) -> dict:
     """Core hibernate business logic: send /exit, snapshot metrics, update DB.
 
     Shared between sessions router and agent router.
     Returns dict with status and conversation_id.
     """
+    # The agent route checks ownership before scheduling this background job,
+    # but filesystem ownership can change before the job actually runs. Recheck
+    # at the worker boundary immediately before any project path is resolved.
+    if project_slug:
+        async with acquire_db() as ownership_db:
+            await require_unique_project_workspace(
+                ownership_db,
+                project_slug=project_slug,
+                workspace_id=workspace_id,
+            )
     provider_config = get_provider(provider)
     is_claude = (provider or "claude") == "claude"
 
@@ -201,11 +220,13 @@ async def hibernate_session_core(
                 )
     elif (provider or "claude") == "opencode" and not conv_id:
         launch_spec = build_session_start_spec(provider, project_slug)
-        cursor = await db.execute(
-            "SELECT created_at FROM sessions_meta WHERE name = ?",
-            (name,),
-        )
-        row = await cursor.fetchone()
+        async with acquire_db() as db:
+            cursor = await db.execute(
+                "SELECT created_at FROM sessions_meta "
+                "WHERE name = ? AND session_uuid = ? AND workspace_id = ?",
+                (name, session_uuid, workspace_id),
+            )
+            row = await cursor.fetchone()
         conv_id = await asyncio.to_thread(
             opencode_sessions.find_session_id_for_created_at,
             launch_spec.launch_dir,
@@ -234,7 +255,6 @@ async def hibernate_session_core(
 
     # Update DB
     now = datetime.now(timezone.utc).isoformat()
-    await db.execute("INSERT OR IGNORE INTO sessions_meta (name) VALUES (?)", (name,))
     updates = ["hibernated = 1", "hibernated_at = ?"]
     params: list = [now]
     if conv_id:
@@ -257,11 +277,14 @@ async def hibernate_session_core(
                 metrics.message_count,
             ]
         )
-    params.append(name)
-    await db.execute(
-        f"UPDATE sessions_meta SET {', '.join(updates)} WHERE name = ?", params
-    )
-    await db.commit()
+    params.extend((name, workspace_id))
+    params.append(session_uuid)
+    async with write_db(label="agent.hibernate_session") as db:
+        await db.execute(
+            f"UPDATE sessions_meta SET {', '.join(updates)} "
+            "WHERE name = ? AND workspace_id = ? AND session_uuid = ?",
+            params,
+        )
 
     logger.info(
         "Session hibernated: %s (conversation=%s, provider=%s)",

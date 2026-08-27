@@ -98,12 +98,13 @@ is_whitelisted_path() {
 
 deny() {
   local reason="$1"
-  jq -n --arg r "$reason" '{
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: $r
-    }
-  }'
+  # This is the last-resort blocking path, so it cannot depend on jq or
+  # Python: those may be the very missing dependencies we need to report.
+  reason=${reason//\\/\\\\}
+  reason=${reason//\"/\\\"}
+  reason=${reason//$'\n'/\\n}
+  reason=${reason//$'\r'/\\r}
+  reason=${reason//$'\t'/\\t}
+  printf '%s\n' "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"$reason\"}}"
   exit 0
 }

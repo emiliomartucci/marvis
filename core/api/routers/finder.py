@@ -9,17 +9,15 @@ import mimetypes
 import os
 import shutil
 import tempfile
-import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from starlette.requests import Request
-from starlette.responses import HTMLResponse
 
-from core.api.templates.markdown_share import render_markdown_page, MAX_MARKDOWN_RENDER_SIZE
+from core.api.templates.markdown_share import MAX_MARKDOWN_RENDER_SIZE
 
 from core.api.config import settings
 from core.api.db import get_db, get_write_db
@@ -31,8 +29,17 @@ from core.api.models import (
     FinderTreeNode,
     UserInfo,
 )
-from core.api.rbac import require_role
-from core.api.security import get_current_user, get_current_user_or_agent
+from core.api.routers._browser_mutation_denial import agent_only_route
+from core.api.security import (
+    get_agent_user,
+    get_current_user,
+    get_current_user_or_agent,
+    is_local_single_user_mode,
+    is_loopback_request,
+)
+from core.api.services import access_grants
+from core.api.use_cases._context import CallerContext, require_workspace_ctx
+from core.api.use_cases._errors import AuthorizationError
 from core.api.services.share_links import (
     create_shared_link_record,
     enforce_workspace_share_role,
@@ -50,11 +57,50 @@ from core.api.visibility import check_project_access, get_visible_projects
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/finder", tags=["finder"])
-share_router = APIRouter(prefix="/api/v1", tags=["shared"])
+_LOCAL_HOST_DETAIL = (
+    "This host-global filesystem operation is available only to the trusted "
+    "local OSS loopback runtime."
+)
+_LEGACY_SHARE_DETAIL = (
+    "Legacy host-global share routes are local-only. Use the governed share_file "
+    "MCP tool for remote project-owned sharing."
+)
+
+
+def _require_local_host_request(request: Request) -> None:
+    if is_local_single_user_mode() and is_loopback_request(request):
+        return
+    raise HTTPException(status_code=403, detail=_LOCAL_HOST_DETAIL)
+
+
+def _require_local_legacy_share_request(request: Request) -> None:
+    if is_local_single_user_mode() and is_loopback_request(request):
+        return
+    raise HTTPException(status_code=403, detail=_LEGACY_SHARE_DETAIL)
+
+
+router = APIRouter(
+    prefix="/api/v1/finder",
+    tags=["finder"],
+    dependencies=[Depends(_require_local_host_request)],
+)
+share_router = APIRouter(
+    prefix="/api/v1",
+    tags=["shared"],
+    dependencies=[Depends(_require_local_legacy_share_request)],
+)
 
 
 # --- Security ---
+
+
+def _authenticated_actor(user: UserInfo) -> CallerContext:
+    actor = access_grants.actor_from_user_info(user)
+    try:
+        require_workspace_ctx(actor)
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=exc.message) from exc
+    return actor
 
 
 def _validate_path(raw_path: str) -> Path:
@@ -144,7 +190,19 @@ async def _check_finder_visibility(
 
     Slug extracted from RESOLVED path (not raw input) to prevent symlink traversal.
     """
-    if user.system_role in ("super_admin", "admin"):
+    actor = _authenticated_actor(user)
+    # The whole Finder router is socket-guarded to the trusted OSS loopback
+    # runtime.  Preserve that single-user runtime's host-filesystem semantics
+    # even after migration 179 enables workspace isolation in the database.
+    # A hosted admin never matches this principal and remains project-bound.
+    if (
+        actor.user_id == "local"
+        and actor.username == "local"
+        and actor.user_type == "human"
+    ):
+        return
+    isolated = await access_grants.workspace_isolation_enabled(db)
+    if not isolated and user.system_role in ("super_admin", "admin"):
         return
 
     resolved = _validate_path(path)
@@ -164,6 +222,32 @@ async def _check_finder_visibility(
     if len(parts) >= 2:
         slug = parts[1]
         await check_project_access(slug, user, db)
+
+
+async def _check_finder_read(
+    path: str,
+    user: UserInfo,
+    db: aiosqlite.Connection,
+    *,
+    direct_read: bool = False,
+) -> None:
+    await _check_finder_visibility(path, user, db)
+    actor = _authenticated_actor(user)
+    if not await access_grants.file_readable(
+        db, actor, path, direct_read=direct_read
+    ):
+        raise HTTPException(404, "Not found")
+
+
+async def _check_finder_write(
+    path: str,
+    user: UserInfo,
+    db: aiosqlite.Connection,
+) -> None:
+    await _check_finder_visibility(path, user, db)
+    actor = _authenticated_actor(user)
+    if not await access_grants.file_writable(db, actor, path):
+        raise HTTPException(404, "Not found")
 
 
 # --- Endpoints ---
@@ -218,15 +302,14 @@ async def get_tree(
 
     items = await asyncio.to_thread(_scan_tree, target)
 
-    # For non-admins listing projects/, filter to visible slugs only
-    if current_user.system_role not in ("super_admin", "admin"):
-        root_p = Path(settings.finder_root).resolve()
-        rel_target = target.relative_to(root_p)
-        parts = tuple(p for p in rel_target.parts if p)
-        if not parts or parts == ("projects",):
-            visible = await get_visible_projects(db, current_user)
-            if visible is not None:
-                items = [n for n in items if n.get("name") in visible]
+    # Canonical workspace isolation applies to admins too.
+    root_p = Path(settings.finder_root).resolve()
+    rel_target = target.relative_to(root_p)
+    parts = tuple(p for p in rel_target.parts if p)
+    if not parts or parts == ("projects",):
+        visible = await get_visible_projects(db, current_user)
+        if visible is not None:
+            items = [n for n in items if n.get("name") in visible]
 
     return [FinderTreeNode(**n) for n in items]
 
@@ -277,18 +360,17 @@ async def list_directory(
 
     items = await asyncio.to_thread(_scan)
 
-    # For non-admins listing projects/, filter to visible slugs only
-    if current_user.system_role not in ("super_admin", "admin"):
-        root_p = Path(settings.finder_root).resolve()
-        try:
-            rel_target = target.relative_to(root_p)
-            parts = tuple(p for p in rel_target.parts if p)
-            if not parts or parts == ("projects",):
-                visible = await get_visible_projects(db, current_user)
-                if visible is not None:
-                    items = [i for i in items if i.get("name") in visible]
-        except ValueError:
-            pass
+    # Canonical workspace isolation applies to admins too.
+    root_p = Path(settings.finder_root).resolve()
+    try:
+        rel_target = target.relative_to(root_p)
+        parts = tuple(p for p in rel_target.parts if p)
+        if not parts or parts == ("projects",):
+            visible = await get_visible_projects(db, current_user)
+            if visible is not None:
+                items = [i for i in items if i.get("name") in visible]
+    except ValueError:
+        pass
 
     parent = str(Path(path).parent) if path else None
     if parent == ".":
@@ -307,7 +389,7 @@ async def read_file(
     db: aiosqlite.Connection = Depends(get_db),
 ) -> FinderFileContent:
     """Read file content. Text returned as UTF-8, binary as base64."""
-    await _check_finder_visibility(path, current_user, db)
+    await _check_finder_read(path, current_user, db, direct_read=True)
     target = _validate_path(path)
     if not target.is_file():
         raise HTTPException(404, "File not found")
@@ -364,17 +446,16 @@ async def read_file(
     )
 
 
-@router.put("/file", response_model=FinderFileContent)
+@agent_only_route(router, "/file", methods=["PUT"], response_model=FinderFileContent)
 async def save_file(
     path: str,
     body: FinderFileUpdate,
-    current_user: UserInfo = Depends(
-        require_role("operator", "admin", "super_admin", human_only=True)
-    ),
+    current_user: UserInfo = Depends(get_agent_user),
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> FinderFileContent:
     """Save file content. Atomic write with fsync."""
-    await _check_finder_visibility(path, current_user, db)
+    await _check_finder_write(path, current_user, db)
+    actor = _authenticated_actor(current_user)
     target = _validate_path(path)
     if not target.exists():
         raise HTTPException(404, "File not found")
@@ -407,6 +488,10 @@ async def save_file(
 
     await asyncio.to_thread(_write)
 
+    from core.api.services.confidential_files import capture_owner
+
+    await capture_owner(db, actor, path)
+
     stat = await asyncio.to_thread(target.stat)
     return FinderFileContent(
         content=body.content,
@@ -419,12 +504,10 @@ async def save_file(
     )
 
 
-@router.post("/mkdir")
+@agent_only_route(router, "/mkdir", methods=["POST"])
 async def make_directory(
     data: dict,
-    current_user: UserInfo = Depends(
-        require_role("operator", "admin", "super_admin", human_only=True)
-    ),
+    current_user: UserInfo = Depends(get_agent_user),
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> dict:
     """Create a new directory."""
@@ -432,7 +515,7 @@ async def make_directory(
     if not path:
         raise HTTPException(400, "Path required")
 
-    await _check_finder_visibility(path, current_user, db)
+    await _check_finder_write(path, current_user, db)
     target = _validate_path(path)
     if target.exists():
         raise HTTPException(409, "Already exists")
@@ -441,12 +524,10 @@ async def make_directory(
     return {"ok": True}
 
 
-@router.post("/rename")
+@agent_only_route(router, "/rename", methods=["POST"])
 async def rename_item(
     data: dict,
-    current_user: UserInfo = Depends(
-        require_role("operator", "admin", "super_admin", human_only=True)
-    ),
+    current_user: UserInfo = Depends(get_agent_user),
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> dict:
     """Rename a file or directory in place."""
@@ -459,7 +540,7 @@ async def rename_item(
     if "/" in new_name or "\\" in new_name:
         raise HTTPException(400, "Invalid new name")
 
-    await _check_finder_visibility(path, current_user, db)
+    await _check_finder_write(path, current_user, db)
     target = _validate_path(path)
     if not target.exists():
         raise HTTPException(404, "Not found")
@@ -472,20 +553,29 @@ async def rename_item(
         raise HTTPException(409, f"'{new_name}' already exists")
 
     await asyncio.to_thread(target.rename, dest)
+    # RBAC F4: confidentiality travels with the file — a stale file_meta path
+    # would silently declassify the renamed file on DB-authoritative checks.
+    from core.api.services.confidential_files import migrate_file_meta_path
+
+    await migrate_file_meta_path(
+        db,
+        old_path=path,
+        new_path=_rel_path(dest),
+        workspace_id=require_workspace_ctx(_authenticated_actor(current_user)),
+    )
+    await db.commit()
     return {"ok": True}
 
 
-@router.post("/upload", response_model=list[FinderListItem])
+@agent_only_route(router, "/upload", methods=["POST"], response_model=list[FinderListItem])
 async def upload_files(
     path: str,
     files: list[UploadFile],
-    current_user: UserInfo = Depends(
-        require_role("operator", "admin", "super_admin", human_only=True)
-    ),
+    current_user: UserInfo = Depends(get_agent_user),
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> list[FinderListItem]:
     """Upload one or more files to a directory."""
-    await _check_finder_visibility(path, current_user, db)
+    await _check_finder_write(path, current_user, db)
     target_dir = _validate_path(path)
     if not target_dir.is_dir():
         raise HTTPException(400, "Not a directory")
@@ -505,6 +595,14 @@ async def upload_files(
             raise HTTPException(413, f"File too large: {safe_name}")
 
         await asyncio.to_thread(dest.write_bytes, content)
+
+        from core.api.services.confidential_files import capture_owner
+
+        await capture_owner(
+            db,
+            _authenticated_actor(current_user),
+            _rel_path(dest),
+        )
 
         stat = await asyncio.to_thread(dest.stat)
         results.append(
@@ -531,7 +629,7 @@ async def download_file(
     db: aiosqlite.Connection = Depends(get_db),
 ) -> StreamingResponse:
     """Download a file as binary stream."""
-    await _check_finder_visibility(path, current_user, db)
+    await _check_finder_read(path, current_user, db, direct_read=True)
     target = _validate_path(path)
     if not target.is_file():
         raise HTTPException(404, "File not found")
@@ -557,12 +655,10 @@ async def download_file(
     )
 
 
-@router.post("/delete")
+@agent_only_route(router, "/delete", methods=["POST"])
 async def delete_item(
     data: dict,
-    current_user: UserInfo = Depends(
-        require_role("admin", "super_admin", human_only=True)
-    ),
+    current_user: UserInfo = Depends(get_agent_user),
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> dict:
     """Delete a file or directory."""
@@ -570,7 +666,7 @@ async def delete_item(
     if not path:
         raise HTTPException(400, "Path required")
 
-    await _check_finder_visibility(path, current_user, db)
+    await _check_finder_write(path, current_user, db)
     target = _validate_path(path)
     if not target.exists():
         raise HTTPException(404, "Not found")
@@ -590,12 +686,10 @@ async def delete_item(
     return {"ok": True}
 
 
-@router.post("/move")
+@agent_only_route(router, "/move", methods=["POST"])
 async def move_item(
     data: dict,
-    current_user: UserInfo = Depends(
-        require_role("operator", "admin", "super_admin", human_only=True)
-    ),
+    current_user: UserInfo = Depends(get_agent_user),
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> dict:
     """Move a file or directory to a new location."""
@@ -604,8 +698,8 @@ async def move_item(
     if not src_path or not dest_path:
         raise HTTPException(400, "src and dest required")
 
-    await _check_finder_visibility(src_path, current_user, db)
-    await _check_finder_visibility(dest_path, current_user, db)
+    await _check_finder_write(src_path, current_user, db)
+    await _check_finder_write(dest_path, current_user, db)
     src = _validate_path(src_path)
     if not src.exists():
         raise HTTPException(404, "Source not found")
@@ -619,6 +713,16 @@ async def move_item(
         raise HTTPException(409, f"'{src.name}' already exists in destination")
 
     await asyncio.to_thread(shutil.move, str(src), str(final))
+    # RBAC F4: confidentiality travels with the file (cross-project moves too).
+    from core.api.services.confidential_files import migrate_file_meta_path
+
+    await migrate_file_meta_path(
+        db,
+        old_path=src_path,
+        new_path=_rel_path(final),
+        workspace_id=require_workspace_ctx(_authenticated_actor(current_user)),
+    )
+    await db.commit()
     return {"ok": True, "new_path": _rel_path(final)}
 
 
@@ -722,7 +826,7 @@ async def _create_share_link_impl(
             hours=hours,
         )
 
-    await _check_finder_visibility(path, current_user, db)
+    await _check_finder_read(path, current_user, db, direct_read=True)
     target = _validate_path(path)
     if not target.is_file():
         raise HTTPException(404, "File not found")
@@ -891,7 +995,7 @@ async def access_shared_file(
         can_edit = bool(user) and bool(rel)
         if can_edit and user is not None:
             try:
-                await _check_finder_visibility(rel, user, db)
+                await _check_finder_write(rel, user, db)
             except HTTPException:
                 can_edit = False
 
@@ -919,7 +1023,9 @@ async def access_shared_file(
     )
 
 
-@shared_router.put("/{token}")
+@shared_router.put(
+    "/{token}", dependencies=[Depends(_require_local_host_request)]
+)
 async def save_shared_file(
     token: str,
     body: FinderFileUpdate,
@@ -948,7 +1054,8 @@ async def save_shared_file(
         raise HTTPException(404, "Target outside finder root")
 
     # Visibility check FIRST (anti-symlink): slug from resolved path.
-    await _check_finder_visibility(rel, current_user, db)
+    await _check_finder_write(rel, current_user, db)
+    actor = _authenticated_actor(current_user)
 
     if not os.access(target, os.W_OK):
         raise HTTPException(403, "File is read-only")
@@ -978,6 +1085,10 @@ async def save_shared_file(
             raise
 
     await asyncio.to_thread(_write)
+
+    from core.api.services.confidential_files import capture_owner
+
+    await capture_owner(db, actor, rel)
 
     return {
         "path": rel,

@@ -8,52 +8,84 @@ import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.api.db import get_db, get_write_db
-from core.api.models import RaciEntry, RaciAddRequest, RaciReplaceRequest, UserInfo, UserSummary
+from core.api.models import RaciEntry, RaciAddRequest, RaciReplaceRequest, UserSummary
 from core.api.rbac import require_role
-from core.api.security import get_current_user, get_current_user_or_agent
+from core.api.security import get_current_user_or_agent
+from core.api.services import access_grants
 from core.api.services.events import emit_event
-from core.api.visibility import check_project_access
+from core.api.use_cases._context import CallerContext, require_workspace_ctx
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/projects", tags=["raci"])
 
 
 async def _get_raci_with_users(
-    db: aiosqlite.Connection, project: str
+    db: aiosqlite.Connection,
+    project: str,
+    *,
+    workspace_id: str | None,
 ) -> list[RaciEntry]:
-    """Fetch RACI entries with embedded user summaries, excluding soft-deleted users."""
+    """Fetch RACI entries, filtering polluted foreign user references."""
     db.row_factory = aiosqlite.Row
-    async with db.execute(
-        """
-        SELECT r.role, u.id, u.slug, u.display_name, u.avatar_color
-        FROM project_raci r
-        JOIN users u ON u.id = r.user_id
-        WHERE r.project = ? AND u.deleted_at IS NULL
-        ORDER BY
-            CASE r.role
-                WHEN 'responsible' THEN 1
-                WHEN 'accountable' THEN 2
-                WHEN 'consulted'   THEN 3
-                WHEN 'informed'    THEN 4
-            END,
-            u.display_name
-        """,
-        (project,),
-    ) as cursor:
-        rows = await cursor.fetchall()
-
+    query = (
+        "SELECT r.role, u.id, u.slug, u.display_name, u.avatar_color "
+        "FROM project_raci r JOIN users u ON u.id = r.user_id "
+        "WHERE r.project = ? AND u.deleted_at IS NULL"
+    )
+    params: list[str] = [project]
+    if workspace_id is not None:
+        query += " AND u.workspace_id = ?"
+        params.append(workspace_id)
+    query += (
+        " ORDER BY CASE r.role "
+        "WHEN 'responsible' THEN 1 WHEN 'accountable' THEN 2 "
+        "WHEN 'consulted' THEN 3 WHEN 'informed' THEN 4 END, u.display_name"
+    )
+    rows = await (await db.execute(query, params)).fetchall()
     return [
         RaciEntry(
             user=UserSummary(
-                id=r["id"],
-                slug=r["slug"],
-                display_name=r["display_name"],
-                avatar_color=r["avatar_color"] or "#6366f1",
+                id=row["id"],
+                slug=row["slug"],
+                display_name=row["display_name"],
+                avatar_color=row["avatar_color"] or "#6366f1",
             ),
-            role=r["role"],
+            role=row["role"],
         )
-        for r in rows
+        for row in rows
     ]
+
+
+async def _require_workspace_project(
+    db: aiosqlite.Connection, user, project: str
+) -> str | None:
+    """Return workspace for an unambiguous visible slug; local stdio bypasses."""
+    ctx = CallerContext.from_user_info(
+        user, is_human_session=getattr(user, "user_type", "human") == "human"
+    )
+    visible = await access_grants.visible_projects_for_actor(db, ctx)
+    if visible is not None and project not in visible:
+        raise HTTPException(status_code=404, detail="Not found")
+    if ctx.user_id == "local" and ctx.username == "local":
+        return require_workspace_ctx(ctx)
+    workspace_id = require_workspace_ctx(ctx)
+    try:
+        owners = {
+            str(row[0])
+            for row in await (
+                await db.execute(
+                    "SELECT workspace_id FROM workspace_projects "
+                    "WHERE project_slug = ?",
+                    (project,),
+                )
+            ).fetchall()
+            if row[0]
+        }
+    except aiosqlite.Error:
+        owners = set()
+    if owners != {workspace_id}:
+        raise HTTPException(status_code=404, detail="Not found")
+    return workspace_id
 
 
 @router.get("/{slug}/raci", response_model=list[RaciEntry])
@@ -63,8 +95,8 @@ async def get_raci(
     db: aiosqlite.Connection = Depends(get_db),
 ):
     """Lista RACI del progetto con dati utente embedded."""
-    await check_project_access(slug, user, db)
-    return await _get_raci_with_users(db, slug)
+    workspace_id = await _require_workspace_project(db, user, slug)
+    return await _get_raci_with_users(db, slug, workspace_id=workspace_id)
 
 
 @router.post("/{slug}/raci", response_model=list[RaciEntry], status_code=201)
@@ -80,14 +112,24 @@ async def add_raci_entry(
     (partial unique index garantisce uno solo per progetto).
     """
     db.row_factory = aiosqlite.Row
+    workspace_id = await _require_workspace_project(db, user, slug)
 
     # Verifica utente esiste e non e eliminato
-    u = await (
-        await db.execute(
-            "SELECT id FROM users WHERE id = ? AND deleted_at IS NULL",
-            (body.user_id,),
-        )
-    ).fetchone()
+    if workspace_id is None:
+        u = await (
+            await db.execute(
+                "SELECT id FROM users WHERE id = ? AND deleted_at IS NULL",
+                (body.user_id,),
+            )
+        ).fetchone()
+    else:
+        u = await (
+            await db.execute(
+                "SELECT id FROM users WHERE id = ? AND workspace_id = ? "
+                "AND deleted_at IS NULL",
+                (body.user_id, workspace_id),
+            )
+        ).fetchone()
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -120,8 +162,9 @@ async def add_raci_entry(
         target_type="raci",
         target_id=slug,
         payload={"action": "assign", "user_id": body.user_id, "role": body.role},
+        workspace_id=workspace_id,
     )
-    return await _get_raci_with_users(db, slug)
+    return await _get_raci_with_users(db, slug, workspace_id=workspace_id)
 
 
 @router.put("/{slug}/raci", response_model=list[RaciEntry])
@@ -136,9 +179,22 @@ async def replace_raci(
     Revoca tutte le entry esistenti e reinserisce quelle fornite.
     Tutto registrato in project_raci_history per audit trail.
     """
-    await check_project_access(slug, user, db)
+    workspace_id = await _require_workspace_project(db, user, slug)
     db.row_factory = aiosqlite.Row
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    if body.entries and workspace_id is not None:
+        requested_ids = sorted({entry.user_id for entry in body.entries})
+        placeholders = ",".join("?" for _ in requested_ids)
+        rows = await (
+            await db.execute(
+                f"SELECT id FROM users WHERE id IN ({placeholders}) "
+                "AND workspace_id = ? AND deleted_at IS NULL",
+                [*requested_ids, workspace_id],
+            )
+        ).fetchall()
+        if {str(row[0]) for row in rows} != set(requested_ids):
+            raise HTTPException(status_code=404, detail="Not found")
 
     # Leggi entries esistenti per audit trail
     async with db.execute(
@@ -188,8 +244,9 @@ async def replace_raci(
         target_type="raci",
         target_id=slug,
         payload={"action": "replace", "entries": len(body.entries)},
+        workspace_id=workspace_id,
     )
-    return await _get_raci_with_users(db, slug)
+    return await _get_raci_with_users(db, slug, workspace_id=workspace_id)
 
 
 @router.delete("/{slug}/raci/{user_id}/{role}", status_code=204)
@@ -201,6 +258,17 @@ async def remove_raci_entry(
     db: aiosqlite.Connection = Depends(get_write_db),
 ):
     """Rimuovi singola entry RACI. Registra revoca in audit trail."""
+    workspace_id = await _require_workspace_project(db, user, slug)
+    if workspace_id is not None:
+        target_user = await (
+            await db.execute(
+                "SELECT id FROM users WHERE id = ? AND workspace_id = ? "
+                "AND deleted_at IS NULL",
+                (user_id, workspace_id),
+            )
+        ).fetchone()
+        if target_user is None:
+            raise HTTPException(status_code=404, detail="RACI entry not found")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     result = await db.execute(
@@ -225,4 +293,5 @@ async def remove_raci_entry(
         target_type="raci",
         target_id=slug,
         payload={"action": "revoke", "user_id": user_id, "role": role},
+        workspace_id=workspace_id,
     )

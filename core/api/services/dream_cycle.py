@@ -97,7 +97,9 @@ async def _default_neighbor_provider(
     its top-k LIVE (``invalid_at IS NULL``) neighbours via sqlite-vec kNN. Returns
     ``(None, [])`` when the mirror isn't present yet so the caller skips the row.
     """
-    new_vec = await tw.fetch_learning_vector(db, learning_id)
+    new_vec = await tw.fetch_learning_vector(
+        db, learning_id, workspace_id=workspace_id
+    )
     if new_vec is None:
         return None, []
     neighbors = await tw.fetch_live_neighbor_vectors(
@@ -205,6 +207,7 @@ async def run_dream_cycle_shadow(
                 f"Dream-cycle near-match between learnings '{a}' and '{b}' "
                 f"(cosine={score:.4f}) — confirm supersede or keep both."
             ),
+            workspace_id=workspace_id,
             project=project,
         )
         proposed += 1

@@ -1,7 +1,14 @@
 export const APP_BASE_PATH = "/ui";
+export const CONSOLE_LOGIN_PATH = `${APP_BASE_PATH}/login/`;
 export const SERVICE_WORKER_PATH = `${APP_BASE_PATH}/sw.js`;
 export const SERVICE_WORKER_SCOPE = `${APP_BASE_PATH}/`;
 export const MANIFEST_PATH = `${APP_BASE_PATH}/manifest.webmanifest`;
+
+export function redirectToConsoleLogin(
+  navigate: (url: string) => void = (url) => window.location.assign(url)
+): void {
+  navigate(CONSOLE_LOGIN_PATH);
+}
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");

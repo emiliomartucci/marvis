@@ -17,6 +17,10 @@ SessionId = NewType("SessionId", str)
 
 class SessionInfo(BaseModel):
     name: str
+    # Internal partition key used by the router/cache. It is deliberately
+    # excluded from API responses so the public SessionInfo contract stays
+    # stable while cached rows can still be filtered before serialization.
+    workspace_id: str | None = Field(default=None, exclude=True)
     display_name: str | None = None
     pinned: bool = False
     sort_order: int = 0

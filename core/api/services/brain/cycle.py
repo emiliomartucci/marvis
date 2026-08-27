@@ -247,6 +247,65 @@ async def supersede_orphan_partials(
     return updated
 
 
+async def reinstate_richer_superseded_run(
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
+    cycle_key: str,
+    empty_run_id: str,
+) -> str | None:
+    """Hand cycle authority back to the richest superseded run when a re-run is empty.
+
+    supersede_active_runs must demote prior runs BEFORE the new run is inserted
+    (partial unique index), so a cycle re-run whose window was already fully digested
+    collects 0 fresh events yet has already ousted the prior rich run. Left as-is,
+    brain_events/drift/findings (which read only the non-superseded run) go empty
+    while the journal still cites the prior run's evidence. This restores the richest
+    superseded run as canonical and marks the empty run as superseded by it.
+
+    Returns the reinstated run_id, or None if there was nothing richer to restore.
+    """
+    db.row_factory = aiosqlite.Row
+    row = await (
+        await db.execute(
+            'SELECT run_id, event_count, partial_failures_json FROM brain_runs '
+            'WHERE workspace_id = ? AND cycle_key = ? '
+            'AND superseded_by_run_id = ? AND event_count > 0 '
+            'ORDER BY event_count DESC, started_at DESC LIMIT 1',
+            (workspace_id, cycle_key, empty_run_id),
+        )
+    ).fetchone()
+    if row is None:
+        return None
+    rich_id = row['run_id']
+    try:
+        had_failures = bool(json.loads(row['partial_failures_json'] or '[]'))
+    except (TypeError, ValueError):
+        had_failures = False
+    restored_status = 'partial' if had_failures else 'succeeded'
+    # Order matters for uniq_brain_runs_active_cycle (one active run per cycle):
+    # demote the empty run FIRST, then promote the rich one — never two active.
+    await db.execute(
+        "UPDATE brain_runs SET status = 'superseded', superseded_by_run_id = ? "
+        'WHERE run_id = ?',
+        (rich_id, empty_run_id),
+    )
+    # Re-point any OTHER runs the empty run had superseded to the reinstated run,
+    # keeping the supersede chain single-hop (they stay superseded).
+    await db.execute(
+        'UPDATE brain_runs SET superseded_by_run_id = ? '
+        'WHERE workspace_id = ? AND cycle_key = ? '
+        'AND superseded_by_run_id = ? AND run_id != ?',
+        (rich_id, workspace_id, cycle_key, empty_run_id, rich_id),
+    )
+    await db.execute(
+        'UPDATE brain_runs SET status = ?, superseded_by_run_id = NULL '
+        'WHERE run_id = ?',
+        (restored_status, rich_id),
+    )
+    return rich_id
+
+
 # ----------------------------------------------------------------------
 # Event persistence
 # ----------------------------------------------------------------------

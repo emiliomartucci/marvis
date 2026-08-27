@@ -64,7 +64,20 @@ async def _log_event(
          task_id, pr_id, payload_json, error),
     )
     await db.commit()
-    return cursor.rowcount > 0
+    if cursor.rowcount > 0:
+        return True
+
+    # A transition conflict is deliberately retained as unprocessed so the
+    # original delivery can be retried after the competing task writer settles.
+    # Reclaim only this explicit retryable state; a duplicate in-flight or
+    # successfully processed delivery remains idempotently ignored.
+    retry = await db.execute(
+        "UPDATE webhook_events SET error = NULL WHERE delivery_id = ? "
+        "AND processed = 0 AND error LIKE 'task_transition_conflict:%'",
+        (delivery_id,),
+    )
+    await db.commit()
+    return retry.rowcount > 0
 
 
 async def _update_event_error(
@@ -116,7 +129,8 @@ async def _send_telegram(text: str) -> None:
 async def _find_task_by_id(db: aiosqlite.Connection, task_id: str) -> aiosqlite.Row | None:
     """Find task by ID."""
     cursor = await db.execute(
-        "SELECT id, status, project, title FROM tasks WHERE id = ? AND deleted_at IS NULL",
+        "SELECT id, status, project, title, workspace_id FROM tasks "
+        "WHERE id = ? AND deleted_at IS NULL",
         (task_id,),
     )
     return await cursor.fetchone()
@@ -129,6 +143,24 @@ async def _find_pr_by_branch(db: aiosqlite.Connection, branch: str) -> aiosqlite
         (branch,),
     )
     return await cursor.fetchone()
+
+
+async def _resolve_unique_project_workspace(
+    db: aiosqlite.Connection, project: str
+) -> str | None:
+    """Resolve a webhook project only when ownership identifies one workspace."""
+    cursor = await db.execute(
+        "SELECT DISTINCT workspace_id FROM ("
+        "SELECT workspace_id FROM tasks WHERE project = ? AND deleted_at IS NULL "
+        "UNION SELECT t.workspace_id FROM project_teams pt "
+        "JOIN teams t ON t.id = pt.team_id WHERE pt.project = ?"
+        ") WHERE workspace_id IS NOT NULL LIMIT 2",
+        (project, project),
+    )
+    rows = await cursor.fetchall()
+    if len(rows) != 1:
+        return None
+    return rows[0]["workspace_id"]
 
 
 async def handle_pr_opened(
@@ -186,17 +218,47 @@ async def handle_pr_opened(
         try:
             await db.execute(
                 """INSERT OR IGNORE INTO pull_requests
-                   (id, task_id, project, branch, target, status, title, body, created_at)
-                   VALUES (?, ?, ?, ?, 'main', 'open', ?, ?, ?)""",
-                (pr_id, task_id, project, branch, pr_title, pr_body, now),
+                   (id, task_id, project, branch, target, status, title, body,
+                    created_at, workspace_id)
+                   VALUES (?, ?, ?, ?, 'main', 'open', ?, ?, ?, ?)""",
+                (
+                    pr_id,
+                    task_id,
+                    project,
+                    branch,
+                    pr_title,
+                    pr_body,
+                    now,
+                    task["workspace_id"],
+                ),
             )
             await db.commit()
 
             # Only transition to review if not already in review
             if task["status"] != "review":
-                from core.api.services.task_transitions import validate_and_transition_task
+                from core.api.services.task_transitions import (
+                    TaskTransitionConflict,
+                    validate_and_transition_task,
+                )
                 try:
-                    await validate_and_transition_task(db, task_id, "review", trigger="webhook_pr_opened")
+                    await validate_and_transition_task(
+                        db,
+                        task_id,
+                        "review",
+                        trigger="webhook_pr_opened",
+                        workspace_id=task["workspace_id"],
+                    )
+                except TaskTransitionConflict as exc:
+                    logger.warning(
+                        "Task %s changed while processing PR-open delivery %s: %s",
+                        task_id,
+                        delivery_id,
+                        exc,
+                    )
+                    await _update_event_error(
+                        db, delivery_id, f"task_transition_conflict: {exc}"
+                    )
+                    return
                 except ValueError as exc:
                     logger.warning("Could not transition task %s to review: %s", task_id, exc)
 
@@ -222,16 +284,25 @@ async def handle_pr_opened(
 
         # Extract project from repo name (last segment) as best guess
         project_guess = repo.split("/")[-1] if repo else "unknown"
+        workspace_id = await _resolve_unique_project_workspace(db, project_guess)
+        if workspace_id is None:
+            message = (
+                "Cannot create retroactive task: webhook project does not resolve "
+                "to exactly one workspace"
+            )
+            logger.warning("%s (project=%s)", message, project_guess)
+            await _update_event_error(db, delivery_id, message)
+            return
 
         try:
             await db.execute(
                 """INSERT OR IGNORE INTO tasks
                    (id, title, description, status, project, priority,
-                    created_by, source, source_ref, created_at, updated_at)
-                   VALUES (?, ?, ?, 'pending', ?, 'medium', 'github', 'github', ?, ?, ?)""",
+                    created_by, source, source_ref, created_at, updated_at, workspace_id)
+                   VALUES (?, ?, ?, 'pending', ?, 'medium', 'github', 'github', ?, ?, ?, ?)""",
                 (new_task_id, pr_title or f"PR #{pr_number} da GitHub",
                  pr_body or None, project_guess,
-                 source_ref, now, now),
+                 source_ref, now, now, workspace_id),
             )
             await db.commit()
 
@@ -239,9 +310,19 @@ async def handle_pr_opened(
             pr_id = str(uuid.uuid4())
             await db.execute(
                 """INSERT INTO pull_requests
-                   (id, task_id, project, branch, target, status, title, body, created_at)
-                   VALUES (?, ?, ?, ?, 'main', 'open', ?, ?, ?)""",
-                (pr_id, new_task_id, project_guess, branch, pr_title, pr_body, now),
+                   (id, task_id, project, branch, target, status, title, body,
+                    created_at, workspace_id)
+                   VALUES (?, ?, ?, ?, 'main', 'open', ?, ?, ?, ?)""",
+                (
+                    pr_id,
+                    new_task_id,
+                    project_guess,
+                    branch,
+                    pr_title,
+                    pr_body,
+                    now,
+                    workspace_id,
+                ),
             )
             await db.commit()
 
@@ -286,10 +367,14 @@ async def handle_pr_merged(
         return
 
     task_id = pr_row["task_id"]
+    workspace_id = pr_row["workspace_id"]
+    if not workspace_id:
+        await _update_event_error(db, delivery_id, "missing_pr_workspace")
+        return
 
     try:
         from core.api.services.pr_service import merge_pr
-        await merge_pr(task_id, db)
+        await merge_pr(task_id, db, workspace_id=workspace_id)
         await _update_event_processed(db, delivery_id, task_id=task_id, pr_id=pr_row["id"])
     except Exception as exc:
         logger.exception("merge_pr failed for task %s (branch %s): %s", task_id, branch, exc)
@@ -337,11 +422,15 @@ async def handle_pr_closed(
         return
 
     task_id = pr_row["task_id"]
+    workspace_id = pr_row["workspace_id"]
+    if not workspace_id:
+        await _update_event_error(db, delivery_id, "missing_pr_workspace")
+        return
     reason = pr_body or f"PR #{pr_number} chiusa senza merge"
 
     try:
         from core.api.services.pr_service import close_pr
-        await close_pr(task_id, reason, db)
+        await close_pr(task_id, reason, db, workspace_id=workspace_id)
         await _update_event_processed(db, delivery_id, task_id=task_id, pr_id=pr_row["id"])
     except Exception as exc:
         logger.exception("close_pr failed for task %s (branch %s): %s", task_id, branch, exc)

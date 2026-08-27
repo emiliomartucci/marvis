@@ -158,7 +158,10 @@ def decide_write_action(
 
 
 async def fetch_learning_vector(
-    db: aiosqlite.Connection, learning_id: str
+    db: aiosqlite.Connection,
+    learning_id: str,
+    *,
+    workspace_id: str,
 ) -> list[float] | None:
     """Read a learning's vector back from the search-index mirror. NEVER runs a model.
 
@@ -173,8 +176,9 @@ async def fetch_learning_vector(
     little-endian float32 blob (``embedding_service.serialize_f32`` produced it).
     """
     cur = await db.execute(
-        "SELECT id FROM documents WHERE file_path = ?",
-        [f"learning:{learning_id}"],
+        "SELECT id FROM documents WHERE file_path = ? "
+        "AND COALESCE(workspace_id, 'ws_default') = ?",
+        [f"learning:{learning_id}", workspace_id],
     )
     doc_row = await cur.fetchone()
     if doc_row is None:
@@ -268,7 +272,20 @@ _WRITE_TIME_CYCLE_KEY = "write_time"
 _PROPOSAL_EXPIRY_DAYS = 30
 
 
-async def _ensure_write_time_run(db: aiosqlite.Connection, now_iso: str) -> None:
+def _write_time_run_id(workspace_id: str) -> str:
+    if workspace_id == "ws_default":
+        return _WRITE_TIME_RUN_ID
+    import hashlib
+
+    suffix = hashlib.blake2b(
+        workspace_id.encode("utf-8"), digest_size=8
+    ).hexdigest()
+    return f"{_WRITE_TIME_RUN_ID}_{suffix}"
+
+
+async def _ensure_write_time_run(
+    db: aiosqlite.Connection, now_iso: str, workspace_id: str
+) -> str:
     """Idempotently ensure the sentinel brain_runs envelope for write-time proposals."""
     await db.execute(
         """
@@ -276,11 +293,12 @@ async def _ensure_write_time_run(db: aiosqlite.Connection, now_iso: str) -> None
             (run_id, workspace_id, cycle_key, cycle_window_start_utc,
              cycle_window_end_utc, cutoff_hour_utc_at_run, scope_type, scope_key,
              trigger, status, started_at, finished_at)
-        VALUES (?, 'ws_default', ?, ?, ?, 0, 'company', '__company__',
+        VALUES (?, ?, ?, ?, ?, 0, 'company', '__company__',
                 'manual', 'succeeded', ?, ?)
         """,
         [
-            _WRITE_TIME_RUN_ID,
+            _write_time_run_id(workspace_id),
+            workspace_id,
             _WRITE_TIME_CYCLE_KEY,
             now_iso,
             now_iso,
@@ -288,6 +306,7 @@ async def _ensure_write_time_run(db: aiosqlite.Connection, now_iso: str) -> None
             now_iso,
         ],
     )
+    return _write_time_run_id(workspace_id)
 
 
 async def propose_supersede_candidate(
@@ -297,6 +316,7 @@ async def propose_supersede_candidate(
     new_id: str,
     score: float,
     summary: str,
+    workspace_id: str,
     project: str | None = None,
 ) -> str:
     """Write a pending SUPERSEDE_CANDIDATE proposal into brain_memory_operations.
@@ -321,7 +341,7 @@ async def propose_supersede_candidate(
     expires_at = now.replace(microsecond=0)
     expires_at = expires_at.isoformat().replace("+00:00", "Z")
 
-    await _ensure_write_time_run(db, now_iso)
+    run_id = await _ensure_write_time_run(db, now_iso, workspace_id)
 
     source_ref = f"learning:{old_id}"
     target_ref = f"learning:{new_id}"
@@ -334,7 +354,7 @@ async def propose_supersede_candidate(
         "|".join(evidence).encode("utf-8"), digest_size=32
     ).hexdigest()  # 64 hex chars (CHECK length = 64)
     op_seed = (
-        f"{_WRITE_TIME_CYCLE_KEY}|supersede_candidate|project|"
+        f"{workspace_id}|{_WRITE_TIME_CYCLE_KEY}|supersede_candidate|project|"
         f"{project or '__company__'}|{source_ref}|{target_ref}|{ev_hash}"
     )
     operation_id = hashlib.blake2b(op_seed.encode("utf-8"), digest_size=16).hexdigest()
@@ -347,13 +367,15 @@ async def propose_supersede_candidate(
             "supersede_reason": reason,
             "score": score,
             "origin": "write_time",
+            "workspace_id": workspace_id,
         }
     )
     scope_type = "project" if project else "company"
     scope_key = project or "__company__"
     involved = json.dumps([project] if project else [])
     recurrence_key = hashlib.blake2b(
-        f"supersede_candidate|{scope_type}|{scope_key}|{source_ref}|{target_ref}".encode(),
+        f"{workspace_id}|supersede_candidate|{scope_type}|{scope_key}|"
+        f"{source_ref}|{target_ref}".encode(),
         digest_size=8,
     ).hexdigest()
 
@@ -375,7 +397,7 @@ async def propose_supersede_candidate(
         """,
         [
             operation_id,
-            _WRITE_TIME_RUN_ID,
+            run_id,
             _WRITE_TIME_CYCLE_KEY,
             detected_at,
             scope_type,
@@ -407,6 +429,7 @@ async def apply_supersede(
     old_id: str,
     new_id: str,
     reason: str,
+    workspace_id: str,
 ) -> None:
     """Soft-invalidate the OLD learning, pointing it at the new live row.
 
@@ -426,6 +449,10 @@ async def apply_supersede(
     now = datetime.now(timezone.utc).isoformat()
     await db.execute(
         "UPDATE learnings SET invalid_at = ?, superseded_by = ?, supersede_reason = ? "
-        "WHERE id = ? AND invalid_at IS NULL",
-        (now, new_id, reason, old_id),
+        "WHERE id = ? AND invalid_at IS NULL "
+        "AND COALESCE(workspace_id, 'ws_default') = ? "
+        "AND EXISTS (SELECT 1 FROM learnings replacement "
+        "WHERE replacement.id = ? "
+        "AND COALESCE(replacement.workspace_id, 'ws_default') = ?)",
+        (now, new_id, reason, old_id, workspace_id, new_id, workspace_id),
     )

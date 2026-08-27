@@ -17,6 +17,7 @@ async def try_acquire_advisory(
     db,
     expected_status: str,
     *,
+    workspace_id: str = "ws_default",
     worker_id: str = WORKER_ID,
     timeout_seconds: int = LOCK_TIMEOUT_SECONDS,
 ) -> bool:
@@ -27,13 +28,20 @@ async def try_acquire_advisory(
            SET locked_by = ?,
                locked_at = datetime('now')
          WHERE id = ?
+           AND workspace_id = ?
            AND status = ?
            AND (
                 locked_by IS NULL
                 OR datetime(locked_at) < datetime('now', ?)
            )
         """,
-        (worker_id, ingest_id, expected_status, f"-{timeout_seconds} seconds"),
+        (
+            worker_id,
+            ingest_id,
+            workspace_id,
+            expected_status,
+            f"-{timeout_seconds} seconds",
+        ),
     )
     return cursor.rowcount == 1
 
@@ -42,6 +50,7 @@ async def release_advisory(
     ingest_id: str,
     db,
     *,
+    workspace_id: str = "ws_default",
     worker_id: str = WORKER_ID,
 ) -> None:
     """Release this worker's recovery lock if it still owns it."""
@@ -51,7 +60,8 @@ async def release_advisory(
            SET locked_by = NULL,
                locked_at = NULL
          WHERE id = ?
+           AND workspace_id = ?
            AND locked_by = ?
         """,
-        (ingest_id, worker_id),
+        (ingest_id, workspace_id, worker_id),
     )

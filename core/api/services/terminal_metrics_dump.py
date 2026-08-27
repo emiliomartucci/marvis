@@ -7,7 +7,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import aiofiles
 import httpx
@@ -157,9 +157,47 @@ async def sample_internet_probe(collector: TerminalMetricsCollector) -> dict[str
     return probe
 
 
+def workspace_collectors(
+    default_collector: TerminalMetricsCollector,
+    collectors_by_workspace: Mapping[str, TerminalMetricsCollector] | None = None,
+) -> dict[str, TerminalMetricsCollector]:
+    """Return an immutable, exact-workspace snapshot of live collectors."""
+    result = {"ws_default": default_collector}
+    for workspace_id, collector in tuple((collectors_by_workspace or {}).items()):
+        scope = str(workspace_id or "").strip()
+        if (
+            not scope
+            or scope == "ws_default"
+            or not isinstance(collector, TerminalMetricsCollector)
+        ):
+            continue
+        result[scope] = collector
+    return result
+
+
+async def append_workspace_snapshots(
+    collectors: Mapping[str, TerminalMetricsCollector],
+    *,
+    reason: str,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+) -> None:
+    """Persist one explicitly attributed snapshot per workspace."""
+    for workspace_id, collector in collectors.items():
+        await append_terminal_metrics_record(
+            {
+                "kind": "server_snapshot",
+                "workspace_id": workspace_id,
+                "reason": reason,
+                "snapshot": collector.snapshot(),
+            },
+            output_dir=output_dir,
+        )
+
+
 async def terminal_metrics_background_loop(
     collector: TerminalMetricsCollector,
     *,
+    collectors_by_workspace: Mapping[str, TerminalMetricsCollector] | None = None,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     dump_interval_seconds: float = DUMP_INTERVAL_SECONDS,
     network_interval_seconds: float = NETWORK_PROBE_INTERVAL_SECONDS,
@@ -175,12 +213,9 @@ async def terminal_metrics_background_loop(
             await asyncio.sleep(lag_interval_seconds)
         except asyncio.CancelledError:
             try:
-                await append_terminal_metrics_record(
-                    {
-                        "kind": "server_snapshot",
-                        "reason": "shutdown",
-                        "snapshot": collector.snapshot(),
-                    },
+                await append_workspace_snapshots(
+                    workspace_collectors(collector, collectors_by_workspace),
+                    reason="shutdown",
                     output_dir=output_dir,
                 )
             except Exception:
@@ -188,19 +223,34 @@ async def terminal_metrics_background_loop(
             raise
 
         now = time.monotonic()
-        collector.record_event_loop_lag(max(0.0, (now - expected_wake) * 1000))
+        current_collectors = workspace_collectors(
+            collector, collectors_by_workspace
+        )
+        event_loop_lag_ms = max(0.0, (now - expected_wake) * 1000)
+        for current_collector in current_collectors.values():
+            current_collector.record_event_loop_lag(event_loop_lag_ms)
 
         if now >= next_probe_at:
             if network_probe_enabled():
                 try:
-                    probe = await sample_internet_probe(collector)
-                    await append_terminal_metrics_record(
-                        {
-                            "kind": "internet_probe",
-                            "probe": probe,
-                        },
-                        output_dir=output_dir,
-                    )
+                    probe = await run_internet_probe()
+                    for workspace_id, current_collector in current_collectors.items():
+                        current_collector.record_internet_probe(
+                            target=probe["target"],
+                            ok=bool(probe["ok"]),
+                            duration_ms=float(probe["duration_ms"]),
+                            status_code=probe["status_code"],
+                            bytes_received=int(probe["bytes_received"]),
+                            error=probe["error"],
+                        )
+                        await append_terminal_metrics_record(
+                            {
+                                "kind": "internet_probe",
+                                "workspace_id": workspace_id,
+                                "probe": probe,
+                            },
+                            output_dir=output_dir,
+                        )
                 except Exception:
                     logger.warning(
                         "terminal metrics internet probe failed", exc_info=True
@@ -209,12 +259,9 @@ async def terminal_metrics_background_loop(
 
         if now >= next_dump_at:
             try:
-                await append_terminal_metrics_record(
-                    {
-                        "kind": "server_snapshot",
-                        "reason": "periodic",
-                        "snapshot": collector.snapshot(),
-                    },
+                await append_workspace_snapshots(
+                    current_collectors,
+                    reason="periodic",
                     output_dir=output_dir,
                 )
             except Exception:

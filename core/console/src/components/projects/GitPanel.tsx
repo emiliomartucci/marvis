@@ -1,18 +1,14 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { getProjectGitLog, getProjectGitBranches, getProjectGitDiff, projectGitPush, projectGitPull } from "@/lib/api";
+import { getProjectGitLog, getProjectGitBranches, getProjectGitDiff } from "@/lib/api";
 import type { GitCommit, GitBranch } from "@/lib/types";
-import { ErrorAlert } from "@/components/ui/ErrorAlert";
 
 export default function GitPanel({ slug }: { slug: string }) {
   const [commits, setCommits] = useState<GitCommit[]>([]);
   const [branches, setBranches] = useState<GitBranch[]>([]);
   const [diff, setDiff] = useState("");
   const [loading, setLoading] = useState(true);
-  const [pushing, setPushing] = useState(false);
-  const [pulling, setPulling] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
   const [showDiff, setShowDiff] = useState(false);
 
   useEffect(() => {
@@ -39,33 +35,6 @@ export default function GitPanel({ slug }: { slug: string }) {
       setDiff(res.diff);
     } catch {
       setDiff("Failed to load diff");
-    }
-  }
-
-  async function handlePush() {
-    if (!confirm("Push to remote?")) return;
-    setPushing(true);
-    setMessage(null);
-    try {
-      const res = await projectGitPush(slug);
-      setMessage(res.success ? "Push successful" : `Push failed: ${res.error}`);
-    } catch (err) {
-      setMessage(`Error: ${err instanceof Error ? err.message : "unknown"}`);
-    } finally {
-      setPushing(false);
-    }
-  }
-
-  async function handlePull() {
-    setPulling(true);
-    setMessage(null);
-    try {
-      const res = await projectGitPull(slug);
-      setMessage(res.success ? "Pull successful" : `Pull failed: ${res.error}`);
-    } catch (err) {
-      setMessage(`Error: ${err instanceof Error ? err.message : "unknown"}`);
-    } finally {
-      setPulling(false);
     }
   }
 
@@ -103,20 +72,6 @@ export default function GitPanel({ slug }: { slug: string }) {
         <span className="text-caption text-pir-text-muted">Branch:</span>
         <span className="text-body font-mono text-pir-accent">{currentBranch?.name || "unknown"}</span>
         <div className="ml-auto flex gap-2">
-          <button
-            onClick={handlePull}
-            disabled={pulling || pushing}
-            className="px-3 py-1 text-caption bg-pir-surface-0 border border-pir rounded hover:bg-pir-surface-1 disabled:opacity-50"
-          >
-            {pulling ? "Pulling..." : "Pull"}
-          </button>
-          <button
-            onClick={handlePush}
-            disabled={pushing || pulling}
-            className="px-3 py-1 text-caption bg-pir-accent text-white rounded hover:bg-pir-accent/80 disabled:opacity-50"
-          >
-            {pushing ? "Pushing..." : "Push"}
-          </button>
           {!showDiff && (
             <button
               onClick={handleLoadDiff}
@@ -127,12 +82,6 @@ export default function GitPanel({ slug }: { slug: string }) {
           )}
         </div>
       </div>
-
-      {message && (
-        message.includes("failed") || message.includes("Error")
-          ? <ErrorAlert message={message} />
-          : <div className="text-caption px-3 py-2 rounded bg-pir-success/20 text-pir-success">{message}</div>
-      )}
 
       {/* Diff */}
       {showDiff && diff && (

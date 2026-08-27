@@ -25,13 +25,111 @@ unrestricted — DECISION 1).
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Annotated, Any
 
+import aiosqlite
 from pydantic import Field
 
-from core.api.mcp._adapter import LOCAL_CTX, acquire_db, dump, raise_mcp_error
+from core.api.mcp._adapter import (
+    acquire_db,
+    acquire_write_db,
+    attach_notices,
+    current_mcp_context,
+    current_visible_projects,
+    dump,
+    raise_mcp_error,
+    require_any_grant,
+)
 from core.api.use_cases import projects as projects_uc
+from core.api.use_cases._context import CallerContext
 from core.api.use_cases._errors import ServiceError
+
+logger = logging.getLogger(__name__)
+
+# Background task set for the fire-and-forget project embeds (same GC-prevention
+# pattern as _adapter._bg_embed_tasks: asyncio holds only a weak reference to a
+# bare create_task() result).
+_bg_embed_projects: set[asyncio.Task] = set()
+
+
+def _schedule_embed_project_mcp(
+    *,
+    slug: str,
+    description: str | None,
+    workspace_id: str,
+) -> None:
+    """MCP-local twin of ``routers.projects._schedule_embed_project`` (fastapi-free).
+
+    Embed-on-write so a just-created project is immediately searchable by meaning.
+    Fire-and-forget on the running tool loop — the embed body re-acquires the
+    single-writer lock itself, so it must NEVER be awaited while the create still
+    holds the writer (learning f83f5209). Keying matches the router seam /
+    ``use_cases.search._reindex_projects``: ``description or ""`` is the embedded
+    description and ``desc or slug`` the doc title. No-ops when the embedder is
+    unavailable.
+    """
+    from core.api.services import embedding_service
+
+    if not embedding_service.is_available():
+        return
+
+    desc = description or ""
+    name = desc or slug
+
+    async def _embed() -> None:
+        try:
+            await embedding_service.embed_project_document(
+                slug=slug,
+                name=name,
+                description=desc,
+                workspace_id=workspace_id,
+            )
+        except Exception:
+            logger.debug(
+                "MCP auto-embed project %s failed (non-critical)", slug, exc_info=True
+            )
+
+    try:
+        t = asyncio.create_task(_embed())
+    except RuntimeError:
+        logger.debug("MCP auto-embed project skipped: no running event loop")
+        return
+    _bg_embed_projects.add(t)
+    t.add_done_callback(_bg_embed_projects.discard)
+
+
+async def create_project_impl(
+    db: aiosqlite.Connection,
+    ctx: CallerContext,
+    *,
+    slug: str,
+    name: str | None,
+    description: str | None,
+    owner: str | None,
+) -> dict[str, Any]:
+    """Body of the ``create_project`` tool (db + ctx explicit for unit tests).
+
+    Same injection the HTTP router does at ``routers/projects.py`` POST: the
+    use_case owns RBAC (operator+), slug conflicts, the disk write (router
+    helper, reached function-locally) and the creator=project-admin grant
+    (RBAC F2.6 — persons automatically, service callers via ``owner``).
+    """
+    result = await projects_uc.create_project(
+        ctx,
+        db,
+        slug=slug,
+        name=name,
+        program=None,
+        scope=None,
+        description=description,
+        lifecycle="idea",
+        language=None,
+        type="work",
+        owner=owner,
+    )
+    return dump(result)
 
 
 def _lean_project_rows(
@@ -91,10 +189,13 @@ def register(mcp) -> None:
         RESTITUISCE: list of {slug, program, lifecycle, language, task_counts}; default limit=100, max=200; mai context.md body."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                require_any_grant(visible_projects)
                 # Node `list_projects` returns the program-grouped project list =
                 # `list_programs` here. visible_projects=None -> local sees all.
                 result = await projects_uc.list_programs(
-                    LOCAL_CTX, db, visible_projects=None
+                    ctx, db, visible_projects=visible_projects
                 )
                 rows = _lean_project_rows(
                     dump(result), lifecycle=lifecycle, program=program
@@ -113,16 +214,21 @@ def register(mcp) -> None:
         QUANDO USARLO: hai lo slug e ti serve context.md body o indice docs/handoff.
         QUANDO NON USARLO: cold-start agent -> session_brief; inventario -> list_projects.
         PROVA: body raw del progetto noto; non sostituisce la bundle cold-start.
+        NOTA: il parametro deep=true e' accettato ma oggi IGNORATO (nessun kg_context; enrichment differito).
         RESTITUISCE: {slug, metadata, context_md, handoffs[], docs[], deploy_info}."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 # DECISION 2: `deep` KG enrichment is an adapter concern; the
                 # use_case returns kg_context=None (core fetch). The deep-attach
                 # is a later F3 increment, same as get_task/get_learning in F3.0.
                 result = await projects_uc.get_project(
-                    LOCAL_CTX, db, slug=slug, visible_projects=None
+                    ctx, db, slug=slug, visible_projects=visible_projects
                 )
-                return dump(result)
+                return await attach_notices(
+                    db, dump(result), ctx, visible_projects=visible_projects, project=slug
+                )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -132,19 +238,58 @@ def register(mcp) -> None:
     ) -> dict[str, Any]:
         """Cold-start bundle for one project.
 
-        QUANDO USARLO: prima call su uno slug; sostituisce get_project + list_tasks + handoff/learnings. CANONICALITY: usa repo_path/metadata_path ritornati come fonte hosted, non path locali.
+        QUANDO USARLO: prima call su uno slug; sostituisce get_project + list_tasks + handoff/learnings. CANONICALITY: metadata_path e' la fonte hosted per lo STATO; repo_path e' un graph-only mirror (vedi repo_path_nature nel payload) — NON usarlo come base di lavoro git: lavora da clone locale, branch feat/task-<id>, push GitHub.
         QUANDO NON USARLO: body context.md/docs completi -> get_project; filtri puntuali -> list_tasks/list_handoffs.
-        PROVA: stato progetto, task aperti, latest_handoff, learnings e repo_path hosted.
+        PROVA: stato progetto, task aperti, latest_handoff, learnings e repo_path hosted (graph-only).
         NEXT: check_learnings prima di codice/deploy/reindex.
-        RESTITUISCE: {project, open_tasks[], latest_handoff, recent_learnings[], top_salience_docs[]}."""
+        RESTITUISCE: {project (include repo_path, repo_path_nature, metadata_path), open_tasks[], latest_handoff, recent_learnings[], top_salience_docs[]}; il payload include anche notices quando il caller e' una persona con notifiche non lette."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                require_any_grant(visible_projects)
                 # The bundle's kg_context is part of the contract (assembled inside
                 # the use_case, not deferred). Node cold-starts deep by default
                 # (`effectiveDeep` -> true), so widen the per-bucket KG limits.
                 result = await projects_uc.get_session_brief(
-                    LOCAL_CTX, db, slug=slug, deep=True, visible_projects=None
+                    ctx, db, slug=slug, deep=True, visible_projects=visible_projects
                 )
-                return dump(result)
+                return await attach_notices(
+                    db, dump(result), ctx, visible_projects=visible_projects, project=slug
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def create_project(
+        slug: Annotated[
+            str,
+            Field(min_length=1, max_length=63, pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+        ],
+        name: Annotated[str, Field(max_length=100)] | None = None,
+        description: Annotated[str, Field(max_length=500)] | None = None,
+        owner: Annotated[str, Field(max_length=200)] | None = None,
+    ) -> dict[str, Any]:
+        """Crea un nuovo progetto work sul tenant (operator+).
+
+        QUANDO USARLO: serve un progetto nuovo (directory + project.yaml + context.md + .task). Se sei una persona diventi project-admin del progetto (creator grant F2.6); un caller bearer/agent puo' nominare owner (user_id/slug/email) per assegnare quel grant.
+        QUANDO NON USARLO: NOT per progetti esistenti -> session_brief/get_project. NOT per dare accessi dopo la creazione -> grant_access o assign_team_project.
+        RESTITUISCE: {slug, name, program, lifecycle, type, metadata_path}; errori project_exists / project_dir_exists su slug gia' usato.
+        NEXT: assign_team_project o grant_access per aprire l'accesso al team."""
+        try:
+            async with acquire_write_db(label="mcp.create_project") as db:
+                ctx = current_mcp_context()
+                result = await create_project_impl(
+                    db, ctx, slug=slug, name=name, description=description, owner=owner
+                )
+                # Embed-on-write parity with the HTTP surface: fire-and-forget,
+                # scheduled AFTER the use_case returns (never awaited under the
+                # writer — the embed body re-acquires the write lock itself).
+                _schedule_embed_project_mcp(
+                    slug=result["slug"],
+                    description=result.get("description"),
+                    workspace_id=ctx.workspace_id,
+                )
+                return result
         except ServiceError as e:
             raise_mcp_error(e)

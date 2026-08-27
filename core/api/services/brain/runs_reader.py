@@ -11,7 +11,7 @@ from typing import Any
 import aiosqlite
 
 from core.api.db import acquire_db, write_db
-from core.api.models.brain import BrainRun, PipelineCounters, RunsListResponse, RunStatus
+from core.api.models.brain import BrainRun, PipelineCounters, RunsListResponse
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200

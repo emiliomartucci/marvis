@@ -10,8 +10,6 @@
 #     ONLY way an artifact actually gets created.
 from __future__ import annotations
 
-from typing import Any
-
 from core.api.models.brain import (
     OperationType,
     ProposedWrite,

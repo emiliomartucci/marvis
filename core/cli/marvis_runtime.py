@@ -317,7 +317,7 @@ def _write_project_yaml(
     project_yaml = project_dir / "project.yaml"
     task_file = project_dir / ".task"
 
-    if project_yaml.exists():
+    def existing_result() -> dict[str, Any]:
         if not json_out:
             err_console.print(f"[yellow]{slug}: already exists, no-op[/]")
         return {
@@ -327,22 +327,31 @@ def _write_project_yaml(
             "metadata_path": str(project_dir.resolve()),
         }
 
-    data = _template_yaml()
-    data["project"] = slug
-    data["type"] = project_type
-    data["language"] = language or data.get("language") or "none"
-    if name:
-        data["description"] = name
-    if repo_path:
-        data["repo_path"] = repo_path
+    if project_yaml.exists():
+        return existing_result()
 
-    project_dir.mkdir(parents=True, exist_ok=True)
-    project_yaml.write_text(
-        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
-    if not task_file.exists():
-        task_file.write_text(slug + "\n", encoding="utf-8")
+    from core.api.use_cases.projects import project_creation_guard
+
+    with project_creation_guard(project_dir.parent):
+        if project_yaml.exists():
+            return existing_result()
+
+        data = _template_yaml()
+        data["project"] = slug
+        data["type"] = project_type
+        data["language"] = language or data.get("language") or "none"
+        if name:
+            data["description"] = name
+        if repo_path:
+            data["repo_path"] = repo_path
+
+        project_dir.mkdir(parents=True, exist_ok=True)
+        project_yaml.write_text(
+            yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        if not task_file.exists():
+            task_file.write_text(slug + "\n", encoding="utf-8")
 
     return {
         "slug": slug,

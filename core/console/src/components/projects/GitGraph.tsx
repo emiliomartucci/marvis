@@ -6,8 +6,6 @@ import {
   getProjectGitGraph,
   getProjectGitDiff,
   getGitCommitDetail,
-  projectGitPush,
-  projectGitPull,
 } from "@/lib/api";
 import type {
   GitGraphCommit,
@@ -129,10 +127,6 @@ export default function GitGraph({ slug }: { slug: string }) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [allBranches, setAllBranches] = useState(true);
 
-  // Git operations state
-  const [pushing, setPushing] = useState(false);
-  const [pulling, setPulling] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
   const [showDiff, setShowDiff] = useState(false);
   const [diff, setDiff] = useState("");
 
@@ -213,42 +207,6 @@ export default function GitGraph({ slug }: { slug: string }) {
       setDiff(res.diff);
     } catch {
       setDiff("Failed to load diff");
-    }
-  }
-
-  async function handlePush() {
-    if (!confirm("Push to remote?")) return;
-    setPushing(true);
-    setMessage(null);
-    try {
-      const res = await projectGitPush(slug);
-      setMessage(
-        res.success ? "Push successful" : `Push failed: ${res.error}`
-      );
-    } catch (err) {
-      setMessage(
-        `Error: ${err instanceof Error ? err.message : "unknown"}`
-      );
-    } finally {
-      setPushing(false);
-    }
-  }
-
-  async function handlePull() {
-    setPulling(true);
-    setMessage(null);
-    try {
-      const res = await projectGitPull(slug);
-      setMessage(
-        res.success ? "Pull successful" : `Pull failed: ${res.error}`
-      );
-      if (res.success) fetchData();
-    } catch (err) {
-      setMessage(
-        `Error: ${err instanceof Error ? err.message : "unknown"}`
-      );
-    } finally {
-      setPulling(false);
     }
   }
 
@@ -368,26 +326,6 @@ export default function GitGraph({ slug }: { slug: string }) {
         </button>
 
         <div className="ml-auto flex items-center gap-1.5">
-          <button
-            onClick={handlePull}
-            disabled={pulling || pushing}
-            className="flex items-center gap-1 px-2.5 py-1 text-caption font-medium bg-pir-surface-1 border border-pir rounded hover:border-pir-strong hover:bg-pir-surface-2 disabled:opacity-40 transition-colors duration-100"
-          >
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-              <path d="M8 3v10M4 9l4 4 4-4" />
-            </svg>
-            {pulling ? "..." : "Pull"}
-          </button>
-          <button
-            onClick={handlePush}
-            disabled={pushing || pulling}
-            className="flex items-center gap-1 px-2.5 py-1 text-caption font-medium bg-pir-accent/15 text-pir-accent border border-pir-accent/30 rounded hover:bg-pir-accent/25 disabled:opacity-40 transition-colors duration-100"
-          >
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-              <path d="M8 13V3M4 7l4-4 4 4" />
-            </svg>
-            {pushing ? "..." : "Push"}
-          </button>
           {!showDiff && (
             <button
               onClick={handleLoadDiff}
@@ -401,18 +339,6 @@ export default function GitGraph({ slug }: { slug: string }) {
           )}
         </div>
       </div>
-
-      {message && (
-        <div
-          className={`text-caption px-3 py-2 rounded border ${
-            message.includes("failed") || message.includes("Error")
-              ? "bg-pir-error/10 text-pir-error border-pir-error/20"
-              : "bg-pir-success/10 text-pir-success border-pir-success/20"
-          }`}
-        >
-          {message}
-        </div>
-      )}
 
       {showDiff && diff && (
         <div className="bg-pir-surface-0 border border-pir rounded p-3 max-h-64 overflow-y-auto">

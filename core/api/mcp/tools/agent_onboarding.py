@@ -23,11 +23,17 @@ def register(mcp) -> None:
         issue: Annotated[str | None, Field(max_length=1000)] = None,
         detail: Detail = "standard",
     ) -> dict[str, Any]:
-        """First-time agent setup guide with concrete instruction patches.
+        """First-time agent setup guide: hosted-canonical facts + wizard pointer.
 
-        QUANDO USARLO: prima connessione di Codex/Claude/altro agente a Marvis hosted, oppure quando AGENTS.md/CLAUDE.md/config locali possono contraddire hosted. PROVA: ritorna patch concrete alle istruzioni e check canonicality.
-        QUANDO NON USARLO: NOT per stato progetto -> session_brief; NOT per dati del brain -> search/read_file/grep.
-        NEXT: applica mentalmente la patch o proponila all'utente, poi session_brief(project_slug)."""
+        QUANDO USARLO: prima connessione di Codex/Claude/altro agente a Marvis
+        hosted, o quando le istruzioni locali possono essere stale. RITORNA:
+        contratto di canonicality (fatti da riferire all'utente) + i controlli di
+        canonicality + `next_tool: onboarding_status` per il tutorial guidato. NON
+        chiede all'agente di riscrivere la propria configurazione.
+        QUANDO NON USARLO: NOT per stato progetto -> session_brief; NOT per dati
+        del brain -> search/read_file/grep.
+        NEXT: onboarding_status() per avviare/riprendere il wizard, poi
+        session_brief(project_slug)."""
         return agent_onboarding_payload(
             client=client,
             project_slug=project_slug,

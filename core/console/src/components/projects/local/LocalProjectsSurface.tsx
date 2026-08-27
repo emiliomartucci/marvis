@@ -24,7 +24,6 @@ import {
   listLearnings,
   listTasks,
   updateProjectColor,
-  updateProjectFile,
   upsertManualProjectEdge,
   type BrainJournalEntryResponse,
 } from "@/lib/api";
@@ -647,7 +646,6 @@ function DocumentDrawer({
   slug,
   doc,
   onClose,
-  toast,
 }: {
   slug: string;
   doc: DocEntry | null;
@@ -657,10 +655,7 @@ function DocumentDrawer({
   const { t } = useT();
   const strings = t.projects.editor;
   const [content, setContent] = useState("");
-  const [draft, setDraft] = useState("");
-  const [mode, setMode] = useState<"preview" | "edit">("preview");
   const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const isMd = Boolean(doc && isMarkdownDoc(doc.filename));
 
@@ -670,11 +665,7 @@ function DocumentDrawer({
     setLoading(true);
     setError(null);
     getProjectFile(slug, doc.filename, { signal: controller.signal })
-      .then((file) => {
-        setContent(file.content);
-        setDraft(file.content);
-        setMode("preview");
-      })
+      .then((file) => setContent(file.content))
       .catch((err) => {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setError(strings.loadError);
@@ -684,23 +675,6 @@ function DocumentDrawer({
       });
     return () => controller.abort();
   }, [doc, isMd, slug, strings.loadError]);
-
-  async function save() {
-    if (!doc) return;
-    setSaving(true);
-    setError(null);
-    try {
-      const updated = await updateProjectFile(slug, doc.filename, draft);
-      setContent(updated.content);
-      setDraft(updated.content);
-      setMode("preview");
-      toast(strings.saved);
-    } catch {
-      setError(strings.saveError);
-    } finally {
-      setSaving(false);
-    }
-  }
 
   return (
     <Drawer
@@ -723,34 +697,6 @@ function DocumentDrawer({
           </button>
         </div>
       }
-      actions={
-        isMd ? (
-          <div className="flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setMode("preview")}
-              className={`rounded border px-2.5 py-1 text-caption ${mode === "preview" ? "border-pir-accent bg-pir-accent/10 text-pir-text-primary" : "border-pir bg-pir-surface-1 text-pir-text-muted"}`}
-            >
-              {strings.preview}
-            </button>
-            <button
-              type="button"
-              onClick={() => setMode("edit")}
-              className={`rounded border px-2.5 py-1 text-caption ${mode === "edit" ? "border-pir-accent bg-pir-accent/10 text-pir-text-primary" : "border-pir bg-pir-surface-1 text-pir-text-muted"}`}
-            >
-              {strings.edit}
-            </button>
-            <button
-              type="button"
-              disabled={saving || mode !== "edit"}
-              onClick={() => void save()}
-              className="rounded border border-pir-accent bg-pir-accent/10 px-3 py-1 text-caption text-pir-text-primary transition-colors hover:bg-pir-accent/20 disabled:opacity-50"
-            >
-              {saving ? strings.saving : strings.save}
-            </button>
-          </div>
-        ) : undefined
-      }
     >
       {!isMd ? (
         <div className="flex h-full items-center justify-center text-center text-body text-pir-text-muted">
@@ -760,13 +706,6 @@ function DocumentDrawer({
         <p className="text-body text-pir-text-muted">{t.projects.dashboard.loading}</p>
       ) : error ? (
         <ErrorAlert message={error} />
-      ) : mode === "edit" ? (
-        <textarea
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          spellCheck={false}
-          className="min-h-[520px] w-full resize-none rounded border border-pir bg-pir-base p-3 font-mono text-body leading-relaxed text-pir-text-primary outline-none focus:border-pir-accent"
-        />
       ) : (
         <SafeMarkdown content={content} />
       )}

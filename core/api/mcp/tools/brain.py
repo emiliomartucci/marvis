@@ -3,7 +3,7 @@
 
 Same TEMPLATE as ``tasks.py`` / ``learnings.py`` / ``graph.py``: the Node HTTP proxy
 (``get`` / ``post`` / ``patchWithIdempotency`` -> ``:8100``) is replaced by an
-in-process ``await brain_uc.<fn>(LOCAL_CTX, ...)``. Docstrings are copied VERBATIM
+in-process ``await brain_uc.<fn>(current_mcp_context(), ...)``. Docstrings are copied VERBATIM
 from ``core/mcp-pir/index.mjs`` (curated, carry the QUANDO USARLO / NON USARLO /
 RESTITUISCE blocks).
 
@@ -22,17 +22,24 @@ internally (the brain services — ``events_reader`` / ``drift_router`` /
 ``memory_ops`` / ``findings_reader`` / ``runs_reader`` / ``journal`` /
 ``capabilities`` / ``jobs`` — open their OWN ``acquire_db()`` / ``write_db()`` from
 the process-level pool, see ``use_cases/brain.py`` RESPONSIBILITY 3). So the tool
-body here calls ``await brain_uc.<fn>(LOCAL_CTX, ...)`` directly, with no
+body here calls ``await brain_uc.<fn>(ctx, ...)`` directly, with no
 ``acquire_db()`` wrapper — wrapping one would acquire a pool connection the
 use_case never touches. The process-level pool is initialised by the server
 lifecycle (and by the ``mcp_db`` fixture in the smoke test).
 
-Visibility: the MCP surface is local single-user. The brain use_cases resolve
-project visibility through ``UserInfo.teams`` (which ``CallerContext`` drops), so
-the local surface passes ``user=None`` = unrestricted (the services treat
-``user is None`` as "no visibility restriction", the same DECISION the other
-groups take with ``visible_projects=None``). ``LOCAL_CTX`` is ``operator``, so the
-operator+ lifecycle patches + ``brain_cycles_recompute`` pass ``require_role_ctx``.
+Visibility (2026-07-03 brain RBAC fix, plan Cross-Review §1-2): the hosted MCP
+surface is multi-user, so the project-scoped reads (events / journal / drift /
+memory_operations / findings, incl. their get-by-id) and the agent-native writes
+(``brain_write_journal`` / ``brain_write_finding``) resolve the REAL caller via
+``current_user_info()`` (``ctx -> UserInfo``). That adapter returns ``None`` for
+admin / super_admin AND the static tenant bearer (which resolves to
+``system_role='admin'``) — so those keep the byte-identical unrestricted path the
+services take on ``user is None``. Every other caller (operator / viewer, OAuth
+person or non-admin agent) gets a real ``UserInfo`` so the services filter by the
+caller's visible projects. ``brain_runs`` / ``brain_runs_get`` stay ``user=None``
+(cycle envelope, workspace-scoped, no per-project rows) and ``brain_staleness`` is
+workspace-global. Lifecycle patches / apply / ``brain_cycles_recompute`` use the
+same authenticated ``ctx`` and retain their existing operator gates.
 
 Error mapping: brain raises ``BrainDetailError`` (a ``ServiceError`` subclass
 carrying a structured ``brain_detail`` body for the HTTP contract) AND plain
@@ -65,11 +72,13 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from core.api.mcp._adapter import (
-    LOCAL_CTX,
+    current_mcp_context,
+    current_user_info,
     dump,
     raise_mcp_error,
 )
 from core.api.use_cases import brain as brain_uc
+from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import ServiceError
 
 # Zod enums -> Literals (mirror the Node tool signatures).
@@ -79,11 +88,34 @@ ScopeType = Literal["company", "program", "project"]
 SeverityMin = Literal["low", "medium", "high", "critical"]
 ConfidenceMin = Literal["low", "medium", "high"]
 DriftState = Literal["open", "superseded", "resolved", "dismissed"]
+# Agent-native finding write (brain_write_finding). scope_type here is the L4
+# variant (findings scope to artifact too, unlike journal's 3-level ScopeType).
+FindingTypeArg = Literal[
+    "idea",
+    "task_candidate",
+    "open_question",
+    "scope_gap",
+    "procedure_change",
+    "contradiction",
+    "direction_drift",
+    "direction_bootstrap",
+]
+ScopeTypeL4 = Literal["company", "program", "project", "artifact"]
+SuggestedArtifactArg = Literal[
+    "task", "adr", "guide", "learning", "status_update", "question", "none"
+]
 DriftAxis = Literal["intent", "context", "both"]
 DriftAction = Literal["dismiss", "acknowledge", "resolve", "reopen"]
 MemoryOpApprovalState = Literal["approved", "dismissed", "rejected"]
 FindingApprovalState = Literal["approved", "dismissed", "resolved"]
 RecomputeSource = Literal["digest", "drift", "memory_ops", "learn"]
+
+
+def _current_brain_context() -> CallerContext:
+    """Resolve the per-call identity and reject remote workspace fallback."""
+    ctx = current_mcp_context()
+    require_workspace_ctx(ctx)
+    return ctx
 
 
 def register(mcp) -> None:
@@ -108,8 +140,9 @@ def register(mcp) -> None:
         QUANDO NON USARLO: per leggere contenuto eventi/journal — quelle sono chiamate downstream. Non usarlo come 'health check' del Brain: lo stato `partial` e' normale (una source fallita non blocca le altre). Per il singolo run usa brain_runs_get.
         RESTITUISCE: {items:[{run_id, cycle_key, status, trigger, event_count, partial_failures, duration_ms, started_at, finished_at}], next_cursor, cycle_key, total_returned}."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.list_brain_runs(
-                LOCAL_CTX,
+                ctx,
                 cycle_key=cycle_key,
                 status=list(status) if status else None,
                 trigger=list(trigger) if trigger else None,
@@ -132,8 +165,9 @@ def register(mcp) -> None:
         QUANDO NON USARLO: per cercare l'ultimo ciclo — usa brain_runs con `cycle_key='latest'`. Per il contenuto del journal/drift/memory_ops/findings — usa i tool dedicati.
         RESTITUISCE: {run_id, workspace_id, cycle_key, status, trigger, started_at, finished_at, event_count, partial_failures, duration_ms}."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.get_brain_run(
-                LOCAL_CTX, run_id=run_id, user=None,
+                ctx, run_id=run_id, user=None,
             )
             return dump(result)
         except ServiceError as e:
@@ -158,15 +192,16 @@ def register(mcp) -> None:
         QUANDO NON USARLO: come surface narrativo per umano — usa brain_journal (aggrega + materializza per scope). Non usarlo per 'voglio sapere se qualcosa e' cambiato' — quelli sono drift signals. Gli eventi sono fatti, non interpretazioni: non aggregarli come 'punteggio di salute progetto'.
         RESTITUISCE: {items:[DigestEvent|DigestEventRedacted], next_cursor, cycle_key, run_id, redacted_count, total_returned}."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.list_events(
-                LOCAL_CTX,
+                ctx,
                 cycle_key=cycle_key,
                 run_id=run_id,
                 event_type=list(event_type) if event_type else None,
                 source_project=source_project,
                 cursor=cursor,
                 limit=limit,
-                user=None,
+                user=current_user_info(ctx),
             )
             return dump(result)
         except ServiceError as e:
@@ -187,15 +222,105 @@ def register(mcp) -> None:
         QUANDO NON USARLO: per cercare segnali di problema (usa brain_drift), proposte di azione (brain_memory_operations) o conclusioni approvabili (brain_findings). Il journal e' contesto: dice 'cosa e' successo', non 'cosa fare'. Non scriverlo a mano: e' generato dal cycle aggregator (sub-01 D2), agent-write su brain_journal_entries e' bloccato dal router.
         RESTITUISCE: {items:[JournalEntry], cycle_key, run_id, total_returned}."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.list_journal(
-                LOCAL_CTX,
+                ctx,
                 cycle_key=cycle_key,
                 run_id=run_id,
                 scope_type=scope_type,
                 scope_key=scope_key,
                 program_key=program_key,
                 limit=limit,
-                user=None,
+                user=current_user_info(ctx),
+            )
+            from core.api.services.brain.journal import (
+                record_customer_value_from_journal,
+            )
+
+            await record_customer_value_from_journal(list(result.items))
+            return dump(result)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def brain_write_journal(
+        cycle_key: Annotated[str, Field(min_length=1)],
+        scope_type: ScopeType,
+        scope_key: Annotated[str, Field(min_length=1)],
+        narrative: Annotated[str, Field(min_length=1, max_length=20000)],
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Agent-native: scrivi la sintesi narrativa dell'AGENTE su una journal entry.
+
+        QUANDO USARLO: la piattaforma NON gira un LLM di sintesi (decision 2026-07-01-brain-agent-native): il TUO agente legge il substrate (brain_events + brain_journal deterministico) e SCRIVE qui la narrativa che ha sintetizzato, per un ciclo+scope. La provenienza agente e' separata da quella del cycle (non si sovrascrivono). Aggiorna anche last_synthesis_at (vedi brain_staleness).
+        QUANDO NON USARLO: per il substrate meccanico (lo produce il cycle). Per findings/drift/memory-op usa i loro tool. Non per riscrivere body_json (deterministico).
+        RESTITUISCE: {written, cycle_key, scope_type, scope_key}."""
+        try:
+            ctx = _current_brain_context()
+            result = await brain_uc.write_journal_narrative(
+                ctx,
+                cycle_key=cycle_key,
+                scope_type=scope_type,
+                scope_key=scope_key,
+                narrative=narrative,
+                user=current_user_info(ctx),
+            )
+            return dump(result)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def brain_staleness() -> dict[str, Any]:
+        """Agent-native: freschezza della sintesi-agente vs il ciclo meccanico (no LLM).
+
+        QUANDO USARLO: a inizio sessione/schedule — sapere quando l'agente ha sintetizzato l'ultima volta (last_synthesis_at) rispetto all'ultimo ciclo meccanico (last_cycle_key), per decidere se ri-sintetizzare prima di rispondere.
+        QUANDO NON USARLO: come health check del servizio. Non sintetizza: solo rileva (meccanico).
+        RESTITUISCE: {last_synthesis_at, last_cycle_key}."""
+        try:
+            ctx = _current_brain_context()
+            result = await brain_uc.get_brain_staleness(ctx)
+            return dump(result)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def brain_write_finding(
+        finding_type: FindingTypeArg,
+        scope_type: ScopeTypeL4,
+        scope_key: Annotated[str, Field(min_length=1)],
+        title: Annotated[str, Field(min_length=1, max_length=200)],
+        summary: Annotated[str, Field(min_length=1, max_length=2000)],
+        why_now: Annotated[str, Field(min_length=1, max_length=500)],
+        severity: SeverityMin,
+        confidence: ConfidenceMin,
+        suggested_artifact: SuggestedArtifactArg = "none",
+        program_key: str | None = None,
+        involved_projects: list[str] | None = None,
+        closure_instruction: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Agent-native: scrivi un FINDING (la TUA conclusione) nella Triage queue.
+
+        QUANDO USARLO: la piattaforma NON gira un LLM di sintesi (decision 2026-07-01-brain-agent-native): quando dalla lettura del substrate concludi qualcosa di azionabile (idea, task_candidate, open_question, scope_gap, procedure_change, contradiction), lo SCRIVI qui. Riusa lo stesso path dei rule meccanici (id/hash/fingerprint derivati identici) e lo marca authored_by_agent (provenienza separata dai finding del cycle). Nasce approval_state='open' -> lo rileggi con brain_findings e lo patchi con brain_findings_patch.
+        QUANDO NON USARLO: per il substrate meccanico (lo produce il cycle). Non per riscrivere un finding esistente (usa il patch). severity/confidence sono TIER categorici, mai un float.
+        RESTITUISCE: {written, finding_id, run_id, cycle_key, approval_state} oppure {written:false, reason} se non c'e' un run a cui agganciarsi o il contenuto e' un doppione."""
+        try:
+            ctx = _current_brain_context()
+            result = await brain_uc.write_finding(
+                ctx,
+                finding_type=finding_type,
+                scope_type=scope_type,
+                scope_key=scope_key,
+                title=title,
+                summary=summary,
+                why_now=why_now,
+                severity=severity,
+                confidence=confidence,
+                suggested_artifact=suggested_artifact,
+                program_key=program_key,
+                involved_projects=involved_projects,
+                closure_instruction=closure_instruction,
+                user=current_user_info(ctx),
             )
             return dump(result)
         except ServiceError as e:
@@ -228,8 +353,9 @@ def register(mcp) -> None:
         QUANDO NON USARLO: per leggere il narrativo del ciclo — usa brain_journal. Per le azioni proposte sulla memoria — usa brain_memory_operations. Drift signal != finding: signal e' fatto osservato, finding e' conclusione approvabile.
         RESTITUISCE: {items:[DriftSignal|DriftSignalRedacted], cycle_key, run_id, redacted_count, total_returned, next_cursor}."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.list_drift(
-                LOCAL_CTX,
+                ctx,
                 cycle_key=cycle_key,
                 run_id=run_id,
                 scope_type=scope_type,
@@ -244,7 +370,7 @@ def register(mcp) -> None:
                 rule_id=list(rule_id) if rule_id else None,
                 cursor=cursor,
                 limit=limit,
-                user=None,
+                user=current_user_info(ctx),
             )
             return dump(result)
         except ServiceError as e:
@@ -260,8 +386,9 @@ def register(mcp) -> None:
         QUANDO NON USARLO: per cercare per recurrence_key o pattern — usa brain_drift. Per cambiare stato — usa brain_drift_patch.
         RESTITUISCE: DriftSignal completo (o DriftSignalRedacted se cross-scope con qualche progetto invisibile)."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.get_drift_signal(
-                LOCAL_CTX, signal_id=signal_id, user=None,
+                ctx, signal_id=signal_id, user=current_user_info(ctx),
             )
             return dump(result)
         except ServiceError as e:
@@ -276,7 +403,7 @@ def register(mcp) -> None:
     ) -> dict[str, Any]:
         """Lifecycle action on a drift signal (dismiss / acknowledge / resolve / reopen).
 
-        QUANDO USARLO: operator gate — dopo aver letto il signal (brain_drift_get), decidere se 'dismiss' (rumore), 'acknowledge' (visto, non agire), 'resolve' (corretto upstream), 'reopen' (riaperto post-resolve). `reason` raccomandato per audit. Idempotency-Key obbligatoria per evitare double-write audit log.
+        QUANDO USARLO: operator gate — dopo aver letto il signal (brain_drift_get), decidere se 'dismiss' (rumore), 'acknowledge' (visto, non agire), 'resolve' (corretto upstream), 'reopen' (riaperto post-resolve). `reason` raccomandato per audit. NOTA: `idempotency_key` e' accettato ma NON inoltrato ne' enforced su questa superficie — nessun replay-guard, non previene double-write.
         QUANDO NON USARLO: NON usarlo per cambiare evidence o classification — quelle sono immutabili. NON usarlo per chiudere findings (usa brain_findings_patch). Drift signal e' osservazione, dismiss=non utile, resolve=corretto upstream — non e' la stessa cosa di 'fix' del codice.
         RESTITUISCE: DriftSignal aggiornato con nuovo state + dismissed_by/dismissed_at o resolved_at."""
         # The use_case owns its own write connection internally (drift_router); no
@@ -284,8 +411,9 @@ def register(mcp) -> None:
         # the use_case signature does not carry (HTTP header concern), so it is
         # accepted on the surface for Node parity but not forwarded.
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.patch_drift_signal(
-                LOCAL_CTX,
+                ctx,
                 signal_id=signal_id,
                 action=action,
                 reason=reason,
@@ -319,8 +447,9 @@ def register(mcp) -> None:
         QUANDO NON USARLO: per signal di drift — usa brain_drift. Per findings approvabili (output finale) — usa brain_findings. Per applicare una proposta: brain_memory_operations_apply ritorna GUIDANCE, NON scrive.
         RESTITUISCE: {items:[MemoryOperation|MemoryOperationRedacted], cycle_key, run_id, redacted_count, total_returned, next_cursor}."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.list_memory_operations(
-                LOCAL_CTX,
+                ctx,
                 cycle_key=cycle_key,
                 run_id=run_id,
                 scope_type=scope_type,
@@ -332,7 +461,7 @@ def register(mcp) -> None:
                 score_min=score_min,
                 cursor=cursor,
                 limit=limit,
-                user=None,
+                user=current_user_info(ctx),
             )
             return dump(result)
         except ServiceError as e:
@@ -348,8 +477,9 @@ def register(mcp) -> None:
         QUANDO NON USARLO: per cercare per recurrence_key — usa brain_memory_operations. Per applicare: vedi brain_memory_operations_apply (NO write).
         RESTITUISCE: MemoryOperation completa (o MemoryOperationRedacted se cross-scope con progetto invisibile)."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.get_memory_operation(
-                LOCAL_CTX, operation_id=operation_id, user=None,
+                ctx, operation_id=operation_id, user=current_user_info(ctx),
             )
             return dump(result)
         except ServiceError as e:
@@ -366,14 +496,15 @@ def register(mcp) -> None:
         """Lifecycle action on a memory operation (approve / dismiss / reject).
 
         QUANDO USARLO: operator gate — approva (sblocca apply guidance), dismiss (non utile per ora), reject (proposta sbagliata). `applied_artifact_ref` opzionale dopo aver creato artifact via guidance. Idempotency-Key obbligatoria.
-        QUANDO NON USARLO: per applicare l'azione concreta — l'apply NON scrive, ritorna SOLO guidance. La scrittura effettiva e' agente-driven, MAI inline qui. Per bulk: brain_memory_operations_bulk_patch.
+        QUANDO NON USARLO: per applicare l'azione concreta — l'apply NON scrive, ritorna SOLO guidance. La scrittura effettiva e' agente-driven, MAI inline qui. NIENTE bulk per le memory operations su questa superficie: una operation per chiamata (il bulk esiste solo per i findings, brain_findings_bulk_patch).
         RESTITUISCE: MemoryOperation aggiornata con nuovo approval_state."""
         # Node sends `approval_state` as the desired terminal state; the use_case
         # takes it as `action` (the lifecycle verb). idempotency_key is the
         # transport replay header; the use_case forwards it to the service.
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.patch_memory_operation(
-                LOCAL_CTX,
+                ctx,
                 operation_id=operation_id,
                 action=approval_state,
                 reason=reason,
@@ -389,7 +520,7 @@ def register(mcp) -> None:
     async def brain_memory_operations_apply(
         operation_id: Annotated[str, Field(min_length=1)],
     ) -> dict[str, Any]:
-        """Get apply GUIDANCE for an approved memory operation (NO write — sub-03 §11.1).
+        """NON applica e NON scrive nulla: ritorna SOLO le istruzioni da eseguire (sub-03 §11.1).
 
         QUANDO USARLO: dopo aver `approved` un'operazione (via brain_memory_operations_patch), per ottenere `next_action.tool` (es. mcp__marvis__create_task) + args + `must_include_in_tags` (es. `brain_memory_op:abc123`). L'apply NON scrive l'artifact — ritorna istruzioni. L'agente esegue il `next_action.tool` con i tag richiesti per stabilire la chain di audit.
         QUANDO NON USARLO: per scrivere direttamente l'artifact — questo endpoint ritorna SOLO guidance. Pattern: PATCH → apply (guidance) → call next_action.tool con must_include_in_tags. Non usarlo prima di approval_state='approved' (409 precondition).
@@ -398,8 +529,9 @@ def register(mcp) -> None:
         # check + next-action envelope). It opens no write transaction and mutates
         # nothing — preserved verbatim, no acquire_write_db.
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.apply_memory_operation(
-                LOCAL_CTX, operation_id=operation_id, user=None,
+                ctx, operation_id=operation_id, user=None,
             )
             return dump(result)
         except ServiceError as e:
@@ -427,15 +559,17 @@ def register(mcp) -> None:
         owner_user_id: str | None = None,
         cursor: str | None = None,
         limit: Annotated[int, Field(ge=1, le=200)] = 50,
+        backlog: bool = False,
     ) -> dict[str, Any]:
         """List Brain Learn findings (sub-04 §11.2) — conclusioni approvabili dal ciclo.
 
-        QUANDO USARLO: trovare findings aperti (default `approval_state=['open']`) per drain del Triage Queue. Filtri: finding_type, severity_min, confidence_min (low|medium|high — TIER, non float), recurrence_min, regression_only, applied. Default agent: `cycle_key='latest', approval_state=['open'], severity_min='low'`. CE2 recency_factor disponibile read-time (se decay enabled in settings).
+        QUANDO USARLO: trovare findings aperti (default `approval_state=['open']`) per drain del Triage Queue. Con `backlog=true` ignora il filtro run/ciclo e ritorna gli open di TUTTI i cicli (vista drain cross-cycle: il default `cycle_key='latest'` mostra solo i findings nati nell'ultimo run e nasconde il backlog dei cicli precedenti). Filtri: finding_type, severity_min, confidence_min (low|medium|high — TIER, non float), recurrence_min, regression_only, applied. Default agent: `cycle_key='latest', approval_state=['open'], severity_min='low'`; per il drain periodico usa `backlog=true`. CE2 recency_factor disponibile read-time (se decay enabled in settings).
         QUANDO NON USARLO: per drift signals — usa brain_drift. Per proposte di azione (intermedio) — usa brain_memory_operations. Per applicare: vedi brain_findings_apply (GUIDANCE-only). NEVER multiplica confidence × severity in score composito (F10/FR1 anti-pattern).
         RESTITUISCE: {items:[Finding|FindingRedacted], cycle_key, run_id, redacted_count, redacted_evidence_count, total_returned, next_cursor}."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.list_findings(
-                LOCAL_CTX,
+                ctx,
                 cycle_key=cycle_key,
                 run_id=run_id,
                 scope_type=scope_type,
@@ -452,7 +586,8 @@ def register(mcp) -> None:
                 owner_user_id=owner_user_id,
                 cursor=cursor,
                 limit=limit,
-                user=None,
+                backlog=backlog,
+                user=current_user_info(ctx),
             )
             return dump(result)
         except ServiceError as e:
@@ -468,8 +603,9 @@ def register(mcp) -> None:
         QUANDO NON USARLO: per ricerca semantica — usa brain_findings con filtri. Per modificare lo stato — usa brain_findings_patch.
         RESTITUISCE: Finding completo (o FindingRedacted se cross-scope con progetto invisibile)."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.get_finding(
-                LOCAL_CTX, finding_id=finding_id, user=None,
+                ctx, finding_id=finding_id, user=current_user_info(ctx),
             )
             return dump(result)
         except ServiceError as e:
@@ -491,8 +627,9 @@ def register(mcp) -> None:
         # Node sends `approval_state` (desired state); the use_case takes it as the
         # lifecycle `action` verb. idempotency_key forwarded to the service.
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.patch_finding(
-                LOCAL_CTX,
+                ctx,
                 finding_id=finding_id,
                 action=approval_state,
                 reason=reason,
@@ -517,8 +654,9 @@ def register(mcp) -> None:
         QUANDO NON USARLO: per >25 — splitta. Per gestione individuale con motivazione — usa brain_findings_patch.
         RESTITUISCE: {results:[{finding_id, status}], applied_count, skipped_count}."""
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.bulk_patch_findings(
-                LOCAL_CTX,
+                ctx,
                 finding_ids=list(finding_ids),
                 action=approval_state,
                 reason=reason,
@@ -533,7 +671,7 @@ def register(mcp) -> None:
     async def brain_findings_apply(
         finding_id: Annotated[str, Field(min_length=1)],
     ) -> dict[str, Any]:
-        """Get apply GUIDANCE for an approved finding (NO write — sub-04 F1).
+        """NON applica e NON scrive nulla: ritorna SOLO le istruzioni da eseguire (sub-04 F1).
 
         QUANDO USARLO: dopo aver `approved` una finding, per ottenere `next_action.tool` (es. mcp__marvis__create_task con title/description/tags pre-compilato) + `must_include_in_tags=brain_finding:{id}` per audit chain. L'apply NON scrive l'artifact — ritorna istruzioni. L'agente esegue il next_action.tool con i tag richiesti.
         QUANDO NON USARLO: per scrivere artifact direttamente — pattern e' GUIDANCE-only. Non usarlo prima di approval_state='approved' (409). Non chiamarlo in loop 'ricomputa finche' la finding X appare': se non emerge, e' un problema del producer rule — file un learning via mcp__marvis__create_learning.
@@ -541,8 +679,9 @@ def register(mcp) -> None:
         # GUIDANCE-only: the use_case calls get_apply_guidance (READ-only precondition
         # + next-action envelope). No write transaction, no mutation — preserved.
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.apply_finding(
-                LOCAL_CTX, finding_id=finding_id, user=None,
+                ctx, finding_id=finding_id, user=None,
             )
             return dump(result)
         except ServiceError as e:
@@ -560,10 +699,10 @@ def register(mcp) -> None:
         force: bool = False,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Force manual recompute of a Brain cycle (operator+, sub-01 §6.D4).
+        """Force manual recompute of a Brain cycle (operator+).
 
-        QUANDO USARLO: dopo bug fix in un producer (collector/drift/memory_ops/learn), dopo backfill di dati upstream, o per debug `dry_run=true` (stima eventi senza scrivere). `sources=None` ricomputa tutto; `sources=['drift']` ricomputa solo drift (digest resta, findings citano i nuovi signal_id). Idempotency-Key obbligatoria. Concurrent calls sullo stesso ciclo serializzano via lease: il secondo caller ritorna 202 con il run_id dell'in-flight.
-        QUANDO NON USARLO: come scheduler — il batch giornaliero gira da solo dopo brain_cutoff_hour_utc. Per cicli >30 giorni vecchi: il server rifiuta con `cycle_too_old` (force=true sblocca, audit log la marca come override). Mai chiamarlo in loop 'ricomputa finche' X appare'.
+        QUANDO USARLO: dopo bug fix in un producer (collector/drift/memory_ops/learn), dopo backfill di dati upstream, o per debug `dry_run=true` (stima eventi senza scrivere). Idempotency-Key obbligatoria. NOTA: `sources` e' accettato ma oggi IGNORATO — il recompute e' SEMPRE full-cycle (ricomputa l'intero ciclo, mai un sottoinsieme). Una chiamata concorrente sullo stesso ciclo NON avvia un secondo run: ritorna status='already_running' (lease occupato).
+        QUANDO NON USARLO: come scheduler — il batch giornaliero gira da solo dopo brain_cutoff_hour_utc. Cicli piu' vecchi di 30 giorni vengono rifiutati (force=true sblocca; l'audit log marca l'override). Mai chiamarlo in loop 'ricomputa finche' X appare'.
         RESTITUISCE: {status, cycle_key, run_id, event_count, journal_count, duration_ms, mode, dry_run}."""
         # The use_case owns its own writer (jobs.recompute_brain_cycle) — no
         # acquire_write_db here. `sources` is accepted on the surface for Node
@@ -571,13 +710,14 @@ def register(mcp) -> None:
         # selector lives below the use_case in jobs and is not threaded through
         # recompute_cycle's args), so it is not forwarded.
         try:
+            ctx = _current_brain_context()
             result = await brain_uc.recompute_cycle(
-                LOCAL_CTX,
+                ctx,
                 cycle_key=cycle_key,
                 dry_run=dry_run,
                 force=force,
                 idempotency_key=idempotency_key,
-                triggered_by=LOCAL_CTX.username,
+                triggered_by=ctx.username,
                 user=None,
             )
             return dump(result)
@@ -593,7 +733,8 @@ def register(mcp) -> None:
         RESTITUISCE: {schema_version, event_types[], source_systems[], signal_types[], knowledge_forms[], operation_types[], finding_types[], severities[], confidence_tiers[], drift_axes[], approval_states[], finding_approval_states[], signal_states[], run_statuses[], run_triggers[], scope_types[], suggested_artifacts[], closure_condition_kinds[], knowledge_glyphs:{form: glyph}}."""
         # Deterministic; no DB. The use_case takes only ctx.
         try:
-            result = await brain_uc.get_brain_capabilities(LOCAL_CTX)
+            ctx = _current_brain_context()
+            result = await brain_uc.get_brain_capabilities(ctx)
             return dump(result)
         except ServiceError as e:
             raise_mcp_error(e)

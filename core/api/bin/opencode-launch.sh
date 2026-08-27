@@ -45,8 +45,6 @@ for file in /data/pir/.env "${RUNTIME_HOME}/workspace/.env" "${RUNTIME_HOME}/ope
   load_key_from_file TASKS_API_TOKEN "$file"
   load_key_from_file TASKS_API_URL "$file"
   load_key_from_file PIR_API_URL "$file"
-  load_key_from_file N8N_API_URL "$file"
-  load_key_from_file N8N_API_KEY "$file"
   load_key_from_file EXA_API_KEY "$file"
   load_key_from_file GOOGLE_OAUTH_CLIENT_ID "$file"
   load_key_from_file GOOGLE_OAUTH_CLIENT_SECRET "$file"

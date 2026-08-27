@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import aiosqlite
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from core.api.db import get_write_db
 from core.api.models.auth import UserInfo
@@ -15,15 +15,35 @@ from core.api.models.onboarding import (
     SetupWriteRequest,
 )
 from core.api.routers._adapter import to_http
-from core.api.security import get_current_user_or_agent
+from core.api.security import (
+    get_current_user_or_agent,
+    is_local_single_user_mode,
+    is_loopback_request,
+)
 from core.api.use_cases import onboarding as uc
 from core.api.use_cases._context import CallerContext
 from core.api.use_cases._errors import ServiceError
 
+_LOCAL_HOST_DETAIL = (
+    "This host-global onboarding operation is available only to the trusted "
+    "local OSS loopback runtime."
+)
+
+
+def _require_local_host_request(request: Request) -> None:
+    if is_local_single_user_mode() and is_loopback_request(request):
+        return
+    raise HTTPException(status_code=403, detail=_LOCAL_HOST_DETAIL)
+
+
 router = APIRouter(prefix="/api/v1/onboarding", tags=["onboarding"])
 
 
-@router.post("/scan", response_model=ScanWorkdirResponse)
+@router.post(
+    "/scan",
+    response_model=ScanWorkdirResponse,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def scan_workdir(
     body: ScanWorkdirRequest,
     _user: UserInfo = Depends(get_current_user_or_agent),
@@ -34,14 +54,22 @@ async def scan_workdir(
         raise to_http(e)
 
 
-@router.get("/setup", response_model=SetupReadResponse)
+@router.get(
+    "/setup",
+    response_model=SetupReadResponse,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def read_setup(
     _user: UserInfo = Depends(get_current_user_or_agent),
 ) -> SetupReadResponse:
     return uc.read_setup()
 
 
-@router.put("/setup", response_model=SetupReadResponse)
+@router.put(
+    "/setup",
+    response_model=SetupReadResponse,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def write_setup(
     body: SetupWriteRequest,
     _user: UserInfo = Depends(get_current_user_or_agent),

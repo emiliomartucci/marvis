@@ -38,7 +38,7 @@ from typing import Any
 
 import typer
 
-from core.cli._runtime_ctx import console, emit, err_console
+from core.cli._runtime_ctx import console, emit
 from core.cli.marvis_governance import (
     DEFAULT_PROFILE,
     VALID_PROFILES,

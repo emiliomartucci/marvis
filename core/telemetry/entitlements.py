@@ -3,7 +3,7 @@
 
 Deliberately a SEAM, not a machine (Emilio 2026-05-29: no PRO feature at launch).
 There is NO network call, NO signed cert, NO entitlement fetch here — building that
-now would be dead code gating nothing (the n8n-v2 lesson: they removed gating ceremony
+now would be dead code gating nothing (the retired-integration lesson: removing gating ceremony
 built too early). When the first PRO feature + price exist, THIS is the single place to
 wire the cloud-issued, locally-verified Ed25519 entitlement check (plan Deepening §C).
 

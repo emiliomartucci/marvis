@@ -108,15 +108,16 @@ def seed_minimal() -> None:
             if "avatar_color" in team_columns:
                 conn.execute(
                     """INSERT OR IGNORE INTO teams (
-                        id, slug, display_name, description, avatar_color, created_by
-                    ) VALUES (?, ?, ?, 'Local bootstrap team', '#2563eb', ?)""",
+                        id, slug, display_name, description, avatar_color, created_by,
+                        workspace_id
+                    ) VALUES (?, ?, ?, 'Local bootstrap team', '#2563eb', ?, 'ws_default')""",
                     [team_id, team_slug, team_name, admin_id],
                 )
             else:
                 conn.execute(
                     """INSERT OR IGNORE INTO teams (
-                        id, slug, display_name, description, created_by
-                    ) VALUES (?, ?, ?, 'Local bootstrap team', ?)""",
+                        id, slug, display_name, description, created_by, workspace_id
+                    ) VALUES (?, ?, ?, 'Local bootstrap team', ?, 'ws_default')""",
                     [team_id, team_slug, team_name, admin_id],
                 )
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import tempfile
 import time
@@ -21,7 +20,6 @@ from core.api.services.ingest.parsers.gateway_aux import (
 )
 
 logger = logging.getLogger(__name__)
-MAX_HEYPOCKET_SIDECAR_BYTES = 2 * 1024 * 1024
 
 SUPPORTED_AUDIO_SUFFIXES = frozenset(
     {".aac", ".flac", ".m4a", ".mp3", ".oga", ".ogg", ".opus", ".wav", ".webm"}
@@ -101,100 +99,6 @@ def _normalize_segments(raw: Any) -> list[dict[str, Any]]:
             }
         )
     return segments
-
-
-def _metadata_sidecar_path(path: Path) -> Path:
-    return path.with_suffix(".metadata.json")
-
-
-def _load_heypocket_sidecar(path: Path) -> dict[str, Any] | None:
-    sidecar = _metadata_sidecar_path(path)
-    if not sidecar.exists():
-        return None
-    try:
-        if sidecar.stat().st_size > MAX_HEYPOCKET_SIDECAR_BYTES:
-            logger.warning("heypocket sidecar ignored because it is too large: %s", sidecar)
-            return None
-        payload = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        logger.warning("heypocket sidecar could not be read: %s", sidecar, exc_info=True)
-        return None
-    if not isinstance(payload, dict) or payload.get("source") != "heypocket":
-        return None
-    return payload
-
-
-def _first_summary(sidecar: dict[str, Any]) -> str | None:
-    summarizations = sidecar.get("pocket_summarizations")
-    if not isinstance(summarizations, list):
-        return None
-    for item in summarizations:
-        if not isinstance(item, dict):
-            continue
-        v2 = item.get("v2")
-        if isinstance(v2, dict):
-            summary = str(v2.get("summary") or "").strip()
-            if summary:
-                return summary
-        summary = str(item.get("summary") or "").strip()
-        if summary:
-            return summary
-    return None
-
-
-def _action_item_count(sidecar: dict[str, Any]) -> int:
-    summarizations = sidecar.get("pocket_summarizations")
-    if not isinstance(summarizations, list):
-        return 0
-    count = 0
-    for item in summarizations:
-        if not isinstance(item, dict):
-            continue
-        v2 = item.get("v2")
-        if isinstance(v2, dict) and isinstance(v2.get("actionItems"), list):
-            count += len(v2["actionItems"])
-    return count
-
-
-def _sidecar_markdown(sidecar: dict[str, Any]) -> str:
-    fields = [
-        ("Recording ID", sidecar.get("recording_id")),
-        ("Recorded at", sidecar.get("recording_at")),
-        ("Pocket created at", sidecar.get("created_at")),
-        ("Duration seconds", sidecar.get("duration_seconds")),
-        ("Pocket reported language", sidecar.get("pocket_reported_language")),
-    ]
-    lines = ["## Source Metadata", ""]
-    for label, value in fields:
-        if value not in {None, ""}:
-            lines.append(f"- {label}: `{value}`")
-    tags = sidecar.get("pocket_tags")
-    if isinstance(tags, list) and tags:
-        clean_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
-        if clean_tags:
-            lines.append(f"- Pocket tags: {', '.join(clean_tags[:12])}")
-    summary = _first_summary(sidecar)
-    if summary:
-        lines.extend(["", "### Pocket Summary Hint", "", summary])
-    return "\n".join(lines).strip()
-
-
-def _heypocket_structure(sidecar: dict[str, Any]) -> dict[str, Any]:
-    transcript = sidecar.get("pocket_transcript")
-    return {
-        "source": "heypocket",
-        "recording_id": sidecar.get("recording_id"),
-        "recording_at": sidecar.get("recording_at"),
-        "created_at": sidecar.get("created_at"),
-        "duration_seconds": sidecar.get("duration_seconds"),
-        "title": sidecar.get("title"),
-        "pocket_reported_language": sidecar.get("pocket_reported_language"),
-        "pocket_tags": sidecar.get("pocket_tags") or [],
-        "has_pocket_transcript": isinstance(transcript, dict)
-        and bool(transcript.get("text") or transcript.get("segments")),
-        "pocket_summary": _first_summary(sidecar),
-        "pocket_action_item_count": _action_item_count(sidecar),
-    }
 
 
 async def _extract_audio_from_video(video_path: Path) -> Path:
@@ -391,8 +295,7 @@ async def parse_media_transcript(path: Path, mime_type: str) -> TranscriptParseR
     if not body:
         raise RuntimeError("tier-transcribe returned empty transcript")
 
-    sidecar = _load_heypocket_sidecar(path)
-    title = str((sidecar or {}).get("title") or path.stem).strip() or path.name
+    title = path.stem.strip() or path.name
     language = payload.get("language")
     duration = payload.get("duration")
     tags = ["transcript", kind]
@@ -403,27 +306,12 @@ async def parse_media_transcript(path: Path, mime_type: str) -> TranscriptParseR
         "source_file": path.name,
         "language": language,
     }
-    metadata_block = ""
-    heypocket_structure: dict[str, Any] | None = None
-    if sidecar:
-        tags.append("heypocket")
-        frontmatter.update(
-            {
-                "source": "heypocket",
-                "recording_id": sidecar.get("recording_id"),
-                "recording_at": sidecar.get("recording_at"),
-            }
-        )
-        metadata_block = f"{_sidecar_markdown(sidecar)}\n\n"
-        heypocket_structure = _heypocket_structure(sidecar)
-
     transcript = (
         f"# Transcript: {title}\n\n"
         f"- Source file: `{path.name}`\n"
         f"- Source kind: `{kind}`\n"
         f"- Language: `{language or 'unknown'}`\n"
         f"- Duration: `{duration if duration is not None else 'unknown'}`\n\n"
-        f"{metadata_block}"
         "## Transcript\n\n"
         f"{body}\n"
     )
@@ -436,8 +324,6 @@ async def parse_media_transcript(path: Path, mime_type: str) -> TranscriptParseR
         "chunk_count": payload.get("chunk_count"),
         "segments": segments,
     }
-    if heypocket_structure:
-        structure["heypocket"] = heypocket_structure
     return TranscriptParseResult(
         frontmatter=frontmatter,
         text=transcript,

@@ -122,6 +122,10 @@ class PrDiffResult(TypedDict):
     stats: dict  # {additions, deletions, files_changed}
     unified_diff: str
     is_empty: bool
+    # Repo-relative paths this diff touches. The CI merge gate needs them to
+    # tell a check that cannot apply to this change from one that simply never
+    # reported — the two are indistinguishable from the check ledger alone.
+    files: list[str]
 
 
 class MergeResult(TypedDict):
@@ -251,6 +255,15 @@ def _get_pr_diff_sync(
     unified = diff.patch or ""
     stats = diff.stats
 
+    # Both sides of every delta: a rename moves a file into or out of a path
+    # filter's scope, and either end is enough to make a check apply.
+    touched: set[str] = set()
+    for delta in diff.deltas:
+        for side in (delta.old_file, delta.new_file):
+            path = getattr(side, "path", None)
+            if path:
+                touched.add(path)
+
     return PrDiffResult(
         stats={
             "additions": stats.insertions,
@@ -259,7 +272,18 @@ def _get_pr_diff_sync(
         },
         unified_diff=unified,
         is_empty=stats.files_changed == 0,
+        files=sorted(touched),
     )
+
+
+def _get_branch_head_sha_sync(repo_path: str, branch: str) -> str:
+    """Resolve one local branch to the exact commit CI must have tested."""
+    repo_dir = _validate_repo_path(repo_path)
+    repo = pygit2.Repository(str(repo_dir))
+    branch_ref = repo.lookup_branch(branch)
+    if branch_ref is None:
+        raise GitOpsError(f"Branch '{branch}' not found")
+    return str(branch_ref.peel(pygit2.Commit).id)
 
 
 def _build_temp_merge_worktree_path(target: str) -> Path:
@@ -640,6 +664,10 @@ async def get_pr_diff_async(
     repo_path: str, branch: str, target: str = "main"
 ) -> PrDiffResult:
     return await asyncio.to_thread(_get_pr_diff_sync, repo_path, branch, target)
+
+
+async def get_branch_head_sha_async(repo_path: str, branch: str) -> str:
+    return await asyncio.to_thread(_get_branch_head_sha_sync, repo_path, branch)
 
 
 async def merge_branch_async(

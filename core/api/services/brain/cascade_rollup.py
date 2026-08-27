@@ -24,17 +24,13 @@ from typing import Any
 import aiosqlite
 
 from core.api.db import acquire_db
-from core.api.models.brain import ProposedWriteContextMdAppend
 from core.api.services.brain.compound_bridge import (
     build_proposed_write_context_md_append,
 )
 from core.api.services.brain.memory_ops import (
-    DigestEventRow,
     JournalEntryRow,
     OperationDraft,
     OpSnapshot,
-    evidence_hash,
-    make_operation_id,
 )
 
 logger = logging.getLogger(__name__)

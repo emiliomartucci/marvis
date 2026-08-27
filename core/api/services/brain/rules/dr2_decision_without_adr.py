@@ -8,6 +8,7 @@
 # graph_service call with batched chunked IN (max 500).
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from core.api.models.brain import DriftSignal
@@ -18,13 +19,36 @@ _DECISION_MARKERS_REQUIRING_ADR = frozenset(
     {"merged", "deployed", "approved", "decision"}
 )
 
+# A PR carried in by the pir_tasks collector always has a Marvis ``task_id`` and
+# a task-shaped branch (``feat/task-<uuid>`` / ``fix/task-<uuid>``); that IS the
+# decision's provenance. Match the first uuid segment (8 hex).
+_TASK_BRANCH_RE = re.compile(r"task-[0-9a-f]{8}", re.IGNORECASE)
+
+
+def _has_task_provenance(ev: dict) -> bool:
+    """A merged PR tracked by a Marvis task/plan is NOT an undocumented decision.
+
+    The pir_tasks collector stamps ``task_id`` and ``branch`` on every PR event;
+    ignoring them made DR2 fire on every task-tracked PR (audit 2026-08-05,
+    task 01752f08: 48 of 50 open findings were this exact false positive).
+    """
+    task_id = ev.get("task_id")
+    if isinstance(task_id, str) and task_id.strip():
+        return True
+    branch = ev.get("branch")
+    if isinstance(branch, str) and _TASK_BRANCH_RE.search(branch):
+        return True
+    return False
+
 
 def _has_linked_artifact(event: DigestEventRow) -> bool:
-    """Check whether the event already references an ADR/plan."""
+    """Check whether the event already references an ADR/plan/task."""
     ev = event.evidence
     if not isinstance(ev, dict):
         return False
     if ev.get("adr_ref") or ev.get("plan_ref"):
+        return True
+    if _has_task_provenance(ev):
         return True
     linked = ev.get("linked_artifacts")
     if isinstance(linked, list):
@@ -96,7 +120,10 @@ async def build_signals(
                 observed_direction_ref=observed_ref,
                 observed_delta=observed_delta,
                 evidence_refs=evidence_refs,
-                severity_base="high",
+                # Base medium (task 01752f08): a decision with no ADR/plan/task
+                # link is worth an open_question, not a high task_candidate.
+                # `claimed_by_external` still bumps a genuinely-external one to high.
+                severity_base="medium",
                 drift_axis="intent",
                 involved_projects=_involved_projects(event),
                 severity_modifiers=modifiers,

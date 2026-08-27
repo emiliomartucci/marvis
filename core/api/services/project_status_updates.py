@@ -205,14 +205,42 @@ def _row_to_feed_item(row: aiosqlite.Row) -> StatusUpdateFeedItem:
     )
 
 
+async def _require_unique_workspace_owner(
+    db: aiosqlite.Connection,
+    slug: str,
+    workspace_id: str | None,
+) -> None:
+    """Recheck legacy slug ownership at the final DB read/write boundary."""
+    if workspace_id is None:
+        return
+    try:
+        owners = {
+            str(row[0])
+            for row in await (
+                await db.execute(
+                    "SELECT workspace_id FROM workspace_projects "
+                    "WHERE project_slug = ?",
+                    (slug,),
+                )
+            ).fetchall()
+            if row[0]
+        }
+    except aiosqlite.Error as exc:
+        raise LookupError("project not found") from exc
+    if owners != {workspace_id}:
+        raise LookupError("project not found")
+
+
 async def list_feed(
     db: aiosqlite.Connection,
     slug: str,
     metadata_path: Path | None,
     repo_path: Path | None,
     limit: int = 20,
+    workspace_id: str | None = None,
 ) -> tuple[list[StatusUpdateFeedItem], int]:
     """Combine stored updates + derived entries into a chronological feed."""
+    await _require_unique_workspace_owner(db, slug, workspace_id)
     # Persisted rows (cap at limit just in case — typical project has <50)
     cursor = await db.execute(
         "SELECT id, project, status, what_done, blockers, next_steps, "
@@ -240,8 +268,10 @@ async def create_manual_update(
     content_md: str,
     author: str,
     author_display: str | None,
+    workspace_id: str | None = None,
 ) -> StatusUpdateFeedItem:
     """Insert a manual feed entry. Callers must have already enforced RBAC."""
+    await _require_unique_workspace_owner(db, slug, workspace_id)
     now = datetime.now(timezone.utc).isoformat()
     # Legacy `status` column is NOT NULL, pick 'active' as a neutral default for
     # feed-mode entries (UI surfaces the kind/author, not the status badge).

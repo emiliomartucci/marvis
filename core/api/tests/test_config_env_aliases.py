@@ -32,18 +32,23 @@ def _clear(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+def _settings_for_alias(attr: str) -> Settings:
+    kwargs = {"pir_jwt_secret": "t" * 32} if attr == "pir_env" else {}
+    return Settings(_env_file=None, **kwargs)
+
+
 @pytest.mark.parametrize("attr,marvis,pir,value", _ALIAS_CASES)
 def test_pir_alias_still_accepted(monkeypatch, attr, marvis, pir, value):
     _clear(monkeypatch, marvis, pir)
     monkeypatch.setenv(pir, value)
-    assert getattr(Settings(_env_file=None), attr) == value
+    assert getattr(_settings_for_alias(attr), attr) == value
 
 
 @pytest.mark.parametrize("attr,marvis,pir,value", _ALIAS_CASES)
 def test_marvis_alias_accepted(monkeypatch, attr, marvis, pir, value):
     _clear(monkeypatch, marvis, pir)
     monkeypatch.setenv(marvis, value)
-    assert getattr(Settings(_env_file=None), attr) == value
+    assert getattr(_settings_for_alias(attr), attr) == value
 
 
 @pytest.mark.parametrize("attr,marvis,pir,value", _ALIAS_CASES)
@@ -51,7 +56,7 @@ def test_marvis_wins_when_both_set(monkeypatch, attr, marvis, pir, value):
     _clear(monkeypatch, marvis, pir)
     monkeypatch.setenv(marvis, value)
     monkeypatch.setenv(pir, f"legacy-{value}")
-    assert getattr(Settings(_env_file=None), attr) == value
+    assert getattr(_settings_for_alias(attr), attr) == value
 
 
 def test_canary_banner_both_aliases(monkeypatch):

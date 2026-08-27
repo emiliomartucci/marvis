@@ -30,7 +30,6 @@ import asyncio
 import json
 import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
 import typer
@@ -59,6 +58,18 @@ LOCAL_ADMIN_CTX: CallerContext = CallerContext(
 )
 
 T = TypeVar("T")
+
+
+def service_error_json(exc: Exception) -> str:
+    return json.dumps(
+        {
+            "code": getattr(exc, "code", "service_error"),
+            "message": getattr(exc, "message", str(exc)),
+            "context": getattr(exc, "context", {}),
+        },
+        sort_keys=True,
+    )
+
 
 def _apply_settings() -> None:
     """Point the runtime at the user's configured DB + projects_root (once).
@@ -154,7 +165,11 @@ def handle_service_error(func: Callable[..., T]) -> Callable[..., T]:
         try:
             return func(*args, **kwargs)
         except ServiceError as exc:
-            err_console.print(f"[red]{exc.message}[/red]")
+            if exc.context:
+                sys.stderr.write(service_error_json(exc))
+                sys.stderr.write("\n")
+            else:
+                err_console.print(f"[red]{exc.message}[/red]")
             raise typer.Exit(1) from exc
 
     return wrapper

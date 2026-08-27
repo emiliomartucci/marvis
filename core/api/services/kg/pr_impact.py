@@ -670,7 +670,7 @@ def _module_slug_from_path(path: str) -> str:
 
     Single-file paths whose 2nd segment is a real file (has extension)
     collapse to the 1st segment so we don't end up with a planet per
-    script. `scripts/heypocket_sync.py` -> `scripts`,
+    script. `scripts/ingest_recovery.py` -> `scripts`,
     `tests/test_foo.py` -> `tests`.
 
     Top-level files fall into `root` so they don't pollute the canvas.

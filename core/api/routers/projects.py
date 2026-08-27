@@ -58,11 +58,12 @@ from core.api.models import (
 )
 from core.api.rbac import require_role
 from core.api.routers._adapter import to_http
-from core.api.security import get_current_user, get_current_user_or_agent
+from core.api.routers._browser_mutation_denial import agent_only_route
+from core.api.security import get_agent_user, get_current_user_or_agent
 from core.api.services import project_status_updates as status_feed_service  # noqa: F401  (re-export / used by use_case)
 from core.api.visibility import check_project_access, get_visible_projects  # noqa: F401  (check_project_access kept as re-export seam)
 from core.api.services.kg.audit import check_deep_rate_limit, log_kg_deep_access
-from core.api.services.kg.lens import build_kg_context_for_project
+from core.api.services.kg.lens import build_kg_context_for_project, require_kg_visibility
 from core.api.use_cases import projects as uc
 from core.api.use_cases._context import CallerContext
 from core.api.use_cases._errors import ServiceError
@@ -370,13 +371,22 @@ def _safe_read_file(project_path: Path, relative_path: str) -> str | None:
 # --- Task counts batch query ---
 
 
-async def _get_all_task_counts(db: aiosqlite.Connection) -> dict[str, dict[str, int]]:
-    """Single GROUP BY query for all projects."""
-    cursor = await db.execute(
+async def _get_all_task_counts(
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str | None = None,
+) -> dict[str, dict[str, int]]:
+    """Single GROUP BY query, workspace-scoped for every remote caller."""
+    query = (
         "SELECT project, status, COUNT(*) as cnt "
-        "FROM tasks WHERE deleted_at IS NULL "
-        "GROUP BY project, status"
+        "FROM tasks WHERE deleted_at IS NULL"
     )
+    params: list[str] = []
+    if workspace_id is not None:
+        query += " AND workspace_id = ?"
+        params.append(workspace_id)
+    query += " GROUP BY project, status"
+    cursor = await db.execute(query, params)
     result: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     async for row in cursor:
         result[row["project"]][row["status"]] = row["cnt"]
@@ -386,12 +396,27 @@ async def _get_all_task_counts(db: aiosqlite.Connection) -> dict[str, dict[str, 
 # --- Latest status update per project ---
 
 
-async def _get_latest_status_updates(db: aiosqlite.Connection) -> dict[str, tuple[str, str]]:
-    """Latest status update (status, date) per project."""
-    cursor = await db.execute(
-        "SELECT project, status, created_at FROM project_status_updates "
-        "WHERE id IN (SELECT MAX(id) FROM project_status_updates GROUP BY project)"
+async def _get_latest_status_updates(
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Latest status per project, quarantining legacy same-slug ownership."""
+    query = (
+        "SELECT s.project, s.status, s.created_at FROM project_status_updates s "
+        "WHERE s.id IN (SELECT MAX(s2.id) FROM project_status_updates s2 "
+        "GROUP BY s2.project)"
     )
+    params: list[str] = []
+    if workspace_id is not None:
+        query += (
+            " AND (SELECT COUNT(DISTINCT wp.workspace_id) "
+            "FROM workspace_projects wp WHERE wp.project_slug = s.project) = 1 "
+            "AND EXISTS (SELECT 1 FROM workspace_projects wp "
+            "WHERE wp.project_slug = s.project AND wp.workspace_id = ?)"
+        )
+        params.append(workspace_id)
+    cursor = await db.execute(query, params)
     result: dict[str, tuple[str, str]] = {}
     async for row in cursor:
         result[row["project"]] = (row["status"], row["created_at"])
@@ -880,12 +905,13 @@ def _create_project_on_disk(
 async def create_project(
     body: ProjectCreateRequest,
     user: UserInfo = Depends(require_role("operator")),
-    db: aiosqlite.Connection = Depends(get_db),
+    db: aiosqlite.Connection = Depends(get_write_db),
 ) -> ProjectCreateResponse:
     """Create a new work project on the server.
 
     Creates the directory structure, project.yaml, context.md, and .task file
-    under /data/projects/{slug}/.
+    under /data/projects/{slug}/. A person creating a project becomes its
+    project-admin (RBAC F2.6); service callers may name an explicit owner.
     """
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
@@ -900,6 +926,7 @@ async def create_project(
             lifecycle=body.lifecycle,
             language=body.language,
             type=body.type,
+            owner=body.owner,
         )
         # Embed-on-write so the just-created project is immediately searchable by
         # meaning (keyword-only until a manual reindex otherwise). Fire-and-forget:
@@ -935,9 +962,19 @@ async def get_project(
     deep = deep_param if deep_param is not None else settings.kg_http_deep_default
     deep_source = "client" if deep_param is not None else "env"
     if deep:
+        try:
+            require_kg_visibility(ctx, visible_projects)
+        except ServiceError as e:
+            raise to_http(e)
         check_deep_rate_limit(user.username)
         log_kg_deep_access(user.username, "get_project", slug)
-        kg_ctx = await build_kg_context_for_project(db, slug, deep=True)
+        kg_ctx = await build_kg_context_for_project(
+            db,
+            slug,
+            deep=True,
+            ctx=ctx,
+            visible_projects=visible_projects,
+        )
         if kg_ctx is not None:
             kg_ctx.setdefault("meta", {})
             kg_ctx["meta"]["deep_effective"] = deep
@@ -1108,10 +1145,10 @@ async def get_git_branches(
     return await _git_branches(repo)
 
 
-@router.post("/{slug}/git/push")
+@agent_only_route(router, "/{slug}/git/push", methods=["POST"])
 async def git_push(
     slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
-    user: UserInfo = Depends(get_current_user),
+    user: UserInfo = Depends(get_agent_user),
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> dict:
     """Git push (user only, requires confirmation)."""
@@ -1131,10 +1168,10 @@ async def git_push(
     return {"success": True, "output": stdout.decode().strip()}
 
 
-@router.post("/{slug}/git/pull")
+@agent_only_route(router, "/{slug}/git/pull", methods=["POST"])
 async def git_pull(
     slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
-    user: UserInfo = Depends(get_current_user),
+    user: UserInfo = Depends(get_agent_user),
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> dict:
     """Git pull (user only)."""

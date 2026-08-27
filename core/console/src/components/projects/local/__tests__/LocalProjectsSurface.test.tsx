@@ -23,7 +23,6 @@ vi.mock("@/lib/api", () => ({
   listLearnings: vi.fn(),
   listTasks: vi.fn(),
   updateProjectColor: vi.fn(),
-  updateProjectFile: vi.fn(),
   upsertManualProjectEdge: vi.fn(),
 }));
 
@@ -38,7 +37,6 @@ import {
   listLearnings,
   listTasks,
   updateProjectColor,
-  updateProjectFile,
 } from "@/lib/api";
 import type { DocEntry, ProgramInfo, ProjectDetail, ProjectInfo } from "@/lib/types";
 import LocalProjectsSurface from "../LocalProjectsSurface";
@@ -138,7 +136,7 @@ describe("LocalProjectsSurface", () => {
     });
   });
 
-  it("saves markdown documents with the mocked PUT path", async () => {
+  it("opens markdown documents for inspection without editor controls", async () => {
     const user = userEvent.setup();
     const docs: DocEntry[] = [
       {
@@ -155,12 +153,6 @@ describe("LocalProjectsSurface", () => {
       content: "# Original",
       size: 10,
     });
-    vi.mocked(updateProjectFile).mockResolvedValue({
-      filename: "readme.md",
-      path: "docs/readme.md",
-      content: "# Updated",
-      size: 9,
-    });
 
     render(<LocalProjectsSurface />);
 
@@ -172,16 +164,8 @@ describe("LocalProjectsSurface", () => {
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
     });
-
-    await user.click(screen.getByRole("button", { name: "Modifica" }));
-    const textarea = screen.getByRole("textbox");
-    await user.clear(textarea);
-    await user.type(textarea, "# Updated");
-    await user.click(screen.getByRole("button", { name: "Salva" }));
-
-    await waitFor(() => {
-      expect(updateProjectFile).toHaveBeenCalledWith("marvisx", "docs/readme.md", "# Updated");
-      expect(screen.getByText("Documento salvato")).toBeInTheDocument();
-    });
+    expect(screen.queryByRole("button", { name: "Modifica" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Salva" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 });

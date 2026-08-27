@@ -28,6 +28,16 @@ from core.api.models.auth import (
     UserInfo,
 )
 
+# --- ce2 shared contracts ---
+from core.api.models.ce2_shared import (
+    ActorIdentityV1,
+    CE2_SHARED_CONTRACT_VERSION,
+    ErrorEnvelopeV1,
+    ResourceRefV1,
+    error_envelope_from_service_error,
+    identity_from_user,
+)
+
 # --- inbox ---
 from core.api.models.inbox import (
     INBOX_INGEST_BATCH_MAX,
@@ -238,6 +248,13 @@ __all__ = [
     "TicketRequest",
     "TicketResponse",
     "UserInfo",
+    # ce2 shared contracts
+    "ActorIdentityV1",
+    "CE2_SHARED_CONTRACT_VERSION",
+    "ErrorEnvelopeV1",
+    "ResourceRefV1",
+    "error_envelope_from_service_error",
+    "identity_from_user",
     # inbox
     "INBOX_INGEST_BATCH_MAX",
     "VALID_INBOX_STATUSES",

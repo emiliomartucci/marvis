@@ -12,21 +12,13 @@ implementation, no fork.
 
 How the template decisions land on the PR domain:
 
-MERGE HUMAN-GATE — stays a transport-layer ``Depends``, NOT duplicated here.
-    The legacy ``POST /{task_id}/merge`` (and ``/revert``) used
-    ``Depends(require_role(..., human_only=True))``. ``human_only=True`` swaps the
-    auth dependency to ``get_current_user`` (cookie-only), so a Bearer-only agent
-    is rejected with ``401 Not authenticated`` BEFORE any handler/``ctx`` exists
-    (pinned by the merge-gate regression test ``test_br03_merge_pr_blocked_without_cookie``,
-    which asserts 401/403). A use_case receiving a ``ctx`` cannot reproduce that
-    401 — authentication failure happens at the dependency, upstream of the domain.
-    So the adapter KEEPS ``Depends(require_role(..., human_only=True))`` and this
-    module does NOT add an ``is_human_session`` check on merge/revert: it would be
-    dead on HTTP because agents are already blocked before the domain layer, and
-    merge/revert are not exposed as MCP tools. Each write use_case still calls
-    :func:`require_role_ctx` so the ROLE-level gate is enforced on the MCP surface
-    (parity with the tasks template, which keeps ``require_role_ctx`` despite the
-    router's ``Depends(require_role(...))``).
+MERGE/REVERT HUMAN-GATE — defense in depth across transport and domain.
+    HTTP keeps ``Depends(require_role(..., human_only=True))`` for early rejection.
+    The use cases also call :func:`has_approval_authority`, because direct/internal
+    callers must not gain destructive PR authority by constructing an operator
+    ``CallerContext``. A validated human/local session passes directly; an agent
+    passes only through a persisted, active, bounded operator+ delegation. There
+    is still no MCP Git/PR lifecycle tool.
 
 DECISION 1 — Visibility on ``get_merge_conflicts``. The legacy endpoint called
     ``check_project_access(project, user, db)`` (raises 404 if the project is not
@@ -76,12 +68,20 @@ moved (like costs/tasks). The router keeps the REQUEST models.
 from __future__ import annotations
 
 import logging
+import uuid
 
 import aiosqlite
 
 from core.api.services.git_ops import GitOpsError, MergeConflictError
-from core.api.use_cases._context import CallerContext, require_role_ctx
+from core.api.use_cases._context import (
+    ApprovalAuthorityReceipt,
+    CallerContext,
+    require_role_ctx,
+    require_workspace_ctx,
+    resolve_approval_authority,
+)
 from core.api.use_cases._errors import (
+    AuthorizationError,
     ConflictError,
     NotFoundError,
     ServiceError,
@@ -89,6 +89,67 @@ from core.api.use_cases._errors import (
 )
 
 logger = logging.getLogger(__name__)
+
+PR_LIFECYCLE_REQUIRES_HUMAN_DETAIL = (
+    "PR merge and revert require a validated human session or an active "
+    "persisted delegation"
+)
+
+
+async def _require_pr_lifecycle_authority(
+    ctx: CallerContext, db: aiosqlite.Connection
+) -> ApprovalAuthorityReceipt:
+    """Keep destructive PR authority in the domain, not only the transport."""
+    authority = await resolve_approval_authority(ctx, db)
+    if authority is None:
+        raise AuthorizationError(
+            code="pr_lifecycle_requires_human",
+            message=PR_LIFECYCLE_REQUIRES_HUMAN_DETAIL,
+        )
+    return authority
+
+
+async def _append_pr_lifecycle_audit(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+    *,
+    operation: str,
+    stage: str,
+    task_id: str,
+    correlation_id: str,
+    authority: ApprovalAuthorityReceipt,
+    failure_type: str | None = None,
+) -> None:
+    """Persist one durable saga receipt around an external Git side effect."""
+    from core.api.services.audit import log_audit
+
+    if db.in_transaction:
+        raise RuntimeError("PR lifecycle audit requires a clean transaction boundary")
+    details = {
+        "task_id": task_id,
+        "stage": stage,
+        "correlation_id": correlation_id,
+        **authority.audit_details(),
+    }
+    if failure_type is not None:
+        details["failure_type"] = failure_type
+    action = f"pr.{operation}" if stage == "confirmed" else f"pr.{operation}.{stage}"
+    workspace_id = require_workspace_ctx(ctx)
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        await log_audit(
+            db,
+            action=action,
+            user=ctx.username,
+            resource_type="pull_request",
+            resource_id=task_id,
+            details=details,
+            workspace_id=workspace_id,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -113,13 +174,16 @@ async def get_merge_conflicts(
     Raises :class:`ValidationError` (422) on a bad project arg and re-raises
     :class:`GitOpsError` (-> 500 in the adapter) — matching the legacy router.
     """
+    workspace_id = require_workspace_ctx(ctx)
     if visible_projects is not None and project not in visible_projects:
         raise NotFoundError(code="project_not_found", message="Not found")
 
     from core.api.services import pr_service
 
     try:
-        return await pr_service.get_merge_conflicts(project, db)
+        return await pr_service.get_merge_conflicts(
+            project, db, workspace_id=workspace_id
+        )
     except ValueError as exc:
         raise ValidationError(code="invalid_merge_conflicts_request", message=str(exc))
     # GitOpsError propagates; the adapter maps it to the legacy 500.
@@ -130,6 +194,7 @@ async def get_pull_request(
     db: aiosqlite.Connection,
     *,
     task_id: str,
+    visible_projects: set[str] | None = None,
 ) -> dict:
     """Get PR status and diff for a task (any authenticated caller).
 
@@ -137,10 +202,25 @@ async def get_pull_request(
     is a per-surface adapter concern (DECISION 2) — the adapter attaches it.
     Raises :class:`NotFoundError` (404) when no PR exists for the task.
     """
+    workspace_id = require_workspace_ctx(ctx)
+    if visible_projects is not None:
+        task_cursor = await db.execute(
+            "SELECT project FROM tasks WHERE id = ? AND workspace_id = ? "
+            "AND deleted_at IS NULL",
+            (task_id, workspace_id),
+        )
+        task_row = await task_cursor.fetchone()
+        if task_row is None or (
+            task_row["project"] is not None
+            and task_row["project"] not in visible_projects
+        ):
+            raise NotFoundError(code="pr_not_found", message="Pull request not found")
     from core.api.services import pr_service
 
     try:
-        return await pr_service.get_pr_status(task_id, db)
+        return await pr_service.get_pr_status(
+            task_id, db, workspace_id=workspace_id
+        )
     except ValueError as exc:
         raise NotFoundError(code="pr_not_found", message=str(exc))
 
@@ -162,11 +242,14 @@ async def create_branch(
     409) and re-raises :class:`GitOpsError` (-> 500 in the adapter).
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     from core.api.services import pr_service
 
     try:
-        return await pr_service.start_branch_short_write(task_id, db)
+        return await pr_service.start_branch_short_write(
+            task_id, db, workspace_id=workspace_id
+        )
     except ValueError as exc:
         raise ConflictError(code="branch_conflict", message=str(exc))
     # GitOpsError propagates; the adapter maps it to the legacy 500.
@@ -186,12 +269,17 @@ async def register_branch(
     :class:`ValidationError` (422) on a ``ValueError`` (matching the legacy 422).
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     from core.api.services import pr_service
 
     try:
         return await pr_service.register_branch(
-            task_id, branch_name, db, worktree_path=worktree_path
+            task_id,
+            branch_name,
+            db,
+            worktree_path=worktree_path,
+            workspace_id=workspace_id,
         )
     except ValueError as exc:
         raise ValidationError(code="register_branch_failed", message=str(exc))
@@ -212,12 +300,18 @@ async def submit_pull_request(
     and re-raises :class:`GitOpsError` (-> 500 in the adapter).
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     from core.api.services import pr_service
 
     try:
         return await pr_service.submit_pr(
-            task_id, title, body, db, submitted_by=ctx.user_id
+            task_id,
+            title,
+            body,
+            db,
+            submitted_by=ctx.user_id,
+            workspace_id=workspace_id,
         )
     except ValueError as exc:
         raise ValidationError(code="submit_pr_failed", message=str(exc))
@@ -230,9 +324,7 @@ async def merge_pull_request(
     *,
     task_id: str,
 ) -> dict:
-    """Merge a PR (operator+). The HUMAN-ONLY gate is enforced at the HTTP
-    ``Depends(require_role(..., human_only=True))`` (see module docstring) — it is
-    NOT re-checked here, by design.
+    """Merge a PR with operator+ and persisted human/delegated authority.
 
     Writes a ``pr.merge`` audit entry (``merger_id=ctx.user_id``) on success.
     Raises :class:`ValidationError` (422) on a ``ValueError`` and re-raises both
@@ -241,24 +333,56 @@ async def merge_pull_request(
     preserve those exact legacy bodies.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
+    authority = await _require_pr_lifecycle_authority(ctx, db)
 
     from core.api.services import pr_service
-    from core.api.services.audit import log_audit
+    correlation_id = uuid.uuid4().hex
+
+    await _append_pr_lifecycle_audit(
+        ctx,
+        db,
+        operation="merge",
+        stage="intent",
+        task_id=task_id,
+        correlation_id=correlation_id,
+        authority=authority,
+    )
 
     try:
-        result = await pr_service.merge_pr(task_id, db, merger_id=ctx.user_id)
-    except ValueError as exc:
-        raise ValidationError(code="merge_failed", message=str(exc))
+        result = await pr_service.merge_pr(
+            task_id,
+            db,
+            merger_id=ctx.user_id,
+            workspace_id=workspace_id,
+        )
+    except Exception as exc:
+        if db.in_transaction:
+            await db.rollback()
+        await _append_pr_lifecycle_audit(
+            ctx,
+            db,
+            operation="merge",
+            stage="failed",
+            task_id=task_id,
+            correlation_id=correlation_id,
+            authority=authority,
+            failure_type=type(exc).__name__,
+        )
+        if isinstance(exc, ValueError):
+            raise ValidationError(code="merge_failed", message=str(exc)) from exc
+        raise
     # MergeConflictError (subclass of GitOpsError) and plain GitOpsError propagate;
     # the adapter maps them to the exact legacy 409 dict / 500 plain-string bodies.
 
-    await log_audit(
+    await _append_pr_lifecycle_audit(
+        ctx,
         db,
-        action="pr.merge",
-        user=ctx.username,
-        resource_type="pull_request",
-        resource_id=task_id,
-        details={"task_id": task_id},
+        operation="merge",
+        stage="confirmed",
+        task_id=task_id,
+        correlation_id=correlation_id,
+        authority=authority,
     )
     return result
 
@@ -280,12 +404,15 @@ async def approve_pull_request(
     (403) on a ``PermissionError`` — matching the legacy router.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     from core.api.services import pr_service
     from core.api.use_cases._errors import AuthorizationError
 
     try:
-        return await pr_service.approve_pr(task_id, reviewer, db)
+        return await pr_service.approve_pr(
+            task_id, reviewer, db, workspace_id=workspace_id
+        )
     except ValueError as exc:
         raise ValidationError(code="approve_pr_failed", message=str(exc))
     except PermissionError as exc:
@@ -308,12 +435,19 @@ async def request_pull_request_changes(
     :class:`AuthorizationError` (403) on a ``PermissionError``.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     from core.api.services import pr_service
     from core.api.use_cases._errors import AuthorizationError
 
     try:
-        return await pr_service.request_changes_pr(task_id, reviewer, comment, db)
+        return await pr_service.request_changes_pr(
+            task_id,
+            reviewer,
+            comment,
+            db,
+            workspace_id=workspace_id,
+        )
     except ValueError as exc:
         raise ValidationError(code="request_changes_failed", message=str(exc))
     except PermissionError as exc:
@@ -332,11 +466,14 @@ async def close_pull_request(
     Raises :class:`ValidationError` (422) on a ``ValueError`` (matching legacy).
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     from core.api.services import pr_service
 
     try:
-        return await pr_service.close_pr(task_id, reason, db)
+        return await pr_service.close_pr(
+            task_id, reason, db, workspace_id=workspace_id
+        )
     except ValueError as exc:
         raise ValidationError(code="close_pr_failed", message=str(exc))
 
@@ -354,11 +491,18 @@ async def update_pull_request(
     Raises :class:`ValidationError` (422) on a ``ValueError`` (matching legacy).
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     from core.api.services import pr_service
 
     try:
-        return await pr_service.update_pr(task_id, db, title=title, body=body)
+        return await pr_service.update_pr(
+            task_id,
+            db,
+            title=title,
+            body=body,
+            workspace_id=workspace_id,
+        )
     except ValueError as exc:
         raise ValidationError(code="update_pr_failed", message=str(exc))
 
@@ -369,31 +513,58 @@ async def revert_pull_request(
     *,
     task_id: str,
 ) -> dict:
-    """Revert a merged PR — creates a new task + new PR with a git revert commit
-    (operator+). HUMAN-ONLY gate at the HTTP ``Depends`` (see module docstring),
-    not re-checked here.
+    """Revert a merged PR with operator+ and persisted human/delegated authority.
 
     Writes a ``pr.revert`` audit entry on success. Raises :class:`ValidationError`
     (422) on a ``ValueError`` and re-raises :class:`GitOpsError` (-> 500).
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
+    authority = await _require_pr_lifecycle_authority(ctx, db)
 
     from core.api.services import pr_service
-    from core.api.services.audit import log_audit
+    correlation_id = uuid.uuid4().hex
+
+    await _append_pr_lifecycle_audit(
+        ctx,
+        db,
+        operation="revert",
+        stage="intent",
+        task_id=task_id,
+        correlation_id=correlation_id,
+        authority=authority,
+    )
 
     try:
-        result = await pr_service.revert_pr(task_id, db)
-    except ValueError as exc:
-        raise ValidationError(code="revert_pr_failed", message=str(exc))
+        result = await pr_service.revert_pr(
+            task_id, db, workspace_id=workspace_id
+        )
+    except Exception as exc:
+        if db.in_transaction:
+            await db.rollback()
+        await _append_pr_lifecycle_audit(
+            ctx,
+            db,
+            operation="revert",
+            stage="failed",
+            task_id=task_id,
+            correlation_id=correlation_id,
+            authority=authority,
+            failure_type=type(exc).__name__,
+        )
+        if isinstance(exc, ValueError):
+            raise ValidationError(code="revert_pr_failed", message=str(exc)) from exc
+        raise
     # GitOpsError propagates; the adapter maps it to the legacy 500.
 
-    await log_audit(
+    await _append_pr_lifecycle_audit(
+        ctx,
         db,
-        action="pr.revert",
-        user=ctx.username,
-        resource_type="pull_request",
-        resource_id=task_id,
-        details={"task_id": task_id},
+        operation="revert",
+        stage="confirmed",
+        task_id=task_id,
+        correlation_id=correlation_id,
+        authority=authority,
     )
     return result
 
@@ -401,6 +572,7 @@ async def revert_pull_request(
 __all__ = [
     "GitOpsError",
     "MergeConflictError",
+    "PR_LIFECYCLE_REQUIRES_HUMAN_DETAIL",
     "ServiceError",
     "get_merge_conflicts",
     "get_pull_request",

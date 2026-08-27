@@ -27,7 +27,15 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 
 from core.api.config import settings
-from core.api.security import consume_ws_ticket, get_current_user
+from core.api.db import acquire_db
+from core.api.models import UserInfo
+from core.api.routers._browser_mutation_denial import agent_only_route
+from core.api.security import (
+    TerminalTicketPrincipal,
+    consume_ws_ticket_principal,
+    get_agent_user,
+    get_current_user,
+)
 from core.api.services.runas import runas_user
 from core.api.services.terminal_metrics import TerminalMetricsCollector
 from core.api.services.tmux import (
@@ -55,6 +63,10 @@ TMUX_CAPTURE_TIMEOUT = 10
 PROJECTS_ROOT = Path("/data/projects")
 
 _ws_send_locks: dict[int, asyncio.Lock] = {}
+
+
+def _local_terminal_compatibility() -> bool:
+    return settings.deploy_mode == "core" and not settings.multi_tenant_enabled
 
 
 def _ws_send_lock(ws: WebSocket) -> asyncio.Lock:
@@ -94,9 +106,63 @@ async def _close_ws(
         _drop_ws_send_lock(ws)
 
 
-def _metrics_collector(ws: WebSocket) -> TerminalMetricsCollector | None:
-    collector = getattr(ws.app.state, "terminal_metrics", None)
-    return collector if isinstance(collector, TerminalMetricsCollector) else None
+def _metrics_collector(
+    ws: WebSocket, workspace_id: str | None = None
+) -> TerminalMetricsCollector | None:
+    if workspace_id is None:
+        return None
+    if workspace_id == "ws_default":
+        collector = getattr(ws.app.state, "terminal_metrics", None)
+        if not isinstance(collector, TerminalMetricsCollector):
+            collector = TerminalMetricsCollector()
+            ws.app.state.terminal_metrics = collector
+        return collector
+    collectors = getattr(ws.app.state, "terminal_metrics_by_workspace", None)
+    if not isinstance(collectors, dict):
+        collectors = {}
+        ws.app.state.terminal_metrics_by_workspace = collectors
+    collector = collectors.get(workspace_id)
+    if not isinstance(collector, TerminalMetricsCollector):
+        collector = TerminalMetricsCollector()
+        collectors[workspace_id] = collector
+    return collector
+
+
+async def _terminal_binding_is_active(
+    db, principal: TerminalTicketPrincipal
+) -> bool:
+    """Revalidate the ticket's user/session/workspace tuple before PTY attach."""
+    cursor = await db.execute("PRAGMA table_info(sessions_meta)")
+    session_columns = {row["name"] for row in await cursor.fetchall()}
+    if "workspace_id" in session_columns:
+        session_row = await (
+            await db.execute(
+                "SELECT 1 FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+                (principal.session_name, principal.workspace_id),
+            )
+        ).fetchone()
+    elif _local_terminal_compatibility():
+        session_row = await (
+            await db.execute(
+                "SELECT 1 FROM sessions_meta WHERE name = ?",
+                (principal.session_name,),
+            )
+        ).fetchone()
+    else:
+        return False
+
+    if session_row is None:
+        return False
+    if _local_terminal_compatibility() and principal.user_id == "local":
+        return True
+    user_row = await (
+        await db.execute(
+            "SELECT 1 FROM users WHERE workspace_id = ? AND deleted_at IS NULL "
+            "AND (id = ? OR slug = ?)",
+            (principal.workspace_id, principal.user_id, principal.username),
+        )
+    ).fetchone()
+    return user_row is not None
 
 
 async def _capture_pane_snapshot(
@@ -180,6 +246,46 @@ async def _capture_pane_snapshot(
     return snapshot
 
 
+def _session_safe_slug(slug: str) -> str:
+    """Mirror the tmux session-name sanitization applied to project slugs.
+
+    A tmux session name cannot contain '&' (nor other shell metacharacters), so a
+    real project slug such as ``c&i-master`` surfaces as the session-safe form
+    ``c-i-master``. Any character outside the session-safe set ``[a-z0-9_-]``
+    collapses to '-'. This is intentionally distinct from the KG sanitization
+    (``&``->``_``/removed) and must not be conflated with it.
+    """
+    return "".join(char if (char.isalnum() or char in "_-") else "-" for char in slug)
+
+
+def _resolve_registered_slug(slug: str) -> tuple[str | None, bool]:
+    """Resolve a (possibly session-sanitized) slug to a real registered project.
+
+    Returns ``(resolved_slug_or_None, index_available)``:
+      - direct hit: ``slug`` is itself a registered project slug;
+      - alias hit: exactly one registered slug whose session-safe form == ``slug``
+        (recovers ``c&i-master`` from the sanitized ``c-i-master``);
+      - miss: ``None``.
+    ``index_available`` reports whether a non-empty project index was available to
+    check against; when it is empty/cold the caller cannot verify registration and
+    should trust the slug as-is rather than reject it.
+    """
+    from core.api.routers import projects as _projects
+    import time as _t
+
+    if _t.monotonic() - _projects._index_built_at > _projects._INDEX_TTL:
+        _projects._build_project_index()
+    index = _projects._project_index
+    if not index:
+        return None, False
+    if slug in index:
+        return slug, True
+    matches = [registered for registered in index if _session_safe_slug(registered) == slug]
+    if len(matches) == 1:
+        return matches[0], True
+    return None, True
+
+
 def _resolve_upload_target(
     project_slug: str | None, pane_cwd: str | None
 ) -> tuple[str | None, Path]:
@@ -188,6 +294,12 @@ def _resolve_upload_target(
     Prefer the session project when known. If the DB row is contaminated/missing,
     try to recover the project from the pane cwd. Otherwise fall back to the
     generic upload directory instead of hard-failing the UI.
+
+    The candidate slug is resolved against the registered project index before it
+    is used to build a filesystem path: a session-sanitized alias (``c-i-master``)
+    is remapped to its real slug (``c&i-master``), and a slug that matches no
+    registered project is rejected to the fallback dir instead of spawning a
+    phantom ``/data/projects/<slug>/`` tree.
     """
     if not project_slug and pane_cwd:
         from core.api.routers.sessions import _detect_project_from_path
@@ -195,7 +307,13 @@ def _resolve_upload_target(
         project_slug = _detect_project_from_path(pane_cwd)
 
     if project_slug:
-        return project_slug, Path(f"/data/projects/{project_slug}/input")
+        resolved, index_available = _resolve_registered_slug(project_slug)
+        if resolved is None and index_available:
+            # Slug matches no registered project (e.g. a stale tmux-sanitized
+            # alias). Don't create a phantom project dir — fall back.
+            return None, FALLBACK_UPLOAD_DIR
+        effective_slug = resolved or project_slug
+        return effective_slug, Path(f"/data/projects/{effective_slug}/input")
 
     return None, FALLBACK_UPLOAD_DIR
 
@@ -227,10 +345,10 @@ def _terminal_attachment_paths(
     return absolute_dir, relative_dir
 
 
-@router.post("/terminal/upload")
+@agent_only_route(router, "/terminal/upload", methods=["POST"])
 async def upload_file(
     file: UploadFile,
-    _user: str = Depends(get_current_user),
+    _user: UserInfo = Depends(get_agent_user),
     session: str | None = Query(default=None),
 ):
     """Upload a file and return its server-side path.
@@ -251,6 +369,17 @@ async def upload_file(
             content={"detail": "Invalid filename"},
         )
 
+    workspace_id = (_user.workspace_id or "").strip()
+    if not workspace_id:
+        if not _local_terminal_compatibility():
+            return JSONResponse(status_code=404, content={"detail": "Upload not found"})
+        workspace_id = "ws_default"
+    workspace_fallback_dir = (
+        FALLBACK_UPLOAD_DIR
+        if _local_terminal_compatibility()
+        else FALLBACK_UPLOAD_DIR / _safe_upload_segment(workspace_id, "workspace")
+    )
+
     # Determine upload directory based on session -> project_slug
     project_slug: str | None = None
     if session:
@@ -264,26 +393,89 @@ async def upload_file(
         from core.api.db import acquire_db
 
         async with acquire_db() as db:
-            cursor = await db.execute(
-                "SELECT project_slug FROM sessions_meta WHERE name = ?", (session,)
-            )
-            row = await cursor.fetchone()
+            columns_cursor = await db.execute("PRAGMA table_info(sessions_meta)")
+            session_columns = {
+                row["name"] for row in await columns_cursor.fetchall()
+            }
+            session_has_workspace = "workspace_id" in session_columns
+            if session_has_workspace:
+                cursor = await db.execute(
+                    "SELECT project_slug FROM sessions_meta "
+                    "WHERE workspace_id = ? AND name = ?",
+                    (workspace_id, session),
+                )
+            elif _local_terminal_compatibility():
+                cursor = await db.execute(
+                    "SELECT project_slug FROM sessions_meta WHERE name = ?",
+                    (session,),
+                )
+            else:
+                cursor = None
+            row = await cursor.fetchone() if cursor is not None else None
+            if row is None and not _local_terminal_compatibility():
+                return JSONResponse(
+                    status_code=404, content={"detail": "Session not found"}
+                )
             stored_project_slug = row[0] if row else None
 
         pane_cwd = await get_pane_cwd(session) if not stored_project_slug else None
         project_slug, upload_dir = _resolve_upload_target(stored_project_slug, pane_cwd)
+        if project_slug is None:
+            upload_dir = workspace_fallback_dir
+
+        if project_slug:
+            async with acquire_db() as db:
+                try:
+                    project_row = await (
+                        await db.execute(
+                            "SELECT COUNT(DISTINCT workspace_id) AS workspace_count, "
+                            "MAX(CASE WHEN workspace_id = ? THEN 1 ELSE 0 END) AS owned "
+                            "FROM workspace_projects WHERE project_slug = ?",
+                            (workspace_id, project_slug),
+                        )
+                    ).fetchone()
+                except Exception:
+                    project_row = None
+            workspace_count = (
+                int(project_row["workspace_count"] or 0) if project_row else 0
+            )
+            project_owned = bool(project_row and project_row["owned"])
+            if not (
+                workspace_count == 1
+                and project_owned
+                or (_local_terminal_compatibility() and workspace_count == 0)
+            ):
+                return JSONResponse(
+                    status_code=404, content={"detail": "Project not found"}
+                )
 
         if project_slug and not stored_project_slug:
             from core.api.db import acquire_write_db
 
             async with acquire_write_db() as db:
-                await db.execute(
-                    "UPDATE sessions_meta SET project_slug = COALESCE(project_slug, ?) WHERE name = ?",
-                    (project_slug, session),
-                )
+                if _local_terminal_compatibility():
+                    if session_has_workspace:
+                        await db.execute(
+                            "UPDATE sessions_meta SET "
+                            "project_slug = COALESCE(project_slug, ?), workspace_id = ? "
+                            "WHERE name = ?",
+                            (project_slug, workspace_id, session),
+                        )
+                    else:
+                        await db.execute(
+                            "UPDATE sessions_meta SET "
+                            "project_slug = COALESCE(project_slug, ?) WHERE name = ?",
+                            (project_slug, session),
+                        )
+                else:
+                    await db.execute(
+                        "UPDATE sessions_meta SET project_slug = COALESCE(project_slug, ?) "
+                        "WHERE workspace_id = ? AND name = ?",
+                        (project_slug, workspace_id, session),
+                    )
                 await db.commit()
     else:
-        upload_dir = FALLBACK_UPLOAD_DIR
+        upload_dir = workspace_fallback_dir
 
     ingest_dir = upload_dir
     project_relative_path: str | None = None
@@ -352,7 +544,11 @@ async def upload_file(
     )
     if project_slug and ingest_path:
         try:
-            await enqueue_file(ingest_path, source_kind="terminal_upload")
+            await enqueue_file(
+                ingest_path,
+                workspace_id=workspace_id,
+                source_kind="terminal_upload",
+            )
         except Exception:
             logger.exception("failed to enqueue terminal upload: %s", ingest_path)
     response = {
@@ -375,6 +571,7 @@ class TerminalSession:
     name: str
     master_fd: int
     pid: int
+    workspace_id: str = "ws_default"
     connections: set = field(default_factory=set)
     # snapshot_pending gates the PTY fanout from pushing live bytes to a
     # ws until the cold-attach capture-pane replay frame has been delivered.
@@ -407,16 +604,32 @@ class SessionManager:
         return session._reader_task is not None and session._reader_task.done()
 
     async def attach(
-        self, session_name: str, ws: WebSocket, cols: int = 80, rows: int = 24
+        self,
+        session_name: str,
+        ws: WebSocket,
+        cols: int = 80,
+        rows: int = 24,
+        *,
+        workspace_id: str = "ws_default",
     ) -> TerminalSession:
         """Attach a WebSocket to a terminal session. Creates PTY if needed."""
+        if not workspace_id.strip():
+            raise ConnectionError("Workspace context required")
         async with self._lock:
             if session_name in self._sessions:
                 session = self._sessions[session_name]
+                if session.workspace_id != workspace_id:
+                    raise ConnectionError("Session not found")
                 if self._needs_fresh_pty(session):
                     await self._cleanup_session(session)
                     del self._sessions[session_name]
-                    session = await self._create_pty(session_name, cols, rows)
+                    if workspace_id == "ws_default":
+                        session = await self._create_pty(session_name, cols, rows)
+                    else:
+                        session = await self._create_pty(
+                            session_name, cols, rows, workspace_id=workspace_id
+                        )
+                    session.workspace_id = workspace_id
                     session.connections.add(ws)
                     session.snapshot_pending_connections.add(ws)
                     self._sessions[session_name] = session
@@ -437,7 +650,13 @@ class SessionManager:
                 return session
 
             # Create new PTY with correct initial dimensions
-            session = await self._create_pty(session_name, cols, rows)
+            if workspace_id == "ws_default":
+                session = await self._create_pty(session_name, cols, rows)
+            else:
+                session = await self._create_pty(
+                    session_name, cols, rows, workspace_id=workspace_id
+                )
+            session.workspace_id = workspace_id
             session.connections.add(ws)
             session.snapshot_pending_connections.add(ws)
             self._sessions[session_name] = session
@@ -447,6 +666,7 @@ class SessionManager:
         self,
         event: str,
         *,
+        workspace_id: str | None = None,
         session_name: str | None = None,
         state: str | None = None,
         **extras: Any,
@@ -472,13 +692,22 @@ class SessionManager:
         for key, value in extras.items():
             if value is not None:
                 payload[key] = value
-        await self.broadcast_control_message(payload)
+        await self.broadcast_control_message(payload, workspace_id=workspace_id)
 
-    async def broadcast_control_message(self, payload: dict) -> None:
-        """Send a JSON control message to every connected terminal WebSocket."""
+    async def broadcast_control_message(
+        self, payload: dict, *, workspace_id: str | None = None
+    ) -> None:
+        """Send a JSON control message only inside one authenticated workspace."""
+        if workspace_id is None:
+            if not _local_terminal_compatibility():
+                logger.warning("Dropped terminal broadcast without workspace context")
+                return
+            workspace_id = "ws_default"
         msg = json.dumps(payload)
         async with self._lock:
             for session in self._sessions.values():
+                if session.workspace_id != workspace_id:
+                    continue
                 dead: set = set()
                 for ws in list(session.connections):
                     try:
@@ -490,7 +719,9 @@ class SessionManager:
                     session.snapshot_pending_connections.discard(ws)
                     _drop_ws_send_lock(ws)
 
-    async def detach(self, session_name: str, ws: WebSocket) -> None:
+    async def detach(
+        self, session_name: str, ws: WebSocket, *, workspace_id: str | None = None
+    ) -> None:
         """Detach a WebSocket from a session and clean up the PTY when orphaned.
 
         The tmux session itself survives independently. We only destroy the
@@ -501,6 +732,8 @@ class SessionManager:
         async with self._lock:
             session = self._sessions.get(session_name)
             if not session:
+                return
+            if workspace_id is not None and session.workspace_id != workspace_id:
                 return
             session.connections.discard(ws)
             session.snapshot_pending_connections.discard(ws)
@@ -513,7 +746,12 @@ class SessionManager:
                 )
 
     async def _create_pty(
-        self, session_name: str, cols: int = 80, rows: int = 24
+        self,
+        session_name: str,
+        cols: int = 80,
+        rows: int = 24,
+        *,
+        workspace_id: str = "ws_default",
     ) -> TerminalSession:
         """Fork and exec tmux attach in a PTY with correct initial dimensions."""
         name = validate_session_name(session_name)
@@ -565,6 +803,7 @@ class SessionManager:
                 name=session_name,
                 master_fd=master_fd,
                 pid=pid,
+                workspace_id=workspace_id,
             )
             logger.info(
                 "PTY created for session %s (pid=%d, fd=%d, %dx%d)",
@@ -705,7 +944,7 @@ async def terminal_websocket(
     """WebSocket endpoint for terminal access via PTY proxy."""
     # Accept FIRST (FastAPI requires accept before close)
     await ws.accept()
-    collector = _metrics_collector(ws)
+    collector: TerminalMetricsCollector | None = None
 
     # Origin validation (CORS doesn't cover WebSocket)
     origin = ws.headers.get("origin", "")
@@ -731,11 +970,13 @@ async def terminal_websocket(
     consume_timings: dict[str, float | str] = {}
     try:
         lock_started = time.perf_counter()
-        username = await consume_ws_ticket(
+        principal = await consume_ws_ticket_principal(
             ticket,
             session,
             timings=consume_timings,
         )
+        if principal is not None:
+            collector = _metrics_collector(ws, principal.workspace_id)
         lock_wait_ms = (time.perf_counter() - lock_started) * 1000
     except Exception:
         if collector:
@@ -760,17 +1001,35 @@ async def terminal_websocket(
             session_name=session,
             duration_ms=(time.perf_counter() - consume_started) * 1000,
             outcome=str(
-                consume_timings.get("outcome") or ("ok" if username else "invalid")
+                consume_timings.get("outcome") or ("ok" if principal else "invalid")
             ),
             metadata=metadata,
         )
 
-    if not username:
+    if not principal:
         logger.warning("WS rejected: invalid ticket for session %s", session)
         await _close_ws(ws, code=1008, reason="Invalid or expired ticket")
         return
 
-    logger.info("WS connected: user=%s session=%s", username, session)
+    # Revalidate both sides of the ticket immediately before any tmux/PTY side
+    # effect. A deleted user or moved/deleted session invalidates an already
+    # issued ticket without revealing which object changed.
+    async with acquire_db() as db:
+        binding_active = await _terminal_binding_is_active(db, principal)
+
+    if not binding_active:
+        logger.warning("WS rejected: stale terminal identity binding")
+        await _close_ws(ws, code=1008, reason="Invalid or expired ticket")
+        return
+
+    username = principal.username
+    workspace_id = principal.workspace_id
+    logger.info(
+        "WS connected: user=%s workspace=%s session=%s",
+        username,
+        workspace_id,
+        session,
+    )
 
     # Clamp dimensions to sane values
     cols = max(40, min(cols, 500))
@@ -779,7 +1038,9 @@ async def terminal_websocket(
     # Attach to terminal session with correct initial dimensions
     attached = False
     try:
-        term_session = await session_manager.attach(session, ws, cols, rows)
+        term_session = await session_manager.attach(
+            session, ws, cols, rows, workspace_id=workspace_id
+        )
     except ConnectionError as e:
         await _close_ws(ws, code=1008, reason=str(e))
         return
@@ -1026,6 +1287,6 @@ async def terminal_websocket(
         _ws_missed_pongs.pop(ws, None)
         if attached and collector:
             collector.websocket_disconnected(session)
-        await session_manager.detach(session, ws)
+        await session_manager.detach(session, ws, workspace_id=workspace_id)
         _drop_ws_send_lock(ws)
         logger.info("WS disconnected: user=%s session=%s", username, session)

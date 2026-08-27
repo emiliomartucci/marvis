@@ -42,8 +42,10 @@ async def test_create_session_starts_command_directly(
 
     monkeypatch.setattr(tmux.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(tmux.os, "getuid", lambda: 1000)
+    monkeypatch.setattr(tmux, "RUNTIME_HOME", "/var/marvisx")
     monkeypatch.setattr(tmux, "_marvisx_tmux_tmpdir", lambda: tmpdir)
     monkeypatch.setenv("PIR_JWT_SECRET", "must-not-leak")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
     monkeypatch.delenv("TERM", raising=False)
     monkeypatch.delenv("LANG", raising=False)
     monkeypatch.delenv("LC_ALL", raising=False)
@@ -67,10 +69,13 @@ async def test_create_session_starts_command_directly(
     assert "TMUX_TMPDIR" not in envs[1]
     assert calls[2] == (
         "/usr/bin/systemd-run",
-        "--user",
         "--scope",
         "--quiet",
         "--collect",
+        "--slice=agents.slice",
+        "--property=OOMPolicy=kill",
+        "--property=MemorySwapMax=0",
+        "--property=CPUWeight=40",
         "--setenv=HOME=/var/marvisx",
         f"--setenv=PATH={tmux.RUNTIME_PATH}",
         "--setenv=SHELL=/bin/bash",
@@ -292,9 +297,6 @@ async def test_kill_session_targets_legacy_server_when_session_is_legacy(
     assert "TMUX_TMPDIR" not in calls[-1][1]
 
 
-def test_pir_api_service_does_not_kill_child_sessions_on_restart():
-    unit = Path(__file__).resolve().parents[2] / "deploy" / "pir-api.service"
-    text = unit.read_text()
-
-    assert "KillMode=process" in text
-    assert "KillMode=mixed" not in text
+def test_oss_does_not_ship_hosted_pir_api_service():
+    unit = Path(__file__).resolve().parents[3] / "deploy" / "pir-api.service"
+    assert not unit.exists()

@@ -80,12 +80,14 @@ async def get_costs_summary(
     from_d, to_d = _resolve_date_range(from_date, to_date)
     ctx = CallerContext.from_user_info(_user, is_human_session=False)
     try:
+        visible_projects = await get_visible_projects(db, _user)
         return await uc.get_costs_summary(
             ctx,
             db,
             from_date=from_d,
             to_date=to_d,
             programs_loader=_get_programs,
+            visible_projects=visible_projects,
         )
     except ServiceError as e:
         raise to_http(e)
@@ -106,9 +108,9 @@ async def get_project_costs(
     # DECISION 1 (visibility template): resolve visibility at the boundary
     # (needs UserInfo.teams/user_id, not carried by CallerContext) and pass it in;
     # the use_case enforces it (404 on a non-visible slug, does not reveal existence).
-    visible_projects = await get_visible_projects(db, _user)
     ctx = CallerContext.from_user_info(_user, is_human_session=False)
     try:
+        visible_projects = await get_visible_projects(db, _user)
         return await uc.get_project_costs(
             ctx,
             db,
@@ -133,9 +135,9 @@ async def get_project_billing(
 ) -> ProjectBillingSummary:
     """Billing summary from task_cost_entries for a project, aggregated by date range."""
     from_d, to_d = _resolve_date_range(from_date, to_date)
-    visible_projects = await get_visible_projects(db, _user)
     ctx = CallerContext.from_user_info(_user, is_human_session=False)
     try:
+        visible_projects = await get_visible_projects(db, _user)
         return await uc.get_project_billing(
             ctx,
             db,

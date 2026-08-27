@@ -58,32 +58,51 @@ except Exception:
     pass
 " 2>/dev/null || true)
 
+CWD_RESOLUTION_FAILED=0
 if [ -z "$CWD_RESOLVED" ]; then
   CWD_RESOLVED="$REPO_ROOT"
+  CWD_RESOLUTION_FAILED=1
 fi
 
 # Consolidated git diff --cached call (julik P1). Previously migration check
 # and MCP check ran two separate subprocess.run invocations → race window +
 # double cost. Now one call, shared between both checks.
-# Fail-closed philosophy: only run if `git commit` is the actual command; a git
-# error inside an allow-listed worktree leaves STAGED_FILES empty (subsequent
-# checks no-op) rather than silently skipping with misleading green.
+# Fail-closed philosophy: only run if `git commit` is the actual command; any
+# inability to resolve the repository or staged diff blocks that commit.
 STAGED_FILES=""
 CMD_KIND=$(printf '%s' "$INPUT" | python3 -c "
-import sys, json
+import sys, json, shlex
 try:
     d = json.load(sys.stdin)
     cmd = d.get('tool_input', {}).get('command', '') or ''
-    if 'git' in cmd and 'commit' in cmd:
-        print('commit')
+    lexer = shlex.shlex(cmd, posix=True, punctuation_chars=';&|')
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    tokens = list(lexer)
+    for index, token in enumerate(tokens):
+        if token != 'git':
+            continue
+        for candidate in tokens[index + 1:]:
+            if candidate and all(character in ';&|' for character in candidate):
+                break
+            if candidate == 'commit':
+                print('commit')
+                raise SystemExit
 except Exception:
     pass
 " 2>/dev/null || true)
 
-if [ "$CMD_KIND" = "commit" ] && [ -d "$CWD_RESOLVED/.git" -o -f "$CWD_RESOLVED/.git" ]; then
+if [ "$CMD_KIND" = "commit" ] && [ "$CWD_RESOLUTION_FAILED" -ne 0 ]; then
+  deny "Quality gate could not validate the commit working directory; blocked fail-closed."
+fi
+
+if [ "$CMD_KIND" = "commit" ]; then
+  if ! GIT_ROOT=$(git -C "$CWD_RESOLVED" rev-parse --show-toplevel 2>/dev/null); then
+    deny "Quality gate could not resolve the commit repository; blocked fail-closed."
+  fi
+  CWD_RESOLVED="$GIT_ROOT"
   if ! STAGED_FILES=$(cd "$CWD_RESOLVED" && git diff --cached --name-only 2>/dev/null); then
-    echo "Quality gate: git diff --cached failed in $CWD_RESOLVED" >&2
-    STAGED_FILES=""
+    deny "Quality gate could not read staged files in $CWD_RESOLVED; blocked fail-closed."
   fi
 fi
 
@@ -97,11 +116,13 @@ if migrations:
 " 2>/dev/null || true)
 
 if [[ -n "$STAGED_MIGRATIONS" ]]; then
-  MIG_CHECK="$REPO_ROOT/core/scripts/check-migration-version.sh"
+  MIG_CHECK="$CWD_RESOLVED/core/scripts/check-migration-version.sh"
   if [[ -x "$MIG_CHECK" ]]; then
     if ! (cd "$CWD_RESOLVED" && bash "$MIG_CHECK" 2>&1); then
       deny "Migration version gate failed. Local migration version must be > production. See core/scripts/check-migration-version.sh output above."
     fi
+  else
+    deny "Migration version gate dependency is missing or not executable: core/scripts/check-migration-version.sh."
   fi
 fi
 
@@ -114,12 +135,8 @@ fi
 # MARVIS_MCP_MIN_TOOLS = baseline assertion (default 61, the S1 OSS baseline).
 # NOT hardcoded to 91 — the OSS server ships fewer tools by design.
 #
-# GRACEFUL SKIP: if the `mcp` SDK (or any optional dependency) isn't importable
-# in the hook's environment, the smoke SKIPS (treated as pass). It MUST NEVER
-# fail-closed on a missing dependency — that would block every commit on a host
-# that simply lacks the MCP runtime (this hook also fires on the Marvis server,
-# where `mcp` is not installed). It runs the real check only in Docker/CI where
-# the dependency exists (never a host build — learning 3ffb65ef).
+# This expensive smoke runs only when MCP Python files are staged. Once selected,
+# every dependency is required: an unavailable SDK cannot become a green bypass.
 STAGED_MCP=$(printf '%s' "$STAGED_FILES" | python3 -c "
 import sys
 staged = [line for line in sys.stdin.read().splitlines() if line]
@@ -131,21 +148,17 @@ if mcp_files:
 if [[ -n "$STAGED_MCP" ]]; then
   MIN_TOOLS="${MARVIS_MCP_MIN_TOOLS:-61}"
   # One in-process round-trip: import the server module + list_tools(). Emits
-  # exactly one token on stdout: SKIP (deps missing → pass), an integer (tool
-  # count), or FAIL:<reason> (genuine server breakage → block).
+  # exactly one token on stdout: an integer tool count or FAIL:<reason>.
   SMOKE=$(cd "$CWD_RESOLVED" && MARVIS_OSS_LOCAL=1 python3 -c "
 import sys, asyncio
 try:
-    import mcp  # the FastMCP SDK — optional dependency
-except ImportError:
-    print('SKIP'); sys.exit(0)
+    import mcp  # the FastMCP SDK — required for this selected smoke
+except ImportError as exc:
+    print('FAIL:required mcp SDK unavailable'); sys.exit(0)
 try:
     from core.api.mcp.server import mcp as server
 except ImportError as exc:
-    # A missing optional dependency pulled in by the server (NOT the server's own
-    # code being broken) must also skip, never block. The SDK is already present
-    # here, so a remaining ImportError is a transitive optional dep → skip.
-    print('SKIP'); sys.exit(0)
+    print('FAIL:required MCP server dependency unavailable: ' + type(exc).__name__); sys.exit(0)
 except Exception as exc:  # syntax/registration error inside the server module
     print('FAIL:' + repr(exc)[:300]); sys.exit(0)
 try:
@@ -153,15 +166,15 @@ try:
     print(len(tools))
 except Exception as exc:
     print('FAIL:' + repr(exc)[:300])
-" 2>/dev/null || echo SKIP)
+" 2>/dev/null || echo 'FAIL:python smoke execution failed')
 
   case "$SMOKE" in
-    SKIP|"")
-      : ;;  # deps unavailable → smoke skipped, allow.
     FAIL:*)
       deny "MCP smoke test: 'import core.api.mcp.server' failed → ${SMOKE#FAIL:}. The MCP server module is broken; fix before commit (see learning f2663d51)." ;;
-    *)
-      if [[ "$SMOKE" =~ ^[0-9]+$ ]] && [[ "$SMOKE" -lt "$MIN_TOOLS" ]]; then
+    ''|*[!0-9]*)
+      deny "MCP smoke test returned an invalid result; blocked fail-closed." ;;
+    [0-9]*)
+      if [[ "$SMOKE" -lt "$MIN_TOOLS" ]]; then
         deny "MCP smoke test: tools/list returned $SMOKE tools (expected >= $MIN_TOOLS, the S1 OSS baseline). Likely a tool registration crash — see learning f2663d51."
       fi ;;
   esac

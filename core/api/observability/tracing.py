@@ -42,7 +42,6 @@ def init_tracing(app: "FastAPI") -> None:
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
         from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
         from opentelemetry.propagate import set_global_textmap
-        from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
         from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
         from phoenix.otel import register
     except ImportError as e:

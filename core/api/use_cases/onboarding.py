@@ -23,7 +23,11 @@ from core.api.models.todos import TodoCreateRequest
 from core.api.use_cases import projects as projects_uc
 from core.api.use_cases import tasks as tasks_uc
 from core.api.use_cases import todos as todos_uc
-from core.api.use_cases._context import CallerContext, require_role_ctx
+from core.api.use_cases._context import (
+    CallerContext,
+    require_role_ctx,
+    require_workspace_ctx,
+)
 from core.api.use_cases._errors import ConflictError, ValidationError
 
 AUTHORED_SETUP_SECTIONS = (
@@ -362,11 +366,13 @@ async def _fetch_id_by_source_ref(
     *,
     table: str,
     source_ref: str,
+    workspace_id: str,
 ) -> str | None:
     row = await (
         await db.execute(
-            f"SELECT id FROM {table} WHERE source_ref = ? ORDER BY created_at ASC LIMIT 1",
-            (source_ref,),
+            f"SELECT id FROM {table} WHERE source_ref = ? AND workspace_id = ? "
+            "ORDER BY created_at ASC LIMIT 1",
+            (source_ref, workspace_id),
         )
     ).fetchone()
     return row["id"] if row else None
@@ -386,6 +392,7 @@ async def _create_demo_task(
     *,
     item: _DemoTask,
 ) -> str:
+    workspace_id = require_workspace_ctx(ctx)
     source_ref = f"{_DEMO_SOURCE_PREFIX}task:{item.key}"
     body = TaskCreateRequest(
         title=item.title,
@@ -413,7 +420,12 @@ async def _create_demo_task(
         return task.id
     except ConflictError:
         await db.rollback()
-        existing = await _fetch_id_by_source_ref(db, table="tasks", source_ref=source_ref)
+        existing = await _fetch_id_by_source_ref(
+            db,
+            table="tasks",
+            source_ref=source_ref,
+            workspace_id=workspace_id,
+        )
         if existing:
             return existing
         raise
@@ -425,6 +437,7 @@ async def _create_demo_todo(
     *,
     item: _DemoTodo,
 ) -> str:
+    workspace_id = require_workspace_ctx(ctx)
     source_ref = f"{_DEMO_SOURCE_PREFIX}todo:{item.key}"
     body = TodoCreateRequest(
         text=item.text,
@@ -446,7 +459,12 @@ async def _create_demo_todo(
         return todo.id
     except ConflictError:
         await db.rollback()
-        existing = await _fetch_id_by_source_ref(db, table="todos", source_ref=source_ref)
+        existing = await _fetch_id_by_source_ref(
+            db,
+            table="todos",
+            source_ref=source_ref,
+            workspace_id=workspace_id,
+        )
         if existing:
             return existing
         raise
@@ -503,12 +521,32 @@ async def seed_demo(
     lang: str = "it",
 ) -> DemoSeedResponse:
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    require_workspace_ctx(ctx)
     if lang not in _DEMO_CONTENT:
         raise ValidationError(code="invalid_lang", message="lang must be 'it' or 'en'.")
     content = _DEMO_CONTENT[lang]
     created_project = await _ensure_demo_project(ctx, db, lang=lang)
     task_ids = [await _create_demo_task(ctx, db, item=item) for item in content["tasks"]]
     todo_ids = [await _create_demo_todo(ctx, db, item=item) for item in content["todos"]]
+    try:
+        from core.api.services.first_value import hosted_tenant_id
+        from core.api.services.product_events import record_product_event
+    except ImportError:
+        hosted_tenant_id = record_product_event = None
+
+    tenant_id = hosted_tenant_id() if hosted_tenant_id is not None else None
+    if tenant_id and record_product_event is not None:
+        await record_product_event(
+            db,
+            subject_type="tenant",
+            subject_id=tenant_id,
+            tenant_id=tenant_id,
+            event_name="demo_served",
+            event_key="onboarding-demo-v1",
+            source="tenant_onboarding",
+            payload={"project_slug": _DEMO_PROJECT, "demo": True},
+        )
+        await db.commit()
     return DemoSeedResponse(
         project=_DEMO_PROJECT,
         created=created_project,
@@ -520,18 +558,52 @@ async def seed_demo(
 
 async def teardown_demo(ctx: CallerContext, db: aiosqlite.Connection) -> DemoTeardownResponse:
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
     now = _now()
     task_cursor = await db.execute(
         "UPDATE tasks SET deleted_at = ?, updated_at = ? "
-        "WHERE deleted_at IS NULL AND project = ? AND (source_ref LIKE ? OR tags LIKE ?)",
-        (now, now, _DEMO_PROJECT, f"{_DEMO_SOURCE_PREFIX}%", '%"demo"%'),
+        "WHERE workspace_id = ? AND deleted_at IS NULL AND project = ? "
+        "AND (source_ref LIKE ? OR tags LIKE ?)",
+        (
+            now,
+            now,
+            workspace_id,
+            _DEMO_PROJECT,
+            f"{_DEMO_SOURCE_PREFIX}%",
+            '%"demo"%',
+        ),
     )
     todo_cursor = await db.execute(
-        "DELETE FROM todos WHERE project = ? AND (source_ref LIKE ? OR payload LIKE ?)",
-        (_DEMO_PROJECT, f"{_DEMO_SOURCE_PREFIX}%", '%"demo": true%'),
+        "DELETE FROM todos WHERE workspace_id = ? AND project = ? "
+        "AND (source_ref LIKE ? OR payload LIKE ?)",
+        (
+            workspace_id,
+            _DEMO_PROJECT,
+            f"{_DEMO_SOURCE_PREFIX}%",
+            '%"demo": true%',
+        ),
     )
+    remaining_demo = await (
+        await db.execute(
+            "SELECT "
+            "EXISTS(SELECT 1 FROM tasks WHERE deleted_at IS NULL AND project = ? "
+            "AND (source_ref LIKE ? OR tags LIKE ?)) "
+            "OR EXISTS(SELECT 1 FROM todos WHERE project = ? "
+            "AND (source_ref LIKE ? OR payload LIKE ?))",
+            (
+                _DEMO_PROJECT,
+                f"{_DEMO_SOURCE_PREFIX}%",
+                '%"demo"%',
+                _DEMO_PROJECT,
+                f"{_DEMO_SOURCE_PREFIX}%",
+                '%"demo": true%',
+            ),
+        )
+    ).fetchone()
     await db.commit()
-    project_deleted = _delete_demo_project_dir()
+    project_deleted = (
+        False if remaining_demo and bool(remaining_demo[0]) else _delete_demo_project_dir()
+    )
     return DemoTeardownResponse(
         project=_DEMO_PROJECT,
         tasks_deleted=task_cursor.rowcount if task_cursor.rowcount != -1 else 0,

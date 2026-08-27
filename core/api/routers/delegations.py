@@ -30,10 +30,10 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from core.api.db import get_write_db
+from core.api.db import get_db, get_write_db
 from core.api.models import UserInfo
 from core.api.security import (
-    blacklist_token,
+    consume_token_proof_in_transaction,
     get_agent_user,
     get_current_user,
     is_token_blacklisted,
@@ -50,6 +50,16 @@ router = APIRouter(prefix="/api/v1/delegations", tags=["delegations"])
 # 7d is the longest leash (a full work-week of autonomy) — still bounded, still
 # instantly revocable, still audited.
 _TTL_HOURS = {"1h": 1, "4h": 4, "24h": 24, "7d": 168}
+
+
+def _authenticated_workspace(user: UserInfo) -> str:
+    workspace_id = (user.workspace_id or "").strip()
+    if not workspace_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated workspace context is required.",
+        )
+    return workspace_id
 
 
 class DelegationCreateRequest(BaseModel):
@@ -87,6 +97,7 @@ async def create_delegation(
             status_code=403,
             detail="Delegations can only be granted TO an agent identity.",
         )
+    ws = _authenticated_workspace(agent)
 
     # 1. Proof validation: signature + expiry.
     try:
@@ -103,6 +114,22 @@ async def create_delegation(
             status_code=401,
             detail="Proof token missing jti/sub claims — not a session JWT from our auth flow.",
         )
+    proof_ws = str(payload.get("workspace_id") or "").strip()
+    if not proof_ws:
+        raise HTTPException(
+            status_code=401,
+            detail="Proof token is missing its workspace claim.",
+        )
+    if proof_ws != ws:
+        raise HTTPException(
+            status_code=403,
+            detail="Proof token belongs to a different workspace.",
+        )
+
+    # Own one definitive writer transaction for replay check, proof burn,
+    # scoped grant, and chained audit receipt.
+    if not db.in_transaction:
+        await db.execute("BEGIN IMMEDIATE")
 
     # 2. Anti-replay: a burned (or logged-out) proof is dead.
     if await is_token_blacklisted(jti, db):
@@ -114,8 +141,10 @@ async def create_delegation(
     # 3. The proof must belong to a LIVE HUMAN account (never trust JWT validity
     #    alone — learning 4dcab404: deleted users keep valid tokens).
     async with db.execute(
-        "SELECT id, system_role, type FROM users WHERE slug = ? AND deleted_at IS NULL",
-        (slug,),
+        "SELECT id, system_role, type FROM users WHERE slug = ? "
+        "AND deleted_at IS NULL "
+        "AND workspace_id = ?",
+        (slug, ws),
     ) as cursor:
         human = await cursor.fetchone()
     if human is None:
@@ -129,7 +158,13 @@ async def create_delegation(
 
     # 4. Burn the proof: from this instant the pasted token is inert everywhere.
     proof_exp = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
-    await blacklist_token(jti, proof_exp, db)
+    try:
+        await consume_token_proof_in_transaction(jti, proof_exp, db)
+    except aiosqlite.IntegrityError:
+        raise HTTPException(
+            status_code=409,
+            detail="Proof token already exchanged or revoked.",
+        )
 
     # 5. Mint the grant for the calling agent identity.
     now = datetime.now(timezone.utc)
@@ -139,8 +174,8 @@ async def create_delegation(
         await db.execute(
             "INSERT INTO delegations "
             "(id, agent_username, granted_by, granted_by_user_id, granted_by_role, "
-            " proof_jti, scope, created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'full', ?, ?)",
+            " proof_jti, scope, created_at, expires_at, workspace_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'full', ?, ?, ?)",
             (
                 grant_id,
                 agent.username,
@@ -150,9 +185,9 @@ async def create_delegation(
                 jti,
                 now.isoformat(),
                 expires_at.isoformat(),
+                ws,
             ),
         )
-        await db.commit()
     except aiosqlite.IntegrityError:
         # UNIQUE(proof_jti) — second line of anti-replay defense.
         raise HTTPException(status_code=409, detail="Proof token already exchanged for a grant.")
@@ -170,7 +205,9 @@ async def create_delegation(
             "expires_at": expires_at.isoformat(),
             "proof_jti_burned": jti,
         },
+        workspace_id=ws,
     )
+    await db.commit()
     logger.info(
         "super-session grant %s: %s -> %s (role %s, ttl %s)",
         grant_id, slug, agent.username, human["system_role"], body.ttl,
@@ -193,19 +230,30 @@ async def revoke_delegation(
     db: aiosqlite.Connection = Depends(get_write_db),
 ) -> None:
     """Revoke a grant instantly (kill switch). Human cookie session only."""
+    ws = _authenticated_workspace(user)
+    can_revoke_any = user.system_role in ("admin", "super_admin")
+    ownership_sql = "" if can_revoke_any else " AND granted_by_user_id = ?"
+    ownership_params: tuple[str, ...] = () if can_revoke_any else (user.user_id,)
     async with db.execute(
-        "SELECT id FROM delegations WHERE id = ? AND revoked_at IS NULL",
-        (delegation_id,),
+        "SELECT id FROM delegations WHERE id = ? AND revoked_at IS NULL "
+        f"AND workspace_id = ?{ownership_sql}",
+        (delegation_id, ws, *ownership_params),
     ) as cursor:
         row = await cursor.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Delegation not found or already revoked.")
 
     await db.execute(
-        "UPDATE delegations SET revoked_at = ?, revoked_by = ? WHERE id = ?",
-        (datetime.now(timezone.utc).isoformat(), user.username, delegation_id),
+        "UPDATE delegations SET revoked_at = ?, revoked_by = ? "
+        f"WHERE id = ? AND workspace_id = ?{ownership_sql}",
+        (
+            datetime.now(timezone.utc).isoformat(),
+            user.username,
+            delegation_id,
+            ws,
+            *ownership_params,
+        ),
     )
-    await db.commit()
     await log_audit(
         db,
         action="delegation.revoke",
@@ -213,23 +261,29 @@ async def revoke_delegation(
         resource_type="delegation",
         resource_id=delegation_id,
         details=None,
+        workspace_id=ws,
     )
+    await db.commit()
 
 
 @router.get("", response_model=list[DelegationResponse])
 async def list_delegations(
     user: UserInfo = Depends(get_current_user),
-    db: aiosqlite.Connection = Depends(get_write_db),
+    db: aiosqlite.Connection = Depends(get_db),
 ) -> list[DelegationResponse]:
     """Active grants first, then the 20 most recent dead ones (digest/debug)."""
+    ws = _authenticated_workspace(user)
     now = datetime.now(timezone.utc).isoformat()
+    can_list_any = user.system_role in ("admin", "super_admin")
+    ownership_sql = "" if can_list_any else " AND granted_by_user_id = ?"
+    params: tuple[str, ...] = (ws,) if can_list_any else (ws, user.user_id)
     async with db.execute(
         "SELECT id, agent_username, granted_by, granted_by_role, scope, "
         "       created_at, expires_at, revoked_at "
-        "FROM delegations "
+        f"FROM delegations WHERE workspace_id = ?{ownership_sql} "
         "ORDER BY (revoked_at IS NULL AND expires_at > ?) DESC, created_at DESC "
         "LIMIT 50",
-        (now,),
+        (*params, now),
     ) as cursor:
         rows = await cursor.fetchall()
     return [

@@ -133,8 +133,16 @@ def build_signal(
     observed_event: DigestEventRow | None = None,
     decision_marker: str | None = None,
     any_ref_unresolved: bool = False,
+    confidence_override: float | None = None,
 ) -> DriftSignal:
-    """Construct a DriftSignal with deterministic id / hash / classifier output."""
+    """Construct a DriftSignal with deterministic id / hash / classifier output.
+
+    ``confidence_override`` lets a rule that owns a deterministic confidence (e.g.
+    DR9 task_superseded, with its 0.9/0.6 levels) bypass the evidence-density
+    derivation — which would otherwise classify a new/``unknown`` signal_type and
+    cap it at 0.5, so it could never clear a promotion threshold. All id/hash/
+    recurrence invariants are unaffected; only the final confidence changes.
+    """
     evidence_sorted = sorted(set(evidence_refs))
     ev_hash = evidence_hash(evidence_sorted)
     signal_id = make_signal_id(
@@ -156,15 +164,18 @@ def build_signal(
     knowledge_form, form_confidence = classify_knowledge_form(
         signal_type, observed_event=observed_event, decision_marker=decision_marker
     )
-    confidence = compute_confidence(
-        knowledge_form=knowledge_form,
-        baseline_source=expected_direction_source,
-        any_ref_unresolved=any_ref_unresolved,
-    )
-    # Form classifier confidence ≤ 1.0 acts as multiplicative floor only when
-    # the form is `unknown` (form_confidence=0.5). Don't double-discount.
-    if knowledge_form == "unknown":
-        confidence = max(CONFIDENCE_FLOOR, min(confidence, form_confidence))
+    if confidence_override is not None:
+        confidence = max(CONFIDENCE_FLOOR, min(1.0, round(confidence_override, 4)))
+    else:
+        confidence = compute_confidence(
+            knowledge_form=knowledge_form,
+            baseline_source=expected_direction_source,
+            any_ref_unresolved=any_ref_unresolved,
+        )
+        # Form classifier confidence ≤ 1.0 acts as multiplicative floor only when
+        # the form is `unknown` (form_confidence=0.5). Don't double-discount.
+        if knowledge_form == "unknown":
+            confidence = max(CONFIDENCE_FLOOR, min(confidence, form_confidence))
     severity = _bump_severity(severity_base, severity_modifiers)
     return DriftSignal(
         signal_id=signal_id,

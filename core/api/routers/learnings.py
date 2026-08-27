@@ -31,7 +31,7 @@ from core.api.rbac import require_role
 from core.api.routers._adapter import to_http
 from core.api.security import get_current_user_or_agent
 from core.api.services.kg.audit import check_deep_rate_limit, log_kg_deep_access
-from core.api.services.kg.lens import build_kg_context_for_learning
+from core.api.services.kg.lens import build_kg_context_for_learning, require_kg_visibility
 from core.api.use_cases import learnings as uc
 from core.api.use_cases._context import CallerContext
 from core.api.use_cases._errors import ServiceError
@@ -171,9 +171,19 @@ async def check_learnings(
     db: aiosqlite.Connection = Depends(get_db),
 ) -> LearningCheckResponse:
     """Search learnings relevant to a keyword/module. Used by MCP before risky actions."""
+    visible_projects = await get_visible_projects(db, user)
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
-        result = await uc.check_learnings(ctx, db, query=q, module=module, as_of=as_of)
+        if deep:
+            require_kg_visibility(ctx, visible_projects)
+        result = await uc.check_learnings(
+            ctx,
+            db,
+            query=q,
+            module=module,
+            as_of=as_of,
+            visible_projects=visible_projects,
+        )
     except ServiceError as e:
         raise to_http(e)
 
@@ -182,7 +192,16 @@ async def check_learnings(
         check_deep_rate_limit(user.username)
         log_kg_deep_access(user.username, "check_learnings", q)
         kg_contexts = await asyncio.gather(
-            *[build_kg_context_for_learning(db, r.id, deep=True) for r in result.results],
+            *[
+                build_kg_context_for_learning(
+                    db,
+                    r.id,
+                    deep=True,
+                    ctx=ctx,
+                    visible_projects=visible_projects,
+                )
+                for r in result.results
+            ],
             return_exceptions=True,
         )
         for r, kg_ctx in zip(result.results, kg_contexts):
@@ -281,9 +300,18 @@ async def get_learning(
     db: aiosqlite.Connection = Depends(get_db),
 ) -> LearningResponse:
     """Get a single learning by ID."""
+    visible_projects = await get_visible_projects(db, user)
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
-        result = await uc.get_learning(ctx, db, learning_id=learning_id, as_of=as_of)
+        if deep:
+            require_kg_visibility(ctx, visible_projects)
+        result = await uc.get_learning(
+            ctx,
+            db,
+            learning_id=learning_id,
+            as_of=as_of,
+            visible_projects=visible_projects,
+        )
     except ServiceError as e:
         raise to_http(e)
 
@@ -291,7 +319,13 @@ async def get_learning(
     if deep:
         check_deep_rate_limit(user.username)
         log_kg_deep_access(user.username, "get_learning", learning_id)
-        result.kg_context = await build_kg_context_for_learning(db, learning_id, deep=True)
+        result.kg_context = await build_kg_context_for_learning(
+            db,
+            learning_id,
+            deep=True,
+            ctx=ctx,
+            visible_projects=visible_projects,
+        )
     return result
 
 

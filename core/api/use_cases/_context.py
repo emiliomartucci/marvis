@@ -17,7 +17,10 @@ a pure, duck-typed mapper) so the domain layer stays transport-agnostic.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
+
+import aiosqlite
 
 from core.api.use_cases._errors import AuthorizationError
 from core.api.use_cases._roles import ROLE_HIERARCHY
@@ -37,14 +40,20 @@ class CallerContext:
     scopes: tuple[str, ...] = field(default_factory=tuple)
     is_human_session: bool = False  # replaces the request.cookies.get("pir_session") check
     user_id: str = ""  # DB user PK; "" for local single-user / when unknown
-    # Super-session (Constitution v2.0 Rule 6): id of the active delegation the
-    # HTTP adapter resolved for an agent caller; None when no grant applies.
+    # Legacy audit metadata only. A caller-provided id is NEVER authorization;
+    # approval authority is re-read from the persisted delegation row at the
+    # use-case decision point (see ``has_approval_authority`` below).
     delegation_grant_id: str | None = None
 
     @property
     def can_act_as_approver(self) -> bool:
-        """Human session OR an active super-session delegation (Rule 6)."""
-        return self.is_human_session or self.delegation_grant_id is not None
+        """Whether this is a validated human principal.
+
+        Persisted agent delegations require a DB read and therefore deliberately
+        do not participate in this local property. In particular, a synthetic
+        ``delegation_grant_id`` string never grants authority.
+        """
+        return self.user_type == "human" and self.is_human_session
 
     @classmethod
     def local_single_user(cls) -> "CallerContext":
@@ -70,8 +79,8 @@ class CallerContext:
         Duck-typed (no runtime ``UserInfo`` import) and side-effect free. Maps the
         fields ``CallerContext`` actually carries; ``UserInfo.teams`` has no
         counterpart here and is intentionally dropped. ``delegation_grant_id``
-        is filled by the HTTP adapter when the caller is an agent with an active
-        super-session delegation (Constitution v2.0 Rule 6).
+        is retained only for backwards-compatible audit metadata and is never
+        treated as authorization.
         """
         return cls(
             username=u.username,
@@ -83,6 +92,108 @@ class CallerContext:
             user_id=u.user_id,
             delegation_grant_id=delegation_grant_id,
         )
+
+
+@dataclass(frozen=True)
+class ApprovalAuthorityReceipt:
+    """Evidence for the principal that opened a privileged approval gate."""
+
+    kind: str
+    grant_id: str | None = None
+    granted_by: str | None = None
+    granted_by_role: str | None = None
+
+    def audit_details(self) -> dict[str, str]:
+        details = {"authority_kind": self.kind}
+        if self.grant_id is not None:
+            details["delegation_grant_id"] = self.grant_id
+        if self.granted_by is not None:
+            details["delegation_granted_by"] = self.granted_by
+        if self.granted_by_role is not None:
+            details["delegation_granted_by_role"] = self.granted_by_role
+        return details
+
+
+async def find_active_delegation(
+    agent_username: str,
+    workspace_id: str,
+    db: aiosqlite.Connection,
+    *,
+    minimum_role: str | None = None,
+) -> aiosqlite.Row | None:
+    """Return a persisted, live, bounded delegation for ``agent_username``.
+
+    The only currently issued scope is ``full``. Unknown/future scopes fail
+    closed until a use case explicitly understands their bounds. A missing
+    migration also fails closed, which keeps pure unit-test schemas and partial
+    upgrades from accidentally authorizing an agent.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        async with db.execute(
+            "SELECT id, granted_by, granted_by_user_id, granted_by_role, scope, "
+            "created_at, expires_at "
+            "FROM delegations "
+            "WHERE agent_username = ? AND workspace_id = ? AND scope = 'full' "
+            "AND revoked_at IS NULL AND created_at <= ? AND expires_at > ? "
+            "ORDER BY expires_at DESC",
+            (agent_username, workspace_id, now, now),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    except aiosqlite.Error:
+        return None
+
+    minimum_level = ROLE_HIERARCHY[minimum_role] if minimum_role else None
+    for row in rows:
+        try:
+            created_at = datetime.fromisoformat(row["created_at"])
+            expires_at = datetime.fromisoformat(row["expires_at"])
+        except (TypeError, ValueError):
+            continue
+        try:
+            lifetime = expires_at - created_at
+        except TypeError:
+            continue
+        if not timedelta(0) < lifetime <= timedelta(days=7):
+            continue
+        if minimum_level is not None and ROLE_HIERARCHY.get(
+            row["granted_by_role"], -1
+        ) < minimum_level:
+            continue
+        return row
+    return None
+
+
+async def has_approval_authority(
+    ctx: CallerContext, db: aiosqlite.Connection
+) -> bool:
+    """Validated human/local principal or live operator+ delegation."""
+    return await resolve_approval_authority(ctx, db) is not None
+
+
+async def resolve_approval_authority(
+    ctx: CallerContext, db: aiosqlite.Connection
+) -> ApprovalAuthorityReceipt | None:
+    """Return persisted authority evidence, never a caller-provided grant id."""
+    if ctx.can_act_as_approver:
+        return ApprovalAuthorityReceipt(kind="human_session")
+    if ctx.user_type != "agent":
+        return None
+    workspace_id = require_workspace_ctx(ctx)
+    grant = await find_active_delegation(
+        ctx.username,
+        workspace_id,
+        db,
+        minimum_role="operator",
+    )
+    if grant is None:
+        return None
+    return ApprovalAuthorityReceipt(
+        kind="persisted_delegation",
+        grant_id=grant["id"],
+        granted_by=grant["granted_by"],
+        granted_by_role=grant["granted_by_role"],
+    )
 
 
 def require_role_ctx(ctx: CallerContext, *allowed: str) -> None:
@@ -104,3 +215,21 @@ def require_role_ctx(ctx: CallerContext, *allowed: str) -> None:
             code="insufficient_permissions",
             message="Insufficient permissions",
         )
+
+
+def require_workspace_ctx(ctx: CallerContext) -> str:
+    """Return the authenticated workspace or fail closed when it is missing.
+
+    ``ws_default`` remains the explicit OSS/local-single-user workspace.  It is
+    not inferred for hosted identities: adapters must carry the workspace that
+    was authenticated for the principal.
+    """
+    workspace_id = (ctx.workspace_id or "").strip()
+    if workspace_id:
+        return workspace_id
+    if ctx.user_id == "local" and ctx.username == "local":
+        return "ws_default"
+    raise AuthorizationError(
+        code="workspace_context_required",
+        message="Authenticated workspace context is required",
+    )

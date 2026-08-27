@@ -6,16 +6,36 @@ import logging
 from pathlib import Path
 
 import aiosqlite
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from core.api.db import get_db, get_write_db
 from core.api.models import UserInfo
-from core.api.security import get_current_user
+from core.api.security import (
+    get_current_user,
+    is_local_single_user_mode,
+    is_loopback_request,
+)
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
+_LOCAL_HOST_DETAIL = (
+    "Host project-directory settings are available only to the trusted local "
+    "OSS loopback runtime."
+)
+
+
+def _require_local_host_request(request: Request) -> None:
+    if is_local_single_user_mode() and is_loopback_request(request):
+        return
+    raise HTTPException(status_code=403, detail=_LOCAL_HOST_DETAIL)
+
+
+router = APIRouter(
+    prefix="/api/v1/settings",
+    tags=["settings"],
+    dependencies=[Depends(_require_local_host_request)],
+)
 
 
 class ProjectDirsResponse(BaseModel):

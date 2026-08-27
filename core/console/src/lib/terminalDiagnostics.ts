@@ -39,6 +39,7 @@ export type TerminalDiagnosticEventType =
   | "active_session_select"
   | "active_session_url_updated"
   | "browser_blur"
+  | "browser_file_upload_denied"
   | "browser_focus"
   | "browser_pagehide"
   | "browser_pageshow"

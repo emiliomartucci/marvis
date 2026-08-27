@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import fnmatch
 import mimetypes
-import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 import aiosqlite
@@ -15,6 +14,8 @@ from starlette.responses import HTMLResponse
 
 from core.api.config import settings
 from core.api.models import UserInfo
+from core.api.services.share_records import create_shared_link_record as _create_share_record
+from core.api.use_cases._errors import ValidationError
 from core.api.templates.markdown_share import MAX_MARKDOWN_RENDER_SIZE, render_markdown_page
 
 REPO_SHARE_PREFIX = "repo:"
@@ -99,24 +100,17 @@ async def create_shared_link_record(
     hours: int | float,
     public_url_prefix: str = "/api/v1/shared",
 ) -> dict:
-    if not isinstance(hours, (int, float)) or hours <= 0 or hours > 720:
-        raise HTTPException(400, "hours must be between 1 and 720")
-
-    token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)
-
-    await db.execute(
-        "INSERT INTO shared_links (token, path, created_by, expires_at) VALUES (?, ?, ?, ?)",
-        (token, stored_path, current_user.user_id, expires_at.isoformat()),
-    )
-    await db.commit()
-
-    return {
-        "token": token,
-        "url": f"{public_url_prefix}/{token}",
-        "expires_at": expires_at.isoformat(),
-        "path": public_path,
-    }
+    try:
+        return await _create_share_record(
+            stored_path=stored_path,
+            public_path=public_path,
+            created_by=current_user.user_id,
+            db=db,
+            hours=hours,
+            public_url_prefix=public_url_prefix,
+        )
+    except ValidationError as exc:
+        raise HTTPException(400, exc.message) from exc
 
 
 async def fetch_active_shared_path(token: str, db: aiosqlite.Connection) -> str:

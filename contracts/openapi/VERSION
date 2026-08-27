@@ -1,0 +1,58 @@
+# Governed marvisx HTTP contract — version pin.
+# Consumers (marvis-cloud, marvis, marvis-enterprise) generate their clients from
+# contracts/openapi/marvisx.json pinned to this engine_ref.
+#
+# Lineage note (2026-08-04): the internal-main / GitHub-main split is RECONCILED
+# by Emilio's decision — the leak vector that justified it (auto public mirror on
+# push) was removed by U4, and this unified main is the single engine truth. The
+# old clause forbidding synchronization is superseded; the public mirror remains
+# frozen and separately governed.
+contract_version: 3
+lineage: unified-main
+openapi: "3.1.0"
+engine_ref: e9c9db62ef27aada51438d76d53a05d4de8a99d9
+predecessor_contract_version: 2
+predecessor_engine_ref: e0a6994ae2102e3a6a631a11fb9934940e180a60
+paths: 285
+generator: contracts/openapi/generate.py
+# Profile (ratified by owner 2026-07-27): the governed contract covers all public,
+# discoverable routes registered in the app, optional routers included. Historical
+# browser file-mutation routes are intentionally agent-only and non-discoverable;
+# they remain runtime-served for internal bearer clients, preserving N/N-1 runtime
+# compatibility while no longer advertising a browser mutation surface.
+profile: all-surfaces
+# Breaking-change policy (ratified by owner 2026-07-27): the oasdiff gate fails hard
+# on any breaking change (--fail-on ERR). Intentional breaks go through deprecation:
+# compatibility window N/N-1 — the current and previous contract versions stay served
+# for one release cycle before removal.
+breaking_gate: hard-fail
+compatibility_window: N/N-1
+# The spec is coupled to the resolved FastAPI/pydantic versions. Regenerate under the
+# same dep set the CI gate installs: requirements-tenant.txt (the production API image
+# manifest) — see .github/workflows/openapi-diff.yml.
+coupled_to: requirements-tenant.txt
+# v2 -> v3: the hosted account router and the signed auth handoff route become
+# discoverable (GET /api/v1/account, GET /auth/handoff). Additive only: no
+# existing operation changed, so the oasdiff breaking gate stays green.
+# 2026-08-05 (additive, no version bump): the code-graph ingest surface becomes
+# discoverable (POST /api/v1/graph/ingest, GET /api/v1/graph/provenance/{project}).
+# Additive only: no existing operation changed, so the breaking gate stays green.
+# 2026-08-26 (additive, no version bump): bounded token lifecycle fields,
+# task compare-and-set metadata, and POST /api/v1/agent-tokens/personal/{token_id}/acknowledge.
+# No operation or required request field was removed or made mandatory.
+# 2026-08-27 (owner-approved retirement): removed the operational n8n Automations
+# proxy and Reddit-farmer implementations. Their authenticated HTTP paths remain
+# as deprecated 410 tombstones for the N/N-1 window, without service, database,
+# configuration, worker, or UI dependencies. Preserved internal events and Gmail
+# backend contracts are unchanged.
+# 2026-08-27 (additive, no version bump): PATCH /api/v1/tasks/{task_id}
+# declares its runtime-reachable 409 TaskVersionConflict response ON THE ROUTE
+# (typed response model; no generator overlay). The baseline gate additionally
+# runs contracts/openapi/runtime_probe.py in a fresh process and requires
+# app.openapi() to equal the committed baseline byte-for-byte.
+# engine_ref moved to the source commit carrying this spec (e9c9db62) by
+# metadata-only follow-up. Exact-SHA consumers can therefore reproduce the
+# committed contract before reading this metadata commit.
+# The baseline test compares git show <engine_ref>:contracts/openapi/marvisx.json
+# byte-for-byte with the committed file — keep this repoint rule on every
+# future contract change.

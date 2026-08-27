@@ -17,6 +17,13 @@ from core.api.db import acquire_write_db
 from core.api.paths import repo_root
 from core.api.services.ingest.embedding_router import embed_and_index
 from core.api.services.ingest.events import broadcast_ingest_changed
+from core.api.services.ingest.xlsx_privacy import (
+    PROPRIETARY_DETECTOR,
+    neutral_xlsx_collision_filename,
+    neutral_xlsx_filename,
+    neutral_xlsx_filenames,
+    neutral_xlsx_title,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +105,9 @@ _SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9_.:-]+")
 _COMMIT_SUBJECT_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 _COMMIT_SUBJECT_MAX_FRAGMENT = 120
 _TEXT_TARGET_SUFFIXES = {".md", ".txt"}
+_IMAGE_SUFFIXES_WITH_POST_PARSE_DIGEST = {".jpeg", ".jpg", ".png", ".webp"}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_XLSX_TARGET_FOLDER = "docs/assets"
 ProjectType = Literal["work", "code", "system"]
 
 
@@ -169,7 +179,46 @@ def _safe_relative_path(value: str) -> Path:
     return rel
 
 
-def _unique_target_path(project_root: Path, target_folder: str, target_filename: str, sha: str) -> Path:
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _path_has_digest(path: Path, sha256: str) -> bool:
+    return path.is_file() and _file_sha256(path) == str(sha256).lower()
+
+
+def _materialization_sha256(row, source_path: Path) -> str:
+    """Resolve the digest of the bytes that must be materialized.
+
+    Image parsing can intentionally rewrite the source to remove EXIF metadata.
+    In that case the parser records the post-redaction digest in structure_json;
+    every other format keeps using the immutable queue-time digest.
+    """
+    queued_sha = str(row["sha256"] or "").lower()
+    if source_path.suffix.lower() not in _IMAGE_SUFFIXES_WITH_POST_PARSE_DIGEST:
+        return queued_sha
+    try:
+        structure = json.loads(row["structure_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return queued_sha
+    if not isinstance(structure, dict) or structure.get("kind") != "image":
+        return queued_sha
+    post_redact_sha = str(structure.get("sha256_post_redact") or "").lower()
+    return post_redact_sha if _SHA256_RE.fullmatch(post_redact_sha) else queued_sha
+
+
+def _unique_target_path(
+    project_root: Path,
+    target_folder: str,
+    target_filename: str,
+    sha: str,
+    *,
+    target_sha256: str | None = None,
+) -> Path:
     folder = _safe_relative_path(target_folder)
     filename = _safe_relative_path(target_filename)
     if len(filename.parts) != 1:
@@ -184,10 +233,56 @@ def _unique_target_path(project_root: Path, target_folder: str, target_filename:
         raise ValueError("target path escapes project root")
     if not candidate.exists():
         return candidate
+    expected_target_sha = target_sha256 or sha
+    if _path_has_digest(candidate, expected_target_sha):
+        return candidate
+
+    valid_xlsx_names = set(neutral_xlsx_filenames(sha))
+    if filename.name in valid_xlsx_names:
+        if filename.name == neutral_xlsx_collision_filename(sha):
+            raise FileExistsError("XLSX neutral target collision")
+        collision_candidate = (
+            target_dir / neutral_xlsx_collision_filename(sha)
+        ).resolve()
+        if not collision_candidate.is_relative_to(project_root):
+            raise ValueError("target path escapes project root")
+        if not collision_candidate.exists():
+            return collision_candidate
+        if _path_has_digest(collision_candidate, expected_target_sha):
+            return collision_candidate
+        raise FileExistsError("XLSX neutral target collision")
 
     stem = candidate.stem
     suffix = candidate.suffix or ".md"
-    return target_dir / f"{stem}-{sha[:8]}{suffix}"
+    collision_candidate = (target_dir / f"{stem}-{sha[:8]}{suffix}").resolve()
+    if not collision_candidate.is_relative_to(project_root):
+        raise ValueError("target path escapes project root")
+    if not collision_candidate.exists() or _path_has_digest(
+        collision_candidate,
+        expected_target_sha,
+    ):
+        return collision_candidate
+    raise FileExistsError("target path collision")
+
+
+def _recover_materialized_xlsx_target(
+    project_root: Path,
+    target_folder: str,
+    sha256: str,
+) -> Path | None:
+    """Find a completed XLSX target after a crash before the saga DB update."""
+    folder = _safe_relative_path(target_folder)
+    target_dir = (project_root / folder).resolve()
+    if not target_dir.is_relative_to(project_root):
+        raise ValueError("target_folder escapes project root")
+    for filename in neutral_xlsx_filenames(sha256):
+        candidate = (target_dir / filename).resolve()
+        if candidate.is_relative_to(project_root) and _path_has_digest(
+            candidate,
+            sha256,
+        ):
+            return candidate
+    return None
 
 
 def _sidecar_path(path: Path) -> Path:
@@ -237,6 +332,24 @@ def _text_artifact_body(extracted_text: str, classification: dict[str, Any]) -> 
     return f"{_classification_frontmatter(classification)}{body}"
 
 
+def _expected_target_sha256(
+    *,
+    source_path: Path,
+    target_path: Path,
+    row,
+    classification: dict[str, Any],
+) -> str:
+    extracted_text = str(row["extracted_text"] or "")
+    if _should_materialize_extracted_text(
+        source_path=source_path,
+        target_path=target_path,
+        extracted_text=extracted_text,
+    ):
+        artifact_body = _text_artifact_body(extracted_text, classification)
+        return hashlib.sha256(artifact_body.encode("utf-8")).hexdigest()
+    return _materialization_sha256(row, source_path)
+
+
 def _should_materialize_extracted_text(
     *,
     source_path: Path,
@@ -267,6 +380,30 @@ def _materialize_target_file(
     classification: dict[str, Any],
 ) -> None:
     """Create the target artifact without confusing source bytes and parser output."""
+    expected_sha = _materialization_sha256(row, source_path)
+    is_xlsx = source_path.suffix.lower() == ".xlsx"
+    if _file_sha256(source_path) != expected_sha:
+        message = (
+            "XLSX source changed since parsing"
+            if is_xlsx
+            else "source changed since parsing"
+        )
+        raise ValueError(message)
+    expected_target_sha = _expected_target_sha256(
+        source_path=source_path,
+        target_path=target_path,
+        row=row,
+        classification=classification,
+    )
+    if target_path.exists():
+        if not _path_has_digest(target_path, expected_target_sha):
+            raise FileExistsError("target path collision")
+        if source_path.resolve() == target_path.resolve():
+            return
+        _move_sidecar_if_present(source_path, target_path, expected_sha)
+        source_path.unlink()
+        return
+
     extracted_text = str(row["extracted_text"] or "")
     if _should_materialize_extracted_text(
         source_path=source_path,
@@ -281,8 +418,20 @@ def _materialize_target_file(
         source_path.unlink()
         return
 
-    source_path.replace(target_path)
-    _move_sidecar_if_present(source_path, target_path, row["sha256"])
+    if is_xlsx:
+        try:
+            os.link(source_path, target_path, follow_symlinks=False)
+        except FileExistsError:
+            raise FileExistsError("target path collision") from None
+        except OSError:
+            raise RuntimeError("XLSX target materialization failed") from None
+        if _file_sha256(target_path) != expected_sha:
+            target_path.unlink(missing_ok=True)
+            raise ValueError("XLSX target digest mismatch")
+        source_path.unlink()
+    else:
+        source_path.replace(target_path)
+    _move_sidecar_if_present(source_path, target_path, expected_sha)
 
 
 async def _run_populator(module: str, target_path: Path) -> tuple[bool, str]:
@@ -384,7 +533,12 @@ def _commit_ingested_file(
     return True
 
 
-async def _set_saga_error(ingest_id: str, project_slug: str, message: str) -> None:
+async def _set_saga_error(
+    ingest_id: str,
+    workspace_id: str,
+    project_slug: str,
+    message: str,
+) -> None:
     async with acquire_write_db() as db:
         await db.execute(
             """
@@ -393,19 +547,25 @@ async def _set_saga_error(ingest_id: str, project_slug: str, message: str) -> No
                    error_message = ?,
                    updated_at = datetime('now')
              WHERE id = ?
+               AND workspace_id = ?
             """,
-            (message[:1000], ingest_id),
+            (message[:1000], ingest_id, workspace_id),
         )
         await db.commit()
     await broadcast_ingest_changed(
         "saga_error",
+        workspace_id=workspace_id,
         ingest_id=ingest_id,
         project_slug=project_slug,
         status="parse_error",
     )
 
 
-async def compensate_step(ingest_id: str, step_failed: str) -> None:
+async def compensate_step(
+    ingest_id: str,
+    workspace_id: str,
+    step_failed: str,
+) -> None:
     """Best-effort compensation for partially written ingest side effects."""
     pattern = f'%"ingest_id":"{ingest_id}"%'
     spaced_pattern = f'%"ingest_id": "{ingest_id}"%'
@@ -444,8 +604,13 @@ async def compensate_step(ingest_id: str, step_failed: str) -> None:
                    error_message = ?,
                    updated_at = datetime('now')
              WHERE id = ?
+               AND workspace_id = ?
             """,
-            (f"compensated failed ingest step: {step_failed}", ingest_id),
+            (
+                f"compensated failed ingest step: {step_failed}",
+                ingest_id,
+                workspace_id,
+            ),
         )
         await db.commit()
 
@@ -459,6 +624,7 @@ def _fallback_node_id(document_type: str, slug: str, target_path: Path) -> str:
 async def _ensure_kg_edge(
     *,
     ingest_id: str,
+    workspace_id: str,
     project_slug: str,
     target_path: Path,
     document_type: str,
@@ -471,6 +637,7 @@ async def _ensure_kg_edge(
     metadata_json = json.dumps(
         {
             "ingest_id": ingest_id,
+            "workspace_id": workspace_id,
             "target_path": str(target_path),
             "classification": classification,
             "populator_warnings": populator_warnings,
@@ -577,10 +744,11 @@ async def _ensure_kg_edge(
     return artifact_node_id
 
 
-async def _load_ingest_row(ingest_id: str):
+async def _load_ingest_row(ingest_id: str, workspace_id: str):
     async with acquire_write_db() as db:
         async with db.execute(
-            "SELECT * FROM ingest_pending WHERE id = ?", (ingest_id,)
+            "SELECT * FROM ingest_pending WHERE workspace_id = ? AND id = ?",
+            (workspace_id, ingest_id),
         ) as cursor:
             return await cursor.fetchone()
 
@@ -602,7 +770,77 @@ def _target_path_from_inserted_row(row) -> Path:
     return target_path
 
 
-async def _finish_inserted_row(row) -> None:
+def _privacy_safe_xlsx_classification(
+    sha256: str,
+    *,
+    target_filename: str,
+) -> dict[str, Any]:
+    """Rebuild XLSX classification without retaining pre-fix payload."""
+    if target_filename not in neutral_xlsx_filenames(sha256):
+        raise ValueError("XLSX target filename is not privacy-safe")
+    return {
+        "type": "file",
+        "title": neutral_xlsx_title(sha256),
+        "tags": ["xlsx", "spreadsheet"],
+        "target_folder": _XLSX_TARGET_FOLDER,
+        "target_filename": target_filename,
+        "confidence": 0.74,
+        "reason": "spreadsheet requires manual triage",
+        "auto_approve": False,
+    }
+
+
+def _should_skip_xlsx_embedding(row, target_path: Path) -> bool:
+    """Fail closed unless an XLSX row proves that it has one worksheet."""
+    if target_path.suffix.lower() != ".xlsx":
+        return False
+    try:
+        structure = json.loads(row["structure_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return True
+    if not isinstance(structure, dict) or structure.get("kind") != "xlsx":
+        return True
+    if structure.get("proprietary_detector") != PROPRIETARY_DETECTOR:
+        return True
+    raw_sheet_count = structure.get("sheet_count")
+    if isinstance(raw_sheet_count, bool):
+        return True
+    try:
+        sheet_count = int(raw_sheet_count)
+    except (TypeError, ValueError):
+        sheets = structure.get("sheets")
+        sheet_count = len(sheets) if isinstance(sheets, list) else 0
+    return sheet_count != 1 or structure.get("proprietary") is True
+
+
+async def _embed_inserted_row(
+    *,
+    row,
+    target_path: Path,
+    classification: dict[str, Any],
+    project_type: ProjectType,
+) -> str:
+    if _should_skip_xlsx_embedding(row, target_path):
+        logger.info(
+            "embedding backend: skipped ingest_id=%s reason=xlsx-structural-privacy",
+            row["id"],
+        )
+        return "skipped"
+    return await embed_and_index(
+        ingest_id=row["id"],
+        workspace_id=row["workspace_id"],
+        slug=row["project_slug"],
+        target_path=target_path,
+        extracted_text=row["extracted_text"],
+        document_type=str(classification.get("type") or "file"),
+        title=str(classification.get("title") or target_path.stem),
+        project_type=project_type,
+    )
+
+
+async def _finish_inserted_row(row, workspace_id: str) -> None:
+    if row["workspace_id"] != workspace_id:
+        raise ValueError("ingest row workspace mismatch")
     project_slug = row["project_slug"]
     target_path = _target_path_from_inserted_row(row)
     if not target_path.exists():
@@ -610,6 +848,51 @@ async def _finish_inserted_row(row) -> None:
 
     project_type, _repo_path = _load_project_entry(project_slug)
     classification = json.loads(row["classification_json"] or "{}")
+    if target_path.suffix.lower() == ".xlsx":
+        queued_sha = str(row["sha256"] or "").lower()
+        project_root = _project_root(project_slug)
+        neutral_target = _unique_target_path(
+            project_root,
+            _XLSX_TARGET_FOLDER,
+            neutral_xlsx_filename(queued_sha),
+            queued_sha,
+            target_sha256=queued_sha,
+        )
+        safe_classification = _privacy_safe_xlsx_classification(
+            queued_sha,
+            target_filename=neutral_target.name,
+        )
+        _materialize_target_file(
+            source_path=target_path,
+            target_path=neutral_target,
+            row=row,
+            classification=safe_classification,
+        )
+        target_path = neutral_target
+        classification = safe_classification
+        async with acquire_write_db() as db:
+            await db.execute(
+                """
+                UPDATE ingest_pending
+                   SET file_path = ?,
+                       target_folder = ?,
+                       target_filename = ?,
+                       classification_json = ?,
+                       updated_at = datetime('now')
+                 WHERE id = ?
+                   AND workspace_id = ?
+                   AND status = 'inserted'
+                """,
+                (
+                    str(target_path),
+                    _XLSX_TARGET_FOLDER,
+                    target_path.name,
+                    json.dumps(classification, ensure_ascii=False),
+                    row["id"],
+                    workspace_id,
+                ),
+            )
+            await db.commit()
     populator_warnings: list[str] = []
     for module in ("core.scripts.populate_artifacts", "core.scripts.populate_cross_project"):
         ok, message = await _run_populator(module, target_path)
@@ -618,19 +901,17 @@ async def _finish_inserted_row(row) -> None:
 
     await _ensure_kg_edge(
         ingest_id=row["id"],
+        workspace_id=workspace_id,
         project_slug=project_slug,
         target_path=target_path,
         document_type=str(classification.get("type") or "file"),
         classification=classification,
         populator_warnings=populator_warnings,
     )
-    embed_status = await embed_and_index(
-        ingest_id=row["id"],
-        slug=project_slug,
+    embed_status = await _embed_inserted_row(
+        row=row,
         target_path=target_path,
-        extracted_text=row["extracted_text"],
-        document_type=str(classification.get("type") or "file"),
-        title=str(classification.get("title") or target_path.stem),
+        classification=classification,
         project_type=project_type,
     )
     logger.info("saga recovery embed: ingest_id=%s status=%s", row["id"], embed_status)
@@ -644,13 +925,15 @@ async def _finish_inserted_row(row) -> None:
                    error_message = ?,
                    updated_at = datetime('now')
              WHERE id = ?
+               AND workspace_id = ?
                AND status = 'inserted'
             """,
-            (error_message, row["id"]),
+            (error_message, row["id"], workspace_id),
         )
         await db.commit()
     await broadcast_ingest_changed(
         "done",
+        workspace_id=workspace_id,
         ingest_id=row["id"],
         project_slug=project_slug,
         status="done",
@@ -661,30 +944,50 @@ async def resume_saga_from_status(
     ingest_id: str,
     prev_status: str,
     timeout: int | None = None,
+    *,
+    workspace_id: str,
 ) -> None:
     """Idempotently resume a stale ingest saga row from the live schema states."""
     step_timeout = timeout or int(os.environ.get("INGEST_STEP_TIMEOUT_SECONDS", "60"))
     if prev_status == "approved":
-        await asyncio.wait_for(execute_saga(ingest_id), timeout=step_timeout)
+        await asyncio.wait_for(
+            execute_saga(ingest_id, workspace_id),
+            timeout=step_timeout,
+        )
         return
     if prev_status == "inserted":
-        row = await _load_ingest_row(ingest_id)
+        row = await _load_ingest_row(ingest_id, workspace_id)
         if row is None or row["status"] != "inserted":
             return
-        await asyncio.wait_for(_finish_inserted_row(row), timeout=step_timeout)
+        await asyncio.wait_for(
+            _finish_inserted_row(row, workspace_id),
+            timeout=step_timeout,
+        )
         return
     raise ValueError(f"unsupported ingest recovery status: {prev_status}")
 
 
-async def execute_saga(ingest_id: str) -> None:
+async def execute_saga(ingest_id: str, workspace_id: str) -> None:
+    workspace_id = workspace_id.strip()
+    if not workspace_id:
+        raise ValueError("workspace_id is required for ingest saga")
     row = None
     async with acquire_write_db() as db:
         async with db.execute(
-            "SELECT * FROM ingest_pending WHERE id = ?", (ingest_id,)
+            "SELECT * FROM ingest_pending WHERE workspace_id = ? AND id = ?",
+            (workspace_id, ingest_id),
         ) as cursor:
             row = await cursor.fetchone()
         if row is None or row["status"] != "approved":
             return
+        from core.api.services.access_grants import require_unique_project_workspace
+
+        await require_unique_project_workspace(
+            db,
+            project_slug=str(row["project_slug"] or ""),
+            workspace_id=workspace_id,
+            allow_local_single_user=True,
+        )
         # U3 defense-in-depth: an api_ingress row must never AUTO-insert (no human
         # in the loop) unless its key policy is 'trusted'. This backstop guards
         # AUTO-insert only — explicit human triage approval (basis "approve:<user>")
@@ -717,8 +1020,6 @@ async def execute_saga(ingest_id: str) -> None:
             project_type,
         )
         source_path = Path(row["file_path"]).resolve()
-        if not source_path.exists():
-            raise FileNotFoundError(str(source_path))
         if not source_path.is_relative_to(project_root):
             raise ValueError("source path escapes project root")
 
@@ -727,19 +1028,56 @@ async def execute_saga(ingest_id: str) -> None:
         target_filename = row["target_filename"] or classification.get("target_filename")
         if not target_folder or not target_filename:
             raise ValueError("missing target_folder/target_filename")
+        is_xlsx_source = source_path.suffix.lower() == ".xlsx"
+        if is_xlsx_source:
+            queued_sha = str(row["sha256"] or "").lower()
+            target_folder = _XLSX_TARGET_FOLDER
+            if str(target_filename) not in neutral_xlsx_filenames(queued_sha):
+                target_filename = neutral_xlsx_filename(queued_sha)
+            classification = _privacy_safe_xlsx_classification(
+                queued_sha,
+                target_filename=str(target_filename),
+            )
+        if not source_path.exists():
+            target_path = (
+                _recover_materialized_xlsx_target(
+                    project_root,
+                    str(target_folder),
+                    queued_sha,
+                )
+                if is_xlsx_source
+                else None
+            )
+            if target_path is None:
+                raise FileNotFoundError(str(source_path))
+            _move_sidecar_if_present(source_path, target_path, queued_sha)
+        else:
+            materialization_sha = _materialization_sha256(row, source_path)
+            expected_target_sha = _expected_target_sha256(
+                source_path=source_path,
+                target_path=Path(str(target_filename)),
+                row=row,
+                classification=classification,
+            )
 
-        target_path = _unique_target_path(
-            project_root,
-            str(target_folder),
-            str(target_filename),
-            row["sha256"],
-        )
-        _materialize_target_file(
-            source_path=source_path,
-            target_path=target_path,
-            row=row,
-            classification=classification,
-        )
+            target_path = _unique_target_path(
+                project_root,
+                str(target_folder),
+                str(target_filename),
+                materialization_sha,
+                target_sha256=expected_target_sha,
+            )
+            _materialize_target_file(
+                source_path=source_path,
+                target_path=target_path,
+                row=row,
+                classification=classification,
+            )
+        if is_xlsx_source:
+            classification = _privacy_safe_xlsx_classification(
+                queued_sha,
+                target_filename=target_path.name,
+            )
 
         commit_created = False
         if project_type in ("code", "system"):
@@ -752,23 +1090,40 @@ async def execute_saga(ingest_id: str) -> None:
                 )
             except Exception as exc:
                 logger.warning("ingest git commit blocked: %s", exc)
-                await _set_saga_error(ingest_id, project_slug, f"workspace guard: {exc}")
+                await _set_saga_error(
+                    ingest_id,
+                    workspace_id,
+                    project_slug,
+                    f"workspace guard: {exc}",
+                )
                 return
 
         async with acquire_write_db() as db:
+            persisted_file_path = (
+                str(target_path)
+                if is_xlsx_source
+                else str(row["file_path"])
+            )
             await db.execute(
                 """
                 UPDATE ingest_pending
                    SET status = 'inserted',
+                       file_path = ?,
                        target_folder = ?,
                        target_filename = ?,
+                       classification_json = ?,
                        updated_at = datetime('now')
                  WHERE id = ?
+                   AND workspace_id = ?
+                   AND status = 'approved'
                 """,
                 (
+                    persisted_file_path,
                     str(target_path.parent.relative_to(project_root)),
                     target_path.name,
+                    json.dumps(classification, ensure_ascii=False),
                     ingest_id,
+                    workspace_id,
                 ),
             )
             await db.commit()
@@ -784,19 +1139,17 @@ async def execute_saga(ingest_id: str) -> None:
 
         artifact_node_id = await _ensure_kg_edge(
             ingest_id=ingest_id,
+            workspace_id=workspace_id,
             project_slug=project_slug,
             target_path=target_path,
             document_type=str(classification.get("type") or "file"),
             classification=classification,
             populator_warnings=populator_warnings,
         )
-        embed_status = await embed_and_index(
-            ingest_id=ingest_id,
-            slug=project_slug,
+        embed_status = await _embed_inserted_row(
+            row=row,
             target_path=target_path,
-            extracted_text=row["extracted_text"],
-            document_type=str(classification.get("type") or "file"),
-            title=str(classification.get("title") or target_path.stem),
+            classification=classification,
             project_type=project_type,
         )
         logger.info("saga embed: ingest_id=%s status=%s", ingest_id, embed_status)
@@ -810,12 +1163,15 @@ async def execute_saga(ingest_id: str) -> None:
                        error_message = ?,
                        updated_at = datetime('now')
                  WHERE id = ?
+                   AND workspace_id = ?
+                   AND status = 'inserted'
                 """,
-                (error_message, ingest_id),
+                (error_message, ingest_id, workspace_id),
             )
             await db.commit()
         await broadcast_ingest_changed(
             "done",
+            workspace_id=workspace_id,
             ingest_id=ingest_id,
             project_slug=project_slug,
             status="done",
@@ -828,7 +1184,9 @@ async def execute_saga(ingest_id: str) -> None:
         ):
             from core.api.services.ingest.llm.kg_enricher import enrich_kg_for_node
 
-            task = asyncio.create_task(enrich_kg_for_node(artifact_node_id))
+            task = asyncio.create_task(
+                enrich_kg_for_node(artifact_node_id, workspace_id)
+            )
             _PENDING_ENRICHMENT_TASKS.add(task)
             task.add_done_callback(_PENDING_ENRICHMENT_TASKS.discard)
     except Exception as exc:
@@ -841,12 +1199,14 @@ async def execute_saga(ingest_id: str) -> None:
                        error_message = ?,
                        updated_at = datetime('now')
                  WHERE id = ?
+                   AND workspace_id = ?
                 """,
-                (str(exc)[:1000], ingest_id),
+                (str(exc)[:1000], ingest_id, workspace_id),
             )
             await db.commit()
         await broadcast_ingest_changed(
             "saga_error",
+            workspace_id=workspace_id,
             ingest_id=ingest_id,
             project_slug=project_slug,
             status="parse_error",

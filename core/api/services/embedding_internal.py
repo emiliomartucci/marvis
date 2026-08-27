@@ -128,6 +128,7 @@ class GraniteEmbeddingClient:
         # the lazy load succeeds. This is what is_available() gates on, mirroring
         # the previous contract (review delta #5).
         self._model: tuple[Any, Any] | None = None
+        self._tokenizer_only: Any = None
         self._backend: str | None = None
         self._dimensions: int | None = None
         self._load_error: BaseException | None = None
@@ -219,6 +220,41 @@ class GraniteEmbeddingClient:
         _, tokenizer = self._get_model()
         return tokenizer
 
+    def tokenizer_only(self) -> Any:
+        """Return the Rust tokenizer WITHOUT loading the ONNX InferenceSession.
+
+        The prose chunker needs only per-token char offsets, never a forward pass.
+        In granite_remote the model lives in the sidecar, so loading the full
+        session here would defeat the purpose (re-import onnxruntime + ~390MB into
+        the tenant). This loads ONLY tokenizer.json (a few MB) at the pinned
+        revision with the SAME truncation config the embedder uses -> identical
+        offsets, so chunk boundaries never drift between the modes.
+        """
+        if self._tokenizer_only is not None:
+            return self._tokenizer_only
+        with self._load_lock:
+            if self._tokenizer_only is not None:
+                return self._tokenizer_only
+            tokenizers_mod = importlib.import_module("tokenizers")
+            hub = importlib.import_module("huggingface_hub")
+            local = hub.snapshot_download(
+                self._active_model_name,
+                revision=MODEL_REVISION,
+                cache_dir=str(self._cache_folder),
+                allow_patterns=[
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "special_tokens_map.json",
+                    "config.json",
+                ],
+            )
+            tokenizer = tokenizers_mod.Tokenizer.from_file(
+                str(Path(local) / "tokenizer.json")
+            )
+            tokenizer.enable_truncation(max_length=MAX_LEN)
+            self._tokenizer_only = tokenizer
+            return self._tokenizer_only
+
     def embed_texts(
         self,
         texts: list[str],
@@ -251,6 +287,14 @@ class GraniteEmbeddingClient:
         if vectors:
             self._dimensions = len(vectors[0])
         return vectors
+
+    def release_model(self) -> None:
+        """Drop the warm ONNX session and ask libc to return freed arenas."""
+
+        with self._load_lock:
+            self._model = None
+            self._backend = None
+        _trim_native_allocator()
 
     def _get_model(self) -> tuple[Any, Any]:
         if self._model is not None:
@@ -331,6 +375,16 @@ class GraniteEmbeddingClient:
         sess_options.graph_optimization_level = (
             ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         )
+        # F5: the CPU memory arena keeps ~2GB resident after a large
+        # (4096-token) forward and never releases it, so a fleet-serving
+        # sidecar creeps toward its cap. Opt-out (set ONLY in the sidecar
+        # unit) frees that memory after each run: queries stay fast (tiny
+        # tensors), only large doc embeds pay ~3x (rare, background). It is
+        # an allocation strategy, not compute -> vectors are byte-identical.
+        if os.environ.get("EMBEDDING_DISABLE_ARENA", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            sess_options.enable_cpu_mem_arena = False
         # Persist the optimized graph next to the model so subsequent cold-starts
         # skip re-optimization (review delta #6). Best-effort: ignore if unwritable.
         try:
@@ -511,6 +565,23 @@ def _warn_truncation(count: int, max_tokens: int) -> None:
         count,
         max_tokens,
     )
+
+
+def _trim_native_allocator() -> None:
+    try:
+        import gc
+
+        gc.collect()
+        if os.name != "posix":
+            return
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is not None:
+            malloc_trim(0)
+    except Exception:  # noqa: BLE001 — allocator trimming is best-effort
+        logger.debug("Native allocator trim failed", exc_info=True)
 
 
 def _plan_batches(

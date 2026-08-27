@@ -14,10 +14,35 @@ import aiosqlite
 RANKER_VERSION = "hipporag-specificity-v1"
 
 
+def _unambiguous_workspace_project_clause(
+    column: str,
+    workspace_id: str | None,
+    *,
+    alias: str,
+) -> tuple[str, list[str]]:
+    """Quarantine same-slug graph rows until the graph is workspace-keyed."""
+    if workspace_id is None:
+        return "", []
+    owner = f"{alias}_owner"
+    other = f"{alias}_other"
+    return (
+        " AND EXISTS (SELECT 1 FROM workspace_projects "
+        f"{owner} WHERE {owner}.workspace_id = ? "
+        f"AND {owner}.project_slug = {column})"
+        " AND NOT EXISTS (SELECT 1 FROM workspace_projects "
+        f"{other} WHERE {other}.project_slug = {column} "
+        f"AND {other}.workspace_id <> ?)",
+        [workspace_id, workspace_id],
+    )
+
+
 async def score_specificity(
     conn: aiosqlite.Connection,
     node_id: str,
     alpha: float = 1.0,
+    *,
+    workspace_id: str | None = None,
+    visible_projects: set[str] | None = None,
 ) -> float:
     """Compute HippoRAG specificity score for a node.
 
@@ -30,9 +55,22 @@ async def score_specificity(
 
     Returns 0.0 when the node does not exist or is deprecated.
     """
+    params: list[Any] = [node_id]
+    workspace_clause, workspace_params = _unambiguous_workspace_project_clause(
+        "graph_nodes.project_id", workspace_id, alias="specificity_node"
+    )
+    params.extend(workspace_params)
+    if visible_projects is not None:
+        if not visible_projects:
+            return 0.0
+        ordered_projects = sorted(visible_projects)
+        placeholders = ",".join("?" for _ in ordered_projects)
+        workspace_clause += f" AND graph_nodes.project_id IN ({placeholders})"
+        params.extend(ordered_projects)
     cur = await conn.execute(
-        "SELECT qualified_name FROM graph_nodes WHERE id = ? AND deprecated_at IS NULL",
-        [node_id],
+        "SELECT qualified_name FROM graph_nodes "
+        "WHERE id = ? AND deprecated_at IS NULL" + workspace_clause,
+        params,
     )
     row = await cur.fetchone()
     if row is None:
@@ -40,10 +78,25 @@ async def score_specificity(
 
     qualified_name: str = row[0]
 
+    count_params: list[Any] = [qualified_name]
+    count_workspace_clause, count_workspace_params = (
+        _unambiguous_workspace_project_clause(
+            "graph_nodes.project_id", workspace_id, alias="specificity_count"
+        )
+    )
+    count_params.extend(count_workspace_params)
+    if visible_projects is not None:
+        ordered_projects = sorted(visible_projects)
+        placeholders = ",".join("?" for _ in ordered_projects)
+        count_workspace_clause += (
+            f" AND graph_nodes.project_id IN ({placeholders})"
+        )
+        count_params.extend(ordered_projects)
     cur = await conn.execute(
         "SELECT COUNT(DISTINCT project_id) FROM graph_nodes "
-        "WHERE qualified_name = ? AND deprecated_at IS NULL AND project_id IS NOT NULL",
-        [qualified_name],
+        "WHERE qualified_name = ? AND deprecated_at IS NULL "
+        "AND project_id IS NOT NULL" + count_workspace_clause,
+        count_params,
     )
     count_row = await cur.fetchone()
     project_count: int = count_row[0] if count_row is not None else 0
@@ -56,6 +109,9 @@ async def rank_neighbors(
     neighbors: list[dict[str, Any]],
     project_id: str,
     top_k: int = 10,
+    *,
+    workspace_id: str | None = None,
+    visible_projects: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Reorder neighbor dicts using two-tier logic.
 
@@ -75,11 +131,22 @@ async def rank_neighbors(
         return []
 
     specificity_scores = await asyncio.gather(
-        *[score_specificity(conn, n["id"]) for n in neighbors]
+        *[
+            score_specificity(
+                conn,
+                n["id"],
+                workspace_id=workspace_id,
+                visible_projects=visible_projects,
+            )
+            for n in neighbors
+        ]
     )
 
     ranked: list[dict[str, Any]] = []
     for n, spec in zip(neighbors, specificity_scores):
+        if workspace_id is not None and spec == 0.0:
+            # Missing, invisible, or ambiguous nodes must not survive ranking.
+            continue
         confidence_base: float = float(n.get("confidence", 0.5)) if n.get("confidence") is not None else 0.5
         tier1_boost: float = 1.5 if n.get("project_id") == project_id else 1.0
         final_score = confidence_base * tier1_boost * spec

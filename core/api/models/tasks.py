@@ -1,6 +1,8 @@
 # v1.3.0 - 2026-04-11 - Add completion_mode for non-PR task lifecycle
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from core.api.models.common import CommentResponse, StatusCounts, UserSummary
@@ -24,6 +26,7 @@ VALID_SOURCES = {
     "console",
     "rem_proposal",
     "todo",
+    "bug_report",
 }
 
 VALID_TRANSITIONS: dict[str, set[str]] = {
@@ -74,6 +77,14 @@ class TaskCreateRequest(BaseModel):
 
 
 class TaskUpdateRequest(BaseModel):
+    expected_updated_at: str | None = Field(
+        None,
+        max_length=64,
+        description=(
+            "Optional mutation version from the last task read. A stale value "
+            "returns 409 with the current status and updated_at."
+        ),
+    )
     title: str | None = Field(None, min_length=1, max_length=200)
     description: str | None = Field(None, max_length=10000)
     status: str | None = Field(
@@ -95,6 +106,39 @@ class TaskUpdateRequest(BaseModel):
     )
     # Completion mode
     completion_mode: str | None = Field(None, pattern=r"^(pr|doc|none)$")
+
+
+class TaskConflictContext(BaseModel):
+    """Current task state that beat a stale expected_updated_at (CAS 409 body).
+
+    Mirrors the context dict the use case puts on ConflictError and
+    routers/_adapter.to_http serializes as HTTPException detail.
+    """
+
+    task_id: str = Field(description="Task id of the conflicting update")
+    current_status: str = Field(description="Task status at the conflicting update")
+    current_updated_at: str = Field(
+        description="Mutation version that beat the caller's expected_updated_at"
+    )
+
+
+class TaskConflictDetail(BaseModel):
+    """Structured service-error detail for the task version conflict."""
+
+    code: Literal["task_version_conflict"]
+    message: str = Field(description="Human-readable conflict explanation")
+    context: TaskConflictContext
+
+
+class TaskVersionConflict(BaseModel):
+    """Response envelope of PATCH /api/v1/tasks/{task_id} on a CAS conflict.
+
+    Matches the body the shared HTTP adapter emits for HTTPException
+    ({"detail": {...}}), so generated clients parse the documented recovery
+    path: refresh the task, then retry the mutation.
+    """
+
+    detail: TaskConflictDetail
 
 
 class TaskListResponse(BaseModel):

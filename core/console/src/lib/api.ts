@@ -1,4 +1,4 @@
-import { API_BASE_URL } from "./config";
+import { API_BASE_URL, redirectToConsoleLogin } from "./config";
 import type {
   CICheck,
   CIChecksSummary,
@@ -140,7 +140,7 @@ async function fetchAPI<T>(
 
   if (res.status === 401) {
     if (redirectOnUnauthorized && typeof window !== "undefined") {
-      window.location.href = "/login/";
+      redirectToConsoleLogin();
     }
     throw new APIError("Unauthorized", 401);
   }
@@ -185,8 +185,12 @@ export async function getMe(): Promise<UserInfo> {
   return fetchAPI<UserInfo>("/api/v1/auth/me");
 }
 
-export async function logout(): Promise<void> {
-  await fetchAPI("/api/v1/auth/logout", { method: "POST" });
+export async function logout(): Promise<{ logout_url?: string | null }> {
+  // The response carries a WorkOS logout_url; the caller must send the browser
+  // there to end the AuthKit session (clearing our cookie alone is not logout).
+  return fetchAPI<{ logout_url?: string | null }>("/api/v1/auth/logout", {
+    method: "POST",
+  });
 }
 
 export async function listSessions(): Promise<Session[]> {
@@ -604,110 +608,6 @@ export async function listIngestHistory(
   });
 }
 
-async function uploadIngestForm(
-  path: string,
-  formData: FormData,
-  opts?: { signal?: AbortSignal }
-): Promise<IngestUploadResponse> {
-  const res = await fetch(`${API_BASE_URL}${path}`, {
-    method: "POST",
-    credentials: "include",
-    signal: opts?.signal,
-    body: formData,
-  });
-
-  if (res.status === 401) {
-    if (typeof window !== "undefined") window.location.href = "/login/";
-    throw new Error("Unauthorized");
-  }
-
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(responseErrorMessage(body.detail, res.status));
-  }
-
-  return res.json();
-}
-
-export async function uploadIngestFolder(
-  projectSlug: string,
-  files: Array<{ file: File; relativePath: string }>,
-  opts?: { signal?: AbortSignal }
-): Promise<IngestUploadResponse> {
-  const formData = new FormData();
-  formData.set("project_slug", projectSlug);
-  for (const item of files) {
-    formData.append("files", item.file, item.relativePath);
-  }
-  return uploadIngestForm("/api/v1/ingest/upload-folder", formData, opts);
-}
-
-export async function uploadIngestZip(
-  projectSlug: string,
-  archive: File,
-  opts?: { signal?: AbortSignal }
-): Promise<IngestUploadResponse> {
-  const formData = new FormData();
-  formData.set("project_slug", projectSlug);
-  formData.set("archive", archive, archive.name);
-  return uploadIngestForm("/api/v1/ingest/upload-zip", formData, opts);
-}
-
-export async function approveIngestPending(
-  id: string,
-  opts?: { signal?: AbortSignal }
-): Promise<IngestDecisionResponse> {
-  return fetchAPI<IngestDecisionResponse>(
-    `/api/v1/ingest/pending/${encodeURIComponent(id)}/approve`,
-    { method: "POST", signal: opts?.signal }
-  );
-}
-
-export interface IngestPendingPatchBody {
-  project_slug?: string;
-}
-
-export async function patchIngestPending(
-  id: string,
-  patch: IngestPendingPatchBody,
-  opts?: { ifMatch?: string; signal?: AbortSignal }
-): Promise<IngestPendingItem> {
-  const headers: Record<string, string> = {};
-  if (opts?.ifMatch) headers["If-Match"] = opts.ifMatch;
-  return fetchAPI<IngestPendingItem>(
-    `/api/v1/ingest/pending/${encodeURIComponent(id)}`,
-    {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify(patch),
-      signal: opts?.signal,
-    }
-  );
-}
-
-export async function rejectIngestPending(
-  id: string,
-  opts?: { signal?: AbortSignal }
-): Promise<IngestDecisionResponse> {
-  return fetchAPI<IngestDecisionResponse>(
-    `/api/v1/ingest/pending/${encodeURIComponent(id)}/reject`,
-    { method: "POST", signal: opts?.signal }
-  );
-}
-
-export async function deleteIngestPending(
-  id: string,
-  opts?: { signal?: AbortSignal }
-): Promise<void> {
-  const res = await fetch(
-    `${API_BASE_URL}/api/v1/ingest/pending/${encodeURIComponent(id)}`,
-    { method: "DELETE", credentials: "include", signal: opts?.signal }
-  );
-  if (!res.ok && res.status !== 204) {
-    throw new APIError(`Delete failed: HTTP ${res.status}`, res.status);
-  }
-}
-
 // UX-1: pre-upload dedup probe. Returns the existing non-rejected row for
 // (sha256, project_slug) — null/undefined if no collision.
 export interface IngestPreflightResult {
@@ -729,16 +629,6 @@ export async function preflightIngest(
   );
 }
 
-export async function retryParseIngestPending(
-  id: string,
-  opts?: { signal?: AbortSignal }
-): Promise<IngestDecisionResponse> {
-  return fetchAPI<IngestDecisionResponse>(
-    `/api/v1/ingest/pending/${encodeURIComponent(id)}/reparse`,
-    { method: "POST", signal: opts?.signal }
-  );
-}
-
 export async function getIngestPreviewMd(
   id: string,
   opts?: { signal?: AbortSignal }
@@ -751,7 +641,7 @@ export async function getIngestPreviewMd(
     }
   );
   if (res.status === 401) {
-    if (typeof window !== "undefined") window.location.href = "/login/";
+    if (typeof window !== "undefined") redirectToConsoleLogin();
     throw new Error("Unauthorized");
   }
   if (!res.ok) {
@@ -775,7 +665,7 @@ export async function getIngestPreviewBlob(
     }
   );
   if (res.status === 401) {
-    if (typeof window !== "undefined") window.location.href = "/login/";
+    if (typeof window !== "undefined") redirectToConsoleLogin();
     throw new APIError("Unauthorized", 401);
   }
   if (!res.ok) {
@@ -855,14 +745,6 @@ export async function getSourceScores(
   return fetchAPI<SourceScore[]>("/api/v1/inbox/source-scores", {
     signal: opts?.signal,
   });
-}
-
-export async function projectGitPush(slug: string): Promise<{ success: boolean; error?: string }> {
-  return fetchAPI(`/api/v1/projects/${encodeURIComponent(slug)}/git/push`, { method: "POST" });
-}
-
-export async function projectGitPull(slug: string): Promise<{ success: boolean; error?: string }> {
-  return fetchAPI(`/api/v1/projects/${encodeURIComponent(slug)}/git/pull`, { method: "POST" });
 }
 
 export async function getProjectGitGraph(
@@ -1666,20 +1548,6 @@ export async function getProjectFile(
   );
 }
 
-export async function updateProjectFile(
-  slug: string,
-  filePath: string,
-  content: string
-): Promise<import("./types").FileContent> {
-  return fetchAPI<import("./types").FileContent>(
-    `/api/v1/projects/${encodeURIComponent(slug)}/files/${filePath}`,
-    {
-      method: "PUT",
-      body: JSON.stringify({ content }),
-    }
-  );
-}
-
 // --- Costs (Sprint 4) ---
 
 export async function getCostsSummary(
@@ -1777,63 +1645,6 @@ export async function getFinderFile(
   );
 }
 
-export async function saveFinderFile(
-  path: string,
-  content: string
-): Promise<FinderFileContent> {
-  return fetchAPI<FinderFileContent>(
-    `/api/v1/finder/file?path=${encodeURIComponent(path)}`,
-    {
-      method: "PUT",
-      body: JSON.stringify({ content }),
-    }
-  );
-}
-
-export async function finderMkdir(path: string): Promise<{ ok: boolean }> {
-  return fetchAPI("/api/v1/finder/mkdir", {
-    method: "POST",
-    body: JSON.stringify({ path }),
-  });
-}
-
-export async function finderRename(
-  path: string,
-  newName: string
-): Promise<{ ok: boolean }> {
-  return fetchAPI("/api/v1/finder/rename", {
-    method: "POST",
-    body: JSON.stringify({ path, new_name: newName }),
-  });
-}
-
-export async function finderUpload(
-  path: string,
-  files: File[]
-): Promise<FinderListItem[]> {
-  const form = new FormData();
-  form.append("path", path);
-  files.forEach((f) => form.append("files", f));
-
-  const res = await fetch(
-    `${API_BASE_URL}/api/v1/finder/upload?path=${encodeURIComponent(path)}`,
-    {
-      method: "POST",
-      credentials: "include",
-      body: form,
-    }
-  );
-  if (res.status === 401) {
-    if (typeof window !== "undefined") window.location.href = "/login/";
-    throw new Error("Unauthorized");
-  }
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
 export async function finderDownload(path: string): Promise<Blob> {
   const res = await fetch(
     `${API_BASE_URL}/api/v1/finder/download?path=${encodeURIComponent(path)}`,
@@ -1841,23 +1652,6 @@ export async function finderDownload(path: string): Promise<Blob> {
   );
   if (!res.ok) throw new Error(`Download failed: ${res.status}`);
   return res.blob();
-}
-
-export async function finderDelete(path: string): Promise<{ ok: boolean }> {
-  return fetchAPI("/api/v1/finder/delete", {
-    method: "POST",
-    body: JSON.stringify({ path }),
-  });
-}
-
-export async function finderMove(
-  src: string,
-  dest: string
-): Promise<{ ok: boolean; new_path: string }> {
-  return fetchAPI("/api/v1/finder/move", {
-    method: "POST",
-    body: JSON.stringify({ src, dest }),
-  });
 }
 
 export async function getFinderPins(): Promise<Array<{id: number; path: string; label: string | null; position: number}>> {
@@ -1954,47 +1748,6 @@ export interface UploadResult {
   filename: string;
   size: number;
   project: string;
-}
-
-export async function uploadFile(
-  file: Blob,
-  filename: string,
-  options?: { session?: string }
-): Promise<UploadResult> {
-  const formData = new FormData();
-  formData.append("file", file, filename);
-  const params = options?.session ? `?session=${encodeURIComponent(options.session)}` : "";
-  // Use XMLHttpRequest to bypass Next.js fetch patching which can cause
-  // "Cannot read properties of undefined (reading 'payload')" errors
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${API_BASE_URL}/terminal/upload${params}`);
-    xhr.withCredentials = true; // send cookies cross-origin
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch {
-          reject(new Error("Invalid response"));
-        }
-      } else {
-        try {
-          const body = JSON.parse(xhr.responseText);
-          reject(new Error(body.detail || `Upload failed: HTTP ${xhr.status}`));
-        } catch {
-          reject(new Error(`Upload failed: HTTP ${xhr.status}`));
-        }
-      }
-    };
-    xhr.onerror = () => reject(new Error("Network error during upload"));
-    xhr.send(formData);
-  });
-}
-
-/** @deprecated Use uploadFile instead */
-export async function uploadImage(file: Blob, filename: string): Promise<string> {
-  const result = await uploadFile(file, filename);
-  return result.path;
 }
 
 // --- Users ---
@@ -2172,53 +1925,6 @@ export async function createHumanCostEntry(
   });
 }
 
-// --- Automations (n8n) ---
-
-export async function listAutomations(
-  opts?: { signal?: AbortSignal }
-): Promise<{ workflows: import("./types").N8nWorkflow[]; count: number }> {
-  return fetchAPI("/api/v1/automations", { signal: opts?.signal });
-}
-
-export async function triggerAutomation(
-  workflowId: string,
-  data?: Record<string, unknown>
-): Promise<{ triggered: boolean; workflow_id: string; result: unknown }> {
-  return fetchAPI(`/api/v1/automations/${encodeURIComponent(workflowId)}/trigger`, {
-    method: "POST",
-    body: JSON.stringify({ data }),
-  });
-}
-
-export async function listExecutions(
-  params?: { workflow_id?: string; status?: string; limit?: number },
-  opts?: { signal?: AbortSignal }
-): Promise<{ executions: import("./types").N8nExecution[]; count: number }> {
-  const searchParams = new URLSearchParams();
-  if (params?.workflow_id) searchParams.set("workflow_id", params.workflow_id);
-  if (params?.status) searchParams.set("status", params.status);
-  if (params?.limit) searchParams.set("limit", String(params.limit));
-  const qs = searchParams.toString();
-  return fetchAPI(withQuery("/api/v1/automations/executions", qs), {
-    signal: opts?.signal,
-  });
-}
-
-export async function listOutboxEvents(
-  params?: { event_type?: string; project?: string; dispatched?: boolean; limit?: number },
-  opts?: { signal?: AbortSignal }
-): Promise<{ events: import("./types").OutboxEvent[]; count: number }> {
-  const searchParams = new URLSearchParams();
-  if (params?.event_type) searchParams.set("event_type", params.event_type);
-  if (params?.project) searchParams.set("project", params.project);
-  if (params?.dispatched !== undefined) searchParams.set("dispatched", String(params.dispatched));
-  if (params?.limit) searchParams.set("limit", String(params.limit));
-  const qs = searchParams.toString();
-  return fetchAPI(withQuery("/api/v1/automations/events", qs), {
-    signal: opts?.signal,
-  });
-}
-
 // --- Notifications ---
 
 export async function listNotifications(
@@ -2304,20 +2010,26 @@ export async function getCIChecksSummary(
 // --- SSO ---
 
 export async function getSSOConfig(
-  domain: string,
+  workspaceId: string = "ws_default",
   opts?: { signal?: AbortSignal }
 ): Promise<SSOConfig> {
   return fetchAPI<SSOConfig>(
-    `/api/v1/auth/sso/config?domain=${encodeURIComponent(domain)}`,
+    `/api/v1/auth/sso/config?workspace=${encodeURIComponent(workspaceId)}`,
     { signal: opts?.signal }
   );
 }
 
-export async function getSSOLoginUrl(
-  workspaceId?: string
-): Promise<{ redirect_url: string }> {
-  const qs = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
-  return fetchAPI<{ redirect_url: string }>(`/api/v1/auth/sso/login${qs}`);
+export function getSSOLoginUrl(
+  workspaceId: string = "ws_default"
+): string {
+  return `/api/v1/auth/sso/login?workspace=${encodeURIComponent(workspaceId)}`;
+}
+
+export function startSSOLogin(
+  workspaceId: string = "ws_default",
+  navigate: (url: string) => void = (url) => window.location.assign(url)
+): void {
+  navigate(getSSOLoginUrl(workspaceId));
 }
 
 export async function completeSSOCallback(

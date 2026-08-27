@@ -17,6 +17,7 @@ _SCHEMA = """
 CREATE TABLE graph_nodes (
     id TEXT PRIMARY KEY,
     type TEXT,
+    project_id TEXT,
     deprecated_at TEXT,
     last_verified_at TEXT
 );
@@ -38,8 +39,10 @@ async def _db():
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     await conn.executescript(_SCHEMA)
-    await conn.execute(
-        "INSERT INTO graph_nodes (id, type) VALUES ('py:function:a', 'function')"
+    await conn.executemany(
+        "INSERT INTO graph_nodes (id, type, project_id) "
+        "VALUES (?, 'function', 'marvisx')",
+        [("py:function:a",), ("py:function:b",)],
     )
     await conn.execute(
         "INSERT INTO graph_edges (source_id, target_id, relation) "

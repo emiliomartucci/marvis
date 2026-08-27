@@ -16,31 +16,13 @@ API_TOKEN = "test-api-token-share-edit"
 
 @pytest.fixture
 def tmp_db(tmp_path: Path) -> str:
-    from core.api.db import MIGRATIONS_DIR
+    from core.api.tests._db_fixture import apply_migrations
 
     db_path = str(tmp_path / "test.db")
+    apply_migrations(db_path)
+
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_versions "
-        "(version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
-    )
-
-    migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
-    for migration in migration_files:
-        if migration.stem.endswith("_down"):
-            continue
-        version = int(migration.stem.split("_")[0])
-        conn.executescript(migration.read_text())
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_versions (version) VALUES (?)",
-            (version,),
-        )
-        conn.commit()
-
     conn.execute(
         "INSERT OR IGNORE INTO users (id, slug, display_name, type, system_role, "
         "created_at, updated_at) "
@@ -100,6 +82,19 @@ def _user_info(user_id: str, slug: str, role: str):
         system_role=role,
         user_type="agent" if role != "super_admin" else "human",
         display_name=slug,
+        workspace_id="ws_default",
+    )
+
+
+def _local_user_info():
+    from core.api.models import UserInfo
+
+    return UserInfo(
+        username="local",
+        user_id="local",
+        system_role="operator",
+        user_type="human",
+        display_name="Local Operator",
         workspace_id="ws_default",
     )
 
@@ -178,23 +173,23 @@ async def test_get_json_unauthenticated_returns_no_can_edit(
 
 
 @pytest.mark.anyio
-async def test_get_json_authenticated_admin_workspace_share_can_edit(
+async def test_get_json_authenticated_local_workspace_share_can_edit(
     share_modules, tmp_db: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Authenticated admin on workspace share: can_edit=True (visibility bypass)."""
+    """Trusted local OSS operator can edit its host-local workspace share."""
     finder, _, _ = share_modules
     connection = sqlite3.connect(tmp_db)
     connection.row_factory = sqlite3.Row
     db = _FakeAsyncDB(connection)
-    admin = _user_info("usr_admin", "admin", "super_admin")
+    local = _local_user_info()
 
     async def _fake_auth(request: Request, db: Any) -> Any:
-        return admin
+        return local
 
     monkeypatch.setattr(finder, "_try_get_authenticated_user", _fake_auth)
 
     try:
-        payload = await _create_share(finder, db, user=admin)
+        payload = await _create_share(finder, db, user=local)
         result = await finder.access_shared_file(
             payload["token"],
             request=_make_request(b"format=json"),
@@ -278,25 +273,25 @@ async def test_put_unauthenticated_rejected(share_modules, tmp_db: str) -> None:
 
 
 @pytest.mark.anyio
-async def test_put_admin_workspace_share_writes_file(
+async def test_put_local_workspace_share_writes_file(
     share_modules, tmp_db: str, tmp_repo: Path
 ) -> None:
-    """Admin can save a workspace share — file is updated atomically."""
+    """Trusted local OSS operator can save a host-local workspace share."""
     finder, _, _ = share_modules
     from core.api.models import FinderFileUpdate
 
     connection = sqlite3.connect(tmp_db)
     connection.row_factory = sqlite3.Row
     db = _FakeAsyncDB(connection)
-    admin = _user_info("usr_admin", "admin", "super_admin")
+    local = _local_user_info()
     try:
-        payload = await _create_share(finder, db, user=admin)
+        payload = await _create_share(finder, db, user=local)
         new_content = "# Edited via shared PUT\n\nNew body.\n"
         result = await finder.save_shared_file(
             payload["token"],
             body=FinderFileUpdate(content=new_content),
             request=_make_request(),
-            current_user=admin,
+            current_user=local,
             db=db,
         )
         assert result["filename"] == "report.md"
@@ -340,14 +335,14 @@ async def test_put_operator_workspace_share_blocked_by_visibility(
 
 
 @pytest.mark.anyio
-async def test_put_data_project_share_admin_writes(
+async def test_put_data_project_share_local_operator_writes(
     share_modules, tmp_db: str, tmp_path: Path
 ) -> None:
-    """Admin can save a /data project share (PR #25 — gate workspace-only rimosso).
+    """Trusted local OSS operator can save a /data project share.
 
     Caso piu' comune via mcp_share su file metadata di progetto:
     `projects/<slug>/docs/foo.md`. Pre-PR#25 era 403 "Public shares are
-    read-only"; ora admin con visibility (super_admin → bypass) riesce a salvare.
+    read-only"; the host-local route still supports the OSS single-user flow.
     """
     finder, _, _ = share_modules
     from core.api.models import FinderFileUpdate
@@ -375,13 +370,13 @@ async def test_put_data_project_share_admin_writes(
     connection = sqlite3.connect(tmp_db)
     connection.row_factory = sqlite3.Row
     db = _FakeAsyncDB(connection)
-    admin = _user_info("usr_admin", "admin", "super_admin")
+    local = _local_user_info()
     try:
         # Insert share riga direttamente con path projects/demo/report.md
         connection.execute(
             "INSERT INTO shared_links (token, path, created_by, expires_at) "
             "VALUES (?, ?, ?, datetime('now', '+1 day'))",
-            ("data-token", "projects/demo/report.md", "usr_admin"),
+            ("data-token", "projects/demo/report.md", "local"),
         )
         connection.commit()
 
@@ -389,7 +384,7 @@ async def test_put_data_project_share_admin_writes(
             "data-token",
             body=FinderFileUpdate(content="# Edited via /data share PUT\n"),
             request=_make_request(),
-            current_user=admin,
+            current_user=local,
             db=db,
         )
         assert result["filename"] == "report.md"
