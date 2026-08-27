@@ -35,6 +35,7 @@ oss_owned_areas:
   - README.md
   - pyproject.toml
   - core/api/tests/
+approved_preserve_paths: []
 deny:
   forbidden_prefixes:
     - core/hosted_control/
@@ -185,19 +186,34 @@ def inject_entry(bundle: Path, path: str, mode: str = "100644") -> None:
 
 
 def make_args(repo: Path, bundle: Path, **overrides):
+    payload_manifest = json.loads((bundle / "manifests/payload.json").read_text(encoding="utf-8"))
+    consumer_manifest_bytes = (bundle / "manifests/oss.json").read_bytes()
     defaults = {
         "repo": repo,
         "bundle": bundle,
         "ownership_map": repo / "contracts/shared-ownership.yaml",
         "mode": "dry-run",
         "expected_source_sha": SOURCE_SHA,
-        "expected_exporter_sha": None,
-        "expected_payload_sha256": None,
+        "expected_exporter_sha": EXPORTER_SHA,
+        "expected_exporter_identity_sha256": EXPORTER_IDENTITY,
+        "expected_payload_sha256": payload_manifest["payload_sha256"],
+        "expected_consumer_manifest_sha256": isp.sha256_bytes(consumer_manifest_bytes),
         "backup_dir": None,
         "report": None,
     }
     defaults.update(overrides)
     return type("Args", (), defaults)
+
+
+def bundle_expectations(bundle: Path) -> dict[str, str]:
+    args = make_args(Path("."), bundle)
+    return {
+        "source_sha": args.expected_source_sha,
+        "exporter_sha": args.expected_exporter_sha,
+        "exporter_identity_sha256": args.expected_exporter_identity_sha256,
+        "payload_sha256": args.expected_payload_sha256,
+        "consumer_manifest_sha256": args.expected_consumer_manifest_sha256,
+    }
 
 
 class ImportGateTest(unittest.TestCase):
@@ -237,6 +253,7 @@ class ImportGateTest(unittest.TestCase):
 
     def test_cli_smoke_green_bundle(self) -> None:
         bundle = build_bundle(self.base, green_files())
+        expected = bundle_expectations(bundle)
         process = subprocess.run(
             [
                 sys.executable,
@@ -244,6 +261,10 @@ class ImportGateTest(unittest.TestCase):
                 "--repo", str(self.repo),
                 "--bundle", str(bundle),
                 "--expected-source-sha", SOURCE_SHA,
+                "--expected-exporter-sha", EXPORTER_SHA,
+                "--expected-exporter-identity-sha256", EXPORTER_IDENTITY,
+                "--expected-payload-sha256", expected["payload_sha256"],
+                "--expected-consumer-manifest-sha256", expected["consumer_manifest_sha256"],
             ],
             capture_output=True,
             text=True,
@@ -296,10 +317,74 @@ class ImportGateTest(unittest.TestCase):
         (bundle / "payload/core/api/smuggled.py").write_bytes(b"x = 1\n")
         self.refused(make_args(self.repo, bundle))
 
-    def test_missing_expected_source_sha_required(self) -> None:
+    def test_every_expected_identity_is_required(self) -> None:
         bundle = build_bundle(self.base, green_files())
-        args = make_args(self.repo, bundle, expected_source_sha=None)
-        self.assertEqual(isp.run(args), 2)
+        for attribute in (
+            "expected_source_sha",
+            "expected_exporter_sha",
+            "expected_exporter_identity_sha256",
+            "expected_payload_sha256",
+            "expected_consumer_manifest_sha256",
+        ):
+            with self.subTest(attribute=attribute):
+                args = make_args(self.repo, bundle, **{attribute: None})
+                self.assertEqual(isp.run(args), 2)
+
+    def test_wrong_expected_consumer_manifest_digest_refused(self) -> None:
+        bundle = build_bundle(self.base, green_files())
+        self.refused(
+            make_args(
+                self.repo,
+                bundle,
+                expected_consumer_manifest_sha256="f" * 64,
+            )
+        )
+
+    def test_consumer_identity_mismatch_refused(self) -> None:
+        for field, value in (
+            ("source_sha", "e" * 40),
+            ("exporter_sha", "e" * 40),
+            ("exporter_identity_sha256", "e" * 64),
+        ):
+            with self.subTest(field=field):
+                bundle = build_bundle(self.base, green_files())
+                manifest_path = bundle / "manifests/oss.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest[field] = value
+                manifest_path.write_bytes(isp.canonical_json(manifest))
+                self.refused(make_args(self.repo, bundle))
+
+    def test_consumer_counts_and_coverage_drift_refused(self) -> None:
+        mutations = (
+            ("payload_file_count", lambda manifest: manifest.__setitem__("payload_file_count", 999)),
+            ("import_file_count", lambda manifest: manifest.__setitem__("import_file_count", 999)),
+            (
+                "omitted_path",
+                lambda manifest: (
+                    manifest["import_paths"].pop(),
+                    manifest.__setitem__("import_file_count", len(manifest["import_paths"])),
+                ),
+            ),
+            (
+                "duplicate_path",
+                lambda manifest: (
+                    manifest["import_paths"].append(manifest["import_paths"][0]),
+                    manifest.__setitem__("import_file_count", len(manifest["import_paths"])),
+                ),
+            ),
+            (
+                "overlap",
+                lambda manifest: manifest["preserved_overlap_paths"].append(manifest["import_paths"][0]),
+            ),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                bundle = build_bundle(self.base, green_files())
+                manifest_path = bundle / "manifests/oss.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                mutate(manifest)
+                manifest_path.write_bytes(isp.canonical_json(manifest))
+                self.refused(make_args(self.repo, bundle))
 
     # -- unsafe paths ------------------------------------------------------
 
@@ -345,7 +430,7 @@ class ImportGateTest(unittest.TestCase):
         exit_code = isp.run(make_args(self.repo, bundle))
         self.assertEqual(exit_code, 2)
         # Visible in the violations of a forced classification run.
-        state = isp.load_bundle(bundle, {"source_sha": SOURCE_SHA})
+        state = isp.load_bundle(bundle, bundle_expectations(bundle))
         ownership, _ = isp.load_ownership_map(self.repo / "contracts/shared-ownership.yaml")
         result = isp.classify(state, ownership, self.repo)
         self.assertTrue(any("case-insensitive collision" in v for v in result["violations"]))
@@ -368,7 +453,7 @@ class ImportGateTest(unittest.TestCase):
         bundle = build_bundle(self.base, files)
         exit_code = isp.run(make_args(self.repo, bundle))
         self.assertEqual(exit_code, 2)
-        state = isp.load_bundle(bundle, {"source_sha": SOURCE_SHA})
+        state = isp.load_bundle(bundle, bundle_expectations(bundle))
         ownership, _ = isp.load_ownership_map(self.repo / "contracts/shared-ownership.yaml")
         result = isp.classify(state, ownership, self.repo)
         self.assertTrue(any(needle in violation for violation in result["violations"]), result["violations"])
@@ -410,7 +495,7 @@ class ImportGateTest(unittest.TestCase):
         bundle = build_bundle(self.base, {"core/api/optional.py": (content, "100644")})
         exit_code = isp.run(make_args(self.repo, bundle))
         self.assertEqual(exit_code, 0)
-        state = isp.load_bundle(bundle, {"source_sha": SOURCE_SHA})
+        state = isp.load_bundle(bundle, bundle_expectations(bundle))
         ownership, _ = isp.load_ownership_map(self.repo / "contracts/shared-ownership.yaml")
         result = isp.classify(state, ownership, self.repo)
         self.assertEqual(result["violations"], [])
@@ -437,6 +522,54 @@ class ImportGateTest(unittest.TestCase):
         blocked_paths = {item["path"] for item in self._blocked(bundle)}
         self.assertIn("core/api/tests/test_engine.py", blocked_paths)
 
+    def test_approved_oss_owned_path_is_preserved_on_apply(self) -> None:
+        ownership_path = self.repo / "contracts/shared-ownership.yaml"
+        ownership_path.write_text(
+            TEST_MAP.replace("approved_preserve_paths: []", "approved_preserve_paths:\n  - README.md"),
+            encoding="utf-8",
+        )
+        _git(self.repo, "add", str(ownership_path))
+        _git(self.repo, "commit", "-q", "-m", "approve preserve")
+        files = dict(green_files())
+        files["README.md"] = (b"upstream readme\n", "100644")
+        bundle = build_bundle(self.base, files)
+        report_path = self.base / "preserve-report.json"
+        self.assertEqual(isp.run(make_args(self.repo, bundle, report=report_path)), 0)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["classification"]["preserved_oss_owned"], ["README.md"])
+        backup = self.base / "preserve-backup"
+        apply_report_path = self.base / "preserve-apply-report.json"
+        self.assertEqual(
+            isp.run(
+                make_args(
+                    self.repo,
+                    bundle,
+                    mode="apply",
+                    backup_dir=backup,
+                    report=apply_report_path,
+                )
+            ),
+            0,
+        )
+        self.assertEqual((self.repo / "README.md").read_bytes(), b"oss readme\n")
+        apply_report = json.loads(apply_report_path.read_text(encoding="utf-8"))
+        self.assertNotEqual(
+            apply_report["applied"]["readback_imported_files_sha256"],
+            apply_report["identities"]["payload_sha256"],
+        )
+
+    def test_preserve_path_outside_oss_ownership_is_invalid(self) -> None:
+        ownership_path = self.repo / "contracts/shared-ownership.yaml"
+        ownership_path.write_text(
+            TEST_MAP.replace(
+                "approved_preserve_paths: []",
+                "approved_preserve_paths:\n  - core/api/engine.py",
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(isp.ImportRefused):
+            isp.load_ownership_map(ownership_path)
+
     def test_undeclared_path_outside_managed_areas_blocks(self) -> None:
         bundle = build_bundle(self.base, {"docs/decisions/adr.md": (b"# overwritten\n", "100644")})
         blocked_paths = {item["path"]: item for item in self._blocked(bundle)}
@@ -449,7 +582,7 @@ class ImportGateTest(unittest.TestCase):
         bundle = build_bundle(self.base, files)
         exit_code = isp.run(make_args(self.repo, bundle))
         self.assertEqual(exit_code, 2)
-        state = isp.load_bundle(bundle, {"source_sha": SOURCE_SHA})
+        state = isp.load_bundle(bundle, bundle_expectations(bundle))
         ownership, _ = isp.load_ownership_map(self.repo / "contracts/shared-ownership.yaml")
         result = isp.classify(state, ownership, self.repo)
         self.assertTrue(any("migration compatibility" in v for v in result["violations"]))
@@ -457,7 +590,7 @@ class ImportGateTest(unittest.TestCase):
     def test_real_ownership_map_loads(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
         ownership, _ = isp.load_ownership_map(repo_root / "contracts/shared-ownership.yaml")
-        self.assertEqual(ownership["ownership_map_version"], 1)
+        self.assertEqual(ownership["ownership_map_version"], 2)
         self.assertIn("core/api/", ownership["managed_areas"])
 
     # -- apply / rollback --------------------------------------------------
@@ -519,7 +652,7 @@ class ImportGateTest(unittest.TestCase):
     # -- helpers -----------------------------------------------------------
 
     def _blocked(self, bundle: Path) -> list[dict]:
-        state = isp.load_bundle(bundle, {"source_sha": SOURCE_SHA})
+        state = isp.load_bundle(bundle, bundle_expectations(bundle))
         ownership, _ = isp.load_ownership_map(self.repo / "contracts/shared-ownership.yaml")
         return isp.classify(state, ownership, self.repo)["blocked"]
 

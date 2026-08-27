@@ -15,9 +15,10 @@
 # something an import silently does (KTD3).
 #
 # Authored against OSS base 07821c76b5e890c341eeed80ca2f4002ad482b79
-# (origin/main, 2026-08-27). Pre-candidate exporter reviewed: 936e1e6e.
+# (origin/main, 2026-08-27). Final Plan A candidate reviewed at merge SHA
+# 4f3b656be26153c8e34b86af74473845e12d6979.
 schema: marvis-shared-ownership/v1
-ownership_map_version: 1
+ownership_map_version: 2
 
 # Paths a public/shared payload may write. A rule ending in "/" is a prefix;
 # anything else is an exact file. A payload path must match exactly one rule;
@@ -91,6 +92,16 @@ oss_owned_areas:
   - docs/decisions/
   - docs/projection/
   - AGENTS.md
+
+# Exact payload collisions approved for preservation after byte-level review
+# against the final Plan A candidate. They stay OSS-owned and are never copied
+# by the shared importer. Any product-level reconciliation is a separate,
+# visible change in this repository; adding an entry here requires review.
+approved_preserve_paths:
+  - .github/workflows/release.yml
+  - .gitignore
+  - README.md
+  - pyproject.toml
 
 # Independent deny policy (defense in depth: the exporter enforces its own,
 # but the consumer must not have to trust it). All checks are fail-closed.

@@ -59,6 +59,7 @@ ALLOWED_MODES = {"100644", "100755"}
 ABSOLUTE_MAX_FILE_BYTES = 20971520
 MIGRATIONS_PREFIX = "migrations/"
 MAP_PATH_RULES = ("managed_areas", "oss_owned_areas")
+APPROVED_PRESERVE_KEY = "approved_preserve_paths"
 MAP_DENY_RULES = (
     "forbidden_prefixes",
     "forbidden_components",
@@ -128,6 +129,27 @@ def _validate_path_rules(rules: object, where: str, errors: list[str]) -> list[s
     return clean
 
 
+def _validate_exact_paths(rules: object, where: str, errors: list[str]) -> list[str]:
+    """Validate a possibly-empty list of exact repository paths."""
+    if not isinstance(rules, list):
+        errors.append(f"{where}: must be a list of exact paths")
+        return []
+    clean: list[str] = []
+    for rule in rules:
+        if not isinstance(rule, str) or not rule.strip() or rule.endswith("/"):
+            errors.append(f"{where}: entries must be non-empty exact paths")
+            continue
+        pure = PurePosixPath(rule)
+        if pure.is_absolute() or "\\" in rule or any(part in {"", ".", ".."} for part in pure.parts):
+            errors.append(f"{where}: unsafe path {rule!r}")
+            continue
+        if rule in clean:
+            errors.append(f"{where}: duplicate path {rule!r}")
+            continue
+        clean.append(rule)
+    return clean
+
+
 def load_ownership_map(path: Path) -> tuple[dict, list[str]]:
     """Load and validate the ownership map; every structural doubt is an error.
 
@@ -149,6 +171,11 @@ def load_ownership_map(path: Path) -> tuple[dict, list[str]]:
     clean: dict[str, list[str]] = {}
     for key in MAP_PATH_RULES:
         clean[key] = _validate_path_rules(doc.get(key), f"ownership map: {key}", errors)
+    approved_preserve = _validate_exact_paths(
+        doc.get(APPROVED_PRESERVE_KEY),
+        f"ownership map: {APPROVED_PRESERVE_KEY}",
+        errors,
+    )
     deny_raw = doc.get("deny")
     deny: dict[str, list[str]] = {}
     if not isinstance(deny_raw, dict):
@@ -176,6 +203,14 @@ def load_ownership_map(path: Path) -> tuple[dict, list[str]]:
         for managed in clean["managed_areas"]:
             if owned == managed:
                 errors.append(f"ownership map: {owned!r} is both managed and oss-owned")
+    for path in approved_preserve:
+        if not any(
+            path.startswith(rule) if rule.endswith("/") else path == rule
+            for rule in clean["oss_owned_areas"]
+        ):
+            errors.append(
+                f"ownership map: approved preserve path {path!r} is not OSS-owned"
+            )
     if errors:
         raise ImportRefused("ownership map invalid: " + "; ".join(sorted(set(errors))))
 
@@ -190,6 +225,7 @@ def load_ownership_map(path: Path) -> tuple[dict, list[str]]:
     )
     compiled["ownership_map_version"] = doc["ownership_map_version"]
     compiled["max_file_bytes"] = policy["max_file_bytes"]
+    compiled[APPROVED_PRESERVE_KEY] = approved_preserve
     return compiled, deny
 
 
@@ -277,10 +313,14 @@ def load_bundle(bundle: Path, expected: dict) -> dict:
         if not required.exists():
             raise ImportRefused(f"bundle is incomplete: {required.relative_to(bundle)} is missing")
 
+    payload_manifest_path = manifests / "payload.json"
+    consumer_manifest_path = manifests / "oss.json"
     try:
-        payload_manifest = json.loads((manifests / "payload.json").read_text(encoding="utf-8"))
-        consumer_manifest = json.loads((manifests / "oss.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload_manifest_bytes = payload_manifest_path.read_bytes()
+        consumer_manifest_bytes = consumer_manifest_path.read_bytes()
+        payload_manifest = json.loads(payload_manifest_bytes.decode("utf-8"))
+        consumer_manifest = json.loads(consumer_manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ImportRefused(f"bundle manifests unreadable: {exc}") from exc
     if not isinstance(payload_manifest, dict) or not isinstance(consumer_manifest, dict):
         raise ImportRefused("bundle manifests must be objects")
@@ -290,6 +330,13 @@ def load_bundle(bundle: Path, expected: dict) -> dict:
         raise ImportRefused(f"consumer manifest schema must be {CONSUMER_MANIFEST_SCHEMA}")
     if consumer_manifest.get("consumer") != CONSUMER_NAME:
         raise ImportRefused(f"consumer manifest is for {consumer_manifest.get('consumer')!r}, not {CONSUMER_NAME!r}")
+
+    consumer_manifest_sha256 = sha256_bytes(consumer_manifest_bytes)
+    if expected.get("consumer_manifest_sha256") != consumer_manifest_sha256:
+        raise ImportRefused(
+            "OSS consumer manifest digest "
+            f"{consumer_manifest_sha256} != expected {expected.get('consumer_manifest_sha256')}"
+        )
 
     source_sha = payload_manifest.get("source_sha")
     exporter_sha = payload_manifest.get("exporter_sha")
@@ -306,9 +353,14 @@ def load_bundle(bundle: Path, expected: dict) -> dict:
         raise ImportRefused(
             f"bundle source_sha {source_sha} != expected {expected['source_sha']}"
         )
-    if "exporter_sha" in expected and expected["exporter_sha"] != exporter_sha:
+    if expected.get("exporter_sha") != exporter_sha:
         raise ImportRefused(
             f"bundle exporter_sha {exporter_sha} != expected {expected['exporter_sha']}"
+        )
+    if expected.get("exporter_identity_sha256") != exporter_identity:
+        raise ImportRefused(
+            "bundle exporter identity "
+            f"{exporter_identity} != expected {expected.get('exporter_identity_sha256')}"
         )
 
     files_raw = payload_manifest.get("files")
@@ -359,7 +411,7 @@ def load_bundle(bundle: Path, expected: dict) -> dict:
         raise ImportRefused(
             f"recomputed payload digest {recomputed} != manifest {payload_manifest.get('payload_sha256')}"
         )
-    if "payload_sha256" in expected and expected["payload_sha256"] != recomputed:
+    if expected.get("payload_sha256") != recomputed:
         raise ImportRefused(
             f"payload digest {recomputed} != expected {expected['payload_sha256']}"
         )
@@ -367,12 +419,40 @@ def load_bundle(bundle: Path, expected: dict) -> dict:
         raise ImportRefused("payload manifest file_count does not match the file list")
     if consumer_manifest.get("payload_sha256") != recomputed:
         raise ImportRefused("consumer manifest binds a different payload digest than payload.json")
+    for field, actual in (
+        ("source_sha", source_sha),
+        ("exporter_sha", exporter_sha),
+        ("exporter_identity_sha256", exporter_identity),
+    ):
+        if consumer_manifest.get(field) != actual:
+            raise ImportRefused(
+                f"consumer manifest {field} does not match payload manifest"
+            )
+    if consumer_manifest.get("payload_file_count") != len(seen):
+        raise ImportRefused("consumer manifest payload_file_count does not match payload")
     declared_imports = consumer_manifest.get("import_paths")
     if not isinstance(declared_imports, list):
         raise ImportRefused("consumer manifest import_paths must be a list")
-    unknown = sorted(set(declared_imports) - set(seen))
+    declared_preserved = consumer_manifest.get("preserved_overlap_paths")
+    if not isinstance(declared_preserved, list):
+        raise ImportRefused("consumer manifest preserved_overlap_paths must be a list")
+    if not all(isinstance(path, str) for path in declared_imports + declared_preserved):
+        raise ImportRefused("consumer manifest paths must all be strings")
+    if len(declared_imports) != len(set(declared_imports)):
+        raise ImportRefused("consumer manifest import_paths contains duplicates")
+    if len(declared_preserved) != len(set(declared_preserved)):
+        raise ImportRefused("consumer manifest preserved_overlap_paths contains duplicates")
+    if consumer_manifest.get("import_file_count") != len(declared_imports):
+        raise ImportRefused("consumer manifest import_file_count does not match import_paths")
+    if set(declared_imports) & set(declared_preserved):
+        raise ImportRefused("consumer import and preserved path sets overlap")
+    declared_paths = set(declared_imports) | set(declared_preserved)
+    unknown = sorted(declared_paths - set(seen))
     if unknown:
-        raise ImportRefused(f"consumer manifest imports unknown payload paths: {unknown[0]}")
+        raise ImportRefused(f"consumer manifest names unknown payload paths: {unknown[0]}")
+    omitted = sorted(set(seen) - declared_paths)
+    if omitted:
+        raise ImportRefused(f"consumer manifest omits payload path: {omitted[0]}")
 
     # Unlisted bytes sitting in payload/ are smuggling until proven otherwise.
     listed_files = {str(item) for item in seen}
@@ -391,8 +471,11 @@ def load_bundle(bundle: Path, expected: dict) -> dict:
         "exporter_sha": exporter_sha,
         "exporter_identity_sha256": exporter_identity,
         "payload_sha256": recomputed,
+        "payload_manifest_sha256": sha256_bytes(payload_manifest_bytes),
+        "consumer_manifest_sha256": consumer_manifest_sha256,
         "files": seen,
         "consumer_import_paths": sorted(set(declared_imports)),
+        "consumer_preserved_paths": sorted(set(declared_preserved)),
     }
 
 
@@ -474,6 +557,7 @@ def classify(
     tracked = git_ls_tree(repo)
     violations: list[str] = []
     blocked: list[dict] = []
+    preserved_oss_owned: list[str] = []
     already_synced: list[str] = []
     would_overwrite: list[str] = []
     additions: list[str] = []
@@ -507,7 +591,10 @@ def classify(
         # path matching neither is an undeclared change to this repository.
         owned_rule = owned_rule_for(path, ownership["oss_owned_areas"])
         if owned_rule is not None:
-            blocked.append({"path": path, "rule": owned_rule, "owner": "marvis"})
+            if path in ownership[APPROVED_PRESERVE_KEY]:
+                preserved_oss_owned.append(path)
+            else:
+                blocked.append({"path": path, "rule": owned_rule, "owner": "marvis"})
             continue
         managed_rule = managed_rule_for(path, ownership["managed_areas"])
         if managed_rule is None:
@@ -567,6 +654,7 @@ def classify(
     return {
         "violations": violations,
         "blocked": blocked,
+        "preserved_oss_owned": preserved_oss_owned,
         "already_synced": already_synced,
         "would_overwrite": would_overwrite,
         "additions": additions,
@@ -660,6 +748,7 @@ def build_report(
             "would_overwrite": classification["would_overwrite"],
             "additions": classification["additions"],
             "blocked_collisions": classification["blocked"],
+            "preserved_oss_owned": classification["preserved_oss_owned"],
             "local_only_in_managed_area": classification["local_only_in_managed_area"],
             "optional_integration_seams": classification["optional_integration_seams"],
         },
@@ -735,6 +824,9 @@ def apply_payload(
         # verified payload bytes, not merely have been sent to disk.
         if sha256_bytes(destination.read_bytes()) != entry["sha256"]:
             raise ImportRefused(f"readback mismatch after write: {path}")
+        expected_executable = entry["mode"] == "100755"
+        if bool(destination.stat().st_mode & 0o111) != expected_executable:
+            raise ImportRefused(f"readback mode mismatch after write: {path}")
         written += 1
 
     post_records = [
@@ -746,20 +838,21 @@ def apply_payload(
         }
         for path in importable
     ]
+    imported_readback_digest = payload_digest(post_records)
     backup_manifest = {
         "schema": BACKUP_SCHEMA,
         "source_sha": bundle_state["source_sha"],
         "payload_sha256": bundle_state["payload_sha256"],
         "base_head": git_bytes(repo, "rev-parse", "HEAD").decode().strip(),
         "pre_apply_tree_sha256": pre_apply_tree,
-        "post_apply_readback_digest": payload_digest(post_records),
+        "post_apply_readback_digest": imported_readback_digest,
         "entries": entries,
     }
     (backup_dir / "backup.json").write_bytes(canonical_json(backup_manifest))
     return {
         "applied": {
             "files_written": written,
-            "readback_payload_sha256": bundle_state["payload_sha256"],
+            "readback_imported_files_sha256": imported_readback_digest,
             "backup_manifest_sha256": sha256_bytes(canonical_json(backup_manifest)),
             "pre_apply_tree_sha256": pre_apply_tree,
             "backup_entries": len(entries),
@@ -788,6 +881,9 @@ def rollback_payload(repo: Path, backup_dir: Path, files: dict[str, dict]) -> di
             raise ImportRefused(f"cannot roll back: {path} no longer exists")
         if sha256_bytes(current.read_bytes()) != files[path]["sha256"]:
             raise ImportRefused(f"cannot roll back: {path} changed after apply")
+        expected_executable = files[path]["mode"] == "100755"
+        if bool(current.stat().st_mode & 0o111) != expected_executable:
+            raise ImportRefused(f"cannot roll back: {path} mode changed after apply")
 
     restored = removed = 0
     for entry in sorted(entries, key=lambda item: item["path"]):
@@ -808,6 +904,11 @@ def rollback_payload(repo: Path, backup_dir: Path, files: dict[str, dict]) -> di
         if path != PurePosixPath(".") and candidate.is_dir() and not any(candidate.iterdir()):
             candidate.rmdir()
 
+    dirty = worktree_dirty(repo)
+    if dirty:
+        raise ImportRefused(
+            f"rollback verification failed: worktree is not clean (first issue: {dirty[0]})"
+        )
     restored_digest = proposed_tree_digest(repo, files, set())
     if restored_digest != manifest.get("pre_apply_tree_sha256"):
         raise ImportRefused(
@@ -825,18 +926,34 @@ def run(args: argparse.Namespace) -> int:
     bundle = args.bundle.resolve()
     ownership_path = args.ownership_map.resolve()
     expected: dict = {}
-    if args.mode in {"dry-run", "apply"}:
-        if not args.expected_source_sha:
-            print("--expected-source-sha is required for dry-run and apply", file=sys.stderr)
+    required_expectations = (
+        ("expected_source_sha", "source_sha", "--expected-source-sha", SHA40_RE, "40-hex commit SHA"),
+        ("expected_exporter_sha", "exporter_sha", "--expected-exporter-sha", SHA40_RE, "40-hex commit SHA"),
+        (
+            "expected_exporter_identity_sha256",
+            "exporter_identity_sha256",
+            "--expected-exporter-identity-sha256",
+            SHA256_RE,
+            "64-hex digest",
+        ),
+        ("expected_payload_sha256", "payload_sha256", "--expected-payload-sha256", SHA256_RE, "64-hex digest"),
+        (
+            "expected_consumer_manifest_sha256",
+            "consumer_manifest_sha256",
+            "--expected-consumer-manifest-sha256",
+            SHA256_RE,
+            "64-hex digest",
+        ),
+    )
+    for attribute, key, flag, pattern, description in required_expectations:
+        value = getattr(args, attribute, None)
+        if not value:
+            print(f"{flag} is required for {args.mode}", file=sys.stderr)
             return 2
-        if not SHA40_RE.match(args.expected_source_sha):
-            print("--expected-source-sha must be a full 40-hex commit SHA", file=sys.stderr)
+        if not isinstance(value, str) or not pattern.fullmatch(value):
+            print(f"{flag} must be a full {description}", file=sys.stderr)
             return 2
-        expected["source_sha"] = args.expected_source_sha
-    if args.expected_exporter_sha:
-        expected["exporter_sha"] = args.expected_exporter_sha
-    if args.expected_payload_sha256:
-        expected["payload_sha256"] = args.expected_payload_sha256
+        expected[key] = value
 
     try:
         ownership, _ = load_ownership_map(ownership_path)
@@ -844,7 +961,9 @@ def run(args: argparse.Namespace) -> int:
         classification = classify(bundle_state, ownership, repo)
         dirty = worktree_dirty(repo)
         importable = sorted(
-            set(bundle_state["files"]) - {item["path"] for item in classification["blocked"]}
+            set(bundle_state["consumer_import_paths"])
+            - {item["path"] for item in classification["blocked"]}
+            - set(classification["preserved_oss_owned"])
         )
         compatibility = read_compatibility(repo, bundle)
         identities = {
@@ -852,6 +971,8 @@ def run(args: argparse.Namespace) -> int:
             "exporter_sha": bundle_state["exporter_sha"],
             "exporter_identity_sha256": bundle_state["exporter_identity_sha256"],
             "payload_sha256": bundle_state["payload_sha256"],
+            "payload_manifest_sha256": bundle_state["payload_manifest_sha256"],
+            "consumer_manifest_sha256": bundle_state["consumer_manifest_sha256"],
             "oss_base_head": git_bytes(repo, "rev-parse", "HEAD").decode().strip(),
             "ownership_map_version": ownership["ownership_map_version"],
             "ownership_map_sha256": sha256_bytes(ownership_path.read_bytes()),
@@ -860,6 +981,7 @@ def run(args: argparse.Namespace) -> int:
             "file_count": len(bundle_state["files"]),
             "importable_file_count": len(importable),
             "blocked_file_count": len(classification["blocked"]),
+            "preserved_oss_owned_file_count": len(classification["preserved_oss_owned"]),
             "bytes_total": sum(entry["size"] for entry in bundle_state["files"].values()),
         }
         compatibility["migrations"] = classification["migrations"]
@@ -915,7 +1037,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("dry-run", "apply", "rollback"), default="dry-run")
     parser.add_argument("--expected-source-sha", default=None)
     parser.add_argument("--expected-exporter-sha", default=None)
+    parser.add_argument("--expected-exporter-identity-sha256", default=None)
     parser.add_argument("--expected-payload-sha256", default=None)
+    parser.add_argument("--expected-consumer-manifest-sha256", default=None)
     parser.add_argument("--backup-dir", type=Path, default=None)
     parser.add_argument("--report", type=Path, default=None)
     return parser
