@@ -29,6 +29,13 @@ class ReleaseCandidateTests(unittest.TestCase):
         policy["approval_watchdog"] = {
             "status": "ready",
             "receipt_ref": "ledger:receipt",
+            "verified_at": now.isoformat(),
+            "verified_by": "owner",
+            "repository": policy["repository"],
+            "workflow": policy["trusted_publisher"]["workflow"],
+            "environment": policy["github_environment"]["name"],
+            "candidate_tag": policy["candidate_tag"],
+            "approval_deadline_hours": policy["approval_deadline_hours"],
             "late_approval_upload_guard": True,
         }
         return policy
@@ -37,11 +44,16 @@ class ReleaseCandidateTests(unittest.TestCase):
         report = candidate.validate_static(ROOT)
         self.assertEqual(report["status"], "static_green_external_gates_open")
         self.assertEqual(report["version"], "0.4.1")
+        self.assertEqual(report["release_branch"], "main")
         self.assertEqual(len(report["action_pins"]), 5)
 
     def test_unpinned_action_is_rejected(self) -> None:
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "full commit"):
             candidate._action_pins("steps:\n  - uses: actions/checkout@v4\n")
+
+    def test_tag_build_rejects_another_trigger_tag(self) -> None:
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "another-tag"):
+            candidate._validate_tag_trigger("v0.4.1", "refs/tags/another-tag")
 
     def test_release_delta_rejects_product_code(self) -> None:
         with mock.patch.object(
@@ -65,6 +77,13 @@ class ReleaseCandidateTests(unittest.TestCase):
         candidate._strict_external_receipts(
             self.verified_external_policy(now - timedelta(minutes=5)), now=now
         )
+
+    def test_watchdog_for_another_tag_is_rejected(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.verified_external_policy(now)
+        policy["approval_watchdog"]["candidate_tag"] = "v0.4.2"
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "coordinates"):
+            candidate._strict_external_receipts(policy, now=now)
 
     def test_manifest_byte_tamper_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="release-manifest-") as raw:
@@ -98,6 +117,40 @@ class ReleaseCandidateTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             artifact.write_bytes(b"tampered")
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "bytes differ"):
+                candidate.verify_manifest(root, manifest_path, dist)
+
+    def test_manifest_rejects_unmanifested_release_asset(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="release-assets-") as raw:
+            root = Path(raw)
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / "contracts/release").mkdir(parents=True)
+            workflow = root / candidate.WORKFLOW_PATH
+            policy_path = root / candidate.POLICY_PATH
+            workflow.write_bytes((ROOT / candidate.WORKFLOW_PATH).read_bytes())
+            policy_path.write_bytes((ROOT / candidate.POLICY_PATH).read_bytes())
+            dist = root / "dist"
+            dist.mkdir()
+            artifact = dist / "candidate.whl"
+            artifact.write_bytes(b"reviewed")
+            manifest_path = dist / "release-manifest.json"
+            manifest = {
+                "schema": candidate.MANIFEST_SCHEMA,
+                "workflow": {"sha256": candidate._sha_file(workflow)},
+                "policy": {"sha256": candidate._sha_file(policy_path)},
+                "artifacts": [
+                    {
+                        "filename": artifact.name,
+                        "size": artifact.stat().st_size,
+                        "sha256": candidate._sha_file(artifact),
+                    }
+                ],
+            }
+            manifest["content_digest"] = candidate._sha_bytes(
+                candidate._canonical(manifest)
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            (dist / "unreviewed-installer.sh").write_text("exit 0\n", encoding="utf-8")
+            with self.assertRaisesRegex(candidate.ReleasePolicyError, "file set"):
                 candidate.verify_manifest(root, manifest_path, dist)
 
     def test_registry_readback_retries_then_matches_exact_bytes(self) -> None:
@@ -152,6 +205,63 @@ class ReleaseCandidateTests(unittest.TestCase):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "reviewed"):
                 candidate.pretag(ROOT, token="masked")
 
+    def test_preflight_rejects_source_that_is_not_remote_main_head(self) -> None:
+        policy = self.verified_external_policy(
+            datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        )
+        reviewed = "a" * 40
+        with mock.patch.object(
+            candidate,
+            "validate_static",
+            return_value={"release_source_sha": reviewed},
+        ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
+            candidate, "_strict_external_receipts"
+        ), mock.patch.object(
+            candidate, "_environment_check", return_value={"name": "pypi"}
+        ), mock.patch.object(
+            candidate,
+            "_request_json",
+            return_value={"commit": {"sha": "b" * 40}},
+        ):
+            with self.assertRaisesRegex(candidate.ReleasePolicyError, "exact remote"):
+                candidate.preflight(ROOT, token="masked", api_url="https://api.example")
+
+    def test_preflight_proves_exact_head_and_unused_namespace(self) -> None:
+        policy = self.verified_external_policy(
+            datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        )
+        reviewed = "a" * 40
+        with mock.patch.object(
+            candidate,
+            "validate_static",
+            return_value={"release_source_sha": reviewed},
+        ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
+            candidate, "_strict_external_receipts"
+        ), mock.patch.object(
+            candidate, "_environment_check", return_value={"name": "pypi"}
+        ), mock.patch.object(
+            candidate,
+            "_request_json",
+            side_effect=[
+                {"commit": {"sha": reviewed}},
+                FileNotFoundError("tag"),
+                FileNotFoundError("release"),
+                FileNotFoundError("pypi"),
+            ],
+        ):
+            report = candidate.preflight(
+                ROOT, token="masked", api_url="https://api.example"
+            )
+        self.assertEqual(report["status"], "preflight_green")
+        self.assertEqual(
+            report["namespace"],
+            {
+                "git_tag": "absent",
+                "github_release": "absent",
+                "pypi_version": "absent",
+            },
+        )
+
     def test_environment_admin_bypass_is_rejected(self) -> None:
         policy = self.policy()
         response = {
@@ -193,6 +303,38 @@ class ReleaseCandidateTests(unittest.TestCase):
                 candidate, "_request_json", return_value=run
             ):
                 with self.assertRaisesRegex(candidate.ReleasePolicyError, "expired"):
+                    candidate.publish_window(
+                        ROOT,
+                        manifest_path,
+                        Path(raw),
+                        token="masked",
+                        run_id="123",
+                        now=now,
+                        api_url="https://api.example",
+                    )
+
+    def test_publication_window_rejects_another_tag_run(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.verified_external_policy(now)
+        with tempfile.TemporaryDirectory(prefix="approval-tag-") as raw:
+            manifest_path = Path(raw) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps({"release_source_sha": "a" * 40}), encoding="utf-8"
+            )
+            run = {
+                "created_at": now.isoformat(),
+                "head_sha": "a" * 40,
+                "path": str(candidate.WORKFLOW_PATH),
+                "event": "push",
+                "head_branch": "v0.4.2",
+                "head_repository": {"full_name": policy["repository"]},
+            }
+            with mock.patch.object(
+                candidate, "load_policy", return_value=policy
+            ), mock.patch.object(
+                candidate, "_request_json", return_value=run
+            ):
+                with self.assertRaisesRegex(candidate.ReleasePolicyError, "another tag"):
                     candidate.publish_window(
                         ROOT,
                         manifest_path,

@@ -2,6 +2,7 @@
   "schema": "marvis-public-release-policy/v1",
   "package": "marvisx-cli",
   "repository": "emiliomartucci/marvis",
+  "release_branch": "main",
   "plan_b_product_base_sha": "82b1fff8cbd4c8641faff2de6353ada5f4973b82",
   "candidate_version": "0.4.1",
   "candidate_tag": "v0.4.1",
@@ -41,6 +42,13 @@
   "approval_watchdog": {
     "status": "external_monitor_required",
     "receipt_ref": null,
+    "verified_at": null,
+    "verified_by": null,
+    "repository": "emiliomartucci/marvis",
+    "workflow": "release.yml",
+    "environment": "pypi",
+    "candidate_tag": "v0.4.1",
+    "approval_deadline_hours": 24,
     "late_approval_upload_guard": true
   },
   "build": {

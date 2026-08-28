@@ -53,7 +53,7 @@ jobs:
           set -euo pipefail
           pip install --require-hashes -r requirements-release.lock
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            python scripts/release_candidate.py static --tag-build
+            python scripts/release_candidate.py static --tag-build --trigger-ref "$GITHUB_REF"
           else
             python scripts/release_candidate.py static
           fi
@@ -61,6 +61,12 @@ jobs:
           python scripts/validate_local_surfaces.py
           python scripts/validate_desktop_host.py
           python scripts/verify_public_claims.py
+
+      - name: Run the live pre-tag preflight before the expensive build
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/release_candidate.py preflight
 
       - name: Build the local GUI from a digest-pinned image
         run: |
@@ -126,13 +132,25 @@ jobs:
 
           WORK="$(mktemp -d)"
           trap 'rm -rf "$WORK"' EXIT
-          python -m venv "$WORK/venv"
-          "$WORK/venv/bin/pip" install --quiet "$WHEEL"
+          python -m venv "$WORK/wheel-venv"
+          "$WORK/wheel-venv/bin/pip" install --quiet --no-cache-dir "$WHEEL"
           (
             cd "$WORK"
             unset PYTHONPATH
-            "$WORK/venv/bin/marvis" --version
-            "$WORK/venv/bin/marvis" --help >/dev/null
+            "$WORK/wheel-venv/bin/marvis" --version
+            "$WORK/wheel-venv/bin/marvis" --help >/dev/null
+          )
+
+          python -m venv "$WORK/sdist-venv"
+          "$WORK/sdist-venv/bin/pip" install --quiet --no-cache-dir \
+            --require-hashes -r requirements-release.lock
+          "$WORK/sdist-venv/bin/pip" install --quiet --no-cache-dir \
+            --no-build-isolation "$SDIST"
+          (
+            cd "$WORK"
+            unset PYTHONPATH
+            "$WORK/sdist-venv/bin/marvis" --version
+            "$WORK/sdist-venv/bin/marvis" --help >/dev/null
           )
 
       - name: Create and re-read the immutable artifact manifest

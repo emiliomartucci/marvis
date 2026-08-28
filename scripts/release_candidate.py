@@ -21,6 +21,7 @@ import tarfile
 import time
 from typing import Any
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -160,6 +161,22 @@ def _strict_external_receipts(
         raise ReleasePolicyError("external approval watchdog has no ready receipt")
     if watchdog.get("late_approval_upload_guard") is not True:
         raise ReleasePolicyError("late-approval upload guard is disabled")
+    expected_watchdog = {
+        "repository": policy.get("repository"),
+        "workflow": _publisher_coordinates(policy)["workflow"],
+        "environment": (policy.get("github_environment") or {}).get("name"),
+        "candidate_tag": policy.get("candidate_tag"),
+        "approval_deadline_hours": policy.get("approval_deadline_hours"),
+    }
+    observed_watchdog = {key: watchdog.get(key) for key in expected_watchdog}
+    if observed_watchdog != expected_watchdog:
+        raise ReleasePolicyError("approval watchdog receipt coordinates do not match policy")
+    watchdog_verified_at = _parse_time(str(watchdog.get("verified_at") or ""))
+    watchdog_age = (current - watchdog_verified_at).total_seconds()
+    if watchdog_age < 0 or watchdog_age > 24 * 3600:
+        raise ReleasePolicyError("approval watchdog receipt is stale")
+    if not watchdog.get("verified_by"):
+        raise ReleasePolicyError("approval watchdog receipt has no verifier")
 
 
 def _tag_target(root: Path, tag: str) -> str | None:
@@ -169,11 +186,30 @@ def _tag_target(root: Path, tag: str) -> str | None:
     return str(_git(root, "rev-list", "-n", "1", tag))
 
 
+def _validate_tag_trigger(tag: str, trigger_ref: str | None) -> None:
+    if trigger_ref is None:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            raise ReleasePolicyError("tag build has no GitHub trigger ref")
+        return
+    expected = f"refs/tags/{tag}"
+    if trigger_ref != expected:
+        raise ReleasePolicyError(
+            f"tag build was triggered by {trigger_ref}, expected {expected}"
+        )
+
+
 def validate_static(
-    root: Path, *, head: str = "HEAD", tag_build: bool = False
+    root: Path,
+    *,
+    head: str = "HEAD",
+    tag_build: bool = False,
+    trigger_ref: str | None = None,
 ) -> dict[str, Any]:
     root = root.resolve()
     policy = load_policy(root)
+    release_branch = str(policy.get("release_branch") or "")
+    if not release_branch or release_branch.startswith("refs/"):
+        raise ReleasePolicyError("release branch is invalid")
     base = str(policy.get("plan_b_product_base_sha") or "")
     if not SHA40.fullmatch(base):
         raise ReleasePolicyError("Plan B product base is not a full commit")
@@ -198,6 +234,8 @@ def validate_static(
     tag = str(policy.get("candidate_tag") or "")
     if version != expected or tag != f"v{version}":
         raise ReleasePolicyError("candidate version/tag does not match pyproject")
+    if tag_build:
+        _validate_tag_trigger(tag, trigger_ref or os.environ.get("GITHUB_REF"))
     if version == str(policy.get("historical_failed_version") or ""):
         raise ReleasePolicyError("historical failed version cannot be reused")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -230,6 +268,7 @@ def validate_static(
         'tags: ["v*"]',
         "pip install --require-hashes -r requirements-release.lock",
         "python -m build --no-isolation",
+        "release_candidate.py preflight",
         "release_candidate.py pretag",
         "release_candidate.py publish-window",
         "environment: pypi",
@@ -266,6 +305,7 @@ def validate_static(
         "schema": "marvis-public-release-static-preflight/v1",
         "product_base_sha": base,
         "release_source_sha": resolved_head,
+        "release_branch": release_branch,
         "version": version,
         "tag": tag,
         "changed_paths": changed,
@@ -296,6 +336,16 @@ def _request_json(url: str, *, token: str | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ReleasePolicyError(f"remote preflight returned non-object: {url}")
     return value
+
+
+def _require_remote_absence(
+    url: str, *, label: str, token: str | None = None
+) -> None:
+    try:
+        _request_json(url, token=token)
+    except FileNotFoundError:
+        return
+    raise ReleasePolicyError(f"{label} already exists")
 
 
 def _environment_check(policy: dict[str, Any], *, token: str, api_url: str) -> dict[str, Any]:
@@ -370,6 +420,54 @@ def _draft_release(
     }
 
 
+def preflight(
+    root: Path, *, token: str, api_url: str = "https://api.github.com"
+) -> dict[str, Any]:
+    report = validate_static(root)
+    policy = load_policy(root)
+    _strict_external_receipts(policy)
+    environment = _environment_check(policy, token=token, api_url=api_url)
+    repository = str(policy["repository"])
+    branch = urllib.parse.quote(str(policy["release_branch"]), safe="")
+    remote_branch = _request_json(
+        f"{api_url}/repos/{repository}/branches/{branch}", token=token
+    )
+    remote_sha = str((remote_branch.get("commit") or {}).get("sha") or "")
+    if remote_sha != report["release_source_sha"]:
+        raise ReleasePolicyError("release source is not the exact remote release-branch head")
+
+    tag = urllib.parse.quote(str(policy["candidate_tag"]), safe="")
+    _require_remote_absence(
+        f"{api_url}/repos/{repository}/git/ref/tags/{tag}",
+        label="candidate Git tag",
+        token=token,
+    )
+    _require_remote_absence(
+        f"{api_url}/repos/{repository}/releases/tags/{tag}",
+        label="candidate GitHub Release",
+        token=token,
+    )
+    package = urllib.parse.quote(str(policy["package"]), safe="")
+    version = urllib.parse.quote(str(policy["candidate_version"]), safe="")
+    _require_remote_absence(
+        f"https://pypi.org/pypi/{package}/{version}/json",
+        label="candidate PyPI version",
+    )
+    report.update(
+        {
+            "environment": environment,
+            "remote_release_branch_sha": remote_sha,
+            "namespace": {
+                "git_tag": "absent",
+                "github_release": "absent",
+                "pypi_version": "absent",
+            },
+            "status": "preflight_green",
+        }
+    )
+    return report
+
+
 def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -> dict[str, Any]:
     report = validate_static(root, tag_build=True)
     policy = load_policy(root)
@@ -429,6 +527,8 @@ def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[
         raise ReleasePolicyError("expected exactly one wheel and one source archive")
     rows = []
     for path in artifacts:
+        if path.is_symlink():
+            raise ReleasePolicyError(f"distribution is a symbolic link: {path.name}")
         name, version = _distribution_metadata(path)
         normalized_name = name.lower().replace("_", "-")
         if (
@@ -459,6 +559,16 @@ def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[
         "policy": {"path": str(POLICY_PATH), "sha256": static["policy_sha256"]},
         "action_pins": static["action_pins"],
         "build": policy["build"],
+        "release_controls": {
+            "release_branch": policy["release_branch"],
+            "approval_deadline_hours": policy["approval_deadline_hours"],
+            "github_environment": policy["github_environment"],
+            "trusted_publisher": {
+                "coordinates": _publisher_coordinates(policy),
+                "readback": policy["trusted_publisher"]["readback"],
+            },
+            "approval_watchdog": policy["approval_watchdog"],
+        },
         "artifacts": rows,
         "publication": {"github_release": "not_created", "pypi": "not_uploaded"},
     }
@@ -479,14 +589,40 @@ def verify_manifest(root: Path, manifest_path: Path, dist: Path) -> dict[str, An
         raise ReleasePolicyError("release workflow changed after artifact build")
     if manifest.get("policy", {}).get("sha256") != _sha_file(root / POLICY_PATH):
         raise ReleasePolicyError("release policy changed after artifact build")
-    expected = {row["filename"]: row for row in manifest.get("artifacts", [])}
+    rows = manifest.get("artifacts")
+    if not isinstance(rows, list) or not rows:
+        raise ReleasePolicyError("release manifest artifact inventory is empty")
+    try:
+        filenames = [str(row["filename"]) for row in rows]
+    except (KeyError, TypeError) as exc:
+        raise ReleasePolicyError("release manifest artifact inventory is invalid") from exc
+    if len(set(filenames)) != len(filenames):
+        raise ReleasePolicyError("release manifest contains duplicate artifact names")
+    expected = {filename: row for filename, row in zip(filenames, rows, strict=True)}
     observed = {path.name: path for path in [*dist.glob("*.whl"), *dist.glob("*.tar.gz")]}
     if set(expected) != set(observed):
         raise ReleasePolicyError("artifact file set differs from release manifest")
     for filename, row in expected.items():
         path = observed[filename]
+        if path.is_symlink():
+            raise ReleasePolicyError(f"distribution is a symbolic link: {filename}")
         if path.stat().st_size != row.get("size") or _sha_file(path) != row.get("sha256"):
             raise ReleasePolicyError(f"artifact bytes differ from manifest: {filename}")
+    allowed_files = set(expected)
+    try:
+        if manifest_path.parent.resolve() == dist.resolve():
+            allowed_files.add(manifest_path.name)
+    except OSError as exc:
+        raise ReleasePolicyError("release manifest path is unreadable") from exc
+    all_files = {
+        path.relative_to(dist).as_posix()
+        for path in dist.rglob("*")
+        if path.is_file() or path.is_symlink()
+    }
+    if all_files != allowed_files:
+        raise ReleasePolicyError(
+            f"release asset file set differs from manifest: {sorted(all_files)}"
+        )
     return {"status": "verified", "files": len(expected), "content_digest": claimed}
 
 
@@ -537,6 +673,8 @@ def publish_window(
     now: datetime | None = None,
     api_url: str = "https://api.github.com",
 ) -> dict[str, Any]:
+    if not str(run_id).isdigit():
+        raise ReleasePolicyError("workflow run id is invalid")
     policy = load_policy(root)
     _strict_external_receipts(policy, now=now)
     manifest = _load_json(manifest_path)
@@ -553,6 +691,10 @@ def publish_window(
         raise ReleasePolicyError("workflow identity differs from release policy")
     if run.get("event") != "push":
         raise ReleasePolicyError("publication run is not a tag push")
+    if run.get("head_branch") != policy["candidate_tag"]:
+        raise ReleasePolicyError("publication run was triggered by another tag")
+    if (run.get("head_repository") or {}).get("full_name") != repository:
+        raise ReleasePolicyError("publication run belongs to another repository")
     if _remote_tag_sha(policy, token=token, api_url=api_url) != manifest.get(
         "release_source_sha"
     ):
@@ -578,8 +720,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     static_parser = sub.add_parser("static")
     static_parser.add_argument("--tag-build", action="store_true")
+    static_parser.add_argument("--trigger-ref")
     pretag_parser = sub.add_parser("pretag")
     pretag_parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
+    preflight_parser = sub.add_parser("preflight")
+    preflight_parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
     manifest_parser = sub.add_parser("manifest")
     manifest_parser.add_argument("--dist", type=Path, required=True)
     manifest_parser.add_argument("--output", type=Path, required=True)
@@ -598,11 +743,19 @@ def main(argv: list[str] | None = None) -> int:
     root = args.root.resolve()
     try:
         if args.command == "static":
-            result = validate_static(root, tag_build=args.tag_build)
+            result = validate_static(
+                root,
+                tag_build=args.tag_build,
+                trigger_ref=args.trigger_ref,
+            )
         elif args.command == "pretag":
             if not args.token:
                 raise ReleasePolicyError("GITHUB_TOKEN is required for live pretag checks")
             result = pretag(root, token=args.token)
+        elif args.command == "preflight":
+            if not args.token:
+                raise ReleasePolicyError("GITHUB_TOKEN is required for live preflight checks")
+            result = preflight(root, token=args.token)
         elif args.command == "manifest":
             result = build_manifest(root, args.dist.resolve(), source_sha=args.source_sha)
             args.output.parent.mkdir(parents=True, exist_ok=True)
