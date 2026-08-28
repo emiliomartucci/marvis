@@ -382,6 +382,18 @@ jobs:
           test -n "$WHEEL" && test -n "$SDIST"
           smoke_install "$WHEEL" wheel
           smoke_install "$SDIST" sdist
+          python scripts/release_candidate.py acceptance \
+            --manifest release-artifact/release-manifest.json \
+            --registry-dist pypi-readback \
+            --github-dist gh-release-readback \
+            --output release-acceptance.json \
+            --run-id "$GITHUB_RUN_ID"
+          gh release upload "$GITHUB_REF_NAME" release-acceptance.json
+          mkdir acceptance-readback
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern release-acceptance.json \
+            --dir acceptance-readback
+          cmp release-acceptance.json acceptance-readback/release-acceptance.json
       - name: Finalize the verified GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

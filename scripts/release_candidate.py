@@ -25,6 +25,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+from packaging.version import InvalidVersion, Version
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
@@ -33,11 +35,20 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 POLICY_SCHEMA = "marvis-public-release-policy/v1"
 MANIFEST_SCHEMA = "marvis-public-release-manifest/v1"
+ACCEPTANCE_SCHEMA = "marvis-public-release-acceptance/v1"
 POLICY_PATH = Path("contracts/release/public-release-v1.json")
 WORKFLOW_PATH = Path(".github/workflows/release.yml")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 USES = re.compile(r"(?m)^\s*(?:-\s*)?uses:\s*([^#\s]+)")
+GENERATED_RELEASE_PREFIXES = (
+    "acceptance-readback/",
+    "apps/desktop-ui/out/",
+    "core/api/console_dist/",
+    "gh-release-readback/",
+    "pypi-readback/",
+    "release-artifact/",
+)
 
 
 class ReleasePolicyError(RuntimeError):
@@ -134,6 +145,58 @@ def _project_version(root: Path) -> str:
         raise ReleasePolicyError("pyproject version is not reviewable") from exc
 
 
+def _validate_pyproject_version_only(root: Path, base: str) -> None:
+    """Prove the release delta changes only project.version in pyproject."""
+    try:
+        base_document = tomllib.loads(str(_git(root, "show", f"{base}:pyproject.toml")))
+        candidate_document = tomllib.loads(
+            (root / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        base_version = base_document["project"]["version"]
+        candidate_document["project"]["version"] = base_version
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
+        raise ReleasePolicyError("pyproject release delta is not reviewable") from exc
+    if candidate_document != base_document:
+        raise ReleasePolicyError(
+            "pyproject release delta changes behavior beyond project.version"
+        )
+
+
+def _parsed_versions(values: list[str]) -> list[Version]:
+    parsed: list[Version] = []
+    for value in values:
+        normalized = value.removeprefix("v")
+        try:
+            parsed.append(Version(normalized))
+        except InvalidVersion:
+            continue
+    return parsed
+
+
+def _require_candidate_above_history(
+    policy: dict[str, Any], values: list[str], *, authority: str
+) -> None:
+    try:
+        candidate = Version(str(policy["candidate_version"]))
+    except (KeyError, InvalidVersion) as exc:
+        raise ReleasePolicyError("candidate version is invalid") from exc
+    historical = _parsed_versions(values)
+    if historical and candidate <= max(historical):
+        raise ReleasePolicyError(
+            f"candidate version is not above all {authority} identities"
+        )
+
+
+def _require_local_version_order(root: Path, policy: dict[str, Any]) -> None:
+    candidate_tag = str(policy.get("candidate_tag") or "")
+    tags = [
+        line
+        for line in str(_git(root, "tag", "--list", "v*")).splitlines()
+        if line and line != candidate_tag
+    ]
+    _require_candidate_above_history(policy, tags, authority="Git tag")
+
+
 def _path_allowed(path: str, allowlist: list[str]) -> bool:
     return any(path == item or (item.endswith("/") and path.startswith(item)) for item in allowlist)
 
@@ -141,6 +204,30 @@ def _path_allowed(path: str, allowlist: list[str]) -> bool:
 def _changed_paths(root: Path, base: str, head: str) -> list[str]:
     raw = str(_git(root, "diff", "--name-only", f"{base}..{head}"))
     return sorted(line for line in raw.splitlines() if line)
+
+
+def _require_release_controls_committed(root: Path, resolved_head: str) -> None:
+    tracked_dirty = {
+        line
+        for line in str(_git(root, "diff", "--name-only", resolved_head, "--")).splitlines()
+        if line
+    }
+    untracked = {
+        line
+        for line in str(
+            _git(root, "ls-files", "--others", "--exclude-standard")
+        ).splitlines()
+        if line
+    }
+    unexpected = sorted(
+        path
+        for path in tracked_dirty | untracked
+        if not path.startswith(GENERATED_RELEASE_PREFIXES)
+    )
+    if unexpected:
+        raise ReleasePolicyError(
+            f"release source tree differs from the checked-out commit: {unexpected}"
+        )
 
 
 def _action_pins(workflow: str) -> dict[str, str]:
@@ -270,6 +357,8 @@ def validate_static(
     )
     if ancestor.returncode != 0:
         raise ReleasePolicyError("release source does not descend from exact Plan B merge")
+    _validate_pyproject_version_only(root, base)
+    _require_local_version_order(root, policy)
 
     allowlist = policy.get("allowed_release_delta")
     if not isinstance(allowlist, list) or not allowlist:
@@ -336,6 +425,9 @@ def validate_static(
         '-e MARVIS_CONSOLE_BUILD_ID="$desktop_source_sha" \\',
         "bash -lc 'npm ci && npm run test:build-id && npm run audit:production && npm run build'",
         "python scripts/release_candidate.py registry-download \\",
+        "python scripts/release_candidate.py acceptance \\",
+        'gh release upload "$GITHUB_REF_NAME" release-acceptance.json',
+        "cmp release-acceptance.json acceptance-readback/release-acceptance.json",
         '"$python_bin" scripts/verify_local_upgrade.py \\',
         '"$marvis" doctor --offline',
         '"$marvis" hooks install',
@@ -432,6 +524,68 @@ def _candidate_pypi_url(policy: dict[str, Any]) -> str:
     return f"https://pypi.org/pypi/{package}/{version}/json"
 
 
+def _registry_history_check(policy: dict[str, Any]) -> dict[str, Any]:
+    package = urllib.parse.quote(str(policy["package"]), safe="")
+    registry = _request_json(f"https://pypi.org/pypi/{package}/json")
+    releases = registry.get("releases")
+    if not isinstance(releases, dict):
+        raise ReleasePolicyError("PyPI version history is unavailable")
+    _require_candidate_above_history(
+        policy,
+        [str(version) for version in releases],
+        authority="PyPI",
+    )
+    return registry
+
+
+def _remote_release_branch_sha(
+    policy: dict[str, Any], *, token: str, api_url: str
+) -> str:
+    repository = str(policy["repository"])
+    branch = urllib.parse.quote(str(policy["release_branch"]), safe="")
+    remote_branch = _request_json(
+        f"{api_url}/repos/{repository}/branches/{branch}", token=token
+    )
+    remote_sha = str((remote_branch.get("commit") or {}).get("sha") or "")
+    if not SHA40.fullmatch(remote_sha):
+        raise ReleasePolicyError("remote release-branch head is invalid")
+    return remote_sha
+
+
+def _require_remote_release_source(
+    policy: dict[str, Any],
+    release_source_sha: str,
+    *,
+    token: str,
+    api_url: str,
+    allow_branch_advance: bool = False,
+) -> str:
+    remote_sha = _remote_release_branch_sha(policy, token=token, api_url=api_url)
+    if remote_sha == release_source_sha:
+        return remote_sha
+    if not allow_branch_advance:
+        raise ReleasePolicyError(
+            "release source is not the exact remote release-branch head"
+        )
+    repository = str(policy["repository"])
+    branch = urllib.parse.quote(str(policy["release_branch"]), safe="")
+    source = urllib.parse.quote(release_source_sha, safe="")
+    try:
+        comparison = _request_json(
+            f"{api_url}/repos/{repository}/compare/{source}...{branch}", token=token
+        )
+    except FileNotFoundError as exc:
+        raise ReleasePolicyError(
+            "release source is not contained in remote release-branch history"
+        ) from exc
+    merge_base_sha = str((comparison.get("merge_base_commit") or {}).get("sha") or "")
+    if comparison.get("status") != "ahead" or merge_base_sha != release_source_sha:
+        raise ReleasePolicyError(
+            "release source is not contained in remote release-branch history"
+        )
+    return remote_sha
+
+
 def _environment_check(policy: dict[str, Any], *, token: str, api_url: str) -> dict[str, Any]:
     repository = str(policy["repository"])
     expected = policy["github_environment"]
@@ -440,29 +594,34 @@ def _environment_check(policy: dict[str, Any], *, token: str, api_url: str) -> d
     )
     if environment.get("can_admins_bypass") is not expected["can_admins_bypass"]:
         raise ReleasePolicyError("GitHub environment administrative bypass policy is unsafe")
-    reviewer_logins = {
-        str((item.get("reviewer") or {}).get("login") or "")
+    required_rules = [
+        rule
         for rule in environment.get("protection_rules", [])
         if rule.get("type") == "required_reviewers"
-        for item in rule.get("reviewers", [])
+    ]
+    if len(required_rules) != 1:
+        raise ReleasePolicyError("GitHub environment reviewer rule is ambiguous")
+    reviewer_logins = {
+        str((item.get("reviewer") or {}).get("login") or "")
+        for item in required_rules[0].get("reviewers", [])
     }
-    if expected["required_reviewer_login"] not in reviewer_logins:
-        raise ReleasePolicyError("required owner reviewer is absent from GitHub environment")
-    required_rule = next(
-        (
-            rule
-            for rule in environment.get("protection_rules", [])
-            if rule.get("type") == "required_reviewers"
-        ),
-        {},
-    )
+    if reviewer_logins != {expected["required_reviewer_login"]}:
+        raise ReleasePolicyError(
+            "GitHub environment must have exactly the required owner reviewer"
+        )
+    required_rule = required_rules[0]
     if required_rule.get("prevent_self_review") is not expected["prevent_self_review"]:
         raise ReleasePolicyError("GitHub environment self-review policy drift")
+    if "deployment_branch_policy" not in expected:
+        raise ReleasePolicyError("GitHub environment branch policy is unspecified")
+    if environment.get("deployment_branch_policy") != expected["deployment_branch_policy"]:
+        raise ReleasePolicyError("GitHub environment deployment-branch policy drift")
     return {
         "name": environment.get("name"),
         "can_admins_bypass": environment.get("can_admins_bypass"),
         "reviewers": sorted(reviewer_logins),
         "prevent_self_review": required_rule.get("prevent_self_review"),
+        "deployment_branch_policy": environment.get("deployment_branch_policy"),
     }
 
 
@@ -509,16 +668,16 @@ def preflight(
 ) -> dict[str, Any]:
     report = validate_static(root)
     policy = load_policy(root)
+    _require_release_controls_committed(root, report["release_source_sha"])
     _strict_external_receipts(policy)
     environment = _environment_check(policy, token=token, api_url=api_url)
-    repository = str(policy["repository"])
-    branch = urllib.parse.quote(str(policy["release_branch"]), safe="")
-    remote_branch = _request_json(
-        f"{api_url}/repos/{repository}/branches/{branch}", token=token
+    remote_sha = _require_remote_release_source(
+        policy,
+        report["release_source_sha"],
+        token=token,
+        api_url=api_url,
     )
-    remote_sha = str((remote_branch.get("commit") or {}).get("sha") or "")
-    if remote_sha != report["release_source_sha"]:
-        raise ReleasePolicyError("release source is not the exact remote release-branch head")
+    repository = str(policy["repository"])
 
     tag = urllib.parse.quote(str(policy["candidate_tag"]), safe="")
     _require_remote_absence(
@@ -535,10 +694,12 @@ def preflight(
         _candidate_pypi_url(policy),
         label="candidate PyPI version",
     )
+    registry = _registry_history_check(policy)
     report.update(
         {
             "environment": environment,
             "remote_release_branch_sha": remote_sha,
+            "registry_latest": (registry.get("info") or {}).get("version"),
             "namespace": {
                 "git_tag": "absent",
                 "github_release": "absent",
@@ -557,11 +718,19 @@ def tag_preflight(
 
     report = validate_static(root, tag_build=True)
     policy = load_policy(root)
+    _require_release_controls_committed(root, report["release_source_sha"])
     _strict_external_receipts(policy)
     environment = _environment_check(policy, token=token, api_url=api_url)
     remote_tag_sha = _remote_tag_sha(policy, token=token, api_url=api_url)
     if remote_tag_sha != report["release_source_sha"]:
         raise ReleasePolicyError("GitHub tag differs from the reviewed release source")
+    remote_branch_sha = _require_remote_release_source(
+        policy,
+        report["release_source_sha"],
+        token=token,
+        api_url=api_url,
+        allow_branch_advance=True,
+    )
     repository = str(policy["repository"])
     tag = urllib.parse.quote(str(policy["candidate_tag"]), safe="")
     _require_remote_absence(
@@ -573,10 +742,13 @@ def tag_preflight(
         _candidate_pypi_url(policy),
         label="candidate PyPI version",
     )
+    registry = _registry_history_check(policy)
     report.update(
         {
             "environment": environment,
             "remote_tag_sha": remote_tag_sha,
+            "remote_release_branch_sha": remote_branch_sha,
+            "registry_latest": (registry.get("info") or {}).get("version"),
             "namespace": {"github_release": "absent", "pypi_version": "absent"},
             "status": "tag_preflight_green",
         }
@@ -587,21 +759,30 @@ def tag_preflight(
 def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -> dict[str, Any]:
     report = validate_static(root, tag_build=True)
     policy = load_policy(root)
+    _require_release_controls_committed(root, report["release_source_sha"])
     _strict_external_receipts(policy)
     environment = _environment_check(policy, token=token, api_url=api_url)
     remote_tag_sha = _remote_tag_sha(policy, token=token, api_url=api_url)
     if remote_tag_sha != report["release_source_sha"]:
         raise ReleasePolicyError("GitHub tag differs from the reviewed release source")
+    remote_branch_sha = _require_remote_release_source(
+        policy,
+        report["release_source_sha"],
+        token=token,
+        api_url=api_url,
+        allow_branch_advance=True,
+    )
     release = _draft_release(policy, token=token, api_url=api_url)
     _require_remote_absence(
         _candidate_pypi_url(policy),
         label="candidate PyPI version",
     )
-    registry = _request_json(f"https://pypi.org/pypi/{policy['package']}/json")
+    registry = _registry_history_check(policy)
     report.update(
         {
             "environment": environment,
             "github_release": release,
+            "remote_release_branch_sha": remote_branch_sha,
             "registry_latest": (registry.get("info") or {}).get("version"),
         }
     )
@@ -647,6 +828,8 @@ def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[
     tag_exists = _tag_target(root, load_policy(root)["candidate_tag"]) is not None
     static = validate_static(root, head=resolved_source, tag_build=tag_exists)
     policy = load_policy(root)
+    if tag_exists or os.environ.get("GITHUB_ACTIONS") == "true":
+        _require_release_controls_committed(root, resolved_source)
     artifacts = sorted(
         [*dist.glob("*.whl"), *dist.glob("*.tar.gz")], key=lambda item: item.name
     )
@@ -697,7 +880,10 @@ def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[
             "approval_watchdog": policy["approval_watchdog"],
         },
         "artifacts": rows,
-        "publication": {"github_release": "not_created", "pypi": "not_uploaded"},
+        "candidate_state_at_build": {
+            "github_release": "not_created",
+            "pypi": "not_uploaded",
+        },
     }
     manifest["content_digest"] = _sha_bytes(_canonical(manifest))
     return manifest
@@ -884,6 +1070,115 @@ def registry_download(
     return {**report, "status": "registry_downloaded", "destination": str(destination)}
 
 
+def _workflow_run_readback(
+    policy: dict[str, Any],
+    release_source_sha: str,
+    *,
+    token: str,
+    run_id: str,
+    api_url: str,
+) -> dict[str, Any]:
+    if not str(run_id).isdigit():
+        raise ReleasePolicyError("workflow run id is invalid")
+    repository = str(policy["repository"])
+    run = _request_json(
+        f"{api_url}/repos/{repository}/actions/runs/{run_id}", token=token
+    )
+    if run.get("head_sha") != release_source_sha:
+        raise ReleasePolicyError("workflow run SHA differs from immutable manifest")
+    if run.get("path") != str(WORKFLOW_PATH):
+        raise ReleasePolicyError("workflow identity differs from release policy")
+    if run.get("event") != "push":
+        raise ReleasePolicyError("publication run is not a tag push")
+    if run.get("head_branch") != policy["candidate_tag"]:
+        raise ReleasePolicyError("publication run was triggered by another tag")
+    if (run.get("head_repository") or {}).get("full_name") != repository:
+        raise ReleasePolicyError("publication run belongs to another repository")
+    return run
+
+
+def build_acceptance_receipt(
+    root: Path,
+    manifest_path: Path,
+    registry_dist: Path,
+    github_dist: Path,
+    *,
+    token: str,
+    run_id: str,
+    now: datetime | None = None,
+    api_url: str = "https://api.github.com",
+) -> dict[str, Any]:
+    """Bind registry bytes and passed product-smoke gates before finalization."""
+    manifest = _validated_manifest(manifest_path)
+    source_sha = str(manifest.get("release_source_sha") or "")
+    if not SHA40.fullmatch(source_sha):
+        raise ReleasePolicyError("release manifest source is invalid")
+    verify_manifest(root, manifest_path, registry_dist)
+    verify_manifest(root, github_dist / manifest_path.name, github_dist)
+    registry = registry_verify(manifest_path, attempts=1, delay_seconds=0)
+    policy = load_policy(root)
+    _strict_external_receipts(policy, now=now)
+    remote_tag_sha = _remote_tag_sha(policy, token=token, api_url=api_url)
+    if remote_tag_sha != source_sha:
+        raise ReleasePolicyError("candidate tag moved before acceptance receipt")
+    remote_branch_sha = _require_remote_release_source(
+        policy,
+        source_sha,
+        token=token,
+        api_url=api_url,
+        allow_branch_advance=True,
+    )
+    release = _draft_release(policy, token=token, api_url=api_url)
+    run = _workflow_run_readback(
+        policy,
+        source_sha,
+        token=token,
+        run_id=run_id,
+        api_url=api_url,
+    )
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    receipt = {
+        "schema": ACCEPTANCE_SCHEMA,
+        "created_at": current.isoformat().replace("+00:00", "Z"),
+        "repository": policy["repository"],
+        "package": manifest["package"],
+        "version": manifest["version"],
+        "tag": manifest["tag"],
+        "product_base_sha": manifest["product_base_sha"],
+        "release_source_sha": source_sha,
+        "remote_release_branch_sha": remote_branch_sha,
+        "remote_tag_sha": remote_tag_sha,
+        "workflow_run": {
+            "id": str(run_id),
+            "path": run.get("path"),
+            "event": run.get("event"),
+            "head_branch": run.get("head_branch"),
+            "head_sha": run.get("head_sha"),
+        },
+        "candidate_manifest": {
+            "filename": manifest_path.name,
+            "sha256": _sha_file(manifest_path),
+            "content_digest": manifest["content_digest"],
+        },
+        "registry_readback": {
+            **registry,
+            "artifacts": manifest["artifacts"],
+        },
+        "github_release_readback": release,
+        "passed_gates": [
+            "github_release_asset_bytes",
+            "pypi_registry_file_set",
+            "pypi_registry_download_bytes",
+            "wheel_clean_install_and_local_journey",
+            "sdist_clean_install_and_local_journey",
+            "supported_prior_backup_upgrade_restore_before_pin",
+        ],
+        "terminal_state": "accepted_ready_for_github_release_finalization",
+    }
+    receipt["content_digest"] = _sha_bytes(_canonical(receipt))
+    return receipt
+
+
 def publish_window(
     root: Path,
     manifest_path: Path,
@@ -894,32 +1189,32 @@ def publish_window(
     now: datetime | None = None,
     api_url: str = "https://api.github.com",
 ) -> dict[str, Any]:
-    if not str(run_id).isdigit():
-        raise ReleasePolicyError("workflow run id is invalid")
     policy = load_policy(root)
     _strict_external_receipts(policy, now=now)
     manifest = _validated_manifest(manifest_path)
-    repository = policy["repository"]
-    run = _request_json(f"{api_url}/repos/{repository}/actions/runs/{run_id}", token=token)
+    run = _workflow_run_readback(
+        policy,
+        str(manifest.get("release_source_sha") or ""),
+        token=token,
+        run_id=run_id,
+        api_url=api_url,
+    )
     created = _parse_time(str(run.get("created_at") or ""))
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     age = (current - created).total_seconds()
     if age < 0 or age > int(policy["approval_deadline_hours"]) * 3600:
         raise ReleasePolicyError("release approval window expired")
-    if run.get("head_sha") != manifest.get("release_source_sha"):
-        raise ReleasePolicyError("workflow run SHA differs from immutable manifest")
-    if run.get("path") != str(WORKFLOW_PATH):
-        raise ReleasePolicyError("workflow identity differs from release policy")
-    if run.get("event") != "push":
-        raise ReleasePolicyError("publication run is not a tag push")
-    if run.get("head_branch") != policy["candidate_tag"]:
-        raise ReleasePolicyError("publication run was triggered by another tag")
-    if (run.get("head_repository") or {}).get("full_name") != repository:
-        raise ReleasePolicyError("publication run belongs to another repository")
     if _remote_tag_sha(policy, token=token, api_url=api_url) != manifest.get(
         "release_source_sha"
     ):
         raise ReleasePolicyError("candidate tag moved after artifact creation")
+    remote_branch_sha = _require_remote_release_source(
+        policy,
+        str(manifest.get("release_source_sha") or ""),
+        token=token,
+        api_url=api_url,
+        allow_branch_advance=True,
+    )
     _draft_release(policy, token=token, api_url=api_url)
     environment = _environment_check(policy, token=token, api_url=api_url)
     verify_manifest(root, manifest_path, dist)
@@ -927,11 +1222,14 @@ def publish_window(
         _candidate_pypi_url(policy),
         label="candidate PyPI version",
     )
+    registry = _registry_history_check(policy)
     return {
         "status": "publication_window_green",
         "run_id": str(run_id),
         "age_seconds": int(age),
         "environment": environment,
+        "remote_release_branch_sha": remote_branch_sha,
+        "registry_latest": (registry.get("info") or {}).get("version"),
     }
 
 
@@ -964,6 +1262,15 @@ def main(argv: list[str] | None = None) -> int:
     registry_download_parser = sub.add_parser("registry-download")
     registry_download_parser.add_argument("--manifest", type=Path, required=True)
     registry_download_parser.add_argument("--dest", type=Path, required=True)
+    acceptance_parser = sub.add_parser("acceptance")
+    acceptance_parser.add_argument("--manifest", type=Path, required=True)
+    acceptance_parser.add_argument("--registry-dist", type=Path, required=True)
+    acceptance_parser.add_argument("--github-dist", type=Path, required=True)
+    acceptance_parser.add_argument("--output", type=Path, required=True)
+    acceptance_parser.add_argument(
+        "--token", default=os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    )
+    acceptance_parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID"))
     window_parser = sub.add_parser("publish-window")
     window_parser.add_argument("--manifest", type=Path, required=True)
     window_parser.add_argument("--dist", type=Path, required=True)
@@ -1006,6 +1313,22 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "registry-download":
             result = registry_download(
                 args.manifest.resolve(), args.dest.resolve()
+            )
+        elif args.command == "acceptance":
+            if not args.token or not args.run_id:
+                raise ReleasePolicyError("GITHUB_TOKEN and GITHUB_RUN_ID are required")
+            result = build_acceptance_receipt(
+                root,
+                args.manifest.resolve(),
+                args.registry_dist.resolve(),
+                args.github_dist.resolve(),
+                token=args.token,
+                run_id=args.run_id,
+            )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
             )
         else:
             if not args.token or not args.run_id:

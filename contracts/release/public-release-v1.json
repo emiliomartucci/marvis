@@ -24,7 +24,8 @@
     "name": "pypi",
     "required_reviewer_login": "emiliomartucci",
     "prevent_self_review": false,
-    "can_admins_bypass": false
+    "can_admins_bypass": false,
+    "deployment_branch_policy": null
   },
   "trusted_publisher": {
     "project": "marvisx-cli",

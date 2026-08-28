@@ -80,6 +80,17 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertNotIn("python scripts/test_release_candidate.py", lines)
         self.assertIn("run: echo ok", lines)
 
+    def test_release_source_tree_rejects_uncommitted_product_code(self) -> None:
+        with mock.patch.object(
+            candidate,
+            "_git",
+            side_effect=["core/api/main.py", "release-artifact/packages/a.whl"],
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "source tree"):
+            candidate._require_release_controls_committed(
+                ROOT,
+                "a" * 40,
+            )
+
     def test_tag_build_rejects_another_trigger_tag(self) -> None:
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "another-tag"):
             candidate._validate_tag_trigger("v0.4.1", "refs/tags/another-tag")
@@ -90,6 +101,80 @@ class ReleaseCandidateTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "product behavior"):
                 candidate.validate_static(ROOT)
+
+    def test_pyproject_release_delta_rejects_dependency_change(self) -> None:
+        base = copy.deepcopy(candidate.tomllib.loads((ROOT / "pyproject.toml").read_text()))
+        changed = copy.deepcopy(base)
+        changed["project"]["dependencies"].append("unreviewed-runtime>=1")
+        with mock.patch.object(
+            candidate.tomllib,
+            "loads",
+            side_effect=[base, changed],
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "beyond project.version"):
+            candidate._validate_pyproject_version_only(
+                ROOT, self.policy()["plan_b_product_base_sha"]
+            )
+
+    def test_candidate_version_must_exceed_all_history(self) -> None:
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "above all PyPI"):
+            candidate._require_candidate_above_history(
+                self.policy(), ["0.3.8", "0.4.2"], authority="PyPI"
+            )
+
+    def test_tagged_source_remains_valid_after_release_branch_advances(self) -> None:
+        policy = self.policy()
+        source = "a" * 40
+        remote_head = "b" * 40
+        comparison = {
+            "status": "ahead",
+            "merge_base_commit": {"sha": source},
+        }
+        with mock.patch.object(
+            candidate, "_remote_release_branch_sha", return_value=remote_head
+        ), mock.patch.object(candidate, "_request_json", return_value=comparison):
+            observed = candidate._require_remote_release_source(
+                policy,
+                source,
+                token="masked",
+                api_url="https://api.example",
+                allow_branch_advance=True,
+            )
+        self.assertEqual(observed, remote_head)
+
+    def test_unmerged_tagged_source_is_rejected(self) -> None:
+        policy = self.policy()
+        source = "a" * 40
+        with mock.patch.object(
+            candidate, "_remote_release_branch_sha", return_value="b" * 40
+        ), mock.patch.object(
+            candidate,
+            "_request_json",
+            return_value={
+                "status": "diverged",
+                "merge_base_commit": {"sha": "c" * 40},
+            },
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "not contained"):
+            candidate._require_remote_release_source(
+                policy,
+                source,
+                token="masked",
+                api_url="https://api.example",
+                allow_branch_advance=True,
+            )
+
+    def test_disconnected_tagged_source_is_rejected(self) -> None:
+        with mock.patch.object(
+            candidate, "_remote_release_branch_sha", return_value="b" * 40
+        ), mock.patch.object(
+            candidate, "_request_json", side_effect=FileNotFoundError("compare")
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "not contained"):
+            candidate._require_remote_release_source(
+                self.policy(),
+                "a" * 40,
+                token="masked",
+                api_url="https://api.example",
+                allow_branch_advance=True,
+            )
 
     def test_external_receipts_fail_closed(self) -> None:
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "not verified"):
@@ -175,6 +260,66 @@ class ReleaseCandidateTests(unittest.TestCase):
             (dist / "unreviewed-installer.sh").write_text("exit 0\n", encoding="utf-8")
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "file set"):
                 candidate.verify_manifest(ROOT, manifest_path, dist)
+
+    def test_acceptance_receipt_binds_registry_and_workflow(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.verified_external_policy(now)
+        with tempfile.TemporaryDirectory(prefix="release-acceptance-") as raw:
+            root = Path(raw)
+            registry_dist = root / "registry"
+            github_dist = root / "github"
+            self.write_release_artifacts(registry_dist)
+            self.write_release_artifacts(github_dist)
+            manifest = candidate.build_manifest(ROOT, registry_dist)
+            manifest_path = root / "release-manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            (github_dist / manifest_path.name).write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            run = {
+                "head_sha": manifest["release_source_sha"],
+                "path": str(candidate.WORKFLOW_PATH),
+                "event": "push",
+                "head_branch": policy["candidate_tag"],
+                "head_repository": {"full_name": policy["repository"]},
+            }
+            with mock.patch.object(
+                candidate, "load_policy", return_value=policy
+            ), mock.patch.object(candidate, "_strict_external_receipts"), mock.patch.object(
+                candidate, "verify_manifest"
+            ), mock.patch.object(
+                candidate,
+                "registry_verify",
+                return_value={"status": "registry_verified", "files": 2},
+            ), mock.patch.object(
+                candidate, "_remote_tag_sha", return_value=manifest["release_source_sha"]
+            ), mock.patch.object(
+                candidate,
+                "_require_remote_release_source",
+                return_value=manifest["release_source_sha"],
+            ), mock.patch.object(
+                candidate,
+                "_draft_release",
+                return_value={"id": 1, "draft": True, "prerelease": True},
+            ), mock.patch.object(
+                candidate, "_workflow_run_readback", return_value=run
+            ):
+                receipt = candidate.build_acceptance_receipt(
+                    ROOT,
+                    manifest_path,
+                    registry_dist,
+                    github_dist,
+                    token="masked",
+                    run_id="123",
+                    now=now,
+                    api_url="https://api.example",
+                )
+            claimed = receipt.pop("content_digest")
+            self.assertEqual(claimed, candidate._sha_bytes(candidate._canonical(receipt)))
+            self.assertEqual(
+                receipt["terminal_state"],
+                "accepted_ready_for_github_release_finalization",
+            )
 
     def test_registry_readback_retries_then_matches_exact_bytes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="registry-readback-") as raw:
@@ -318,6 +463,8 @@ class ReleaseCandidateTests(unittest.TestCase):
         ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
             candidate, "_strict_external_receipts"
         ), mock.patch.object(
+            candidate, "_require_release_controls_committed"
+        ), mock.patch.object(
             candidate, "_environment_check", return_value={"name": "pypi"}
         ), mock.patch.object(
             candidate, "_remote_tag_sha", return_value="b" * 40
@@ -335,9 +482,15 @@ class ReleaseCandidateTests(unittest.TestCase):
         ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
             candidate, "_strict_external_receipts"
         ), mock.patch.object(
+            candidate, "_require_release_controls_committed"
+        ), mock.patch.object(
             candidate, "_environment_check", return_value={"name": "pypi"}
         ), mock.patch.object(
             candidate, "_remote_tag_sha", return_value=reviewed
+        ), mock.patch.object(
+            candidate, "_require_remote_release_source", return_value=reviewed
+        ), mock.patch.object(
+            candidate, "_registry_history_check", return_value={"info": {"version": "0.3.8"}}
         ), mock.patch.object(candidate, "_require_remote_absence") as absence:
             report = candidate.tag_preflight(
                 ROOT, token="masked", api_url="https://api.example"
@@ -357,13 +510,18 @@ class ReleaseCandidateTests(unittest.TestCase):
         ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
             candidate, "_strict_external_receipts"
         ), mock.patch.object(
+            candidate, "_require_release_controls_committed"
+        ), mock.patch.object(
             candidate, "_environment_check", return_value={"name": "pypi"}
         ), mock.patch.object(
-            candidate,
-            "_request_json",
-            return_value={"commit": {"sha": "b" * 40}},
+            candidate, "_require_remote_release_source", return_value="b" * 40
+        ), mock.patch.object(
+            candidate, "_registry_history_check", return_value={"info": {"version": "0.3.8"}}
         ):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "exact remote"):
+                candidate._require_remote_release_source.side_effect = candidate.ReleasePolicyError(
+                    "release source is not the exact remote release-branch head"
+                )
                 candidate.preflight(ROOT, token="masked", api_url="https://api.example")
 
     def test_preflight_proves_exact_head_and_unused_namespace(self) -> None:
@@ -378,12 +536,17 @@ class ReleaseCandidateTests(unittest.TestCase):
         ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
             candidate, "_strict_external_receipts"
         ), mock.patch.object(
+            candidate, "_require_release_controls_committed"
+        ), mock.patch.object(
             candidate, "_environment_check", return_value={"name": "pypi"}
+        ), mock.patch.object(
+            candidate, "_require_remote_release_source", return_value=reviewed
+        ), mock.patch.object(
+            candidate, "_registry_history_check", return_value={"info": {"version": "0.3.8"}}
         ), mock.patch.object(
             candidate,
             "_request_json",
             side_effect=[
-                {"commit": {"sha": reviewed}},
                 FileNotFoundError("tag"),
                 FileNotFoundError("release"),
                 FileNotFoundError("pypi"),
@@ -407,6 +570,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         response = {
             "name": "pypi",
             "can_admins_bypass": True,
+            "deployment_branch_policy": None,
             "protection_rules": [
                 {
                     "type": "required_reviewers",
@@ -423,6 +587,54 @@ class ReleaseCandidateTests(unittest.TestCase):
                     policy, token="masked", api_url="https://api.example"
                 )
 
+    def test_environment_extra_reviewer_is_rejected(self) -> None:
+        policy = self.policy()
+        response = {
+            "name": "pypi",
+            "can_admins_bypass": False,
+            "deployment_branch_policy": None,
+            "protection_rules": [
+                {
+                    "type": "required_reviewers",
+                    "prevent_self_review": False,
+                    "reviewers": [
+                        {"reviewer": {"login": "emiliomartucci"}},
+                        {"reviewer": {"login": "another-user"}},
+                    ],
+                }
+            ],
+        }
+        with mock.patch.object(candidate, "_request_json", return_value=response):
+            with self.assertRaisesRegex(candidate.ReleasePolicyError, "exactly"):
+                candidate._environment_check(
+                    policy, token="masked", api_url="https://api.example"
+                )
+
+    def test_tag_preflight_rejects_unmerged_release_source(self) -> None:
+        policy = self.policy()
+        reviewed = "a" * 40
+        with mock.patch.object(
+            candidate, "validate_static", return_value={"release_source_sha": reviewed}
+        ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
+            candidate, "_strict_external_receipts"
+        ), mock.patch.object(
+            candidate, "_require_release_controls_committed"
+        ), mock.patch.object(
+            candidate, "_environment_check", return_value={"name": "pypi"}
+        ), mock.patch.object(
+            candidate, "_remote_tag_sha", return_value=reviewed
+        ), mock.patch.object(
+            candidate,
+            "_require_remote_release_source",
+            side_effect=candidate.ReleasePolicyError(
+                "release source is not the exact remote release-branch head"
+            ),
+        ):
+            with self.assertRaisesRegex(candidate.ReleasePolicyError, "exact remote"):
+                candidate.tag_preflight(
+                    ROOT, token="masked", api_url="https://api.example"
+                )
+
     def test_publication_window_rejects_late_approval(self) -> None:
         now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
         policy = self.verified_external_policy(now)
@@ -434,6 +646,8 @@ class ReleaseCandidateTests(unittest.TestCase):
                 "head_sha": "a" * 40,
                 "path": str(candidate.WORKFLOW_PATH),
                 "event": "push",
+                "head_branch": policy["candidate_tag"],
+                "head_repository": {"full_name": policy["repository"]},
             }
             with mock.patch.object(
                 candidate, "load_policy", return_value=policy
@@ -501,6 +715,8 @@ class ReleaseCandidateTests(unittest.TestCase):
                 candidate, "_request_json", return_value=run
             ), mock.patch.object(
                 candidate, "_remote_tag_sha", return_value="a" * 40
+            ), mock.patch.object(
+                candidate, "_require_remote_release_source", return_value="a" * 40
             ), mock.patch.object(candidate, "_draft_release"), mock.patch.object(
                 candidate, "_environment_check", return_value={"name": "pypi"}
             ), mock.patch.object(candidate, "verify_manifest"), mock.patch.object(
