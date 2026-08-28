@@ -1,0 +1,51 @@
+{
+  "schema": "marvis-hook-policy/v1",
+  "canonical_source": "core/scripts/safety_bridge.py",
+  "generated_resource": "core/scripts/install_hooks/safety_bridge.py",
+  "installer_module": "core/cli/marvis_hooks.py",
+  "installed_name": "safety_bridge.py",
+  "policy_sha256": "9375dd308b51a2dc76701b8ed827db98fd1690b4873e50d0c1d22e033a7a65f6",
+  "mandatory_installer_files": [
+    "_config.sh",
+    "block-dangerous-bash.sh",
+    "block-db-direct-write.sh",
+    "block-push-no-task.sh",
+    "block-staging-to-prod.sh",
+    "block-subtree-push.sh",
+    "config.json",
+    "enforce-no-merge-main.sh",
+    "enforce-worktree.sh",
+    "quality-gate.sh",
+    "safety_bridge.py",
+    "secret-scan.sh"
+  ],
+  "behavior_cases": [
+    {
+      "name": "dangerous-root-delete",
+      "wrapper": "block-dangerous-bash.sh",
+      "payload": {
+        "cwd": "/tmp",
+        "tool_input": {"command": "rm -rf /"}
+      },
+      "expected_permission": "deny"
+    },
+    {
+      "name": "harmless-command",
+      "wrapper": "block-dangerous-bash.sh",
+      "payload": {
+        "cwd": "/tmp",
+        "tool_input": {"command": "printf harmless"}
+      },
+      "expected_permission": "no_output"
+    },
+    {
+      "name": "direct-database-write",
+      "wrapper": "block-db-direct-write.sh",
+      "payload": {
+        "cwd": "/tmp",
+        "tool_input": {"command": "sqlite3 console.db 'DELETE FROM tasks'"}
+      },
+      "expected_permission": "deny"
+    }
+  ]
+}

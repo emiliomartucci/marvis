@@ -1,0 +1,603 @@
+# Governed action manifest — the shared use-case seam of the marvisx engine.
+# U2 artifact 3/3 (separation goal 2026-07-24). Guarded by
+# tests/contracts/test_actions_manifest.py: every public callable under
+# core/api/use_cases/** must appear here (as an action or under internal), and
+# every action must map to a real callable — the manifest cannot rot. And by
+# tests/contracts/actions_compat.py: a published id may not disappear between
+# the base branch and this one without a declared transition.
+#
+# PROPOSED, ratified at Triage (same pattern as the #174 profile):
+# - naming scheme: marvis.<domain>.<action>, where <action> is the callable
+#   name with redundant domain tokens stripped (list_tasks -> list).
+# - mutating classification: mechanical derivation — callables prefixed
+#   get_/list_/search/check_/counters/preflight/graph_/read_/scan_ are reads,
+#   everything else mutates. An entry may contradict the derivation only with a
+#   `mutating_override: <reason>` on the same action; the gate reads it.
+# - internal: module-level helpers that are not product actions.
+# - availability: default matrix below; per-action overrides when a product
+#   must not expose an action.
+#
+# Retiring an id (N/N-1 window, same rule the HTTP contract carries):
+#
+#   transitions:
+#     - id: marvis.tasks.list        # the id leaving
+#       replaced_by: marvis.tasks.list_all   # or `none` when nothing replaces it
+#       reason: why it moved, in one line
+#
+# Consumers bind to these ids. Without an entry here, a rename or a removal
+# fails the compatibility gate rather than passing green.
+schema_version: 1
+# Ratified by Emilio at Triage on 2026-08-04 (decision carried from the GitHub
+# lineage manifest, PR #183, onto this superset during lineage unification).
+status: ratified
+availability_default:
+  engine-api: available
+  cloud: available
+  cli-mcp: available
+  enterprise: available
+  terminal-console: none   # terminal participates only in session/terminal lifecycle (R7)
+domains:
+  agent_tokens:
+    module: core/api/use_cases/agent_tokens.py
+    # Token lifecycle is HTTP-only: neither the Python MCP registrar
+    # (core/api/mcp/tools/__init__.py) nor the Node MCP (core/mcp-pir) ships
+    # a token tool, so the inherited cli-mcp default would advertise four
+    # callable actions with no tool behind them. The cli-mcp:none overrides
+    # are enforced by tests/contracts/test_actions_manifest.py.
+    actions:
+      - id: marvis.agent_tokens.create
+        callable: create_token
+        mutating: true
+        availability:
+          cli-mcp: none
+      - id: marvis.agent_tokens.list
+        callable: list_tokens
+        mutating: false
+        availability:
+          cli-mcp: none
+      - id: marvis.agent_tokens.revoke
+        callable: revoke_token
+        mutating: true
+        availability:
+          cli-mcp: none
+      - id: marvis.agent_tokens.acknowledge_rotation
+        callable: acknowledge_rotation
+        mutating: true
+        availability:
+          cli-mcp: none
+    internal:
+      - hash_token
+  audit:
+    module: core/api/use_cases/audit.py
+    actions:
+      - id: marvis.audit.list_entries
+        callable: list_audit_entries
+        mutating: false
+  brain:
+    module: core/api/use_cases/brain.py
+    actions:
+      - id: marvis.brain.list_events
+        callable: list_events
+        mutating: false
+      - id: marvis.brain.list_drift
+        callable: list_drift
+        mutating: false
+      - id: marvis.brain.get_drift_signal
+        callable: get_drift_signal
+        mutating: false
+      - id: marvis.brain.patch_drift_signal
+        callable: patch_drift_signal
+        mutating: true
+      - id: marvis.brain.list_memory_operations
+        callable: list_memory_operations
+        mutating: false
+      - id: marvis.brain.get_memory_operation
+        callable: get_memory_operation
+        mutating: false
+      - id: marvis.brain.patch_memory_operation
+        callable: patch_memory_operation
+        mutating: true
+      - id: marvis.brain.apply_memory_operation
+        callable: apply_memory_operation
+        mutating: true
+      - id: marvis.brain.list_findings
+        callable: list_findings
+        mutating: false
+      - id: marvis.brain.get_finding
+        callable: get_finding
+        mutating: false
+      - id: marvis.brain.patch_finding
+        callable: patch_finding
+        mutating: true
+      - id: marvis.brain.bulk_patch_findings
+        callable: bulk_patch_findings
+        mutating: true
+      - id: marvis.brain.apply_finding
+        callable: apply_finding
+        mutating: true
+      - id: marvis.brain.list_journal
+        callable: list_journal
+        mutating: false
+      - id: marvis.brain.write_journal_narrative
+        callable: write_journal_narrative
+        mutating: true
+      - id: marvis.brain.get_staleness
+        callable: get_brain_staleness
+        mutating: false
+      - id: marvis.brain.write_finding
+        callable: write_finding
+        mutating: true
+      - id: marvis.brain.list_runs
+        callable: list_brain_runs
+        mutating: false
+      - id: marvis.brain.trigger_run
+        callable: trigger_brain_run
+        mutating: true
+      - id: marvis.brain.get_run
+        callable: get_brain_run
+        mutating: false
+      - id: marvis.brain.discard_run
+        callable: discard_brain_run
+        mutating: true
+      - id: marvis.brain.promote_run
+        callable: promote_brain_run
+        mutating: true
+      - id: marvis.brain.reset_watermarks
+        callable: reset_brain_watermarks
+        mutating: true
+      - id: marvis.brain.get_counters
+        callable: get_counters
+        mutating: false
+      - id: marvis.brain.get_cycle_recap
+        callable: get_cycle_recap
+        mutating: false
+      - id: marvis.brain.recompute_cycle
+        callable: recompute_cycle
+        mutating: true
+      - id: marvis.brain.get_capabilities
+        callable: get_brain_capabilities
+        mutating: false
+      - id: marvis.brain.supersede_orphan_partials_uc
+        callable: supersede_orphan_partials_uc
+        mutating: true
+      - id: marvis.brain.polish_pending_journal_uc
+        callable: polish_pending_journal_uc
+        mutating: true
+      - id: marvis.brain.promote_finding_to_task_uc
+        callable: promote_finding_to_task_uc
+        mutating: true
+    internal:
+      - build_promote_task_description
+  comments:
+    module: core/api/use_cases/comments.py
+    actions:
+      - id: marvis.comments.create
+        callable: create_comment
+        mutating: true
+      - id: marvis.comments.list
+        callable: list_comments
+        mutating: false
+      - id: marvis.comments.update
+        callable: update_comment
+        mutating: true
+      - id: marvis.comments.delete
+        callable: delete_comment
+        mutating: true
+      - id: marvis.comments.add_reaction
+        callable: add_reaction
+        mutating: true
+      - id: marvis.comments.remove_reaction
+        callable: remove_reaction
+        mutating: true
+  costs:
+    module: core/api/use_cases/costs.py
+    actions:
+      - id: marvis.costs.get_summary
+        callable: get_costs_summary
+        mutating: false
+      - id: marvis.costs.get_project
+        callable: get_project_costs
+        mutating: false
+      - id: marvis.costs.get_project_billing
+        callable: get_project_billing
+        mutating: false
+  file_shares:
+    module: core/api/use_cases/file_shares.py
+    actions:
+      - id: marvis.file_shares.create
+        callable: create_file_share
+        mutating: true
+  feedback:
+    module: core/api/use_cases/feedback.py
+    actions:
+      - id: marvis.feedback.memory
+        callable: memory_feedback
+        mutating: true
+    internal:
+      - feedback_counters
+      - reset_feedback_counters
+      - nudge_enabled
+      - attach_feedback_nudge
+      - append_feedback_nudge_row
+      - redact_note
+  graph:
+    module: core/api/use_cases/graph.py
+    actions:
+      - id: marvis.graph.neighbors
+        callable: graph_neighbors
+        mutating: false
+      - id: marvis.graph.hotspots
+        callable: graph_hotspots
+        mutating: false
+      - id: marvis.graph.impact
+        callable: graph_impact
+        mutating: false
+      - id: marvis.graph.context
+        callable: graph_context
+        mutating: false
+      - id: marvis.graph.pattern
+        callable: graph_pattern
+        mutating: false
+      - id: marvis.graph.get_capabilities
+        callable: get_capabilities
+        mutating: false
+      - id: marvis.graph.landing
+        callable: graph_landing
+        mutating: false
+      - id: marvis.graph.list_pins
+        callable: list_graph_pins
+        mutating: false
+      - id: marvis.graph.create_pin
+        callable: create_graph_pin
+        mutating: true
+      - id: marvis.graph.delete_pin
+        callable: delete_graph_pin
+        mutating: true
+      - id: marvis.graph.resolve
+        callable: graph_resolve
+        mutating: false
+      - id: marvis.graph.overview
+        callable: graph_overview
+        mutating: false
+      - id: marvis.graph.orphans
+        callable: graph_orphans
+        mutating: false
+      - id: marvis.graph.mark_node_verified
+        callable: mark_node_verified
+        mutating: true
+      - id: marvis.graph.mark_edge_superseded
+        callable: mark_edge_superseded
+        mutating: true
+    internal:
+      - parse_include_csv
+      - extract_hotspot
+      - parse_db_datetime
+      - orphan_color
+      - compute_index_freshness
+      - validate_qualified_name
+      - lookup_function_node
+      - build_share_function_blocks
+  graph_ingest:
+    module: core/api/use_cases/graph_ingest.py
+    actions:
+      - id: marvis.graph_ingest.ingest
+        callable: ingest_graph
+        mutating: true
+      - id: marvis.graph_ingest.provenance
+        callable: read_provenance
+        mutating: false
+  handoffs:
+    module: core/api/use_cases/handoffs.py
+    actions:
+      - id: marvis.handoffs.create
+        callable: create_handoff
+        mutating: true
+      - id: marvis.handoffs.search
+        callable: search_handoffs
+        mutating: false
+      - id: marvis.handoffs.get
+        callable: get_handoff
+        mutating: false
+      - id: marvis.handoffs.reindex
+        callable: reindex_handoffs
+        mutating: true
+  ingest_triage:
+    module: core/api/use_cases/ingest_triage.py
+    actions:
+      - id: marvis.ingest_triage.list
+        callable: list_pending
+        mutating: false
+      - id: marvis.ingest_triage.list_skipped
+        callable: list_skipped
+        mutating: false
+      - id: marvis.ingest_triage.list_history
+        callable: list_history
+        mutating: false
+      - id: marvis.ingest_triage.counters
+        callable: counters
+        mutating: false
+      - id: marvis.ingest_triage.preflight
+        callable: preflight
+        mutating: false
+      - id: marvis.ingest_triage.retry_parse
+        callable: retry_parse
+        mutating: true
+      - id: marvis.ingest_triage.approve
+        callable: approve
+        mutating: true
+      - id: marvis.ingest_triage.reject
+        callable: reject
+        mutating: true
+      - id: marvis.ingest_triage.delete
+        callable: delete
+        mutating: true
+      - id: marvis.ingest_triage.classify_force
+        callable: classify_force
+        mutating: true
+      - id: marvis.ingest_triage.reparse_single
+        callable: reparse_single
+        mutating: true
+      - id: marvis.ingest_triage.reparse_batch
+        callable: reparse_batch
+        mutating: true
+      - id: marvis.ingest_triage.patch
+        callable: patch_pending
+        mutating: true
+  learnings:
+    module: core/api/use_cases/learnings.py
+    actions:
+      - id: marvis.learnings.check
+        callable: check_learnings
+        mutating: false
+      - id: marvis.learnings.list
+        callable: list_learnings
+        mutating: false
+      - id: marvis.learnings.get
+        callable: get_learning
+        mutating: false
+      - id: marvis.learnings.get_history
+        callable: get_learning_history
+        mutating: false
+      - id: marvis.learnings.create
+        callable: create_learning
+        mutating: true
+      - id: marvis.learnings.update
+        callable: update_learning
+        mutating: true
+      - id: marvis.learnings.delete
+        callable: delete_learning
+        mutating: true
+      - id: marvis.learnings.bump
+        callable: bump_learning
+        mutating: true
+  notifications:
+    module: core/api/use_cases/notifications.py
+    actions:
+      - id: marvis.notifications.list
+        callable: list_notifications
+        mutating: false
+      - id: marvis.notifications.ack
+        callable: ack_notification
+        mutating: true
+      - id: marvis.notifications.count_unread_notices
+        callable: count_unread_notices
+        mutating: false
+        mutating_override: Count-only query; reads notification rows and writes no state.
+      - id: marvis.notifications.count_unread
+        callable: count_unread_notifications
+        mutating: false
+        mutating_override: Count-only query; reads notification rows and writes no state.
+      - id: marvis.notifications.mark
+        callable: mark_notification
+        mutating: true
+      - id: marvis.notifications.mark_all_read
+        callable: mark_all_read
+        mutating: true
+  onboarding:
+    module: core/api/use_cases/onboarding.py
+    actions:
+      - id: marvis.onboarding.scan_workdir
+        callable: scan_workdir
+        mutating: false
+      - id: marvis.onboarding.read_setup
+        callable: read_setup
+        mutating: false
+      - id: marvis.onboarding.write_setup
+        callable: write_setup
+        mutating: true
+      - id: marvis.onboarding.seed_demo
+        callable: seed_demo
+        mutating: true
+      - id: marvis.onboarding.teardown_demo
+        callable: teardown_demo
+        mutating: true
+  onboarding_wizard:
+    module: core/api/use_cases/onboarding_wizard.py
+    actions:
+      - id: marvis.onboarding_wizard.get_status
+        callable: get_status
+        mutating: false
+      - id: marvis.onboarding_wizard.answer
+        callable: answer
+        mutating: true
+    internal:
+      - onboarding_pending
+  projects:
+    module: core/api/use_cases/projects.py
+    actions:
+      - id: marvis.projects.list_programs
+        callable: list_programs
+        mutating: false
+      - id: marvis.projects.create
+        callable: create_project
+        mutating: true
+      - id: marvis.projects.get
+        callable: get_project
+        mutating: false
+      - id: marvis.projects.update
+        callable: update_project
+        mutating: true
+      - id: marvis.projects.get_session_brief
+        callable: get_session_brief
+        mutating: false
+      - id: marvis.projects.get_handoffs
+        callable: get_handoffs
+        mutating: false
+      - id: marvis.projects.list_status_updates_feed
+        callable: list_status_updates_feed
+        mutating: false
+      - id: marvis.projects.create_status_update_feed
+        callable: create_status_update_feed
+        mutating: true
+      - id: marvis.projects.get_plans
+        callable: get_plans
+        mutating: false
+    internal:
+      - data_project_dir
+      - load_signed_project_entitlement
+      - project_creation_guard
+      - resolve_git_repo
+  pull_requests:
+    module: core/api/use_cases/pull_requests.py
+    actions:
+      - id: marvis.pull_requests.get_merge_conflicts
+        callable: get_merge_conflicts
+        mutating: false
+      - id: marvis.pull_requests.get
+        callable: get_pull_request
+        mutating: false
+      - id: marvis.pull_requests.create_branch
+        callable: create_branch
+        mutating: true
+      - id: marvis.pull_requests.register_branch
+        callable: register_branch
+        mutating: true
+      - id: marvis.pull_requests.submit
+        callable: submit_pull_request
+        mutating: true
+      - id: marvis.pull_requests.merge
+        callable: merge_pull_request
+        mutating: true
+      - id: marvis.pull_requests.approve
+        callable: approve_pull_request
+        mutating: true
+      - id: marvis.pull_requests.request_changes
+        callable: request_pull_request_changes
+        mutating: true
+      - id: marvis.pull_requests.close
+        callable: close_pull_request
+        mutating: true
+      - id: marvis.pull_requests.update
+        callable: update_pull_request
+        mutating: true
+      - id: marvis.pull_requests.revert
+        callable: revert_pull_request
+        mutating: true
+  search:
+    module: core/api/use_cases/search.py
+    actions:
+      - id: marvis.search.search
+        callable: search
+        mutating: false
+      - id: marvis.search.trigger_reindex
+        callable: trigger_reindex
+        mutating: true
+      - id: marvis.search.reindex_file_paths
+        callable: reindex_file_paths
+        mutating: true
+    internal:
+      - queue_reindex
+      - queue_reindex_file_paths
+  tasks:
+    module: core/api/use_cases/tasks.py
+    actions:
+      - id: marvis.tasks.get_summary
+        callable: get_tasks_summary
+        mutating: false
+      - id: marvis.tasks.get_projects
+        callable: get_task_projects
+        mutating: false
+      - id: marvis.tasks.list
+        callable: list_tasks
+        mutating: false
+      - id: marvis.tasks.get
+        callable: get_task
+        mutating: false
+      - id: marvis.tasks.get_cost_entries
+        callable: get_task_cost_entries
+        mutating: false
+      - id: marvis.tasks.create
+        callable: create_task
+        mutating: true
+      - id: marvis.tasks.update
+        callable: update_task
+        mutating: true
+      - id: marvis.tasks.create_human_cost_entry
+        callable: create_human_cost_entry
+        mutating: true
+      - id: marvis.tasks.delete
+        callable: delete_task
+        mutating: true
+      - id: marvis.tasks.reset_stale
+        callable: reset_stale_tasks
+        mutating: true
+      - id: marvis.tasks.zombie_scan
+        callable: zombie_scan
+        mutating: true
+      - id: marvis.tasks.bulk_reject
+        callable: bulk_reject_tasks
+        mutating: true
+      - id: marvis.tasks.trigger_reminder_check
+        callable: trigger_reminder_check
+        mutating: true
+  teams:
+    module: core/api/use_cases/teams.py
+    actions:
+      - id: marvis.teams.create
+        callable: create_team
+        mutating: true
+      - id: marvis.teams.update
+        callable: update_team
+        mutating: true
+      - id: marvis.teams.delete
+        callable: delete_team
+        mutating: true
+      - id: marvis.teams.list
+        callable: list_teams
+        mutating: false
+      - id: marvis.teams.list_members
+        callable: list_team_members
+        mutating: false
+      - id: marvis.teams.add_member
+        callable: add_team_member
+        mutating: true
+      - id: marvis.teams.remove_member
+        callable: remove_team_member
+        mutating: true
+      - id: marvis.teams.list_projects
+        callable: list_team_projects
+        mutating: false
+      - id: marvis.teams.assign_project
+        callable: assign_team_project
+        mutating: true
+      - id: marvis.teams.unassign_project
+        callable: unassign_team_project
+        mutating: true
+      - id: marvis.teams.set_user_role
+        callable: set_user_role
+        mutating: true
+  todos:
+    module: core/api/use_cases/todos.py
+    actions:
+      - id: marvis.todos.list
+        callable: list_todos
+        mutating: false
+      - id: marvis.todos.create
+        callable: create_todo
+        mutating: true
+      - id: marvis.todos.delegate
+        callable: delegate_todo
+        mutating: true
+      - id: marvis.todos.update
+        callable: update_todo
+        mutating: true

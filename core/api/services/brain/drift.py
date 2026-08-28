@@ -16,12 +16,10 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-import aiosqlite
-
-from core.api.db import acquire_db, write_db
+from core.api.db import write_db
 from core.api.models.brain import DriftSignal
 from core.api.services.brain.cycle_snapshot import CycleSnapshot, build_snapshot
-from core.api.services.brain.rules import DR_AXIS_MATRIX, REGISTERED_RULES
+from core.api.services.brain.rules import DR_AXIS_MATRIX, active_rules
 from core.api.services.brain.rules._signals import CONFIDENCE_FLOOR
 
 logger = logging.getLogger(__name__)
@@ -33,6 +31,16 @@ DEFAULT_LOOKBACK_CYCLES = 7
 # are promoted to a `direction_drift` finding via emit_finding_dedup. Below
 # the threshold they stay as audit-only drift rows.
 DR8_FINDING_CONFIDENCE_THRESHOLD = 0.85
+
+# P4-F1: promotion generalised from the DR8-only hardcode into a matrix.
+# rule_id -> (finding_type, confidence_threshold). A drift signal at or above its
+# rule's threshold is promoted to an APPROVABLE L5 finding (never an auto-close —
+# the P1 producer notifies the owner/grantees, who decide). Adding a promotable
+# rule = one entry here + a branch in `_finding_content`.
+FINDING_PROMOTION_MATRIX: dict[str, tuple[str, float]] = {
+    "DR8": ("direction_drift", DR8_FINDING_CONFIDENCE_THRESHOLD),
+    "DR9": ("task_probably_done", 0.6),  # both DR9 levels (0.9 PR-merged, 0.6 handoff) promote
+}
 
 
 def _extract_proposed_payload(signal: DriftSignal) -> dict | None:
@@ -51,40 +59,73 @@ def _extract_proposed_payload(signal: DriftSignal) -> dict | None:
     return None
 
 
+def _finding_content(
+    sig: DriftSignal, finding_type: str
+) -> tuple[str, str, str, str, dict, str]:
+    """(title, summary, why_now, entity_ref, payload, suggested_artifact) per finding_type."""
+    if finding_type == "task_probably_done":
+        task_ref = sig.expected_direction_ref or f"task:{sig.scope_key}"
+        entity_ref = f"task_probably_done:{task_ref}"  # stable per task -> dedup, no re-run dup
+        payload = {
+            "drift_signal_id": sig.signal_id,
+            "task_ref": task_ref,
+            "observed_delta": sig.observed_delta,
+            "observed_direction_ref": sig.observed_direction_ref,
+        }
+        title = (f"Task probabilmente conclusa — {sig.scope_key}")[:200]
+        summary = (sig.observed_delta or "task appears resolved")[:2000]
+        why_now = (
+            f"DR9 al confidence={sig.confidence:.2f}; recurrence_key={sig.recurrence_key}"
+        )[:500]
+        return (title, summary, why_now, entity_ref, payload, "status_update")
+
+    # direction_drift (DR8) — content contract unchanged (wave-3.1 regression tests).
+    proposed = _extract_proposed_payload(sig) or {}
+    entity_ref = f"direction_drift:{sig.scope_key}"
+    payload = {
+        "drift_signal_id": sig.signal_id,
+        "observed_delta": sig.observed_delta,
+        "expected_direction_ref": sig.expected_direction_ref,
+        "observed_direction_ref": sig.observed_direction_ref,
+        **proposed,
+    }
+    title = f"Direction drift — {sig.scope_key}"
+    summary = (sig.observed_delta or "direction misalignment observed")[:2000]
+    why_now = (
+        f"DR8 emitted at confidence={sig.confidence:.2f}; "
+        f"recurrence_key={sig.recurrence_key}"
+    )
+    return (title, summary, why_now, entity_ref, payload, "none")
+
+
 async def _emit_direction_drift_findings(
     *, run_id: str, cycle_key: str, signals: list[DriftSignal]
 ) -> int:
-    """Promote DR8 signals at/above the confidence threshold to L5 findings.
+    """Promote drift signals to L5 findings via ``FINDING_PROMOTION_MATRIX``.
 
-    Returns the count of dedup emit calls (new or boost). Failures are logged
-    and swallowed — the cycle must finish even if the finding emit path fails.
+    A signal at/above its rule's threshold becomes an APPROVABLE finding (never an
+    auto-close — the P1 producer notifies the owner/grantees, who decide). Name kept
+    for the DR8 wave-3.1 regression tests; the body is now generic over the matrix
+    (DR8 direction_drift @0.85 + DR9 task_probably_done @0.6). Returns the count of
+    dedup emit calls (new or boost). Failures are logged and swallowed — the cycle
+    must finish even if the finding emit path fails.
     """
     from core.api.services.brain.findings import emit_finding_dedup
 
     emitted = 0
     for sig in signals:
-        if sig.rule_id != "DR8":
+        promo = FINDING_PROMOTION_MATRIX.get(sig.rule_id)
+        if promo is None:
             continue
-        if sig.confidence < DR8_FINDING_CONFIDENCE_THRESHOLD:
+        finding_type, threshold = promo
+        if sig.confidence < threshold:
             continue
-        proposed = _extract_proposed_payload(sig) or {}
-        entity_ref = f"direction_drift:{sig.scope_key}"
-        payload = {
-            "drift_signal_id": sig.signal_id,
-            "observed_delta": sig.observed_delta,
-            "expected_direction_ref": sig.expected_direction_ref,
-            "observed_direction_ref": sig.observed_direction_ref,
-            **proposed,
-        }
-        title = f"Direction drift — {sig.scope_key}"
-        summary = (sig.observed_delta or "direction misalignment observed")[:2000]
-        why_now = (
-            f"DR8 emitted at confidence={sig.confidence:.2f}; "
-            f"recurrence_key={sig.recurrence_key}"
+        title, summary, why_now, entity_ref, payload, suggested = _finding_content(
+            sig, finding_type
         )
         try:
             await emit_finding_dedup(
-                finding_type="direction_drift",
+                finding_type=finding_type,  # type: ignore[arg-type]
                 entity_ref=entity_ref,
                 payload=payload,
                 confidence_numeric=sig.confidence,
@@ -96,8 +137,9 @@ async def _emit_direction_drift_findings(
                 summary=summary,
                 why_now=why_now,
                 severity=sig.severity or "medium",
-                suggested_artifact="none",
+                suggested_artifact=suggested,  # type: ignore[arg-type]
                 program_key=sig.program_key,
+                evidence_refs=[f"drift_signal:{sig.signal_id}"],
             )
             emitted += 1
         except Exception:  # noqa: BLE001 — finding emit is best-effort
@@ -286,7 +328,7 @@ async def run_phase(
     partial_failures: list[dict[str, str]] = []
     suppressed = 0
 
-    for rule_id, builder in REGISTERED_RULES:
+    for rule_id, builder in active_rules():
         try:
             rule_signals = await _run_one_rule(
                 rule_id,
@@ -296,7 +338,7 @@ async def run_phase(
                 now=now,
                 timeout_s=rule_timeout_s,
             )
-        except asyncio.TimeoutError as exc:
+        except asyncio.TimeoutError:
             partial_failures.append(
                 {"kind": "drift_rule_failed", "rule_id": rule_id, "error": "timeout"}
             )

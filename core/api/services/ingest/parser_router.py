@@ -16,7 +16,10 @@ from typing import Any, TypeVar
 from core.api.config import settings
 from core.api.db import acquire_db, acquire_write_db
 from core.api.services import pii_redactor
-from core.api.services.ingest.auto_approve import decide_ingress_routing, should_auto_approve
+from core.api.services.ingest.auto_approve import (
+    decide_ingress_routing,
+    should_auto_approve,
+)
 from core.api.services.ingest.classifier import ALLOWED_TARGETS, classify_markdown
 from core.api.services.ingest.confidence import (
     compute_composite_confidence,
@@ -41,10 +44,15 @@ from core.api.services.ingest.parsers.transcript_parser import (
     VIDEO_MIME_BY_SUFFIX,
     parse_media_transcript,
 )
-from core.api.services.ingest.parsers.xlsx_parser import parse_xlsx
 from core.api.services.ingest.parsers.vision_gateway import parse_vision_with_gateway
+from core.api.services.ingest.parsers.xlsx_parser import parse_xlsx
 from core.api.services.ingest.preflight import build_classifier_content, build_preflight
 from core.api.services.ingest.routing_policy import IngestRoute, choose_route
+from core.api.services.ingest.xlsx_privacy import (
+    neutral_xlsx_filename,
+    neutral_xlsx_title,
+    xlsx_sha256,
+)
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -160,13 +168,18 @@ def _image_classification(
     }
 
 
-def _xlsx_classification(path: Path) -> dict[str, Any]:
+def _xlsx_classification(
+    path: Path,
+    parsed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    structure = (parsed or {}).get("structure") or {}
+    sha256 = str(structure.get("sha256") or xlsx_sha256(path))
     return {
         "type": "file",
-        "title": path.name,
+        "title": neutral_xlsx_title(sha256),
         "tags": ["xlsx", "spreadsheet"],
         "target_folder": "docs/assets",
-        "target_filename": path.name,
+        "target_filename": neutral_xlsx_filename(sha256),
         "confidence": 0.74,
         "reason": "spreadsheet requires manual triage",
         "auto_approve": False,
@@ -244,7 +257,11 @@ def _parser_lane_waiter_count(lane: str) -> int:
     return sum(1 for waiter in waiters if not waiter.done())
 
 
-async def _mark_parser_waiting(ingest_id: str, project_slug: str) -> None:
+async def _mark_parser_waiting(
+    ingest_id: str,
+    workspace_id: str,
+    project_slug: str,
+) -> None:
     async with acquire_write_db() as db:
         await db.execute(
             """
@@ -253,20 +270,26 @@ async def _mark_parser_waiting(ingest_id: str, project_slug: str) -> None:
                    error_message = NULL,
                    updated_at = datetime('now')
              WHERE id = ?
+               AND workspace_id = ?
                AND status IN ('queued', 'parse_error', 'parsing')
             """,
-            (ingest_id,),
+            (ingest_id, workspace_id),
         )
         await db.commit()
     await broadcast_ingest_changed(
         "parser_waiting",
+        workspace_id=workspace_id,
         ingest_id=ingest_id,
         project_slug=project_slug,
         status="parser_waiting",
     )
 
 
-async def _mark_parser_active(ingest_id: str, project_slug: str) -> None:
+async def _mark_parser_active(
+    ingest_id: str,
+    workspace_id: str,
+    project_slug: str,
+) -> None:
     async with acquire_write_db() as db:
         cursor = await db.execute(
             """
@@ -274,15 +297,17 @@ async def _mark_parser_active(ingest_id: str, project_slug: str) -> None:
                SET status = 'parsing',
                    updated_at = datetime('now')
              WHERE id = ?
+               AND workspace_id = ?
                AND status = 'parser_waiting'
             """,
-            (ingest_id,),
+            (ingest_id, workspace_id),
         )
         await db.commit()
     if cursor.rowcount != 1:
         raise _ParserWaitCancelled(ingest_id)
     await broadcast_ingest_changed(
         "parsing",
+        workspace_id=workspace_id,
         ingest_id=ingest_id,
         project_slug=project_slug,
         status="parsing",
@@ -291,6 +316,7 @@ async def _mark_parser_active(ingest_id: str, project_slug: str) -> None:
 
 async def _mark_parse_error(
     ingest_id: str,
+    workspace_id: str,
     project_slug: str,
     message: str,
     *,
@@ -306,12 +332,14 @@ async def _mark_parse_error(
                            error_message = ?,
                            updated_at = datetime('now')
                      WHERE id = ?
+                       AND workspace_id = ?
                     """,
-                    (message[:1000], ingest_id),
+                    (message[:1000], ingest_id, workspace_id),
                 )
                 await db.commit()
             await broadcast_ingest_changed(
                 "parse_error",
+                workspace_id=workspace_id,
                 ingest_id=ingest_id,
                 project_slug=project_slug,
                 status="parse_error",
@@ -338,6 +366,7 @@ async def _mark_parse_error(
 async def _run_heavy_parser(
     *,
     ingest_id: str,
+    workspace_id: str,
     project_slug: str,
     lane: str,
     parser_name: str,
@@ -358,7 +387,7 @@ async def _run_heavy_parser(
         )
 
     async with semaphore:
-        await _mark_parser_active(ingest_id, project_slug)
+        await _mark_parser_active(ingest_id, workspace_id, project_slug)
         logger.info(
             "ingest parser acquired: lane=%s parser=%s path=%s max_concurrency=%d waiters=%d",
             lane,
@@ -399,7 +428,7 @@ def _ingest_llm_model() -> str:
     return settings.ingest_llm_classifier_model
 
 
-async def _resolve_classify_provider():
+async def _resolve_classify_provider(workspace_id: str):
     """Resolve the BYOK 'classify' provider from llm_function_config, or None.
 
     Reads on the read pool, fail-soft (None on any error) so the deterministic
@@ -409,7 +438,9 @@ async def _resolve_classify_provider():
         from core.api.services.ingest.llm.config_store import resolve_function_provider
 
         async with acquire_db() as cfg_db:
-            return await resolve_function_provider(cfg_db, "classify")
+            return await resolve_function_provider(
+                cfg_db, "classify", workspace_id
+            )
     except Exception:  # noqa: BLE001
         logger.debug("byok classify provider resolution failed", exc_info=True)
         return None
@@ -556,6 +587,7 @@ def _ingest_event_for_status(status: str) -> str:
 
 async def _maybe_llm_enrich(
     *,
+    workspace_id: str,
     ingest_id: str | None = None,
     extracted_text: str,
     base_classification: dict[str, Any],
@@ -576,7 +608,10 @@ async def _maybe_llm_enrich(
     # BYOK (U4): a DB-configured provider for the 'classify' function also enables
     # auto-classify (no env flag needed). The deterministic classifier stays
     # PRIMARY; this only gates the optional LLM override.
-    resolved_provider = await _resolve_classify_provider()
+    workspace_id = workspace_id.strip()
+    if not workspace_id:
+        raise ValueError("workspace_id is required for LLM enrichment")
+    resolved_provider = await _resolve_classify_provider(workspace_id)
     byok = resolved_provider is not None
     if not (enabled or shadow or byok):
         # No env flag and no configured BYOK provider: auto-classify is disabled.
@@ -601,7 +636,9 @@ async def _maybe_llm_enrich(
 
     try:
         async with acquire_db() as read_db:
-            ctx = await gather_classification_context(classifier_content, read_db)
+            ctx = await gather_classification_context(
+                classifier_content, read_db, workspace_id
+            )
     except Exception:  # noqa: BLE001
         logger.warning("llm context gather failed", exc_info=True)
         ctx = {"projects": [], "similar_artifacts": [], "hotspots": []}
@@ -609,6 +646,7 @@ async def _maybe_llm_enrich(
         ctx["source_context"] = preflight["source_context"]
     if ingest_id:
         ctx["_idempotency_scope"] = f"ingest:{ingest_id}"
+    ctx["_workspace_id"] = workspace_id
 
     classifier = None
     if byok:
@@ -666,6 +704,17 @@ async def _maybe_llm_enrich(
 
         ptype, _repo = _load_project_entry(llm_result.project_slug)
         if ptype:
+            from core.api.services.access_grants import (
+                require_unique_project_workspace,
+            )
+
+            async with acquire_db() as ownership_db:
+                await require_unique_project_workspace(
+                    ownership_db,
+                    project_slug=llm_result.project_slug,
+                    workspace_id=workspace_id,
+                    allow_local_single_user=True,
+                )
             valid_slug = llm_result.project_slug
     except Exception:  # noqa: BLE001 - any failure -> reject
         valid_slug = None
@@ -966,6 +1015,7 @@ async def _find_ingest_duplicate_for_project(
     db: Any,
     *,
     ingest_id: str,
+    workspace_id: str,
     sha256: str | None,
     project_slug: str,
 ) -> str | None:
@@ -977,10 +1027,11 @@ async def _find_ingest_duplicate_for_project(
           FROM ingest_pending
          WHERE sha256 = ?
            AND project_slug = ?
+           AND workspace_id = ?
            AND id != ?
          LIMIT 1
         """,
-        (sha256, project_slug, ingest_id),
+        (sha256, project_slug, workspace_id, ingest_id),
     ) as cursor:
         row = await cursor.fetchone()
     return str(row["id"]) if row is not None else None
@@ -990,6 +1041,7 @@ async def _apply_llm_project_switch_if_safe(
     db: Any,
     *,
     ingest_id: str,
+    workspace_id: str,
     sha256: str | None,
     current_project_slug: str,
     target_project_slug: str,
@@ -1016,6 +1068,7 @@ async def _apply_llm_project_switch_if_safe(
     duplicate_id = await _find_ingest_duplicate_for_project(
         db,
         ingest_id=ingest_id,
+        workspace_id=workspace_id,
         sha256=sha256,
         project_slug=target_project_slug,
     )
@@ -1152,6 +1205,7 @@ def _ocr_to_docparse_route(route: IngestRoute) -> IngestRoute:
 
 async def _parse_file(
     ingest_id: str,
+    workspace_id: str,
     project_slug: str,
     path: Path,
     mime_type: str,
@@ -1195,6 +1249,7 @@ async def _parse_file(
 
         parsed = await _run_heavy_parser(
             ingest_id=ingest_id,
+            workspace_id=workspace_id,
             project_slug=project_slug,
             lane=_parser_lane_for_workflow(route.workflow),
             parser_name=f"pdf:{route.workflow}",
@@ -1218,6 +1273,7 @@ async def _parse_file(
         if route.workflow == "vision":
             parsed = await _run_heavy_parser(
                 ingest_id=ingest_id,
+                workspace_id=workspace_id,
                 project_slug=project_slug,
                 lane="vision",
                 parser_name="image:vision",
@@ -1242,6 +1298,7 @@ async def _parse_file(
         prefer_docparse = route.workflow == "docparse"
         parsed = await _run_heavy_parser(
             ingest_id=ingest_id,
+            workspace_id=workspace_id,
             project_slug=project_slug,
             lane=_parser_lane_for_workflow(route.workflow),
             parser_name=f"image:{route.workflow}",
@@ -1268,7 +1325,7 @@ async def _parse_file(
             parser_quality,
         )
     if _is_xlsx(path, mime_type):
-        await _mark_parser_active(ingest_id, project_slug)
+        await _mark_parser_active(ingest_id, workspace_id, project_slug)
         parsed = await asyncio.to_thread(parse_xlsx, path)
         parser_quality = estimate_parser_quality(
             parser_used=str(parsed["parser_used"]),
@@ -1283,7 +1340,7 @@ async def _parse_file(
             parser_quality,
         )
     if _is_docx(path, mime_type):
-        await _mark_parser_active(ingest_id, project_slug)
+        await _mark_parser_active(ingest_id, workspace_id, project_slug)
         parsed = await asyncio.to_thread(parse_docx, path)
         parser_quality = estimate_parser_quality(
             parser_used="internal_docx",
@@ -1296,6 +1353,7 @@ async def _parse_file(
     if _is_transcript_media(path, mime_type):
         parsed = await _run_heavy_parser(
             ingest_id=ingest_id,
+            workspace_id=workspace_id,
             project_slug=project_slug,
             lane="transcribe",
             parser_name="transcript",
@@ -1314,7 +1372,7 @@ async def _parse_file(
         "text/markdown",
         "text/plain",
     }:
-        await _mark_parser_active(ingest_id, project_slug)
+        await _mark_parser_active(ingest_id, workspace_id, project_slug)
         parsed = parse_markdown_file(path)
         parser_quality = estimate_parser_quality(
             parser_used="internal_markdown",
@@ -1329,6 +1387,7 @@ async def _parse_file(
 
 async def _parse_file_with_transient_retries(
     ingest_id: str,
+    workspace_id: str,
     project_slug: str,
     path: Path,
     mime_type: str,
@@ -1341,6 +1400,7 @@ async def _parse_file_with_transient_retries(
         try:
             return await _parse_file(
                 ingest_id,
+                workspace_id,
                 project_slug,
                 path,
                 mime_type,
@@ -1351,7 +1411,7 @@ async def _parse_file_with_transient_retries(
             if attempt >= attempts or not _is_transient_parse_error(exc):
                 raise
             delay = _transient_parse_delay_seconds(attempt)
-            await _mark_parser_waiting(ingest_id, project_slug)
+            await _mark_parser_waiting(ingest_id, workspace_id, project_slug)
             logger.warning(
                 "ingest parser transient failure; retrying attempt=%d/%d delay=%.1fs route=%s path=%s error=%s",
                 attempt,
@@ -1414,6 +1474,21 @@ def _bounded_preflight_for_storage(preflight: dict[str, Any]) -> dict[str, Any]:
     return stored
 
 
+def _xlsx_preflight_for_storage(
+    preflight: dict[str, Any],
+    *,
+    sha256: str,
+) -> dict[str, Any]:
+    """Replace source-derived XLSX labels before diagnostics are persisted."""
+    stored = dict(preflight or {})
+    neutral_filename = neutral_xlsx_filename(sha256)
+    file_info = dict(stored.get("file") or {})
+    file_info["filename"] = neutral_filename
+    file_info["stem"] = Path(neutral_filename).stem
+    stored["file"] = file_info
+    return stored
+
+
 def _reconcile_ingress_metadata(
     structure: dict[str, Any] | None, ingress_metadata_raw: str | None
 ) -> dict[str, Any] | None:
@@ -1434,17 +1509,29 @@ def _reconcile_ingress_metadata(
     return {**(structure or {}), "ingress_metadata": parsed}
 
 
-async def parse_pending(ingest_id: str) -> None:
+async def parse_pending(ingest_id: str, workspace_id: str) -> None:
+    workspace_id = workspace_id.strip()
+    if not workspace_id:
+        raise ValueError("workspace_id is required for ingest parsing")
     row = None
     async with acquire_write_db() as db:
         async with db.execute(
-            "SELECT * FROM ingest_pending WHERE id = ?", (ingest_id,)
+            "SELECT * FROM ingest_pending WHERE workspace_id = ? AND id = ?",
+            (workspace_id, ingest_id),
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
             return
         if row["status"] not in {"queued", "parse_error"}:
             return
+        from core.api.services.access_grants import require_unique_project_workspace
+
+        await require_unique_project_workspace(
+            db,
+            project_slug=str(row["project_slug"] or ""),
+            workspace_id=workspace_id,
+            allow_local_single_user=True,
+        )
         await db.execute(
             """
             UPDATE ingest_pending
@@ -1452,14 +1539,16 @@ async def parse_pending(ingest_id: str) -> None:
                    error_message = NULL,
                    updated_at = datetime('now')
              WHERE id = ?
+               AND workspace_id = ?
             """,
-            (ingest_id,),
+            (ingest_id, workspace_id),
         )
         await db.commit()
 
     project_slug = row["project_slug"]
     await broadcast_ingest_changed(
         "parser_waiting",
+        workspace_id=workspace_id,
         ingest_id=ingest_id,
         project_slug=project_slug,
         status="parser_waiting",
@@ -1486,6 +1575,7 @@ async def parse_pending(ingest_id: str) -> None:
         )
         dispatch = await _parse_file_with_transient_retries(
             ingest_id,
+            workspace_id,
             project_slug,
             path,
             mime_type,
@@ -1526,10 +1616,14 @@ async def parse_pending(ingest_id: str) -> None:
             target_filename = classification_json["target_filename"]
             triage_decision_id = "auto_approve:image_parser" if auto_approve else None
         elif is_xlsx:
-            classification_json = _xlsx_classification(path)
+            classification_json = _xlsx_classification(path, parsed)
             next_status = "awaiting_triage"
             extracted_text = str(parsed.get("text") or "")
             structure = parsed.get("structure") or {}
+            if str(structure.get("sha256") or "").lower() != str(
+                row["sha256"] or ""
+            ).lower():
+                raise ValueError("XLSX source changed since queueing")
             target_folder = classification_json["target_folder"]
             target_filename = classification_json["target_filename"]
             triage_decision_id = None
@@ -1573,19 +1667,30 @@ async def parse_pending(ingest_id: str) -> None:
                 classification_json["transcript_summary"] = transcript_summary
                 parser_quality["transcript_summary"] = transcript_summary
 
+        diagnostic_preflight = dispatch.preflight
+        if is_xlsx:
+            diagnostic_preflight = _xlsx_preflight_for_storage(
+                dispatch.preflight,
+                sha256=str(structure.get("sha256") or ""),
+            )
         structure = _with_ingest_v2_diagnostics(
             structure,
-            preflight=dispatch.preflight,
+            preflight=diagnostic_preflight,
             route=dispatch.route,
             parser_quality=parser_quality,
         )
 
-        if next_status == "awaiting_triage" and extracted_text.strip():
+        if (
+            next_status == "awaiting_triage"
+            and extracted_text.strip()
+            and not is_xlsx
+        ):
             # Ingestor 2.0: optional local tier-fast project routing +
             # frontmatter inference. Auto-approval requires composite
             # confidence >= 0.80, not just LLM self-confidence.
             try:
                 enriched = await _maybe_llm_enrich(
+                    workspace_id=workspace_id,
                     ingest_id=ingest_id,
                     extracted_text=extracted_text,
                     base_classification=classification_json,
@@ -1665,6 +1770,7 @@ async def parse_pending(ingest_id: str) -> None:
                 ) = await _apply_llm_project_switch_if_safe(
                     db,
                     ingest_id=ingest_id,
+                    workspace_id=workspace_id,
                     sha256=row["sha256"],
                     current_project_slug=project_slug,
                     target_project_slug=pending_llm_project_slug,
@@ -1688,6 +1794,7 @@ async def parse_pending(ingest_id: str) -> None:
                        error_message = ?,
                        updated_at = datetime('now')
                  WHERE id = ?
+                   AND workspace_id = ?
                 """,
                 (
                     next_status,
@@ -1703,11 +1810,13 @@ async def parse_pending(ingest_id: str) -> None:
                     triage_decision_id,
                     error_message,
                     ingest_id,
+                    workspace_id,
                 ),
             )
             await db.commit()
         await broadcast_ingest_changed(
             _ingest_event_for_status(next_status),
+            workspace_id=workspace_id,
             ingest_id=ingest_id,
             project_slug=project_slug,
             status=next_status,
@@ -1721,13 +1830,13 @@ async def parse_pending(ingest_id: str) -> None:
             # so we keep the boundary explicit).
             from core.api.services.ingest.insert_saga import execute_saga
 
-            asyncio.create_task(execute_saga(ingest_id))
+            asyncio.create_task(execute_saga(ingest_id, workspace_id))
     except _ParserWaitCancelled:
         logger.info("ingest parse cancelled before parser slot: id=%s", ingest_id)
         return
     except Exception as exc:
         logger.exception("ingest parse failed: id=%s", ingest_id)
-        await _mark_parse_error(ingest_id, project_slug, str(exc))
+        await _mark_parse_error(ingest_id, workspace_id, project_slug, str(exc))
 
 
 def _source_context_for_row(

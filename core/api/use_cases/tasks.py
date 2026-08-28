@@ -13,21 +13,12 @@ implementation, no fork.
 This is the **cornerstone** router: it owns the human-approval gate (the
 four-eyes check on ``pending -> approved``). Notes on how the template lands:
 
-CORNERSTONE — the human-approval gate moves to ``ctx.is_human_session``.
-    The legacy guard was ``if not request.cookies.get("pir_session"): raise 403``.
-    That cookie check is a transport detail; the DOMAIN rule is "only a human
-    session may approve". So :func:`update_task` checks ``ctx.is_human_session``
-    and raises :class:`AuthorizationError(code="approval_requires_human")`. The
-    HTTP adapter fills ``is_human_session`` from the cookie
-    (``CallerContext.from_user_info(user, is_human_session=bool(cookie))``); the
-    MCP adapter is agentic by default and can only opt into human-session
-    semantics with an explicit local env flag. The HTTP adapter MUST preserve the
-    exact legacy PLAIN-STRING 403 body (pinned by
-    ``tests/test_tasks.py::test_pending_to_approved_requires_cookie_auth``, which
-    asserts ``"human authorization" in detail.lower()``), so it catches this one
-    ``AuthorizationError`` and re-raises the legacy ``HTTPException(403, <string>)``
-    itself — the audit-router pattern. :data:`APPROVAL_REQUIRES_HUMAN_DETAIL`
-    holds the exact string so router and use_case never drift.
+CORNERSTONE — approval authority is resolved at the decision point.
+    Cookie presence, process flags, and adapter-supplied grant ids are not
+    authority. :func:`update_task` accepts a validated human principal, the
+    explicitly trusted OSS local single-user principal, or an agent backed by a
+    persisted, live, bounded delegation. The HTTP adapter preserves the legacy
+    plain-string 403 transport shape while the use case stays FastAPI-free.
 
 DECISION 1 — Visibility resolution at the adapter, enforcement in the use_case.
     ``list_tasks`` and ``get_task`` filter by ``get_visible_projects`` (needs
@@ -95,7 +86,12 @@ from core.api.models import (
     TaskSummary,
     UserSummary,
 )
-from core.api.use_cases._context import CallerContext, require_role_ctx
+from core.api.use_cases._context import (
+    CallerContext,
+    require_role_ctx,
+    require_workspace_ctx,
+    resolve_approval_authority,
+)
 from core.api.use_cases._errors import (
     AuthorizationError,
     ConflictError,
@@ -117,7 +113,8 @@ ZOMBIE_THRESHOLD_DAYS_DEFAULT = 21
 # code="approval_requires_human" AuthorizationError. Keep router + use_case in sync.
 APPROVAL_REQUIRES_HUMAN_DETAIL = (
     "Task approval (pending→approved) requires explicit triage approval. "
-    "Use mcp__marvis__approve_task(task_id) for hosted/MCP flow, or a valid human Console session where available. "
+    "Use mcp__marvis__approve_task(task_id) with a validated human principal or active persisted delegation, "
+    "or approve from a valid human Console session where available. "
     "Bearer-only update_task(status='approved') requests cannot approve tasks. "
     "Agents cannot approve by changing status directly. Tasks may also be auto-approved at creation via ICE-D policy. "
     "If still pending, call approve_task or reject_task explicitly. "
@@ -134,6 +131,8 @@ _TASK_NOT_FOUND_MESSAGE = (
 _PR_STATUS_SUBQUERY = """(
     SELECT pr.status FROM pull_requests pr
     WHERE pr.task_id = tasks.id
+      AND pr.workspace_id =
+          tasks.workspace_id
     ORDER BY CASE pr.status
         WHEN 'merging' THEN 1 WHEN 'open' THEN 2 WHEN 'draft' THEN 3
         WHEN 'merged' THEN 4 WHEN 'closed' THEN 5
@@ -271,21 +270,42 @@ def _row_to_task(
 async def get_tasks_summary(
     ctx: CallerContext,
     db: aiosqlite.Connection,
+    *,
+    visible_projects: set[str] | None = None,
 ) -> TaskSummary:
-    """Cross-project task summary (any authenticated caller)."""
-    ws = ctx.workspace_id or "ws_default"
+    """Cross-project task summary, filtered to the caller's visible projects.
+
+    ``visible_projects=None`` = unrestricted; an empty set short-circuits to a
+    zero summary (counts and project slugs must not leak to zero-grant actors).
+    """
+    ws = require_workspace_ctx(ctx)
+
+    if visible_projects is not None and not visible_projects:
+        return TaskSummary(
+            total=0, by_status=StatusCounts(), by_project=[], by_priority={}
+        )
+
+    project_sql = ""
+    project_params: list[str] = []
+    if visible_projects is not None:
+        placeholders = ",".join("?" for _ in visible_projects)
+        project_sql = f" AND project IN ({placeholders})"
+        project_params = sorted(visible_projects)
 
     # Total active tasks
     cursor = await db.execute(
-        "SELECT COUNT(*) FROM tasks WHERE deleted_at IS NULL AND COALESCE(workspace_id, 'ws_default') = ?",
-        (ws,),
+        "SELECT COUNT(*) FROM tasks WHERE deleted_at IS NULL AND workspace_id = ?"
+        + project_sql,
+        [ws, *project_params],
     )
     total = (await cursor.fetchone())[0]
 
     # By status
     cursor = await db.execute(
-        "SELECT status, COUNT(*) as cnt FROM tasks WHERE deleted_at IS NULL AND COALESCE(workspace_id, 'ws_default') = ? GROUP BY status",
-        (ws,),
+        "SELECT status, COUNT(*) as cnt FROM tasks WHERE deleted_at IS NULL AND workspace_id = ?"
+        + project_sql
+        + " GROUP BY status",
+        [ws, *project_params],
     )
     status_dict: dict[str, int] = {}
     async for row in cursor:
@@ -296,9 +316,10 @@ async def get_tasks_summary(
     cursor = await db.execute(
         "SELECT project, status, COUNT(*) as cnt FROM tasks "
         "WHERE deleted_at IS NULL AND status IN ('pending', 'approved', 'in_progress', 'review') "
-        "AND COALESCE(workspace_id, 'ws_default') = ? "
-        "GROUP BY project, status",
-        (ws,),
+        "AND workspace_id = ?"
+        + project_sql
+        + " GROUP BY project, status",
+        [ws, *project_params],
     )
     project_map: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     async for row in cursor:
@@ -309,7 +330,11 @@ async def get_tasks_summary(
 
     # By priority
     cursor = await db.execute(
-        "SELECT priority, COUNT(*) as cnt FROM tasks WHERE deleted_at IS NULL GROUP BY priority"
+        "SELECT priority, COUNT(*) as cnt FROM tasks WHERE deleted_at IS NULL "
+        "AND workspace_id = ?"
+        + project_sql
+        + " GROUP BY priority",
+        [ws, *project_params],
     )
     by_priority: dict[str, int] = {}
     async for row in cursor:
@@ -325,11 +350,15 @@ async def get_task_projects(
     db: aiosqlite.Connection,
 ) -> list[ProjectSummary]:
     """List projects with task counts (any authenticated caller)."""
+    workspace_id = require_workspace_ctx(ctx)
     cursor = await db.execute(
         "SELECT project, "
         "SUM(CASE WHEN status IN ('pending', 'approved', 'in_progress', 'review') THEN 1 ELSE 0 END) as open_count, "
         "COUNT(*) as total_count "
-        "FROM tasks WHERE deleted_at IS NULL GROUP BY project ORDER BY project"
+        "FROM tasks WHERE deleted_at IS NULL "
+        "AND workspace_id = ? "
+        "GROUP BY project ORDER BY project",
+        (workspace_id,),
     )
     return [
         ProjectSummary(
@@ -371,8 +400,8 @@ async def list_tasks(
     params: list[str] = []
 
     # Workspace isolation: always scope to caller's workspace
-    ws = ctx.workspace_id or "ws_default"
-    conditions.append("COALESCE(workspace_id, 'ws_default') = ?")
+    ws = require_workspace_ctx(ctx)
+    conditions.append("workspace_id = ?")
     params.append(ws)
 
     if not include_deleted:
@@ -522,9 +551,9 @@ async def get_task(
 
     Returns ``kg_context=None``; the adapter attaches it when ``deep`` (DECISION 2).
     """
-    ws = ctx.workspace_id or "ws_default"
+    ws = require_workspace_ctx(ctx)
     cursor = await db.execute(
-        f"SELECT *, {_PR_STATUS_SUBQUERY} FROM tasks WHERE id = ? AND deleted_at IS NULL AND COALESCE(workspace_id, 'ws_default') = ?",
+        f"SELECT *, {_PR_STATUS_SUBQUERY} FROM tasks WHERE id = ? AND deleted_at IS NULL AND workspace_id = ?",
         (task_id, ws),
     )
     row = await cursor.fetchone()
@@ -548,9 +577,9 @@ async def get_task_cost_entries(
     """Return cost summary + all entries for a task (any authenticated caller)."""
     from core.api.services import cost_service
 
-    ws = ctx.workspace_id or "ws_default"
+    ws = require_workspace_ctx(ctx)
     cursor = await db.execute(
-        "SELECT id FROM tasks WHERE id = ? AND deleted_at IS NULL AND COALESCE(workspace_id, 'ws_default') = ?",
+        "SELECT id FROM tasks WHERE id = ? AND deleted_at IS NULL AND workspace_id = ?",
         (task_id, ws),
     )
     if not await cursor.fetchone():
@@ -615,6 +644,10 @@ async def create_task(
     task_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     tags_json = json.dumps(body.tags)
+    ws = require_workspace_ctx(ctx)
+    from core.api.services.access_grants import require_workspace_project_bound
+
+    await require_workspace_project_bound(db, ctx, body.project)
 
     created_by_value = created_by
 
@@ -630,19 +663,31 @@ async def create_task(
     effective_owner_id = body.owner_id
     if not effective_owner_id and body.project:
         db.row_factory = aiosqlite.Row
-        raci_row = await (
-            await db.execute(
-                "SELECT user_id FROM project_raci WHERE project = ? AND role = 'responsible'",
-                (body.project,),
-            )
-        ).fetchone()
+        try:
+            raci_row = await (
+                await db.execute(
+                    "SELECT r.user_id FROM project_raci r "
+                    "JOIN users u ON u.id = r.user_id AND u.workspace_id = ? "
+                    "AND u.deleted_at IS NULL "
+                    "WHERE r.project = ? AND r.role = 'responsible' "
+                    "AND (SELECT COUNT(DISTINCT wp.workspace_id) "
+                    "FROM workspace_projects wp WHERE wp.project_slug = ?) = 1 "
+                    "AND EXISTS (SELECT 1 FROM workspace_projects wp "
+                    "WHERE wp.project_slug = ? AND wp.workspace_id = ?)",
+                    (ws, body.project, body.project, body.project, ws),
+                )
+            ).fetchone()
+        except aiosqlite.Error:
+            # Legacy/minimal schemas cannot prove RACI workspace ownership.
+            raci_row = None
         if raci_row:
             effective_owner_id = raci_row["user_id"]
 
     # Auto-approval: evaluate policy BEFORE insert (atomic — no two-step update).
     # Agent/Bearer-only sessions create reviewable proposals; only a human session
-    # or active delegation grant may turn an auto-approvable task into approved.
-    if ctx.can_act_as_approver:
+    # or active persisted delegation may turn an auto-approvable task into approved.
+    approval_authority = await resolve_approval_authority(ctx, db)
+    if approval_authority is not None:
         decision, approval_reason = DEFAULT_POLICY.evaluate(
             delegation=body.delegation,
             ease=body.ease,
@@ -685,12 +730,34 @@ async def create_task(
                 scored_by,
                 scored_at,
                 body.due_date,
-                ctx.workspace_id or "ws_default",
+                ws,
                 body.completion_mode,
                 now,
                 now,
             ),
         )
+        # Required audit and business mutation share one commit. If the append
+        # fails, the request dependency rolls the whole operation back.
+        if decision == ApprovalDecision.AUTO_APPROVED:
+            await log_audit(
+                db,
+                action="task.auto_approved",
+                user="system:auto_policy",
+                resource_type="task",
+                resource_id=task_id,
+                details={
+                    "policy_version": "v1",
+                    "approval_reason": approval_reason,
+                    "delegation": body.delegation,
+                    "ease": body.ease,
+                    "impact": body.impact,
+                    "confidence": body.confidence,
+                    "scored_by": scored_by,
+                    "created_by": created_by_value,
+                    **approval_authority.audit_details(),
+                },
+                workspace_id=ws,
+            )
         await db.commit()
     except aiosqlite.IntegrityError:
         raise ConflictError(
@@ -721,26 +788,6 @@ async def create_task(
         updated_at=now,
     )
 
-    # Audit log for auto-approved tasks (distinguishable from human approvals)
-    if decision == ApprovalDecision.AUTO_APPROVED:
-        await log_audit(
-            db,
-            action="task.auto_approved",
-            user="system:auto_policy",
-            resource_type="task",
-            resource_id=task_id,
-            details={
-                "policy_version": "v1",
-                "approval_reason": approval_reason,
-                "delegation": body.delegation,
-                "ease": body.ease,
-                "impact": body.impact,
-                "confidence": body.confidence,
-                "scored_by": scored_by,
-                "created_by": created_by_value,
-            },
-        )
-
     # Emit event + generate notification for new task
     event_payload = {
         "status": initial_status,
@@ -760,6 +807,7 @@ async def create_task(
         target_type="task",
         target_id=task_id,
         payload=event_payload,
+        workspace_id=ws,
     )
     if event_id:
         from core.api.services.notification_service import generate_from_event
@@ -773,18 +821,24 @@ async def create_task(
             "task",
             task_id,
             event_payload,
+            workspace_id=ws,
         )
 
     # Fetch created task + owner summary
     db.row_factory = aiosqlite.Row
-    cursor = await db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    cursor = await db.execute(
+        "SELECT * FROM tasks WHERE id = ? "
+        "AND workspace_id = ?",
+        (task_id, ws),
+    )
     row = await cursor.fetchone()
     owner_row = None
     if row["owner_id"]:
         owner_row = await (
             await db.execute(
-                "SELECT id, slug, display_name, avatar_color FROM users WHERE id = ?",
-                (row["owner_id"],),
+                "SELECT id, slug, display_name, avatar_color FROM users "
+                "WHERE id = ? AND workspace_id = ?",
+                (row["owner_id"], ws),
             )
         ).fetchone()
 
@@ -794,7 +848,7 @@ async def create_task(
         title=body.title,
         project=body.project or "",
         status=initial_status,
-        workspace_id=ctx.workspace_id or "ws_default",
+        workspace_id=ws,
     )
 
     return _row_to_task(row, owner_row)
@@ -811,9 +865,9 @@ async def update_task(
 ) -> TaskDetailResponse:
     """Update a task; validates status transitions (operator+).
 
-    CORNERSTONE: the ``pending -> approved`` four-eyes gate checks
-    ``ctx.is_human_session`` (filled from the cookie by the HTTP adapter, ``True``
-    on the MCP/local surface). Raises :class:`AuthorizationError` with
+    CORNERSTONE: the ``pending -> approved`` four-eyes gate checks a validated
+    human/local principal or a live persisted delegation. Raises
+    :class:`AuthorizationError` with
     ``code="approval_requires_human"`` and the exact legacy detail string so the
     adapter can re-raise the plain-string 403 verbatim.
 
@@ -830,14 +884,31 @@ async def update_task(
     from core.api.services.audit import log_audit
     from core.api.services.events import emit_event
 
-    ws = ctx.workspace_id or "ws_default"
+    ws = require_workspace_ctx(ctx)
     cursor = await db.execute(
-        "SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL AND COALESCE(workspace_id, 'ws_default') = ?",
+        "SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL AND workspace_id = ?",
         (task_id, ws),
     )
     row = await cursor.fetchone()
     if not row:
         raise _task_not_found(task_id)
+
+    expected_updated_at = getattr(body, "expected_updated_at", None)
+    if expected_updated_at is not None and expected_updated_at != row["updated_at"]:
+        raise ConflictError(
+            code="task_version_conflict",
+            message=(
+                "Task changed since the caller last read it; refresh and retry "
+                f"from status={row['status']!r}, updated_at={row['updated_at']!r}."
+            ),
+            context={
+                "task_id": task_id,
+                "current_status": row["status"],
+                "current_updated_at": row["updated_at"],
+            },
+        )
+
+    approval_authority = None
 
     # Validate status transition
     if body.status and body.status != row["status"]:
@@ -854,8 +925,9 @@ async def update_task(
         if body.status == "review":
             pr_cursor = await db.execute(
                 "SELECT id FROM pull_requests"
-                " WHERE task_id = ? AND status IN ('draft', 'open', 'merging') LIMIT 1",
-                (task_id,),
+                " WHERE task_id = ? AND workspace_id = ? "
+                "AND status IN ('draft', 'open', 'merging') LIMIT 1",
+                (task_id, ws),
             )
             if not await pr_cursor.fetchone():
                 raise ValidationError(
@@ -863,17 +935,18 @@ async def update_task(
                     message=(
                         "Cannot set status=review: no active PR for this task. "
                         "Reason: the 'review' state means 'human reviewing a PR' — without a PR there's nothing to review. "
-                        "Fix: create the PR first via mcp__marvis__register_branch(task_id, branch_name) "
-                        "followed by mcp__marvis__submit_pr(task_id, title, body). "
-                        "The status will auto-advance to 'review' on submit."
+                        "Fix: open the PR on GitHub from the task branch (normally feat/task-{task_id}) "
+                        "and wait for the GitHub webhook to register the verified PR and advance the task to 'review'. "
+                        "Marvis does not create, register, or submit repository PRs."
                     ),
                 )
         # Guard: cannot mark completed while a PR is still open (prevents zombie PRs)
         if body.status == "completed":
             active_pr_cursor = await db.execute(
                 "SELECT id FROM pull_requests"
-                " WHERE task_id = ? AND status IN ('draft', 'open', 'merging') LIMIT 1",
-                (task_id,),
+                " WHERE task_id = ? AND workspace_id = ? "
+                "AND status IN ('draft', 'open', 'merging') LIMIT 1",
+                (task_id, ws),
             )
             if await active_pr_cursor.fetchone():
                 raise ValidationError(
@@ -881,9 +954,8 @@ async def update_task(
                     message=(
                         "Cannot set status=completed: PR for this task is still open (status in draft/open/merging). "
                         "Reason: completing a task with an open PR leaves zombie PRs in the queue. "
-                        "Fix: close the PR first — either merge it via mcp__marvis__merge_pr(task_id) (happy path) or "
-                        "mcp__marvis__close_pr(task_id, reason='abandoned') if the work is being dropped, "
-                        "then retry the PATCH to status=completed."
+                        "Fix: merge or close the PR on GitHub, wait for the webhook to reconcile its state, "
+                        "then retry the PATCH to status=completed. Marvis does not merge or close repository PRs."
                     ),
                 )
             # The merged-PR gate for code/system projects applies ONLY to tasks
@@ -897,8 +969,9 @@ async def update_task(
             if row_completion_mode == "pr" and requires_pr_gate(row["project"]):
                 merged_pr_cursor = await db.execute(
                     "SELECT id FROM pull_requests"
-                    " WHERE task_id = ? AND status = 'merged' LIMIT 1",
-                    (task_id,),
+                    " WHERE task_id = ? AND workspace_id = ? "
+                    "AND status = 'merged' LIMIT 1",
+                    (task_id, ws),
                 )
                 if not await merged_pr_cursor.fetchone():
                     raise ValidationError(
@@ -910,11 +983,12 @@ async def update_task(
                             "verify/diagnose tasks that have no PR."
                         ),
                     )
-        # CORNERSTONE: pending→approved requires a human session (four-eyes gate)
-        # — or an active super-session delegation (Constitution v2.0 Rule 6),
-        # which the HTTP adapter resolves into ctx.delegation_grant_id.
+        # CORNERSTONE: pending→approved requires a validated human/local principal
+        # or a persisted, live, bounded super-session delegation. Adapter-supplied
+        # strings (including historical ``mcp:*`` grants) are never authority.
         if body.status == "approved" and row["status"] == "pending":
-            if not ctx.can_act_as_approver:
+            approval_authority = await resolve_approval_authority(ctx, db)
+            if approval_authority is None:
                 raise AuthorizationError(
                     code="approval_requires_human",
                     message=APPROVAL_REQUIRES_HUMAN_DETAIL,
@@ -965,13 +1039,103 @@ async def update_task(
         )
 
     now = datetime.now(timezone.utc).isoformat()
+    if now == row["updated_at"]:
+        now = (datetime.now(timezone.utc) + timedelta(microseconds=1)).isoformat()
     updates["updated_at"] = now
 
     set_clause = ", ".join(f"{k} = ?" for k in updates)
-    values = list(updates.values()) + [task_id]
+    values = list(updates.values()) + [task_id, ws, row["updated_at"]]
 
-    await db.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
-    await db.commit()
+    # Compare-and-set mutation plus its required audit share one transaction.
+    # ``updated_at`` is the public mutation version already returned by every
+    # task read, so no parallel counter can drift from existing writers.
+    try:
+        mutation = await db.execute(
+            f"UPDATE tasks SET {set_clause} WHERE id = ? "
+            "AND workspace_id = ? AND updated_at = ?",
+            values,
+        )
+        if mutation.rowcount != 1:
+            current = await (
+                await db.execute(
+                    "SELECT status,updated_at FROM tasks WHERE id=? "
+                    "AND workspace_id=?",
+                    (task_id, ws),
+                )
+            ).fetchone()
+            await db.rollback()
+            raise ConflictError(
+                code="task_version_conflict",
+                message=(
+                    "Task changed during the update; refresh and retry from "
+                    f"status={current['status']!r}, "
+                    f"updated_at={current['updated_at']!r}."
+                    if current is not None
+                    else "Task changed or disappeared during the update."
+                ),
+                context={
+                    "task_id": task_id,
+                    "current_status": current["status"] if current else None,
+                    "current_updated_at": current["updated_at"] if current else None,
+                },
+            )
+
+        status_changed = (
+            "status" in provided
+            and body.status
+            and body.status != old_status
+        )
+        await log_audit(
+            db,
+            action=f"task.{body.status}" if status_changed else "task.update",
+            user=ctx.username,
+            resource_type="task",
+            resource_id=task_id,
+            details={
+                "old_status": old_status,
+                "new_status": body.status if status_changed else old_status,
+                "project": row["project"],
+                "changed_fields": sorted(updates.keys() - {"updated_at"}),
+                "expected_updated_at": row["updated_at"],
+                "committed_updated_at": now,
+                **(
+                    approval_authority.audit_details()
+                    if approval_authority is not None
+                    else {}
+                ),
+            },
+            workspace_id=ws,
+        )
+        await db.commit()
+    except aiosqlite.OperationalError as exc:
+        await db.rollback()
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            current = await (
+                await db.execute(
+                    "SELECT status,updated_at FROM tasks WHERE id=? "
+                    "AND workspace_id=?",
+                    (task_id, ws),
+                )
+            ).fetchone()
+            raise ConflictError(
+                code="task_version_conflict",
+                message=(
+                    "Task changed during the update; refresh and retry from "
+                    f"status={current['status']!r}, "
+                    f"updated_at={current['updated_at']!r}."
+                    if current is not None
+                    else "Task changed or disappeared during the update."
+                ),
+                context={
+                    "task_id": task_id,
+                    "current_status": current["status"] if current else None,
+                    "current_updated_at": current["updated_at"] if current else None,
+                },
+            ) from exc
+        raise
+    except Exception:
+        await db.rollback()
+        raise
 
     # Cost tracking hook: fire-and-forget on in_progress → completed
     if (
@@ -983,9 +1147,12 @@ async def update_task(
             """SELECT sm.conversation_id, sm.working_seconds, t.project
                FROM tasks t
                LEFT JOIN sessions_meta sm ON sm.project_slug = t.project
+                 AND sm.workspace_id =
+                     t.workspace_id
                WHERE t.id = ?
+                 AND t.workspace_id = ?
                ORDER BY sm.last_active DESC LIMIT 1""",
-            (task_id,),
+            (task_id, ws),
         )
         row_conv = await cursor_conv.fetchone()
         if row_conv and row_conv["conversation_id"]:
@@ -1028,6 +1195,7 @@ async def update_task(
             target_type="task",
             target_id=task_id,
             payload=status_payload,
+            workspace_id=ws,
         )
         # Generate notification (only fires for completed status)
         if event_id:
@@ -1042,6 +1210,7 @@ async def update_task(
                 "task",
                 task_id,
                 status_payload,
+                workspace_id=ws,
             )
         # Auto-mark task_pending notifications as acted/read when task leaves pending
         if old_status == "pending" and body.status in ("approved", "rejected"):
@@ -1050,35 +1219,26 @@ async def update_task(
                 """UPDATE notifications
                    SET acted_at = ?, read_at = COALESCE(read_at, ?)
                    WHERE target_id = ? AND target_type = 'task'
+                   AND workspace_id = ?
                    AND type = 'task_pending' AND acted_at IS NULL""",
-                (now, now, task_id),
+                (now, now, task_id, ws),
             )
-        # Audit log for privileged status transitions
-        if body.status in ("approved", "completed"):
-            await log_audit(
-                db,
-                action=f"task.{body.status}",
-                user=ctx.username,
-                resource_type="task",
-                resource_id=task_id,
-                details={
-                    "old_status": old_status,
-                    "new_status": body.status,
-                    "project": row["project"],
-                },
-            )
+        await db.commit()
 
     db.row_factory = aiosqlite.Row
     cursor = await db.execute(
-        f"SELECT *, {_PR_STATUS_SUBQUERY} FROM tasks WHERE id = ?", (task_id,)
+        f"SELECT *, {_PR_STATUS_SUBQUERY} FROM tasks WHERE id = ? "
+        "AND workspace_id = ?",
+        (task_id, ws),
     )
     row = await cursor.fetchone()
     owner_row = None
     if row["owner_id"]:
         owner_row = await (
             await db.execute(
-                "SELECT id, slug, display_name, avatar_color FROM users WHERE id = ?",
-                (row["owner_id"],),
+                "SELECT id, slug, display_name, avatar_color FROM users "
+                "WHERE id = ? AND workspace_id = ?",
+                (row["owner_id"], ws),
             )
         ).fetchone()
 
@@ -1088,7 +1248,7 @@ async def update_task(
         title=row["title"],
         project=row["project"] or "",
         status=row["status"],
-        workspace_id=row["workspace_id"] or "ws_default",
+        workspace_id=ws,
     )
 
     return _row_to_task(row, owner_row)
@@ -1104,9 +1264,9 @@ async def create_human_cost_entry(
     """Manually record human time for a task (cookie-auth caller; adapter-enforced)."""
     from core.api.services import cost_service
 
-    ws = ctx.workspace_id or "ws_default"
+    ws = require_workspace_ctx(ctx)
     cursor = await db.execute(
-        "SELECT project FROM tasks WHERE id = ? AND deleted_at IS NULL AND COALESCE(workspace_id, 'ws_default') = ?",
+        "SELECT project FROM tasks WHERE id = ? AND deleted_at IS NULL AND workspace_id = ?",
         (task_id, ws),
     )
     row = await cursor.fetchone()
@@ -1141,9 +1301,9 @@ async def delete_task(
 
     from core.api.services.audit import log_audit
 
-    ws = ctx.workspace_id or "ws_default"
+    ws = require_workspace_ctx(ctx)
     cursor = await db.execute(
-        "SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL AND COALESCE(workspace_id, 'ws_default') = ?",
+        "SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL AND workspace_id = ?",
         (task_id, ws),
     )
     row = await cursor.fetchone()
@@ -1157,17 +1317,50 @@ async def delete_task(
                 "Cannot delete task in status='in_progress'. "
                 "Reason: agents may still be writing to this task (commits, PR submission). "
                 "Deleting it mid-flight would orphan the worktree and hide agent output from Triage. "
-                "Fix: first PATCH status to 'completed'/'failed'/'rejected', or mcp__marvis__close_pr "
-                "if there's an associated PR, then delete."
+                "Fix: settle any associated PR on GitHub, wait for its webhook, then PATCH the task "
+                "to 'completed'/'failed'/'rejected' before deleting it."
             ),
         )
 
     now = datetime.now(timezone.utc).isoformat()
-    await db.execute(
-        "UPDATE tasks SET deleted_at = ?, updated_at = ? WHERE id = ?",
-        (now, now, task_id),
+    mutation = await db.execute(
+        "UPDATE tasks SET deleted_at = ?, updated_at = ? WHERE id = ? "
+        "AND workspace_id = ? AND deleted_at IS NULL AND status = ? "
+        "AND updated_at = ?",
+        (now, now, task_id, ws, row["status"], row["updated_at"]),
     )
-    await db.commit()
+    if mutation.rowcount != 1:
+        current = await (
+            await db.execute(
+                "SELECT status, updated_at, deleted_at FROM tasks "
+                "WHERE id = ? AND workspace_id = ?",
+                (task_id, ws),
+            )
+        ).fetchone()
+        await db.rollback()
+        if current and current["status"] == "in_progress" and current["deleted_at"] is None:
+            raise ConflictError(
+                code="cannot_delete_in_progress",
+                message=(
+                    "Cannot delete task because it moved to status='in_progress' "
+                    "while the delete was being applied. Refresh the task and settle "
+                    "the active work before retrying."
+                ),
+                context={
+                    "task_id": task_id,
+                    "current_status": current["status"],
+                    "current_updated_at": current["updated_at"],
+                },
+            )
+        raise ConflictError(
+            code="task_version_conflict",
+            message="Task changed or disappeared during delete; refresh and retry.",
+            context={
+                "task_id": task_id,
+                "current_status": current["status"] if current else None,
+                "current_updated_at": current["updated_at"] if current else None,
+            },
+        )
     await log_audit(
         db,
         action="task.delete",
@@ -1179,7 +1372,9 @@ async def delete_task(
             "title": row["title"],
             "status": row["status"],
         },
+        workspace_id=ws,
     )
+    await db.commit()
 
 
 async def reset_stale_tasks(
@@ -1198,18 +1393,21 @@ async def reset_stale_tasks(
 
     from core.api.services.audit import log_audit
 
+    ws = require_workspace_ctx(ctx)
     now = datetime.now(timezone.utc).isoformat()
     stale_cursor = await db.execute(
-        "SELECT id, tags FROM tasks "
+        "SELECT id, tags, updated_at FROM tasks "
         "WHERE status = 'in_progress' "
         "AND deleted_at IS NULL "
-        "AND updated_at < datetime('now', ?)",
-        (f"-{stale_days} days",),
+        "AND updated_at < datetime('now', ?) "
+        "AND workspace_id = ?",
+        (f"-{stale_days} days", ws),
     )
     stale_rows = await stale_cursor.fetchall()
 
     reset_count = 0
     reset_ids: list[str] = []
+    conflict_ids: list[str] = []
     for stale_row in stale_rows:
         sid = stale_row["id"]
         # Parse existing tags and add stale_reset
@@ -1221,15 +1419,19 @@ async def reset_stale_tasks(
             existing_tags.append("stale_reset")
         tags_json = json.dumps(existing_tags)
 
-        await db.execute(
-            "UPDATE tasks SET status = 'approved', tags = ?, updated_at = ? WHERE id = ?",
-            (tags_json, now, sid),
+        mutation = await db.execute(
+            "UPDATE tasks SET status = 'approved', tags = ?, updated_at = ? "
+            "WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL "
+            "AND status = 'in_progress' AND updated_at = ?",
+            (tags_json, now, sid, ws, stale_row["updated_at"]),
         )
+        if mutation.rowcount != 1:
+            conflict_ids.append(sid)
+            continue
         reset_count += 1
         reset_ids.append(sid)
 
     if reset_count > 0:
-        await db.commit()
         await log_audit(
             db,
             action="task.stale_reset",
@@ -1241,14 +1443,20 @@ async def reset_stale_tasks(
                 "reset_count": reset_count,
                 "task_ids": reset_ids[:20],  # limit audit detail size
             },
+            workspace_id=ws,
         )
+        await db.commit()
         logger.info(
             "Stale reset: %d tasks reset from in_progress to approved (stale_days=%d)",
             reset_count,
             stale_days,
         )
 
-    return {"reset_count": reset_count, "task_ids": reset_ids}
+    return {
+        "reset_count": reset_count,
+        "task_ids": reset_ids,
+        "conflict_ids": conflict_ids,
+    }
 
 
 async def zombie_scan(
@@ -1268,6 +1476,7 @@ async def zombie_scan(
 
     from core.api.services.audit import log_audit
 
+    ws = require_workspace_ctx(ctx)
     cutoff = (
         datetime.now(timezone.utc) - timedelta(days=threshold_days)
     ).isoformat()
@@ -1281,8 +1490,9 @@ async def zombie_scan(
         WHERE status = 'approved'
           AND deleted_at IS NULL
           AND updated_at < ?
+          AND workspace_id = ?
         """,
-        (cutoff,),
+        (cutoff, ws),
     )
     rows = await cursor.fetchall()
 
@@ -1324,10 +1534,16 @@ async def zombie_scan(
     if not dry_run and total > 0:
         # Find admin recipients (one notification per project per admin)
         recipients_cursor = await db.execute(
-            "SELECT id FROM users WHERE type = 'human' AND system_role IN ('admin', 'super_admin')"
+            "SELECT id FROM users WHERE type = 'human' "
+            "AND system_role IN ('admin', 'super_admin') "
+            "AND workspace_id = ?",
+            (ws,),
         )
         recipients = await recipients_cursor.fetchall()
 
+        from core.api.services.notification_service import notify
+
+        recipient_ids = [recipient["id"] for recipient in recipients]
         for project, items in by_project.items():
             sorted_items = sorted(
                 items, key=lambda x: x["age_days"], reverse=True
@@ -1344,24 +1560,18 @@ async def zombie_scan(
                     "samples": sorted_items[:10],
                 }
             )
-            for recipient in recipients:
-                try:
-                    await db.execute(
-                        "INSERT INTO notifications "
-                        "(user_id, type, title, body, target_type, target_id, project) "
-                        "VALUES (?, 'task_zombie_report', ?, ?, NULL, NULL, ?)",
-                        (recipient["id"], title, body_json, project),
-                    )
-                    notifications_created += 1
-                except aiosqlite.Error as exc:
-                    logger.warning(
-                        "zombie-scan: notification insert failed for user=%s project=%s: %s",
-                        recipient["id"],
-                        project,
-                        exc,
-                    )
+            # Single-writer: project-scoped zombie report to each admin (no target,
+            # no event_id -> plain insert, one row per project per admin as before).
+            notifications_created += await notify(
+                db,
+                user_ids=recipient_ids,
+                type="task_zombie_report",
+                title=title,
+                body=body_json,
+                project=project,
+                workspace_id=ws,
+            )
 
-        await db.commit()
         await log_audit(
             db,
             action="task.zombie_scan",
@@ -1374,7 +1584,9 @@ async def zombie_scan(
                 "projects": list(by_project.keys()),
                 "notifications_created": notifications_created,
             },
+            workspace_id=ws,
         )
+        await db.commit()
         logger.info(
             "zombie-scan: %d zombies across %d projects, %d notifications emitted",
             total,
@@ -1411,46 +1623,52 @@ async def bulk_reject_tasks(
     rejected: list[str] = []
     failed: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
+    ws = require_workspace_ctx(ctx)
+    started_transaction = not db.in_transaction
+    if started_transaction:
+        await db.execute("BEGIN IMMEDIATE")
 
     db.row_factory = aiosqlite.Row
-    for task_id in task_ids:
+    for index, task_id in enumerate(task_ids):
+        cursor = await db.execute(
+            "SELECT id, status, project, title, tags FROM tasks "
+            "WHERE id = ? AND deleted_at IS NULL "
+            "AND workspace_id = ?",
+            (task_id, ws),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            failed.append({"task_id": task_id, "error": "not_found"})
+            continue
+
+        allowed = VALID_TRANSITIONS.get(row["status"], set())
+        if "rejected" not in allowed:
+            failed.append(
+                {
+                    "task_id": task_id,
+                    "error": f"invalid_transition from {row['status']}",
+                }
+            )
+            continue
+
+        # Append reason tag for traceability.
         try:
-            cursor = await db.execute(
-                "SELECT id, status, project, title, tags FROM tasks "
-                "WHERE id = ? AND deleted_at IS NULL",
-                (task_id,),
-            )
-            row = await cursor.fetchone()
-            if not row:
-                failed.append({"task_id": task_id, "error": "not_found"})
-                continue
+            existing_tags = json.loads(row["tags"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            existing_tags = []
+        reason_tag = f"rejected:{reason}"
+        if reason_tag not in existing_tags:
+            existing_tags.append(reason_tag)
+        tags_json = json.dumps(existing_tags)
 
-            allowed = VALID_TRANSITIONS.get(row["status"], set())
-            if "rejected" not in allowed:
-                failed.append(
-                    {
-                        "task_id": task_id,
-                        "error": f"invalid_transition from {row['status']}",
-                    }
-                )
-                continue
-
-            # Append reason tag for traceability
-            try:
-                existing_tags = json.loads(row["tags"] or "[]")
-            except (json.JSONDecodeError, TypeError):
-                existing_tags = []
-            reason_tag = f"rejected:{reason}"
-            if reason_tag not in existing_tags:
-                existing_tags.append(reason_tag)
-            tags_json = json.dumps(existing_tags)
-
+        savepoint = f"bulk_reject_{index}"
+        await db.execute(f"SAVEPOINT {savepoint}")
+        try:
             await db.execute(
-                "UPDATE tasks SET status = 'rejected', tags = ?, updated_at = ? WHERE id = ?",
-                (tags_json, now, task_id),
+                "UPDATE tasks SET status = 'rejected', tags = ?, updated_at = ? "
+                "WHERE id = ? AND workspace_id = ?",
+                (tags_json, now, task_id, ws),
             )
-            rejected.append(task_id)
-
             await log_audit(
                 db,
                 action="task.bulk_reject",
@@ -1462,12 +1680,16 @@ async def bulk_reject_tasks(
                     "old_status": row["status"],
                     "project": row["project"],
                 },
+                workspace_id=ws,
             )
-        except Exception as exc:  # noqa: BLE001 — per-task isolation
-            failed.append({"task_id": task_id, "error": str(exc)})
+        except Exception:
+            await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+        rejected.append(task_id)
 
     if rejected:
-        await db.commit()
         await log_audit(
             db,
             action="task.bulk_reject_batch",
@@ -1480,13 +1702,17 @@ async def bulk_reject_tasks(
                 "failed_count": len(failed),
                 "rejected_ids_sample": rejected[:20],
             },
+            workspace_id=ws,
         )
+        await db.commit()
         logger.info(
             "bulk-reject: %d tasks rejected, %d failed (reason=%s)",
             len(rejected),
             len(failed),
             reason,
         )
+    elif started_transaction:
+        await db.rollback()
 
     return BulkRejectResponse(
         rejected=rejected,

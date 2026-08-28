@@ -18,7 +18,7 @@ import {
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { ReconnectingTerminalWS, type TerminalWSLifecycleEvent } from "@/lib/ws";
-import { uploadFile, type UploadResult } from "@/lib/api";
+import type { UploadResult } from "@/lib/api";
 import type { SessionProvider, WSConnectionStatus } from "@/lib/types";
 import { SgrMouseCoalescer, isSgrWheelInput } from "@/lib/sgrMouseCoalescer";
 import {
@@ -1273,25 +1273,11 @@ function TerminalInner({
               file.name,
               `upload-${Date.now()}`,
             );
-            const result: TerminalUploadResult = await uploadFile(file, safeFilename, {
-              session: sessionName,
-            });
-            if (sessionProviderRef.current === "opencode") {
-              await injectOpenCodeUpload(ws, result);
-            } else {
-              ws.sendInput(result.path);
-            }
-            recordTerminalDiagnosticEvent("terminal_upload_succeeded", {
+            recordTerminalDiagnosticEvent("browser_file_upload_denied", {
               sessionName,
               provider: sessionProviderRef.current,
-              filename: result.filename,
-              project: result.project,
-              path: result.path,
-              ingest_path: result.ingest_path,
+              filename: safeFilename,
             });
-            if (isActiveRef.current && panelVisibleRef.current) {
-              scheduleTerminalSync({ focus: true, reason: "upload-success", force: true });
-            }
           } catch (err: unknown) {
             console.error("[upload] failed:", err);
             recordTerminalDiagnosticEvent("terminal_upload_failed", {

@@ -87,12 +87,29 @@ async def ci_checks_summary(
     from core.api.services.ci_service import check_required_ci_passes
 
     # Get task project
-    async with db.execute("SELECT project FROM tasks WHERE id = ?", (task_id,)) as cursor:
+    async with db.execute(
+        "SELECT project FROM tasks WHERE id = ? AND workspace_id = ?",
+        (task_id, ws_id),
+    ) as cursor:
         task_row = await cursor.fetchone()
 
     failing_checks: list[str] = []
     if task_row:
-        failing_checks = await check_required_ci_passes(task_id, task_row["project"], db)
+        # Same diff scope the merge gate uses, so this endpoint cannot report a
+        # block that merging would not actually enforce.
+        from core.api.services.pr_service import changed_paths_for_task
+
+        failing_checks = await check_required_ci_passes(
+            task_id,
+            task_row["project"],
+            db,
+            changed_paths=await changed_paths_for_task(
+                task_id,
+                task_row["project"],
+                db,
+                workspace_id=ws_id,
+            ),
+        )
 
     return {
         "task_id": task_id,

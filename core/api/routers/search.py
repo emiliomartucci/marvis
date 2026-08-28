@@ -29,14 +29,18 @@ import logging
 import time
 from collections import defaultdict
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from core.api.models import UserInfo
 from core.api.models.search import SearchResponse
 from core.api.rbac import require_role
 from core.api.routers._adapter import to_http
-from core.api.security import get_current_user_or_agent
+from core.api.security import (
+    get_current_user_or_agent,
+    is_local_single_user_mode,
+    is_loopback_request,
+)
 from core.api.use_cases import search as uc
 from core.api.use_cases._context import CallerContext
 from core.api.use_cases._errors import ServiceError
@@ -62,6 +66,17 @@ from core.api.use_cases.search import (  # noqa: F401  (re-export surface)
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/search", tags=["search"])
+
+_LOCAL_HOST_DETAIL = (
+    "This host-global search reindex operation is available only to the trusted "
+    "local OSS loopback runtime."
+)
+
+
+def _require_local_host_request(request: Request) -> None:
+    if is_local_single_user_mode() and is_loopback_request(request):
+        return
+    raise HTTPException(status_code=403, detail=_LOCAL_HOST_DETAIL)
 
 
 class ReindexPathsRequest(BaseModel):
@@ -124,7 +139,7 @@ async def search(
         raise to_http(e)
 
 
-@router.post("/reindex")
+@router.post("/reindex", dependencies=[Depends(_require_local_host_request)])
 async def trigger_reindex(
     type: str = Query(
         "all",
@@ -140,7 +155,7 @@ async def trigger_reindex(
         raise to_http(e)
 
 
-@router.post("/reindex-paths")
+@router.post("/reindex-paths", dependencies=[Depends(_require_local_host_request)])
 async def trigger_reindex_paths(
     body: ReindexPathsRequest,
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),

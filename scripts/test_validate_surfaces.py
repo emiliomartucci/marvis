@@ -250,9 +250,14 @@ class TestValidator(FixtureCase):
         self.assertTrue(any("requires a packaged_as block" in e for e in errors), errors)
 
     def test_red_tampered_engine_pin(self) -> None:
+        pin_text = (REPO_ROOT / "contracts/engine-pin.yaml").read_text(
+            encoding="utf-8"
+        )
+        current_ref = re.search(r"^engine_ref: [0-9a-f]{40}$", pin_text, re.MULTILINE)
+        self.assertIsNotNone(current_ref)
         self.rewrite(
             "contracts/engine-pin.yaml",
-            "engine_ref: c02ee4adba4d5130be4ae6beeb43220c28986bde",
+            current_ref.group(0),
             "engine_ref: not-a-sha",
         )
         errors = validate(self.dir)

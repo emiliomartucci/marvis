@@ -12,7 +12,9 @@ from core.api.db import get_db, get_write_db
 from core.api.models import UserCreateRequest, UserUpdateRequest, UserResponse
 from core.api.models.users import UserTeamSummary
 from core.api.rbac import ROLE_HIERARCHY, require_role
-from core.api.security import get_current_user, get_current_user_or_agent
+from core.api.security import get_current_user_or_agent
+from core.api.services import access_grants
+from core.api.use_cases._context import CallerContext, require_workspace_ctx
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/users", tags=["users"])
@@ -55,6 +57,16 @@ def _row_to_user(row: aiosqlite.Row) -> UserResponse:
     )
 
 
+def _caller_workspace(user) -> str:
+    """Return the authenticated workspace; never infer one for hosted callers."""
+    return require_workspace_ctx(
+        CallerContext.from_user_info(
+            user,
+            is_human_session=getattr(user, "user_type", "human") == "human",
+        )
+    )
+
+
 @router.get("", response_model=list[UserResponse])
 async def list_users(
     project: str | None = Query(None, description="Filter users by team membership of this project"),
@@ -67,7 +79,7 @@ async def list_users(
     a team assigned to that project (team-scoped filtering).
     """
     db.row_factory = aiosqlite.Row
-    ws = user.workspace_id or "ws_default"
+    ws = _caller_workspace(user)
 
     if project:
         # Team-scoped: users who belong to a team assigned to this project (in workspace)
@@ -78,15 +90,25 @@ async def list_users(
             JOIN project_teams pt ON tm.team_id = pt.team_id
             JOIN teams t ON tm.team_id = t.id AND t.deleted_at IS NULL
             WHERE pt.project = ? AND u.deleted_at IS NULL
-              AND COALESCE(u.workspace_id, 'ws_default') = ?
+              AND u.workspace_id = ?
+              AND t.workspace_id = ?
+              AND EXISTS (
+                  SELECT 1 FROM workspace_projects wp
+                  WHERE wp.project_slug = pt.project AND wp.workspace_id = ?
+              )
+              AND (
+                  SELECT COUNT(DISTINCT wp.workspace_id)
+                  FROM workspace_projects wp WHERE wp.project_slug = pt.project
+              ) = 1
             ORDER BY u.display_name
             """,
-            [project, ws],
+            [project, ws, ws, ws],
         ) as cursor:
             rows = await cursor.fetchall()
     else:
         async with db.execute(
-            "SELECT * FROM users WHERE deleted_at IS NULL AND COALESCE(workspace_id, 'ws_default') = ? ORDER BY display_name",
+            "SELECT * FROM users WHERE deleted_at IS NULL AND workspace_id = ? "
+            "ORDER BY display_name",
             [ws],
         ) as cursor:
             rows = await cursor.fetchall()
@@ -95,7 +117,10 @@ async def list_users(
     async with db.execute(
         "SELECT tm.user_id, t.id, t.slug, t.display_name, tm.role "
         "FROM team_members tm JOIN teams t ON tm.team_id = t.id "
-        "WHERE t.deleted_at IS NULL ORDER BY t.display_name"
+        "JOIN users u ON u.id = tm.user_id "
+        "WHERE t.deleted_at IS NULL AND t.workspace_id = ? "
+        "AND u.workspace_id = ? AND u.deleted_at IS NULL ORDER BY t.display_name",
+        (ws, ws),
     ) as cursor:
         team_rows = await cursor.fetchall()
 
@@ -137,13 +162,14 @@ async def create_user(
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     avatar = body.avatar_color or "#6366f1"
     channels = json.dumps(body.notification_channels)
+    workspace_id = _caller_workspace(caller)
 
     try:
         await db.execute(
             "INSERT INTO users "
             "(id, slug, display_name, type, email, avatar_color, system_role, "
-            "notification_channels, telegram_chat_id, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "notification_channels, telegram_chat_id, created_at, updated_at, workspace_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 body.slug,
@@ -156,6 +182,7 @@ async def create_user(
                 body.telegram_chat_id,
                 now,
                 now,
+                workspace_id,
             ),
         )
         await db.commit()
@@ -163,13 +190,16 @@ async def create_user(
         if "UNIQUE" in str(exc):
             raise HTTPException(
                 status_code=409,
-                detail=f"User slug '{body.slug}' already exists",
+                detail="User already exists",
             )
         raise
 
     db.row_factory = aiosqlite.Row
     row = await (
-        await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        await db.execute(
+            "SELECT * FROM users WHERE id = ? AND workspace_id = ?",
+            (user_id, workspace_id),
+        )
     ).fetchone()
     return _row_to_user(row)
 
@@ -181,18 +211,13 @@ async def get_user(
     db: aiosqlite.Connection = Depends(get_db),
 ):
     db.row_factory = aiosqlite.Row
-    if user.system_role == "super_admin":
-        row = await (
-            await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        ).fetchone()
-    else:
-        ws = user.workspace_id or "ws_default"
-        row = await (
-            await db.execute(
-                "SELECT * FROM users WHERE id = ? AND COALESCE(workspace_id, 'ws_default') = ?",
-                (user_id, ws)
-            )
-        ).fetchone()
+    ws = _caller_workspace(user)
+    row = await (
+        await db.execute(
+            "SELECT * FROM users WHERE id = ? AND workspace_id = ?",
+            (user_id, ws),
+        )
+    ).fetchone()
     if not row or row["deleted_at"]:
         raise HTTPException(status_code=404, detail="User not found")
     return _row_to_user(row)
@@ -206,21 +231,37 @@ async def get_user_raci(
 ):
     """Progetti dove l'utente appare nel RACI. Usato dagli agenti per scoped monitoring."""
     db.row_factory = aiosqlite.Row
-    if user.system_role != "super_admin":
-        ws = user.workspace_id or "ws_default"
-        check = await (
-            await db.execute(
-                "SELECT id FROM users WHERE id = ? AND COALESCE(workspace_id, 'ws_default') = ?",
-                (user_id, ws)
-            )
-        ).fetchone()
-        if not check:
-            raise HTTPException(status_code=404, detail="User not found")
-    async with db.execute(
-        "SELECT project, role FROM project_raci WHERE user_id = ? ORDER BY project",
-        (user_id,),
-    ) as cursor:
-        rows = await cursor.fetchall()
+    ctx = CallerContext.from_user_info(
+        user, is_human_session=getattr(user, "user_type", "human") == "human"
+    )
+    workspace_id = require_workspace_ctx(ctx)
+    check = await (
+        await db.execute(
+            "SELECT id FROM users WHERE id = ? AND workspace_id = ? "
+            "AND deleted_at IS NULL",
+            (user_id, workspace_id),
+        )
+    ).fetchone()
+    if not check:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    visible = await access_grants.visible_projects_for_actor(db, ctx)
+    query = (
+        "SELECT r.project, r.role FROM project_raci r WHERE r.user_id = ? "
+        "AND (SELECT COUNT(DISTINCT wp.workspace_id) FROM workspace_projects wp "
+        "WHERE wp.project_slug = r.project) = 1 "
+        "AND EXISTS (SELECT 1 FROM workspace_projects wp "
+        "WHERE wp.project_slug = r.project AND wp.workspace_id = ?)"
+    )
+    params: list[str] = [user_id, workspace_id]
+    if visible is not None:
+        if not visible:
+            return []
+        placeholders = ",".join("?" for _ in visible)
+        query += f" AND r.project IN ({placeholders})"
+        params.extend(sorted(visible))
+    query += " ORDER BY r.project"
+    rows = await (await db.execute(query, params)).fetchall()
     return [{"project": r["project"], "role": r["role"]} for r in rows]
 
 
@@ -239,18 +280,13 @@ async def update_user(
         if requested_level > caller_level:
             raise HTTPException(status_code=403, detail="Insufficient permissions")
     db.row_factory = aiosqlite.Row
-    if caller.system_role == "super_admin":
-        row = await (
-            await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        ).fetchone()
-    else:
-        ws = caller.workspace_id or "ws_default"
-        row = await (
-            await db.execute(
-                "SELECT * FROM users WHERE id = ? AND COALESCE(workspace_id, 'ws_default') = ?",
-                (user_id, ws)
-            )
-        ).fetchone()
+    ws = _caller_workspace(caller)
+    row = await (
+        await db.execute(
+            "SELECT * FROM users WHERE id = ? AND workspace_id = ?",
+            (user_id, ws),
+        )
+    ).fetchone()
     if not row or row["deleted_at"]:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -280,12 +316,17 @@ async def update_user(
 
     updates["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     set_clause = ", ".join(f"{k} = ?" for k in updates)
-    values = list(updates.values()) + [user_id]
-    await db.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
+    values = list(updates.values()) + [user_id, ws]
+    await db.execute(
+        f"UPDATE users SET {set_clause} WHERE id = ? AND workspace_id = ?", values
+    )
     await db.commit()
 
     row = await (
-        await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        await db.execute(
+            "SELECT * FROM users WHERE id = ? AND workspace_id = ?",
+            (user_id, ws),
+        )
     ).fetchone()
     return _row_to_user(row)
 
@@ -298,20 +339,14 @@ async def delete_user(
 ):
     """Soft delete — imposta deleted_at. Le RACI entries rimangono per audit trail."""
     db.row_factory = aiosqlite.Row
-    if caller.system_role == "super_admin":
-        row = await (
-            await db.execute(
-                "SELECT id, deleted_at, system_role FROM users WHERE id = ?", (user_id,)
-            )
-        ).fetchone()
-    else:
-        ws = caller.workspace_id or "ws_default"
-        row = await (
-            await db.execute(
-                "SELECT id, deleted_at, system_role FROM users WHERE id = ? AND COALESCE(workspace_id, 'ws_default') = ?",
-                (user_id, ws)
-            )
-        ).fetchone()
+    ws = _caller_workspace(caller)
+    row = await (
+        await db.execute(
+            "SELECT id, deleted_at, system_role FROM users "
+            "WHERE id = ? AND workspace_id = ?",
+            (user_id, ws),
+        )
+    ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
     if row["deleted_at"]:
@@ -325,7 +360,8 @@ async def delete_user(
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
-        "UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?",
-        (now, now, user_id),
+        "UPDATE users SET deleted_at = ?, updated_at = ? "
+        "WHERE id = ? AND workspace_id = ?",
+        (now, now, user_id, ws),
     )
     await db.commit()

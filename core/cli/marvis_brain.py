@@ -155,6 +155,17 @@ def run_cmd(
     json_out: bool = typer.Option(
         False, "--json", help="Emit pure JSON to stdout."
     ),
+    if_due: bool = typer.Option(
+        False,
+        "--if-due",
+        help=(
+            "Scheduled-entry semantics (timers/cron): skip as 'idle' when "
+            "today's cycle is already published or before the cutoff, instead "
+            "of force-running (and superseding) it. Ignores --mode: the "
+            "scheduler path always runs the server default. A plain `run` "
+            "always runs the current cycle."
+        ),
+    ),
 ) -> None:
     """Run one reflection cycle now, then exit."""
     if mode not in ("free", "full"):
@@ -177,6 +188,18 @@ def run_cmd(
         own_pool = db_mod._writer is None
         if own_pool:  # lazy one-shot writer init for the CLI process
             await db_mod.init_pool()
+
+        # --if-due routes to the idempotent scheduler entry (herd rule, task
+        # 64b1eee3): a timer tick after the in-process API scheduler already
+        # published the cycle must be a no-op, not a superseding re-run.
+        if if_due:
+            from core.api.services.brain.jobs import run_brain_jobs_if_due
+
+            try:
+                return await run_brain_jobs_if_due()
+            finally:
+                if own_pool:
+                    await db_mod.close_pool()
 
         from core.api.services.brain.jobs import run_brain_cycle_once
 

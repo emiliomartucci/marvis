@@ -5,7 +5,6 @@ import {
   useEffect,
   useRef,
   useState,
-  type ChangeEvent,
   type MutableRefObject,
 } from "react";
 import dynamic from "next/dynamic";
@@ -21,6 +20,7 @@ import {
   listSessions,
   postTerminalMetricsBatch,
 } from "@/lib/api";
+import { redirectToConsoleLogin } from "@/lib/config";
 import SessionSidebar from "@/components/SessionSidebar";
 import CommandPalette from "@/components/CommandPalette";
 import type {
@@ -654,9 +654,6 @@ export default function TerminalPanel({ panelVisible }: TerminalPanelProps) {
   const coldActivationTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const lastActiveSessionUrlKeyRef = useRef<string | null>(null);
 
-  // Upload button: hidden file input + handler
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
   const syncDiagnosticsInfo = useCallback(() => {
     setDiagnosticsInfo((prev) => {
       const next = getTerminalDiagnosticsInfo();
@@ -741,19 +738,6 @@ export default function TerminalPanel({ panelVisible }: TerminalPanelProps) {
       sessionUuid: session.session_uuid,
       projectSlug: session.project_slug,
     });
-  }, []);
-
-  const handleFileSelect = useCallback((e: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
-    if (files.length === 0) return;
-    recordTerminalDiagnosticEvent("terminal_upload_button_files_selected", {
-      count: files.length,
-      files: files.map((file) => ({ name: file.name, type: file.type, size: file.size })),
-    });
-    // Dispatch a custom event that the active Terminal component listens to
-    window.dispatchEvent(new CustomEvent("terminal-upload", { detail: { files } }));
-    // Reset input so same file can be selected again
-    e.target.value = "";
   }, []);
 
   // Idempotency Map for session_renamed events (Plan 2026-05-21 AC11/AC13).
@@ -1597,7 +1581,7 @@ export default function TerminalPanel({ panelVisible }: TerminalPanelProps) {
     recordTerminalDiagnosticEvent("terminal_auth_error_redirect", {
       activeSession,
     });
-    window.location.href = "/login/";
+    redirectToConsoleLogin();
   }, [activeSession]);
 
   const sessionMetaByName = new Map(allSessions.map((session) => [session.name, session]));
@@ -2078,37 +2062,6 @@ export default function TerminalPanel({ panelVisible }: TerminalPanelProps) {
             >
               Perf
             </button>
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="pir-v2-tbbtn"
-              title="Upload file"
-              style={{
-                fontFamily: "var(--pir-font-mono)",
-                fontWeight: 600,
-                fontSize: 9,
-                letterSpacing: "0.1em",
-                textTransform: "uppercase",
-                padding: "4px 7px",
-                border: "1px solid var(--pir-border)",
-                borderRadius: "var(--radius-sm, 2px)",
-                color: "var(--pir-text-tertiary)",
-                background: "transparent",
-                display: "flex",
-                alignItems: "center",
-              }}
-            >
-              <svg width="10" height="10" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 6.707a1 1 0 010-1.414l3-3a1 1 0 011.414 0l3 3a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L7.707 6.707a1 1 0 01-1.414 0z" clipRule="evenodd" />
-              </svg>
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              className="hidden"
-              onChange={handleFileSelect}
-            />
             <span
               style={{
                 color: "var(--pir-text-muted)",
@@ -2178,22 +2131,6 @@ export default function TerminalPanel({ panelVisible }: TerminalPanelProps) {
             >
               Perf
             </button>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="px-2 py-0.5 text-caption text-pir-text-muted hover:text-pir-text-secondary border border-pir rounded"
-              title="Upload file"
-            >
-              <svg className="w-3.5 h-3.5 inline-block" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 6.707a1 1 0 010-1.414l3-3a1 1 0 011.414 0l3 3a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L7.707 6.707a1 1 0 01-1.414 0z" clipRule="evenodd" />
-              </svg>
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              className="hidden"
-              onChange={handleFileSelect}
-            />
             <button
               onClick={() => setPaletteOpen(true)}
               className="px-2 py-0.5 text-caption text-pir-text-muted hover:text-pir-text-secondary border border-pir rounded font-mono"

@@ -24,6 +24,10 @@ class FakeAsyncCursor:
     async def fetchall(self):
         return self._cursor.fetchall()
 
+    @property
+    def rowcount(self) -> int:
+        return self._cursor.rowcount
+
 
 class FakeAsyncDB:
     def __init__(self, path: str) -> None:
@@ -37,6 +41,9 @@ class FakeAsyncDB:
     async def commit(self) -> None:
         self._conn.commit()
 
+    async def rollback(self) -> None:
+        self._conn.rollback()
+
     def close(self) -> None:
         self._conn.close()
 
@@ -49,6 +56,11 @@ def tmp_db(tmp_path: Path) -> str:
     conn.execute(
         "CREATE TABLE sessions_meta ("
         "name TEXT PRIMARY KEY, "
+        "workspace_id TEXT NOT NULL DEFAULT 'ws_default', "
+        "display_name TEXT, "
+        "pinned INTEGER NOT NULL DEFAULT 0, "
+        "sort_order INTEGER NOT NULL DEFAULT 0, "
+        "group_name TEXT, "
         "session_uuid TEXT, "
         "created_at TEXT, "
         "last_active TEXT, "
@@ -57,9 +69,14 @@ def tmp_db(tmp_path: Path) -> str:
         "conversation_id TEXT, "
         "provider TEXT, "
         "project_slug TEXT, "
+        "model TEXT, "
         "launch_model TEXT, "
         "permission_preset TEXT, "
         "theme_mode TEXT, "
+        "auto_hibernate_minutes INTEGER, "
+        "working_seconds INTEGER, "
+        "agent_managed INTEGER NOT NULL DEFAULT 0, "
+        "owner_id TEXT, "
         # Post-migration-088 schema: legacy column renamed
         "last_context_pct_legacy REAL, "
         # Post-migration-087 dual metrics columns (see migrations/087/088)
@@ -68,13 +85,46 @@ def tmp_db(tmp_path: Path) -> str:
         "last_cost_usd REAL, "
         "last_cost_conversation_usd REAL, "
         "last_cost_session_usd REAL, "
+        "last_cost_session_incomplete INTEGER, "
+        "last_input_tokens INTEGER, "
+        "last_output_tokens INTEGER, "
+        "last_reasoning_tokens INTEGER, "
+        "working_seconds_msg INTEGER, "
+        "metrics_refreshed_at TEXT, "
+        "pricing_version TEXT, "
         # Post-migration-089 shadow cost columns (PR4)
         "last_cost_conversation_equivalent_usd REAL, "
         "last_cost_session_equivalent_usd REAL, "
         "last_cost_equivalent_pricing_version TEXT, "
         "last_message_count INTEGER, "
         "last_metrics_at TEXT, "
+        "activity_state TEXT, "
+        "activity_state_updated_at TEXT, "
         "bootstrap_message TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE session_operation_leases ("
+        "workspace_id TEXT NOT NULL, "
+        "session_name TEXT NOT NULL, "
+        "session_uuid TEXT NOT NULL, "
+        "generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0), "
+        "operation TEXT, "
+        "lease_expires_at TEXT, "
+        "updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), "
+        "PRIMARY KEY (workspace_id, session_name))"
+    )
+    conn.execute(
+        "CREATE TABLE workspace_projects ("
+        "workspace_id TEXT NOT NULL, "
+        "project_slug TEXT NOT NULL, "
+        "source TEXT NOT NULL, "
+        "created_by TEXT NOT NULL, "
+        "PRIMARY KEY (workspace_id, project_slug))"
+    )
+    conn.execute(
+        "INSERT INTO workspace_projects "
+        "(workspace_id, project_slug, source, created_by) VALUES (?, ?, ?, ?)",
+        ("ws_default", "c&i-normativa", "test", "test-fixture"),
     )
     conn.execute(
         "INSERT INTO sessions_meta (name, session_uuid, created_at, hibernated, conversation_id, provider, project_slug, launch_model, permission_preset, theme_mode, bootstrap_message) "
@@ -231,7 +281,7 @@ def test_agent_resume_uses_project_aware_workspace_fallback(
     db = FakeAsyncDB(tmp_db)
     sent: list[tuple[str, str, bool]] = []
 
-    async def _resolve_uuid(_uuid: str, _db) -> str:
+    async def _resolve_uuid(_uuid: str, _db, _workspace_id: str) -> str:
         return "normativa"
 
     async def _send_keys(name: str, cmd: str, double_enter: bool = True) -> bool:

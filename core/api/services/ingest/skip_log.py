@@ -30,6 +30,7 @@ SkipReason = Literal[
 async def log_skip(
     db: aiosqlite.Connection,
     *,
+    workspace_id: str,
     file_path_attempted: str,
     project_slug: str,
     reason: SkipReason,
@@ -44,16 +45,19 @@ async def log_skip(
     flow (audit miss is preferable to a 500 on the user-facing endpoint).
     """
     skip_id = str(uuid.uuid4())
+    if not workspace_id.strip():
+        raise ValueError("workspace_id is required for ingest skip audit")
     try:
         await db.execute(
             """
             INSERT INTO ingest_skipped
-                (id, file_path_attempted, project_slug, sha256,
+                (id, workspace_id, file_path_attempted, project_slug, sha256,
                  reason, existing_ingest_id, error_message, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 skip_id,
+                workspace_id,
                 file_path_attempted,
                 project_slug,
                 sha256,

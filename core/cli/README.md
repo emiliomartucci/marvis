@@ -1,6 +1,6 @@
 # marvis init
 
-Interactive bootstrap wizard for MarvisX OSS. Five prompts (license,
+Interactive bootstrap wizard for the local MarvisX open-core runtime. Five prompts (license,
 storage, BYOK, first project, recap) reusing the shared `core/wizard/`
 state machine so the CLI and the Console `/welcome` route produce
 byte-identical settings when given the same answers.
@@ -120,7 +120,7 @@ administrators provisioning a host.
 
 `marvis init` (this Python CLI) is an onboarding wizard: writes
 `settings.yaml` + BYOK vault + first project seed in the user's home.
-It targets OSS users running MarvisX locally.
+It targets people running the source-available MarvisX runtime locally.
 
 The two flows are complementary and will converge in a later phase. Until
 then both ship side-by-side.

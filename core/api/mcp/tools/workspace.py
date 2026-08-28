@@ -1,15 +1,15 @@
 """Workspace file tools for hosted MCP Phase A."""
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 from typing import Annotated, Any
 
 from pydantic import Field
 
-from core.api.mcp._adapter import LOCAL_CTX, raise_mcp_error
+from core.api.mcp._adapter import LOCAL_CTX, current_mcp_context, raise_mcp_error
 from core.api.services import workspace_tools as svc
+from core.api.use_cases._context import require_workspace_ctx
 from core.api.use_cases._errors import ServiceError
 
 
@@ -47,26 +47,42 @@ def _workspace_audit_sink(event: svc.AuditEvent) -> None:
     if not db_path:
         raise RuntimeError("MARVIS_DB_PATH/PIR_DB_PATH is not configured")
 
+    safe_metadata = {
+        key: value
+        for key, value in event.metadata.items()
+        if key
+        in {
+            "argv0",
+            "returncode",
+            "timed_out",
+            "duration_ms",
+            "replacements",
+            "size_bytes",
+        }
+    }
     details = {
         "phase": event.phase,
         "tenant_id": event.tenant_id,
         "before_sha256": event.before_sha256,
         "after_sha256": event.after_sha256,
         "outcome": event.outcome,
-        "metadata": event.metadata,
+        "metadata": safe_metadata,
     }
+    ctx = current_mcp_context()
+    from core.api.services.audit import log_audit_sync
+
     with sqlite3.connect(db_path, timeout=2.0) as conn:
-        conn.execute(
-            "INSERT INTO audit_log (action, user, resource_type, resource_id, details_json) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                f"workspace.{event.action}.{event.phase}",
-                event.actor_id,
-                "workspace_file",
-                event.path,
-                json.dumps(details, sort_keys=True),
-            ),
+        conn.execute("BEGIN IMMEDIATE")
+        log_audit_sync(
+            conn,
+            action=f"workspace.{event.action}.{event.phase}",
+            user=event.actor_id,
+            resource_type="workspace_file",
+            resource_id=event.path,
+            details=details,
+            workspace_id=require_workspace_ctx(ctx),
         )
+        conn.commit()
 
 
 def register(mcp) -> None:

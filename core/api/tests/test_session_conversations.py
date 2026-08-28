@@ -9,7 +9,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
-from core.api.services import opencode_metrics
+from core.api.services import model_registry, opencode_metrics
 from core.api.services.session_metrics_service import (
     compute_cost_session,
     compute_cost_session_extended,
@@ -21,18 +21,53 @@ def _seed_sessions_meta_schema(conn: sqlite3.Connection) -> None:
     """Minimal schema mirroring migration 001 + 087 for session_conversations tests."""
     conn.executescript(
         """
-        CREATE TABLE sessions_meta (name TEXT PRIMARY KEY);
+        CREATE TABLE sessions_meta (
+            name TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL DEFAULT 'ws_default'
+        );
         CREATE TABLE session_conversations (
+            workspace_id TEXT NOT NULL DEFAULT 'ws_default',
             session_name TEXT NOT NULL,
             conversation_id TEXT NOT NULL,
             ord INTEGER NOT NULL,
             created_at TEXT NOT NULL,
-            PRIMARY KEY (session_name, conversation_id),
+            PRIMARY KEY (workspace_id, session_name, conversation_id),
             FOREIGN KEY (session_name) REFERENCES sessions_meta(name) ON DELETE CASCADE
         );
         CREATE INDEX idx_session_conv_name ON session_conversations(session_name);
         CREATE INDEX idx_session_conv_id ON session_conversations(conversation_id);
         """
+    )
+
+
+def _enable_test_opencode_pricing(monkeypatch) -> None:
+    """Inject fixture rates without coupling OSS tests to the excluded kb/ tree."""
+    monkeypatch.setattr(
+        model_registry,
+        "_OPENCODE_PRICING_CACHE",
+        {
+            "version": "2026-04-23",
+            "providers": {
+                "openai": {
+                    "gpt-5.4": {
+                        "input": 1.25,
+                        "output": 10.0,
+                        "cache_read": 0.13,
+                        "cache_write_5m": 1.56,
+                        "cache_write_1h": 2.5,
+                    }
+                },
+                "anthropic": {
+                    "claude-sonnet-4-5": {
+                        "input": 3.0,
+                        "output": 15.0,
+                        "cache_read": 0.3,
+                        "cache_write_5m": 3.75,
+                        "cache_write_1h": 6.0,
+                    }
+                },
+            },
+        },
     )
 
 
@@ -391,6 +426,7 @@ async def test_compute_cost_session_extended_aggregates_equivalent(
     tmp_path, monkeypatch
 ):
     """cost_session_extended sums real + equivalent across chain."""
+    _enable_test_opencode_pricing(monkeypatch)
     oc_db = tmp_path / "opencode.db"
     # Session 1: OAuth-style — real cost=0, equivalent from tokens
     #   gpt-5.4 pricing: input=$1.25/M, output=$10.00/M → (100000*1.25 + 1000*10)/1M = 0.135

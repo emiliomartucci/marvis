@@ -1,0 +1,13 @@
+{
+  "schema": "marvis-prior-distributions/v1",
+  "supported": [
+    {
+      "version": "0.3.8",
+      "role": "last_stable_public_release",
+      "filename": "marvisx_cli-0.3.8-py3-none-any.whl",
+      "sha256": "77a00a1eedaf6d6d6284ba3d0a5a66da665d35e035a140caaf733a339bad46a2",
+      "url": "https://files.pythonhosted.org/packages/16/f0/510e24d0b838a865ae4ca6f298b5aed5a16e5565c1b16f02c8c2ba2f7c09/marvisx_cli-0.3.8-py3-none-any.whl"
+    }
+  ],
+  "additional_predecessors": []
+}

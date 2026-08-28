@@ -14,7 +14,7 @@ from core.api.db import acquire_db
 
 logger = logging.getLogger(__name__)
 
-# Module-level session (like n8n_client.py pattern)
+# Module-level reusable HTTP session.
 _push_session: aiohttp.ClientSession | None = None
 
 ALLOWED_PUSH_ORIGINS = {
@@ -101,10 +101,16 @@ async def periodic_push_delivery() -> None:
     # Phase 1: READ notifications from pool (fast, release immediately)
     async with acquire_db() as db:
         cursor = await db.execute("""
-            SELECT id, user_id, title, body, type
-            FROM notifications
-            WHERE pushed_at IS NULL AND created_at > datetime('now', '-1 hour', 'utc')
-            ORDER BY created_at
+            SELECT n.id, n.user_id, n.title, n.body, n.type
+            FROM notifications n
+            JOIN users u ON u.id = n.user_id
+                AND u.type = 'human'
+                AND u.deleted_at IS NULL
+                AND u.workspace_id = n.workspace_id
+            WHERE n.workspace_id IS NOT NULL
+                AND n.pushed_at IS NULL
+                AND n.created_at > datetime('now', '-1 hour', 'utc')
+            ORDER BY n.created_at
             LIMIT 50
         """)
         notifications = [dict(r) for r in await cursor.fetchall()]

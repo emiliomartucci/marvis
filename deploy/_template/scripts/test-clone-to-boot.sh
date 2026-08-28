@@ -82,6 +82,8 @@ log() {
 
 cleanup() {
   local exit_code=$?
+  (cd "$INSTANCE_DIR" 2>/dev/null && \
+    docker compose -p "$PROJECT_NAME" logs --no-color >"$LOG_DIR/services.log" 2>&1) || true
   log "tearing down Compose project $PROJECT_NAME"
   (cd "$INSTANCE_DIR" 2>/dev/null && \
     docker compose -p "$PROJECT_NAME" down -v --remove-orphans >>"$LOG_DIR/teardown.log" 2>&1) || true

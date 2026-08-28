@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from core.api.services import providers, session_catalog, session_ops
 from core.api.services.session_catalog import (
     WORKSPACE_ROOT,
     get_model_definition,
@@ -67,7 +68,9 @@ def test_blank_model_is_available_for_all_providers():
         assert "-m " not in launch.start_command
 
 
-def test_opencode_resume_start_spec_preserves_model_and_permission():
+def test_opencode_resume_start_spec_preserves_model_and_permission(monkeypatch):
+    monkeypatch.setattr(session_catalog, "WORKSPACE_ROOT", "/var/marvisx/workspace")
+    monkeypatch.setattr(providers.settings, "runtime_home", "/var/marvisx")
     launch = build_session_start_spec(
         "opencode",
         "marvisx",
@@ -89,7 +92,9 @@ def test_opencode_resume_start_spec_preserves_model_and_permission():
     )
 
 
-def test_codex_default_start_spec_enables_1m_context():
+def test_codex_default_start_spec_enables_1m_context(monkeypatch):
+    monkeypatch.setattr(session_catalog, "WORKSPACE_ROOT", "/var/marvisx/workspace")
+    monkeypatch.setattr(providers.settings, "runtime_home", "/var/marvisx")
     launch = build_session_start_spec("codex", "marvisx")
 
     assert launch.model_id == "gpt-5.5"
@@ -104,12 +109,16 @@ def test_codex_default_start_spec_enables_1m_context():
 
 
 def test_workspace_launch_still_adds_project_access_dirs(monkeypatch):
+    monkeypatch.setattr(session_catalog, "WORKSPACE_ROOT", "/var/marvisx/workspace")
+    monkeypatch.setattr(providers.settings, "runtime_home", "/var/marvisx")
     monkeypatch.setattr(
-        "api.services.session_ops.resolve_project_path",
+        session_ops,
+        "resolve_project_path",
         lambda _slug: "/var/marvisx/repos/propriofacile",
     )
     monkeypatch.setattr(
-        "api.services.session_ops.resolve_project_access_paths",
+        session_ops,
+        "resolve_project_access_paths",
         lambda _slug: (
             "/var/marvisx/repos/propriofacile",
             "/data/projects/propriofacile",

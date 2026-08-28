@@ -86,20 +86,8 @@ describe("AppShell", () => {
       </AppShell>
     );
     expect(screen.getByText("Terminal")).toBeInTheDocument();
-    expect(screen.getByText("Projects")).toBeInTheDocument();
+    expect(screen.getByText("Finder")).toBeInTheDocument();
     expect(screen.getByText("Logout")).toBeInTheDocument();
-  });
-
-  it("exposes Inbox RSS and Ingester menu entries", () => {
-    render(
-      <AppShell>
-        <div>Content</div>
-      </AppShell>
-    );
-
-    expect(screen.getByRole("menu", { name: "Inbox navigation" })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: "RSS" })).toHaveAttribute("href", "/inbox");
-    expect(screen.getByRole("menuitem", { name: "Ingester" })).toHaveAttribute("href", "/inbox/triage/files");
   });
 
   it("renders children in content area", () => {

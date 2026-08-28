@@ -80,7 +80,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const logout = useCallback(async () => {
-    await apiLogout();
+    // Even if the POST fails we still clear local state; the server-side clear
+    // is best-effort and we must not trap the user in a signed-in shell.
+    const result = await apiLogout().catch(() => null);
     setUsername(null);
     setRole(null);
     setUserId(null);
@@ -88,6 +90,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setPermissions(derivePermissions(null));
     setLlmKeyMissing(false);
     setStatus("unauthenticated");
+    // End the WorkOS AuthKit session in the browser too. Without this hard
+    // navigation the provider silently re-authenticates on the next sign-in
+    // and the user appears to stay logged in.
+    const logoutUrl = result?.logout_url;
+    if (logoutUrl && typeof window !== "undefined") {
+      window.location.assign(logoutUrl);
+    }
   }, []);
 
   return (

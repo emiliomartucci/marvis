@@ -178,10 +178,15 @@ def _tokens(text: str) -> set[str]:
     return {match.group(0).lower() for match in TOKEN_RE.finditer(text or "")}
 
 
-async def _list_visible_projects() -> list[dict]:
-    """Return on-server projects that expose an input landing zone."""
+async def _list_visible_projects(db: Any, workspace_id: str) -> list[dict]:
+    """Return only input projects with one owner equal to this workspace."""
+    from core.api.services.access_grants import (
+        ProjectWorkspaceOwnershipError,
+        require_unique_project_workspace,
+    )
+
     projects: list[dict] = []
-    root = Path("/data/projects")
+    root = Path(os.environ.get("MARVIS_PROJECTS_ROOT", "/data/projects"))
     if not root.exists():
         return projects
     try:
@@ -203,9 +208,19 @@ async def _list_visible_projects() -> list[dict]:
             continue
         if not (d / "input").exists():
             continue
+        slug = str(data.get("project") or d.name)
+        try:
+            await require_unique_project_workspace(
+                db,
+                project_slug=slug,
+                workspace_id=workspace_id,
+                allow_local_single_user=True,
+            )
+        except ProjectWorkspaceOwnershipError:
+            continue
         projects.append(
             {
-                "slug": data.get("project") or d.name,
+                "slug": slug,
                 "name": data.get("name") or d.name,
                 "description": (data.get("description") or "")[:200],
                 "type": data.get("type", "work"),
@@ -214,18 +229,27 @@ async def _list_visible_projects() -> list[dict]:
     return projects
 
 
-async def _fetch_recent_hotspots(db: Any, limit: int = 5) -> list[dict]:
+async def _fetch_recent_hotspots(
+    db: Any, workspace_id: str, limit: int = 5
+) -> list[dict]:
     """Top-N hotspots by ``touch_count_30d``. Mirrors graph_landing()."""
     try:
         cur = await db.execute(
             """
-            SELECT id, type, name, qualified_name, touch_count_30d
-              FROM graph_nodes
-             WHERE deprecated_at IS NULL
+            SELECT gn.id, gn.type, gn.name, gn.qualified_name, gn.touch_count_30d
+              FROM graph_nodes gn
+             WHERE gn.deprecated_at IS NULL
+               AND gn.project_id IN (
+                   SELECT wp.project_slug
+                     FROM workspace_projects wp
+                    GROUP BY wp.project_slug
+                   HAVING COUNT(DISTINCT wp.workspace_id) = 1
+                      AND MIN(wp.workspace_id) = ?
+               )
              ORDER BY touch_count_30d DESC, touch_last_at DESC
              LIMIT ?
             """,
-            (limit,),
+            (workspace_id, limit),
         )
         rows = await cur.fetchall()
     except Exception:  # noqa: BLE001 - graph table optional in tests
@@ -252,7 +276,9 @@ async def _fetch_recent_hotspots(db: Any, limit: int = 5) -> list[dict]:
     return out
 
 
-async def _semantic_similar(content: str, db: Any, limit: int = 5) -> list[dict]:
+async def _semantic_similar(
+    content: str, db: Any, workspace_id: str, limit: int = 5
+) -> list[dict]:
     """Best-effort semantic search. Empty list if embedding/sqlite-vec unavailable."""
     try:
         from core.api.config import settings
@@ -271,7 +297,7 @@ async def _semantic_similar(content: str, db: Any, limit: int = 5) -> list[dict]
     try:
         grouped = await search_by_type(
             content[:500],
-            "ws_default",
+            workspace_id,
             db_path,
             vec0_path,
             top_k=limit,
@@ -279,15 +305,44 @@ async def _semantic_similar(content: str, db: Any, limit: int = 5) -> list[dict]
     except Exception:  # noqa: BLE001 - the embedding backend may be unavailable in dev/test
         return []
     files = grouped.get("file", []) if isinstance(grouped, dict) else []
-    return files[:limit]
+    from core.api.services.access_grants import (
+        ProjectWorkspaceOwnershipError,
+        require_unique_project_workspace,
+    )
+
+    visible: list[dict] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        project_slug = str(
+            item.get("project") or item.get("project_slug") or ""
+        ).strip()
+        try:
+            await require_unique_project_workspace(
+                db,
+                project_slug=project_slug,
+                workspace_id=workspace_id,
+                allow_local_single_user=True,
+            )
+        except ProjectWorkspaceOwnershipError:
+            continue
+        visible.append(item)
+        if len(visible) >= limit:
+            break
+    return visible
 
 
-async def gather_classification_context(content: str, db: Any) -> dict:
+async def gather_classification_context(
+    content: str, db: Any, workspace_id: str
+) -> dict:
     """Discovery context via internal services in parallel (H-D1)."""
+    workspace_id = workspace_id.strip()
+    if not workspace_id:
+        raise ValueError("workspace_id is required for classification context")
     projects, similar, hotspots = await asyncio.gather(
-        _list_visible_projects(),
-        _semantic_similar(content, db),
-        _fetch_recent_hotspots(db),
+        _list_visible_projects(db, workspace_id),
+        _semantic_similar(content, db, workspace_id),
+        _fetch_recent_hotspots(db, workspace_id),
         return_exceptions=True,
     )
 

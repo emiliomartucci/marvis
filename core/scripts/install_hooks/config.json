@@ -36,7 +36,6 @@
   "bash_safety": {
     "blocked_patterns": [
       {"id": "force_push_main", "pattern": "git\\s+push.*(--force|-f).*(main|master)", "reason": "force push on main blocked"},
-      {"id": "gh_pr_create", "pattern": "gh\\s+pr\\s+create", "reason": "use submit_pr API instead"},
       {"id": "cp_data_pir", "pattern": "cp\\s+.*\\s+/data/pir/", "reason": "deploy via PR merge, not direct cp"}
     ]
   },

@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import aiosqlite
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from core.api.db import get_db, get_write_db
 from core.api.models import UserInfo
-from core.api.security import get_current_user_or_agent
+from core.api.security import (
+    get_current_user_or_agent,
+    is_local_single_user_mode,
+    is_loopback_request,
+)
 from core.api.services.share_links import (
     create_shared_link_record,
     enforce_workspace_share_role,
     fetch_active_shared_path,
-    is_workspace_share_path,
     mark_share_access,
     normalize_repo_input,
     public_repo_path,
@@ -22,8 +25,28 @@ from core.api.services.share_links import (
 )
 from core.api.routers.finder import _validate_path
 
-router = APIRouter(prefix="/api/v1/share-repo", tags=["share-repo"])
-shared_repo_router = APIRouter(prefix="/api/v1/shared-repo", tags=["share-repo"])
+_LEGACY_SHARE_DETAIL = (
+    "Legacy host-global share routes are local-only. Use the governed share_file "
+    "MCP tool for remote project-owned sharing."
+)
+
+
+def _require_local_legacy_share_request(request: Request) -> None:
+    if is_local_single_user_mode() and is_loopback_request(request):
+        return
+    raise HTTPException(status_code=403, detail=_LEGACY_SHARE_DETAIL)
+
+
+router = APIRouter(
+    prefix="/api/v1/share-repo",
+    tags=["share-repo"],
+    dependencies=[Depends(_require_local_legacy_share_request)],
+)
+shared_repo_router = APIRouter(
+    prefix="/api/v1/shared-repo",
+    tags=["share-repo"],
+    dependencies=[Depends(_require_local_legacy_share_request)],
+)
 
 
 @router.post("")

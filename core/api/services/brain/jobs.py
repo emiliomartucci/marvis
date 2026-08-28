@@ -19,6 +19,7 @@ from core.api.services.brain.cycle import (
     polish_run_journals,
     publish_run_journals,
     supersede_active_runs,
+    reinstate_richer_superseded_run,
     update_run_status,
 )
 from core.api.services.brain.digest_collector import (
@@ -34,6 +35,11 @@ from core.api.services.brain.models import (
 )
 from core.api.services.brain.watermarks import advance_watermark, get_watermark
 from core.api.services.brain.ws_emitter import emit_phase_complete
+
+try:
+    from core.api.services.brain.activation_gate import evaluate_brain_activation
+except ImportError:
+    evaluate_brain_activation = None
 
 logger = logging.getLogger(__name__)
 
@@ -660,6 +666,52 @@ async def _execute_cycle(
                 SourceFailure(source_system="findings", error=str(exc))
             )
 
+        # Phase 6 — Notify producer (P1 F3). Per-user notifications for this run's
+        # actionable findings + drift. Fully isolated: a failure here logs but never
+        # degrades the cycle status — it is a delivery side-channel, not a reflection
+        # phase, so it also does NOT append to `failures`.
+        try:
+            from core.api.services.brain.notify_producer import run_notify_phase
+
+            async with write_db() as ndb:
+                await run_notify_phase(
+                    ndb,
+                    run_id=run_id,
+                    cycle_key=cycle_key,
+                    workspace_id=workspace_id,
+                    now=now,
+                )
+        except Exception:  # noqa: BLE001 — side-channel, never crashes the cycle
+            logger.exception("brain.jobs: notify producer failed")
+
+        # Phase 7 — Salience decay (P4 F1 PR-b, re-enabled after mig 166). Ebbinghaus
+        # decay of document salience so stale docs sink in ranking over time. UNLIKE
+        # the notify side-channel above, a failure here appends to `failures` -> the
+        # run is marked partial. DECAY ONLY — boost stays out of the cycle. Safe for
+        # FTS since mig 166 scoped documents_fts_update to `OF file_path, doc_title`,
+        # so this bulk salience UPDATE no longer rebuilds (clobbers) the FTS content.
+        try:
+            from core.api.services.brain.salience_decay import (
+                run_salience_decay_phase,
+            )
+
+            decay_report = await run_salience_decay_phase(
+                run_id=run_id,
+                now=now,
+                workspace_id=workspace_id,
+            )
+            logger.info(
+                "brain.jobs: salience decay run_id=%s scanned=%d updated=%d",
+                run_id,
+                decay_report.scanned,
+                decay_report.updated,
+            )
+        except Exception as exc:  # noqa: BLE001 — phase-level isolation, marks run partial
+            logger.exception("brain.jobs: salience decay phase failed")
+            failures.append(
+                SourceFailure(source_system="salience_decay", error=str(exc))
+            )
+
         duration_ms = int((time.monotonic() - started) * 1000)
         status = "succeeded" if not failures else "partial"
         async with write_db() as db:
@@ -672,6 +724,15 @@ async def _execute_cycle(
                 duration_ms=duration_ms,
                 finished_at=now,
             )
+            if event_count == 0:
+                # An empty re-run must not oust a richer prior run for
+                # this cycle (its events were already digested).
+                await reinstate_richer_superseded_run(
+                    db,
+                    workspace_id=workspace_id,
+                    cycle_key=cycle_key,
+                    empty_run_id=run_id,
+                )
         await _record_last_cycle(cycle_key=cycle_key, now=now)
 
         await emit_phase_complete(
@@ -749,6 +810,7 @@ async def run_brain_jobs_if_due(
     Returns one of:
       {"status": "disabled"}            — brain_enabled=false
       {"status": "idle", ...}           — before cutoff or cycle already published
+      {"status": "skipped_never_activated", ...} — empty hosted consumer
       {"status": "ok", ...}             — successful run
       {"status": "already_running", ...} — concurrent invocation
       {"status": "partial", ...}        — per-source failures
@@ -771,17 +833,39 @@ async def run_brain_jobs_if_due(
             return {"status": "disabled"}
         last_cycle_key = await _get_setting(db, "brain_last_cycle_key", "")
 
-    cycle_key = current_brain_cycle_key(now, settings.freeze_hour_utc)
-    cutoff_at = cycle_cutoff_at(now, settings.cutoff_hour_utc)
+        cycle_key = current_brain_cycle_key(now, settings.freeze_hour_utc)
+        cutoff_at = cycle_cutoff_at(now, settings.cutoff_hour_utc)
 
-    if now.hour < settings.cutoff_hour_utc:
-        return {"status": "idle", "cycle_key": cycle_key, "reason": "before_cutoff"}
-    if last_cycle_key == cycle_key:
-        return {
-            "status": "idle",
-            "cycle_key": cycle_key,
-            "reason": "cycle_already_published",
-        }
+        if now.hour < settings.cutoff_hour_utc:
+            return {
+                "status": "idle",
+                "cycle_key": cycle_key,
+                "reason": "before_cutoff",
+            }
+        if last_cycle_key == cycle_key:
+            return {
+                "status": "idle",
+                "cycle_key": cycle_key,
+                "reason": "cycle_already_published",
+            }
+
+        activation = (
+            await evaluate_brain_activation(db)
+            if evaluate_brain_activation is not None
+            else None
+        )
+        if activation is not None and not activation.should_run:
+            logger.info(
+                "brain.cycle.skipped_never_activated tenant_id=%s "
+                "local_agent_connected=false real_project_count=0 cycle_key=%s",
+                activation.tenant_id,
+                cycle_key,
+            )
+            return {
+                "status": "skipped_never_activated",
+                "reason": activation.reason,
+                "cycle_key": cycle_key,
+            }
 
     lease = await _claim_run_lease(
         workspace_id=workspace_id,

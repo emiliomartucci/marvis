@@ -4,11 +4,21 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from core.api.db import acquire_db
+from core.api.db import acquire_db, acquire_write_db
 from core.api.models.brain import JournalBody, JournalEntry, ScopeType
+try:
+    from core.api.services.first_value import (
+        hosted_tenant_id,
+        maybe_record_journal_first_value,
+    )
+except ImportError:
+    hosted_tenant_id = maybe_record_journal_first_value = None
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_iso(value: str) -> datetime:
@@ -30,12 +40,21 @@ def _row_to_entry(row: Any) -> JournalEntry:
     # giorni") never miss the polish.
     narrative_polished = None
     polish_model = None
+    narrative_agent = None
+    narrative_agent_at = None
+    narrative_agent_by = None
     if hasattr(row, "keys"):
         keys = set(row.keys())
         if "narrative_polished" in keys:
             narrative_polished = row["narrative_polished"]
         if "narrative_polished_model" in keys:
             polish_model = row["narrative_polished_model"]
+        if "narrative_agent" in keys:
+            narrative_agent = row["narrative_agent"]
+        if "narrative_agent_at" in keys:
+            narrative_agent_at = row["narrative_agent_at"]
+        if "narrative_agent_by" in keys:
+            narrative_agent_by = row["narrative_agent_by"]
     entry_kwargs: dict[str, Any] = {
         "entry_id": row[0] if not hasattr(row, "keys") else row["entry_id"],
         "run_id": row[1] if not hasattr(row, "keys") else row["run_id"],
@@ -54,14 +73,49 @@ def _row_to_entry(row: Any) -> JournalEntry:
         entry_kwargs["narrative_polished"] = narrative_polished
     if polish_model:
         entry_kwargs["polish_model"] = polish_model
+    if narrative_agent:
+        entry_kwargs["narrative_agent"] = narrative_agent
+    if narrative_agent_at:
+        entry_kwargs["narrative_agent_at"] = narrative_agent_at
+    if narrative_agent_by:
+        entry_kwargs["narrative_agent_by"] = narrative_agent_by
     return JournalEntry(**entry_kwargs)
 
 
 _SELECT_COLUMNS = (
     "entry_id, run_id, workspace_id, cycle_key, scope_type, scope_key, "
     "program_key, body_json, is_empty, published_at, narrative_polished, "
-    "narrative_polished_at, narrative_polished_model"
+    "narrative_polished_at, narrative_polished_model, "
+    "narrative_agent, narrative_agent_at, narrative_agent_by"
 )
+
+
+async def record_customer_value_from_journal(entries: list[JournalEntry]) -> None:
+    if hosted_tenant_id is None or maybe_record_journal_first_value is None:
+        return
+    tenant_id = hosted_tenant_id()
+    candidates = [
+        entry
+        for entry in entries
+        if entry.scope_type == "project" and not entry.is_empty
+    ]
+    if tenant_id is None or not candidates:
+        return
+    try:
+        async with acquire_write_db(label="customer_first_value.brain_journal") as db:
+            for entry in candidates:
+                result = await maybe_record_journal_first_value(
+                    db,
+                    tenant_id=tenant_id,
+                    workspace_id=entry.workspace_id,
+                    project_slug=entry.scope_key,
+                    entry_id=entry.entry_id,
+                )
+                if result is not None:
+                    break
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001 - analytics never breaks journal reads
+        logger.warning("customer first value journal write failed: %s", exc)
 
 
 async def get_latest_entry(
@@ -203,4 +257,9 @@ async def list_entries_for_cycle(
     return [_row_to_entry(r) for r in rows]
 
 
-__all__ = ["get_latest_entry", "list_entries", "list_entries_for_cycle"]
+__all__ = [
+    "get_latest_entry",
+    "list_entries",
+    "list_entries_for_cycle",
+    "record_customer_value_from_journal",
+]

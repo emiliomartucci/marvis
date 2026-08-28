@@ -6,22 +6,31 @@ on:
     branches: [main]
 
 jobs:
-  surface-registry:
+  # One consolidated Python job keeps per-job minute rounding low while the
+  # checked collection contract prevents a green result from hiding a suite.
+  python-contract:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyyaml
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Checked test collection (paths, counts, markers, matrices)
+        run: python scripts/verify_ci_collection.py
+      - name: Required Python suites (zero unexplained skips)
+        run: python scripts/run_ci_contract.py
+      - name: Immutable 0.3.8 upgrade and rollback
+        run: python scripts/verify_local_upgrade.py --download --version 0.3.8
+      - name: Public license and audit claims
+        run: python scripts/verify_public_claims.py
       - name: Surface registry gate (fail-closed)
         run: python scripts/validate_surfaces.py
       - name: Local GUI perimeter gate (declaration vs source)
         run: python scripts/validate_local_surfaces.py
       - name: Desktop host contract gate (contract vs launcher)
         run: python scripts/validate_desktop_host.py
-      - name: Validator unit tests (green on good, red on tampered)
-        run: python -m unittest discover -s scripts -p "test_*.py" -v
 
   # The GUI the public product ships had no job running its tests. The tree
   # arrived from the shared console with 17 failing tests and a suite that did
@@ -43,16 +52,3 @@ jobs:
         run: npx tsc --noEmit -p tsconfig.json
       - name: Unit tests
         run: npx vitest run
-
-  console-launcher:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      # Only what the launcher module imports: these tests characterize the
-      # CLI entry point, they do not boot the API.
-      - run: pip install typer rich pytest
-      - name: Console launcher characterization (U7 pre-move baseline)
-        run: python -m pytest core/cli/tests -q

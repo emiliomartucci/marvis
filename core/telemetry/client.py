@@ -1,5 +1,5 @@
-# v1.0.0 - 2026-05-27 - S2 F5: anonymous, opt-out telemetry client (gate-before-IO)
-"""``emit(event, props)`` — the ONE telemetry entrypoint, opt-out by construction.
+# v1.0.0 - 2026-05-27 - S2 F5: anonymous, opt-in telemetry client (gate-before-IO)
+"""``emit(event, props)`` — the ONE telemetry entrypoint, opt-in by construction.
 
 The single hard rule (CRITICAL — mem0 incident, plan S2 F5 §"Gate opt-out PRIMA
 di ogni init di rete"): the opt-out gate runs **before any network/queue/disk
@@ -24,7 +24,7 @@ Precedence (any opt-out wins):
 ``DO_NOT_TRACK`` set (universal standard) OR ``MARVIS_TELEMETRY`` ∈ {0,off,false}
 → disabled. ``MARVIS_TELEMETRY=log`` → print the event JSON to **stderr**, send
 nothing (show-don't-send, the strongest trust signal). Else ``settings.yaml
-telemetry: false`` → disabled. Else default ON.
+telemetry: true`` enables sending. Otherwise it remains OFF.
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ _FLUSH_TIMEOUT = 2.0
 
 # ---------------------------------------------------------------------------
 # THE GATE. Nothing above this line touches disk or network. `_enabled()` is the
-# single opt-out decision; `emit()` returns on a False gate before any init.
+# single consent decision; `emit()` returns on a False gate before any init.
 # ---------------------------------------------------------------------------
 
 
@@ -57,8 +57,8 @@ def _enabled() -> bool:
     Telemetry is OFF by default; it only turns on with explicit consent.
     Precedence:
 
-    1. ``DO_NOT_TRACK`` set to any non-empty value → disabled (universal OSS
-       standard, honored alongside our own var as a courtesy to the community).
+    1. ``DO_NOT_TRACK`` set to any non-empty value → disabled (universal privacy
+       convention, honored alongside our own var as a courtesy to the community).
     2. ``MARVIS_TELEMETRY`` ∈ {``0``, ``off``, ``false``} → disabled.
     3. ``MARVIS_TELEMETRY`` ∈ {``1``, ``on``, ``true``} → enabled.
     4. ``MARVIS_TELEMETRY=log`` → enabled, but downstream prints (never sends).

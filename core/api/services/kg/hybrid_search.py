@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 async def _filter_learnings_temporal(
     grouped: dict[str, list[dict]],
     db_path: str,
+    workspace_id: str,
     as_of: str | None,
 ) -> None:
     """Track 2 #1-S2: drop superseded learnings from the fused result, IN PLACE.
@@ -86,7 +87,9 @@ async def _filter_learnings_temporal(
 
     placeholders = ",".join("?" * len(doc_ids))
     sql = (
-        f"SELECT id FROM learnings WHERE id IN ({placeholders}) {temporal_sql}"
+        f"SELECT id FROM learnings WHERE id IN ({placeholders}) "
+        "AND workspace_id = ? "
+        f"{temporal_sql}"
     )
     try:
         conn = await aiosqlite.connect(db_path)
@@ -96,11 +99,14 @@ async def _filter_learnings_temporal(
     try:
         conn.row_factory = aiosqlite.Row
         try:
-            cur = await conn.execute(sql, [*doc_ids, *temporal_params])
+            cur = await conn.execute(
+                sql, [*doc_ids, workspace_id, *temporal_params]
+            )
             rows = await cur.fetchall()
         except aiosqlite.OperationalError as exc:
             # Pre-migration (no invalid_at/valid_from columns) → fail open.
             logger.warning("temporal learning filter degraded: %s", exc)
+            grouped["learning"] = []
             return
         live_ids = {r["id"] for r in rows}
     finally:
@@ -371,6 +377,8 @@ async def _row_fts_search(
     title_col: str,
     status_col: str | None,
     source_label: str,
+    base_table: str,
+    workspace_id: str,
     limit: int,
 ) -> list[RowFtsHit]:
     """Generic MATCH over a row-mirroring FTS5 table (tasks/inbox/learnings).
@@ -393,19 +401,42 @@ async def _row_fts_search(
         conn.row_factory = aiosqlite.Row
         try:
             # fts_table / title_col / status_col are internal callers; not user input.
-            status_select = f", {status_col} AS status" if status_col else ", '' AS status"
-            sql = (
-                f"SELECT id, {title_col} AS title, project{status_select}, "
-                f"bm25({fts_table}) AS score "
-                f"FROM {fts_table} "
-                f"WHERE {fts_table} MATCH ? "
-                f"ORDER BY score "
-                f"LIMIT ?"
-            )
             q_fts = fts5_safe_query(q)
             if not q_fts:
                 return []
-            cur = await conn.execute(sql, [q_fts, limit])
+            status_select = (
+                f", {fts_table}.{status_col} AS status"
+                if status_col
+                else ", '' AS status"
+            )
+            base_columns = {
+                str(row[1])
+                for row in await (
+                    await conn.execute(f'PRAGMA table_info("{base_table}")')
+                ).fetchall()
+            }
+            workspace_clause = ""
+            query_params: list[object] = [q_fts]
+            if "workspace_id" in base_columns:
+                workspace_clause = (
+                    " AND base.workspace_id = ?"
+                )
+                query_params.append(workspace_id)
+            else:
+                return []
+            sql = (
+                f"SELECT {fts_table}.id, {fts_table}.{title_col} AS title, "
+                f"{fts_table}.project{status_select}, "
+                f"bm25({fts_table}) AS score "
+                f"FROM {fts_table} "
+                f"JOIN {base_table} base ON base.id = {fts_table}.id "
+                f"WHERE {fts_table} MATCH ? "
+                f"{workspace_clause} "
+                f"ORDER BY score "
+                f"LIMIT ?"
+            )
+            query_params.append(limit)
+            cur = await conn.execute(sql, query_params)
             rows = await cur.fetchall()
         except aiosqlite.OperationalError as exc:
             msg = str(exc).lower()
@@ -427,7 +458,9 @@ async def _row_fts_search(
         await conn.close()
 
 
-async def tasks_fts_search(q: str, db_path: str, limit: int = 40) -> list[RowFtsHit]:
+async def tasks_fts_search(
+    q: str, db_path: str, workspace_id: str, limit: int = 40
+) -> list[RowFtsHit]:
     """MATCH over tasks_fts (Phase 6.6). Fixes post-6.5 task recall regression."""
     return await _row_fts_search(
         q,
@@ -436,11 +469,15 @@ async def tasks_fts_search(q: str, db_path: str, limit: int = 40) -> list[RowFts
         title_col="title",
         status_col="status",
         source_label="task",
+        base_table="tasks",
+        workspace_id=workspace_id,
         limit=limit,
     )
 
 
-async def inbox_fts_search(q: str, db_path: str, limit: int = 40) -> list[RowFtsHit]:
+async def inbox_fts_search(
+    q: str, db_path: str, workspace_id: str, limit: int = 40
+) -> list[RowFtsHit]:
     """MATCH over inbox_items_fts (Phase 6.6)."""
     return await _row_fts_search(
         q,
@@ -449,12 +486,14 @@ async def inbox_fts_search(q: str, db_path: str, limit: int = 40) -> list[RowFts
         title_col="title",
         status_col="status",
         source_label="inbox_item",
+        base_table="inbox_items",
+        workspace_id=workspace_id,
         limit=limit,
     )
 
 
 async def learnings_fts_search(
-    q: str, db_path: str, limit: int = 40
+    q: str, db_path: str, workspace_id: str, limit: int = 40
 ) -> list[RowFtsHit]:
     """MATCH over learnings_fts (Phase 6.6).
 
@@ -469,6 +508,8 @@ async def learnings_fts_search(
         title_col="title",
         status_col="severity",
         source_label="learning",
+        base_table="learnings",
+        workspace_id=workspace_id,
         limit=limit,
     )
 
@@ -493,6 +534,7 @@ async def documents_fts_search(
             conn,
             q,
             limit=limit,
+            workspace_id=workspace_id,
         )
         rows_by_doc_id = await embedding_service._fetch_document_rows(
             conn,
@@ -605,6 +647,10 @@ async def _run_semantic_branch(
             top_k=top_k,
         )
         return grouped, None
+    except asyncio.CancelledError:
+        # ``asyncio.wait_for`` uses cancellation to enforce the semantic
+        # deadline; let the wrapper classify it as a timeout.
+        raise
     except BaseException as exc:  # noqa: BLE001 — intentional: degrade gracefully
         logger.warning("hybrid.semantic_branch failed: %s", exc)
         return None, exc
@@ -671,11 +717,12 @@ async def _run_row_fts_branch(
     name: str,
     q: str,
     db_path: str,
+    workspace_id: str,
     limit: int,
 ) -> tuple[list[RowFtsHit] | None, BaseException | None]:
     """Generic (result, error) wrapper for the three Phase 6.6 row-FTS branches."""
     try:
-        return await fn(q, db_path, limit=limit), None
+        return await fn(q, db_path, workspace_id, limit=limit), None
     except BaseException as exc:  # noqa: BLE001
         logger.warning("hybrid.%s_branch failed: %s", name, exc)
         return None, exc
@@ -748,14 +795,23 @@ async def hybrid_search(
                 _run_documents_fts_branch(q, db_path, workspace_id, fetch_n)
             )
             tasks_task = tg.create_task(
-                _run_row_fts_branch(tasks_fts_search, "tasks", q, db_path, fetch_n)
+                _run_row_fts_branch(
+                    tasks_fts_search, "tasks", q, db_path, workspace_id, fetch_n
+                )
             )
             inbox_task = tg.create_task(
-                _run_row_fts_branch(inbox_fts_search, "inbox", q, db_path, fetch_n)
+                _run_row_fts_branch(
+                    inbox_fts_search, "inbox", q, db_path, workspace_id, fetch_n
+                )
             )
             learn_task = tg.create_task(
                 _run_row_fts_branch(
-                    learnings_fts_search, "learnings", q, db_path, fetch_n
+                    learnings_fts_search,
+                    "learnings",
+                    q,
+                    db_path,
+                    workspace_id,
+                    fetch_n,
                 )
             )
         sem_result, sem_err = sem_task.result()
@@ -773,13 +829,18 @@ async def hybrid_search(
             q, db_path, workspace_id, fetch_n
         )
         tasks_hits, tasks_err = await _run_row_fts_branch(
-            tasks_fts_search, "tasks", q, db_path, fetch_n
+            tasks_fts_search, "tasks", q, db_path, workspace_id, fetch_n
         )
         inbox_hits, inbox_err = await _run_row_fts_branch(
-            inbox_fts_search, "inbox", q, db_path, fetch_n
+            inbox_fts_search, "inbox", q, db_path, workspace_id, fetch_n
         )
         learn_hits, learn_err = await _run_row_fts_branch(
-            learnings_fts_search, "learnings", q, db_path, fetch_n
+            learnings_fts_search,
+            "learnings",
+            q,
+            db_path,
+            workspace_id,
+            fetch_n,
         )
 
     # Flatten semantic hits into a ranked list of (doc_type, doc_dict) pairs.
@@ -1086,10 +1147,26 @@ async def hybrid_search(
             if dt in grouped:
                 grouped[dt].append(enriched)
 
+    # Fase 2 mielinizzazione U2 — reinforcement ledger → effective salience,
+    # AFTER fusion/dedupe on the emitted candidate set only. STRUCTURAL branch
+    # (R4): with mode off/shadow this block is never entered — no import, no
+    # query, output byte-identical to the pre-plan path. With mode on, the
+    # documents-backed hits get salience_effettiva = base + clamp(Σ decayed
+    # boosts, 0, cap) and are re-ordered by (rrf_score + delta/(rrf_k+1)) —
+    # RRF weights and the other lanes are untouched (see kg/reinforcement.py).
+    if settings.reinforcement_mode == "on":
+        from core.api.services.kg import reinforcement as _reinf
+
+        await _reinf.apply_reinforcement_to_grouped(
+            grouped, db_path, rrf_k=rrf_k
+        )
+
     # Track 2 #1-S2 — temporal filter on the LEARNING lane, AFTER fusion +
     # grouping (so salience/ranking already applied; no tombstone leaks into
     # top-k). No-op unless MARVIS_TEMPORAL_MEMORY is ON.
-    await _filter_learnings_temporal(grouped, db_path, as_of)
+    await _filter_learnings_temporal(
+        grouped, db_path, workspace_id, as_of
+    )
 
     total_hits = _total()
     meta: dict[str, object] = {

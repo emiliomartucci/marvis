@@ -23,9 +23,16 @@ class ServiceError(Exception):
 
     http_status: int = 400
 
-    def __init__(self, *, code: str, message: str) -> None:
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        context: dict[str, object] | None = None,
+    ) -> None:
         self.code = code
         self.message = message
+        self.context = dict(context or {})
         super().__init__(f"{code}: {message}")
 
     def __str__(self) -> str:

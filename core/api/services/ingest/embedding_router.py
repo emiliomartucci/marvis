@@ -29,6 +29,7 @@ _LOCAL_MODEL_MISSING_LOGGED = False
 async def embed_and_index(
     *,
     ingest_id: str,
+    workspace_id: str = "ws_default",
     slug: str,
     target_path: Path,
     extracted_text: str | None,
@@ -98,6 +99,7 @@ async def embed_and_index(
             return "skipped"
 
     await _persist_ingest_embedding(
+        workspace_id=workspace_id,
         slug=slug,
         target_path=target_path,
         document_type=document_type,
@@ -201,6 +203,7 @@ def _coerce_dimensions(vector: list[float]) -> list[float]:
 
 async def _persist_ingest_embedding(
     *,
+    workspace_id: str,
     slug: str,
     target_path: Path,
     document_type: str,
@@ -212,23 +215,26 @@ async def _persist_ingest_embedding(
     async with acquire_write_db() as db:
         await db.execute(
             """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
-               VALUES (?, ?, 'ws_default', ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(file_path) DO UPDATE SET
                  content_hash = excluded.content_hash,
                  project = excluded.project,
                  workspace_id = excluded.workspace_id,
                  doc_type = excluded.doc_type,
-                 doc_title = excluded.doc_title""",
+                 doc_title = excluded.doc_title
+               WHERE documents.workspace_id = excluded.workspace_id""",
             [
                 file_path,
                 slug,
+                workspace_id,
                 document_type,
                 title,
                 embedding_service.content_hash(content),
             ],
         )
         async with db.execute(
-            "SELECT id FROM documents WHERE file_path = ?", [file_path]
+            "SELECT id FROM documents WHERE workspace_id = ? AND file_path = ?",
+            [workspace_id, file_path],
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:

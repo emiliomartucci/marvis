@@ -6,12 +6,10 @@ Separato da security.py che gestisce authn (JWT, cookies, tokens).
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
 
 import aiosqlite
 from fastapi import Depends, HTTPException
 
-from core.api.config import settings
 from core.api.models import UserInfo
 from core.api.security import (
     get_current_user,  # noqa: F401 — re-export kept for callers importing via rbac
@@ -68,8 +66,8 @@ def require_role(*allowed: str, human_only: bool = False) -> Callable[..., Await
 def require_scope(*required_scopes: str) -> Callable[..., Awaitable[UserInfo]]:
     """FastAPI dependency factory. Enforces agent token scopes.
 
-    For human users (cookie auth), scopes are not checked — humans have full access
-    based on their role. Scopes only restrict agent tokens.
+    Validated human sessions and trusted local single-user calls are role-gated.
+    Every bearer mechanism is scope-gated, even when its persisted owner is human.
 
     Usage: Depends(require_scope("read", "write"))
     """
@@ -79,15 +77,18 @@ def require_scope(*required_scopes: str) -> Callable[..., Awaitable[UserInfo]]:
     async def check(
         user: UserInfo = Depends(get_current_user_or_agent),
     ) -> UserInfo:
-        # Human users (cookie auth) bypass scope checks — their role is the gate.
-        # Bare-username agents (token-auth resolves username=<slug>, not
-        # "agent:<slug>") must NOT bypass: the generic "agent" fallback plus the
-        # configured tenant identities (settings.static_agent_identities, from
-        # the deploy .env) are treated as agents so scope enforcement still
-        # applies. OSS core hardcodes no tenant agent names here.
-        agent_usernames = {"agent"} | set(settings.static_agent_identities)
-        if not user.username.startswith("agent:") and user.username not in agent_usernames:
+        if user.auth_mechanism in {"session", "local"} and user.user_type == "human":
             return user
+
+        if user.auth_mechanism not in {
+            "agent_token",
+            "legacy_shared_token",
+            "delegated_agent_token",
+        }:
+            raise HTTPException(
+                status_code=403,
+                detail="Authenticated mechanism cannot satisfy scoped access.",
+            )
 
         # Agent with no scopes (empty/null) = NO permission for scope-gated ops.
         # Empty MUST deny, not allow-all: an unscoped agent token previously

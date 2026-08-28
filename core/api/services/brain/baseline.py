@@ -17,6 +17,15 @@ from core.api.services.brain.journal import get_latest_entry
 
 logger = logging.getLogger(__name__)
 
+_EXACT_LEGACY_PROJECT_SQL = (
+    "((SELECT COUNT(DISTINCT wp.workspace_id) FROM workspace_projects wp "
+    "WHERE wp.project_slug = ?) = 1 AND EXISTS (SELECT 1 FROM workspace_projects wp "
+    "WHERE wp.project_slug = ? AND wp.workspace_id = ?)) OR "
+    "(NOT EXISTS (SELECT 1 FROM workspace_projects wp WHERE wp.project_slug = ?) "
+    "AND (SELECT COUNT(*) FROM workspaces) = 1 "
+    "AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = ?))"
+)
+
 
 def _parse_iso(value: str | None) -> datetime | None:
     if not value:
@@ -31,7 +40,11 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 
 async def _resolve_project_direction(
-    *, scope_type: ScopeType, scope_key: str, as_of: datetime
+    *,
+    scope_type: ScopeType,
+    scope_key: str,
+    as_of: datetime,
+    workspace_id: str,
 ) -> tuple[str | None, datetime | None]:
     """Return (ref, last_updated_at) of the project_directions row for a slug.
 
@@ -46,8 +59,16 @@ async def _resolve_project_direction(
             row = await (
                 await db.execute(
                     "SELECT project_slug, last_updated_at FROM project_directions"
-                    " WHERE project_slug = ?",
-                    (scope_key,),
+                    " WHERE project_slug = ? "
+                    f"AND ({_EXACT_LEGACY_PROJECT_SQL})",
+                    (
+                        scope_key,
+                        scope_key,
+                        scope_key,
+                        workspace_id,
+                        scope_key,
+                        workspace_id,
+                    ),
                 )
             ).fetchone()
     except Exception as exc:  # noqa: BLE001 — table may not exist on cold DB
@@ -78,8 +99,17 @@ async def _resolve_status_update(
                     "SELECT update_id, created_at FROM project_status_updates "
                     "WHERE project = ? AND created_at <= ? "
                     "AND COALESCE(derived, 0) = 0 "
+                    f"AND ({_EXACT_LEGACY_PROJECT_SQL}) "
                     "ORDER BY created_at DESC LIMIT 1",
-                    (scope_key, cutoff),
+                    (
+                        scope_key,
+                        cutoff,
+                        scope_key,
+                        scope_key,
+                        workspace_id,
+                        scope_key,
+                        workspace_id,
+                    ),
                 )
             ).fetchone()
     except Exception as exc:  # noqa: BLE001 — table may not exist in test DB
@@ -96,6 +126,8 @@ async def _resolve_handoff(
     *, scope_type: ScopeType, scope_key: str, as_of: datetime, workspace_id: str
 ) -> tuple[str | None, datetime | None]:
     """Return (ref, state_at) of the latest auto_handoff for the scope."""
+    if scope_type != "project":
+        return (None, None)
     cutoff = as_of.astimezone(timezone.utc).isoformat()
     try:
         async with acquire_db() as db:
@@ -104,8 +136,17 @@ async def _resolve_handoff(
                     "SELECT handoff_id, created_at FROM handoffs "
                     "WHERE project = ? AND created_at <= ? "
                     "AND COALESCE(kind, '') IN ('auto_handoff','handoff') "
+                    f"AND ({_EXACT_LEGACY_PROJECT_SQL}) "
                     "ORDER BY created_at DESC LIMIT 1",
-                    (scope_key,) if scope_type == "project" else (scope_key,),
+                    (
+                        scope_key,
+                        cutoff,
+                        scope_key,
+                        scope_key,
+                        workspace_id,
+                        scope_key,
+                        workspace_id,
+                    ),
                 )
             ).fetchone()
     except Exception as exc:  # noqa: BLE001 — table may not exist
@@ -158,7 +199,10 @@ async def resolve_baseline(
     # source for project scope. Falls back to journal -> status -> handoff
     # when no direction is present (bootstrap not yet applied).
     direction_ref, direction_state_at = await _resolve_project_direction(
-        scope_type=scope_type, scope_key=scope_key, as_of=as_of
+        scope_type=scope_type,
+        scope_key=scope_key,
+        as_of=as_of,
+        workspace_id=workspace_id,
     )
 
     journal = await get_latest_entry(

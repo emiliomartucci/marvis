@@ -2,7 +2,7 @@
 """Handoffs MCP tools — port of the Node ``handoffs`` group, use_cases-direct.
 
 Same template as ``tasks.py`` / ``learnings.py``: the Node HTTP proxy is replaced
-by an in-process ``await <uc>.<action>(LOCAL_CTX, db, ...)``. Docstrings copied
+by an in-process ``await <uc>.<action>(current_mcp_context(), db, ...)``. Docstrings copied
 VERBATIM from ``core/mcp-pir/index.mjs``.
 
 Name mapping (Node tool name -> use_case function):
@@ -20,8 +20,8 @@ fetch with ``kg_context=None`` and ignores ``deep`` (adapter concern, later F3
 increment).
 
 Return typing: reads return ``dict[str, Any]`` / ``list[dict]`` via ``dump()``
-(DTO lists normalised element-wise). visible_projects=None (local single-user,
-unrestricted — DECISION 1).
+(DTO lists normalised element-wise). Trusted stdio stays unrestricted; remote
+calls resolve their authenticated project visibility.
 """
 from __future__ import annotations
 
@@ -33,12 +33,16 @@ from core.api.mcp._adapter import (
     LOCAL_CTX,
     acquire_db,
     acquire_write_db,
+    current_mcp_context,
+    current_visible_projects,
     dump,
+    require_unambiguous_visible_project,
     raise_mcp_error,
 )
+from core.api.use_cases import feedback as feedback_uc
 from core.api.use_cases import handoffs as handoffs_uc
 from core.api.use_cases import projects as projects_uc
-from core.api.use_cases._errors import ServiceError
+from core.api.use_cases._errors import NotFoundError, ServiceError
 
 
 def _normalize_list_handoff_entry(slug: str, entry: dict[str, Any]) -> dict[str, Any]:
@@ -95,6 +99,47 @@ def _normalize_get_handoff_filename(filename: str) -> str:
     return filename
 
 
+async def _current_handoff_scope(project_slug: str) -> tuple[Any, set[str] | None]:
+    """Resolve one authenticated caller and its project visibility per tool call."""
+    ctx = current_mcp_context()
+    if ctx is LOCAL_CTX:
+        return ctx, None
+    async with acquire_db() as db:
+        visible_projects = await current_visible_projects(db, ctx)
+        await require_unambiguous_visible_project(
+            db,
+            ctx,
+            project_slug,
+            visible_projects,
+        )
+        return ctx, visible_projects
+
+
+async def _only_unambiguous_handoff_projects(
+    db,
+    ctx,
+    visible_projects: set[str] | None,
+) -> set[str] | None:
+    """Quarantine shared slugs from cross-project disk-backed searches."""
+    if ctx is LOCAL_CTX:
+        return None
+    if visible_projects is None:
+        raise NotFoundError(code="project_not_found", message="Project not found")
+    safe: set[str] = set()
+    for project_slug in sorted(visible_projects):
+        try:
+            await require_unambiguous_visible_project(
+                db,
+                ctx,
+                project_slug,
+                visible_projects,
+            )
+        except NotFoundError:
+            continue
+        safe.add(project_slug)
+    return safe
+
+
 def register(mcp) -> None:
     """Register the handoffs tool group on the shared FastMCP instance."""
 
@@ -121,9 +166,10 @@ def register(mcp) -> None:
         RESTITUISCE: {project_slug, filename, path, frontmatter, body};
         project_slug+filename feed get_handoff directly."""
         try:
+            ctx, visible_projects = await _current_handoff_scope(project_slug)
             async with acquire_write_db() as db:
                 result = await handoffs_uc.create_handoff(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     project_slug=project_slug,
                     body=body,
@@ -135,7 +181,7 @@ def register(mcp) -> None:
                     branch=branch,
                     tags=tags,
                     task_id=task_id,
-                    visible_projects=None,
+                    visible_projects=visible_projects,
                 )
                 return dump(result)
         except ServiceError as e:
@@ -154,9 +200,17 @@ def register(mcp) -> None:
         RESTITUISCE: paginated list of {project_slug, filename, path, session_id, branch, tags, date} ordered chronological; project_slug+filename feed get_handoff directly."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db,
+                    ctx,
+                    slug,
+                    visible_projects,
+                )
                 # Node route is /projects/<slug>/handoffs -> projects_uc.get_handoffs.
                 result = await projects_uc.get_handoffs(
-                    LOCAL_CTX, db, slug=slug, visible_projects=None
+                    ctx, db, slug=slug, visible_projects=visible_projects
                 )
                 rows = dump(result)
                 normalized_rows = [
@@ -188,11 +242,21 @@ def register(mcp) -> None:
         acquire_vec_db = asynccontextmanager(get_vec_db)
         try:
             async with acquire_db() as db, acquire_vec_db() as vec_db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                visible_projects = await _only_unambiguous_handoff_projects(
+                    db,
+                    ctx,
+                    visible_projects,
+                )
                 result = await handoffs_uc.search_handoffs(
-                    LOCAL_CTX, db, vec_db, q=q, visible_projects=None
+                    ctx, db, vec_db, q=q, visible_projects=visible_projects
                 )
                 rows = dump(result)
-                return [_normalize_search_handoff_result(row) for row in rows]
+                normalized = [_normalize_search_handoff_result(row) for row in rows]
+                # Fase 2 U3 nudge (R6): list-shaped output → ONE trailing
+                # sentinel element; see append_feedback_nudge_row.
+                return feedback_uc.append_feedback_nudge_row(normalized)
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -204,21 +268,29 @@ def register(mcp) -> None:
     ) -> dict[str, Any]:
         """Get a single handoff file by project and filename.
 
-        QUANDO USARLO: hai project_slug + filename da list_handoffs/search_handoffs e vuoi il body completo + frontmatter. Usa ?deep=true per kg_context inline (references, mentions, context chain).
+        QUANDO USARLO: hai project_slug + filename da list_handoffs/search_handoffs e vuoi il body completo + frontmatter. Il parametro deep=true e' accettato ma oggi IGNORATO su questa superficie: nessun kg_context inline (enrichment differito).
         QUANDO NON USARLO: NOT per ricerca testuale -> usa search_handoffs. NOT per lista handoff di progetto -> usa list_handoffs.
-        RESTITUISCE: {project, file, frontmatter, body, kg_context?}."""
+        RESTITUISCE: {project, file, frontmatter, body}; kg_context NON popolato (deep no-op)."""
         try:
             normalized_filename = _normalize_get_handoff_filename(filename)
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db,
+                    ctx,
+                    project_slug,
+                    visible_projects,
+                )
                 # DECISION 2: `deep` KG enrichment is an adapter concern; the
                 # use_case returns kg_context=None (core fetch). Deep-attach lands
                 # in a later F3 increment, same as get_task/get_project in F3.0.
                 result = await handoffs_uc.get_handoff(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     project_slug=project_slug,
                     filename=normalized_filename,
-                    visible_projects=None,
+                    visible_projects=visible_projects,
                 )
                 return dump(result)
         except ServiceError as e:

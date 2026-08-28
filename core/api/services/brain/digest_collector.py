@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
 from core.api.services.brain.models import EventDraft, SourceCollectorContext

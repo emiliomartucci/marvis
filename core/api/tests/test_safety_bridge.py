@@ -4,6 +4,8 @@ import importlib.util
 from pathlib import Path
 import sys
 
+import pytest
+
 
 def _load_bridge_module():
     bridge_path = Path(__file__).resolve().parents[2] / "scripts" / "safety_bridge.py"
@@ -278,7 +280,7 @@ def test_push_no_refspec_fallback_current_branch_task(monkeypatch):
     assert decision.allowed is True
 
 
-def test_unknown_rule_key_is_advisory_before_config_load(monkeypatch):
+def test_unknown_rule_key_is_blocked_before_config_load(monkeypatch):
     bridge = _load_bridge_module()
     monkeypatch.setattr(
         bridge,
@@ -288,8 +290,8 @@ def test_unknown_rule_key_is_advisory_before_config_load(monkeypatch):
 
     decision = bridge.evaluate_rule("removed-rule-key")
 
-    assert decision.allowed is True
-    assert decision.advisory is True
+    assert decision.allowed is False
+    assert decision.advisory is False
     assert decision.rule == "removed-rule-key"
 
 
@@ -358,8 +360,9 @@ def test_secret_scan_runs_outside_git_repo(monkeypatch):
         bridge, "resolve_repo_root", lambda file_path, cwd=None: None
     )
 
+    synthetic_secret = "sk-live-" + "abcd1234efgh5678ijkl"
     decision = bridge.check_secret_scan(
-        "git commit -m 'add config' && export API_KEY=sk-live-abcd1234efgh5678ijkl",
+        f"git commit -m 'add config' && export API_KEY={synthetic_secret}",
         "/tmp/not-a-repo",
         _config(),
     )
@@ -393,7 +396,7 @@ def test_secret_scan_blocks_secret_in_staged_diff(monkeypatch):
     monkeypatch.setattr(
         bridge,
         "_git_output",
-        lambda args, cwd: "+API_KEY=sk-live-abcd1234efgh5678ijkl",
+        lambda args, cwd: "+API_KEY=" + "sk-live-abcd1234efgh5678ijkl",
     )
 
     decision = bridge.check_secret_scan(
@@ -402,3 +405,44 @@ def test_secret_scan_blocks_secret_in_staged_diff(monkeypatch):
 
     assert decision.allowed is False
     assert decision.rule == "secret-scan"
+
+
+def test_secret_scan_cannot_be_bypassed_with_quoted_git_name(monkeypatch):
+    bridge = _load_bridge_module()
+    monkeypatch.setattr(
+        bridge, "resolve_repo_root", lambda file_path, cwd=None: "/repo"
+    )
+    staged_secret = "+API_KEY=" + "sk-live-abcd1234efgh5678ijkl"
+    monkeypatch.setattr(
+        bridge,
+        "_git_output",
+        lambda args, cwd: staged_secret,
+    )
+
+    decision = bridge.check_secret_scan(
+        "g''it commit -m 'add config'", "/repo", _config()
+    )
+
+    assert decision.allowed is False
+    assert decision.rule == "secret-scan"
+
+
+@pytest.mark.parametrize(
+    "added_line",
+    [
+        "+last_input_tokens,Y=u.last_output_tokens",
+        '+children:"Token markup"}),className="font-mono tabular-nums"',
+    ],
+)
+def test_secret_scan_ignores_non_assignment_code(monkeypatch, added_line):
+    bridge = _load_bridge_module()
+    monkeypatch.setattr(
+        bridge, "resolve_repo_root", lambda file_path, cwd=None: "/repo"
+    )
+    monkeypatch.setattr(bridge, "_git_output", lambda args, cwd: added_line)
+
+    decision = bridge.check_secret_scan(
+        "git commit -m 'refresh generated console'", "/repo", _config()
+    )
+
+    assert decision.allowed is True

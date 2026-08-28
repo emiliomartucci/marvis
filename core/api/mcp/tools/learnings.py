@@ -2,7 +2,7 @@
 """Learnings MCP tools — port of the Node ``learnings`` group, use_cases-direct.
 
 Same template as ``tasks.py``: the Node HTTP proxy is replaced by an in-process
-``await learnings_uc.<action>(LOCAL_CTX, db, ...)``. Docstrings copied
+``await learnings_uc.<action>(current_mcp_context(), db, ...)``. Docstrings copied
 VERBATIM from ``core/mcp-pir/index.mjs``.
 
 Schema notes:
@@ -13,8 +13,8 @@ Schema notes:
     ``Literal[...]``.
 
 Return typing: reads return ``dict[str, Any]`` / ``list[dict]``; ``create_learning``
-(mutator) returns the DTO ``.model_dump()`` via ``dump()``. visible_projects=None
-(local single-user, unrestricted).
+(mutator) returns the DTO ``.model_dump()`` via ``dump()``. Trusted stdio stays
+unrestricted; remote calls resolve their authenticated project visibility.
 """
 from __future__ import annotations
 
@@ -29,18 +29,32 @@ from core.api.mcp._adapter import (
     LOCAL_CTX,
     acquire_db,
     acquire_write_db,
+    current_mcp_context,
+    current_visible_projects,
     dump,
     mcp_embed_learning,
     raise_mcp_error,
 )
+from core.api.services import access_grants
+from core.api.use_cases import feedback as feedback_uc
 from core.api.use_cases import learnings as learnings_uc
-from core.api.use_cases._errors import ServiceError
+from core.api.use_cases._errors import NotFoundError, ServiceError
 
 LearningCategory = Literal[
     "deploy", "migration", "auth", "testing", "architecture", "security", "performance"
 ]
 LearningSeverity = Literal["low", "medium", "high", "critical"]
 logger = logging.getLogger(__name__)
+
+
+def _filter_learning_rows(rows: list[dict[str, Any]], visible_projects: set[str] | None) -> list[dict[str, Any]]:
+    if visible_projects is None:
+        return rows
+    return [
+        row
+        for row in rows
+        if not row.get("project") or row.get("project") in visible_projects
+    ]
 
 
 def _check_learnings_timeout_seconds() -> float:
@@ -57,6 +71,15 @@ def _check_learnings_timeout_seconds() -> float:
         return 8.0
 
 
+async def _current_learning_scope() -> tuple[Any, set[str] | None]:
+    """Resolve one authenticated caller and its project visibility per mutation."""
+    ctx = current_mcp_context()
+    if ctx is LOCAL_CTX:
+        return ctx, None
+    async with acquire_db() as db:
+        return ctx, await current_visible_projects(db, ctx)
+
+
 def register(mcp) -> None:
     """Register the learnings tool group on the shared FastMCP instance."""
 
@@ -71,18 +94,32 @@ def register(mcp) -> None:
         QUANDO NON USARLO: path preciso -> graph_pattern; nuovo post-mortem -> create_learning.
         PROVA: prevention rules ranked per situazione; non sostituisce test/live smoke.
         NEXT: applica prevention prima di deploy/push/reindex e cita i learning rilevanti nel report.
-        RESTITUISCE: list of {id, title, prevention, severity, module} ranked per rilevanza."""
+        RESTITUISCE: list of {id, title, prevention, severity, module} ranked per rilevanza. Con reinforcement mode shadow/on e risultati non vuoti, il payload include il campo suggested_next_tool (nudge memory_feedback)."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 # Node param `q` -> use_case param `query`.
                 timeout = _check_learnings_timeout_seconds()
                 result = await asyncio.wait_for(
                     learnings_uc.check_learnings(
-                        LOCAL_CTX, db, query=q, module=module
+                        ctx,
+                        db,
+                        query=q,
+                        module=module,
+                        visible_projects=visible_projects,
                     ),
                     timeout=timeout,
                 )
-                return dump(result)
+                payload = dump(result)
+                payload["results"] = _filter_learning_rows(
+                    payload.get("results") or [], visible_projects
+                )
+                payload["count"] = len(payload["results"])
+                # Fase 2 U3 nudge (R6) — gating lives in attach_feedback_nudge.
+                return feedback_uc.attach_feedback_nudge(
+                    payload, has_results=bool(payload["results"])
+                )
         except TimeoutError:
             logger.warning(
                 "MCP check_learnings timed out after %.1fs for query=%r",
@@ -120,9 +157,10 @@ def register(mcp) -> None:
         QUANDO NON USARLO: NOT per idea forward-looking improvement -> usa create_task kind='idea'. NOT per task operativo -> usa create_task.
         RESTITUISCE: {id, title, category, severity, created_at} — indexed by check_learnings."""
         try:
+            ctx, visible_projects = await _current_learning_scope()
             async with acquire_write_db(label="mcp.create_learning") as db:
                 result = await learnings_uc.create_learning(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     title=title,
                     category=category,
@@ -132,6 +170,7 @@ def register(mcp) -> None:
                     module=module,
                     tags=tags,
                     project=project,
+                    visible_projects=visible_projects,
                 )
             # Writer lock released: embed-on-write. On a local Granite backend this
             # awaits inline (synchronous) so the learning is immediately retrievable by
@@ -144,7 +183,7 @@ def register(mcp) -> None:
                 severity=result.severity,
                 prevention=result.prevention,
                 project=result.project,
-                workspace_id=LOCAL_CTX.workspace_id,
+                workspace_id=ctx.workspace_id,
             )
             return dump(result)
         except ServiceError as e:
@@ -165,7 +204,7 @@ def register(mcp) -> None:
         """Update an existing learning (operator+), then re-embed it so search/check_learnings see the new content immediately.
 
         QUANDO USARLO: il contenuto di un learning e' obsoleto/incompleto (prevention piu' precisa, severity ricalibrata, nuovo modulo) ma vuoi PRESERVARE la history. BOUNDARY: update_learning aggiorna in-place + re-embed; delete_learning cancella permanente; create_learning scrive nuovo.
-        QUANDO NON USARLO: NOT per un learning nuovo -> usa create_learning. NOT per azzerare un campo a null: la superficie MCP NON puo' settare null (omettere un campo lo lascia invariato) -> usa l'HTTP PATCH se devi pulire un campo.
+        QUANDO NON USARLO: NOT per un learning nuovo -> usa create_learning. NOT per azzerare un campo a null: da questa superficie NON e' possibile (omettere un campo lo lascia invariato, e nessun tool MCP setta null) — serve l'API HTTP PATCH /learnings/{id}, che vive fuori dai tool MCP.
         RESTITUISCE: il learning aggiornato {id, title, category, severity, prevention, tags, module, project, updated_at} — gia' ri-embeddato (retrievable by meaning, non solo keyword)."""
         fields = {
             k: v
@@ -182,9 +221,14 @@ def register(mcp) -> None:
             if v is not None
         }
         try:
+            ctx, visible_projects = await _current_learning_scope()
             async with acquire_write_db(label="mcp.update_learning") as db:
                 result = await learnings_uc.update_learning(
-                    LOCAL_CTX, db, learning_id=learning_id, fields=fields
+                    ctx,
+                    db,
+                    learning_id=learning_id,
+                    fields=fields,
+                    visible_projects=visible_projects,
                 )
             # Writer lock released: re-embed-on-write (mirror create_learning) so the
             # updated content is retrievable by meaning immediately, not stale until
@@ -197,7 +241,7 @@ def register(mcp) -> None:
                 severity=result.severity,
                 prevention=result.prevention,
                 project=result.project,
-                workspace_id=LOCAL_CTX.workspace_id,
+                workspace_id=ctx.workspace_id,
             )
             return dump(result)
         except ServiceError as e:
@@ -220,8 +264,10 @@ def register(mcp) -> None:
         RESTITUISCE: list of {id, title, category, severity, module, project, created_at, tags} paginato ordered per frequency DESC."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 result = await learnings_uc.list_learnings(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     category=category,
                     project=project,
@@ -230,9 +276,9 @@ def register(mcp) -> None:
                     search=search,
                     limit=limit,
                     offset=offset,
-                    visible_projects=None,
+                    visible_projects=visible_projects,
                 )
-                return dump(result)
+                return _filter_learning_rows(dump(result), visible_projects)
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -243,17 +289,27 @@ def register(mcp) -> None:
     ) -> dict[str, Any]:
         """Get a single learning by UUID.
 
-        QUANDO USARLO: hai un learning ID (da list_learnings o check_learnings) e vuoi il body completo (description + prevention + tags). Usa ?deep=true per includere kg_context inline (context chain, related learnings) — risparmia 2-3 tool call aggiuntivi.
+        QUANDO USARLO: hai un learning ID (da list_learnings o check_learnings) e vuoi il body completo (description + prevention + tags). Il parametro deep=true e' accettato ma oggi IGNORATO su questa superficie: nessun kg_context inline, nessun risparmio di tool-call (enrichment differito a un incremento futuro).
         QUANDO NON USARLO: NOT per ricerca semantica pre-azione -> usa check_learnings. NOT per enumerazione filtrata -> usa list_learnings.
-        RESTITUISCE: {id, title, category, description, prevention, severity, tags, module, project, session, created_at, updated_at, frequency, last_occurrence} + kg_context se deep=true."""
+        RESTITUISCE: {id, title, category, description, prevention, severity, tags, module, project, session, created_at, updated_at, frequency, last_occurrence}; kg_context NON popolato (deep no-op)."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 # DECISION 2: deep KG enrichment is an adapter concern; core fetch
                 # here, deep-attach lands in a later F3 increment.
                 result = await learnings_uc.get_learning(
-                    LOCAL_CTX, db, learning_id=learning_id
+                    ctx,
+                    db,
+                    learning_id=learning_id,
+                    visible_projects=visible_projects,
                 )
-                return dump(result)
+                payload = dump(result)
+                project = payload.get("project")
+                if project and not await access_grants.can_read_project(db, ctx, project):
+                    raise NotFoundError(code="learning_not_found", message="Learning not found")
+                # Fase 2 U3 nudge (R6): a fetched learning IS a non-empty result.
+                return feedback_uc.attach_feedback_nudge(payload, has_results=True)
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -267,9 +323,13 @@ def register(mcp) -> None:
         QUANDO NON USARLO: NOT per archiviare un learning ancora valido — la cancellazione e' permanente e perde la history. Aggiornalo con update_learning se il contenuto e' obsoleto.
         RESTITUISCE: {deleted: true} o 404 se non esiste."""
         try:
+            ctx, visible_projects = await _current_learning_scope()
             async with acquire_write_db(label="mcp.delete_learning") as db:
                 await learnings_uc.delete_learning(
-                    LOCAL_CTX, db, learning_id=learning_id
+                    ctx,
+                    db,
+                    learning_id=learning_id,
+                    visible_projects=visible_projects,
                 )
                 return {"deleted": True}
         except ServiceError as e:

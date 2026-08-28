@@ -38,7 +38,7 @@ from typing import Any
 import aiosqlite
 from pydantic import BaseModel
 
-from core.api.use_cases._context import CallerContext
+from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import AuthorizationError
 
 # Actions an ``operator`` may read in the audit trail (prefix-matched, mirrors the
@@ -142,9 +142,10 @@ async def list_audit_entries(
     when the caller is not allowed to read the requested slice.
     """
     _authorize_audit_read(ctx, action, resource_type)
+    workspace_id = require_workspace_ctx(ctx)
 
-    conditions: list[str] = []
-    params: list[str | int] = []
+    conditions: list[str] = ["workspace_id = ?"]
+    params: list[str | int] = [workspace_id]
 
     if action:
         conditions.append("action LIKE ?")

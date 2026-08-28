@@ -18,7 +18,15 @@ def to_http(err: ServiceError) -> HTTPException:
     Uses ``err.http_status`` for the status code and a structured
     ``{"code", "message"}`` detail body.
     """
+    headers = None
+    retry_after = err.context.get("retry_after")
+    if isinstance(retry_after, int) and retry_after > 0:
+        headers = {"Retry-After": str(retry_after)}
+    detail = {"code": err.code, "message": err.message}
+    if err.context:
+        detail["context"] = err.context
     return HTTPException(
         status_code=err.http_status,
-        detail={"code": err.code, "message": err.message},
+        detail=detail,
+        headers=headers,
     )

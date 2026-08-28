@@ -39,7 +39,12 @@ from core.api.models import (
     SystemMetrics,
     UserInfo,
 )
-from core.api.security import get_current_user, get_current_user_or_agent
+from core.api.security import (
+    get_current_user,
+    get_current_user_or_agent,
+    is_local_single_user_mode,
+    is_loopback_request,
+)
 from core.api.services.metrics_collector import VALID_METRICS, metrics_collector
 from core.api.services.security_collector import security_collector
 
@@ -63,6 +68,16 @@ RATE_LIMIT_WINDOW = 60.0
 _RATE_LIMIT_MAX_KEYS = 1000
 _PACKAGE_NAME = "marvisx-cli"
 _UPDATE_LATEST_CACHE = Path.home() / ".marvis" / "update_latest"
+_LOCAL_HOST_DETAIL = (
+    "Host monitoring data is available only to the trusted local OSS loopback "
+    "runtime."
+)
+
+
+def _require_local_host_request(request: Request) -> None:
+    if is_local_single_user_mode() and is_loopback_request(request):
+        return
+    raise HTTPException(status_code=403, detail=_LOCAL_HOST_DETAIL)
 
 
 def _pyproject_cli_version() -> str:
@@ -149,7 +164,11 @@ async def get_version() -> dict[str, str | bool | None]:
     }
 
 
-@router.get("/current", response_model=MonitoringSnapshot)
+@router.get(
+    "/current",
+    response_model=MonitoringSnapshot,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def get_current(
     request: Request,
     user: UserInfo = Depends(get_current_user_or_agent),
@@ -323,7 +342,11 @@ def _build_disk_tree(root_path: str = "/") -> DiskTreeResponse:
     return DiskTreeResponse(items=items, total_mb=total_mb, free_mb=free_mb)
 
 
-@router.get("/disk-tree", response_model=DiskTreeResponse)
+@router.get(
+    "/disk-tree",
+    response_model=DiskTreeResponse,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def get_disk_tree(
     user: UserInfo = Depends(get_current_user_or_agent),
     path: str = Query(default="/", description="Root path for disk usage scan"),
@@ -353,7 +376,11 @@ async def get_disk_tree(
     return result
 
 
-@router.get("/security", response_model=SecurityData)
+@router.get(
+    "/security",
+    response_model=SecurityData,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def get_security(
     user: UserInfo = Depends(get_current_user),
 ) -> SecurityData:

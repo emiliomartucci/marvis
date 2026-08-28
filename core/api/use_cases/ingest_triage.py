@@ -68,7 +68,11 @@ ProjectRootResolver = Callable[[str], Path]
 import aiosqlite
 from pydantic import BaseModel
 
-from core.api.use_cases._context import CallerContext, require_role_ctx
+from core.api.use_cases._context import (
+    CallerContext,
+    require_role_ctx,
+    require_workspace_ctx,
+)
 from core.api.use_cases._errors import (
     ConflictError,
     NotFoundError,
@@ -476,9 +480,14 @@ def _enforce_visibility(project_slug: str, visible_projects: set[str] | None) ->
         raise NotFoundError(code="not_found", message="Not found")
 
 
-async def _load_row(db: aiosqlite.Connection, ingest_id: str) -> aiosqlite.Row:
+async def _load_row(
+    db: aiosqlite.Connection,
+    ingest_id: str,
+    workspace_id: str,
+) -> aiosqlite.Row:
     async with db.execute(
-        "SELECT * FROM ingest_pending WHERE id = ?", (ingest_id,)
+        "SELECT * FROM ingest_pending WHERE workspace_id = ? AND id = ?",
+        (workspace_id, ingest_id),
     ) as cursor:
         row = await cursor.fetchone()
     if row is None:
@@ -487,11 +496,12 @@ async def _load_row(db: aiosqlite.Connection, ingest_id: str) -> aiosqlite.Row:
 
 
 async def _visible_row(
+    ctx: CallerContext,
     db: aiosqlite.Connection,
     ingest_id: str,
     visible_projects: set[str] | None,
 ) -> aiosqlite.Row:
-    row = await _load_row(db, ingest_id)
+    row = await _load_row(db, ingest_id, require_workspace_ctx(ctx))
     _enforce_visibility(row["project_slug"], visible_projects)
     return row
 
@@ -519,9 +529,10 @@ async def list_pending(
     when no explicit status filter is set (parity with the legacy router).
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
-    clauses: list[str] = []
-    params: list[Any] = []
+    clauses: list[str] = ["workspace_id = ?"]
+    params: list[Any] = [workspace_id]
     if status:
         clauses.append("status = ?")
         params.append(status)
@@ -576,9 +587,10 @@ async def list_skipped(
 ) -> list[IngestSkipEntry]:
     """UX-6: list rows from ingest_skipped (audit log) for the sidebar (operator+)."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
-    clauses: list[str] = []
-    params: list[Any] = []
+    clauses: list[str] = ["workspace_id = ?"]
+    params: list[Any] = [workspace_id]
     if reason:
         clauses.append("reason = ?")
         params.append(reason)
@@ -638,13 +650,15 @@ async def list_history(
 ) -> list[IngestHistoryEntry]:
     """Read-only decision history for the Ingest Auto drawer (operator+)."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     pending_clauses: list[str] = [
+        "workspace_id = ?",
         "status IN ('done', 'inserted', 'rejected', 'parse_error')"
     ]
-    skipped_clauses: list[str] = []
-    pending_params: list[Any] = []
-    skipped_params: list[Any] = []
+    skipped_clauses: list[str] = ["workspace_id = ?"]
+    pending_params: list[Any] = [workspace_id]
+    skipped_params: list[Any] = [workspace_id]
 
     if project_slug:
         if not project_filter_visible:
@@ -724,9 +738,13 @@ async def counters(
 ) -> dict[str, int]:
     """Counter auto vs manual approvals con SUM aggregato server-side (H-D11)."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
-    clauses: list[str] = ["status IN ('done','inserted')"]
-    params: list[Any] = []
+    clauses: list[str] = [
+        "workspace_id = ?",
+        "status IN ('done','inserted')",
+    ]
+    params: list[Any] = [workspace_id]
 
     if visible_projects is not None:
         if not visible_projects:
@@ -769,6 +787,7 @@ async def preflight(
 ) -> IngestPreflightResponse:
     """Pre-upload dedup check against any non-rejected row (operator+)."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
     if not project_visible:
         raise NotFoundError(code="not_found", message="Not found")
 
@@ -778,10 +797,11 @@ async def preflight(
           FROM ingest_pending
          WHERE sha256 = ?
            AND project_slug = ?
+           AND workspace_id = ?
            AND status != 'rejected'
          LIMIT 1
         """,
-        (sha256, project_slug),
+        (sha256, project_slug, workspace_id),
     ) as cursor:
         row = await cursor.fetchone()
     if row is None:
@@ -811,7 +831,7 @@ async def retry_parse(
     No DB write — the legacy endpoint only checks state then fire-and-forgets.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
-    row = await _visible_row(db, ingest_id, visible_projects)
+    row = await _visible_row(ctx, db, ingest_id, visible_projects)
     if row["status"] not in {"queued", "parse_error"}:
         raise ConflictError(code="not_parseable", message="Item is not parseable")
     return IngestDecisionResponse(id=ingest_id, status="parser_waiting")
@@ -830,7 +850,8 @@ async def approve(
     and schedule ``execute_saga`` without re-loading the row.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
-    row = await _visible_row(db, ingest_id, visible_projects)
+    workspace_id = require_workspace_ctx(ctx)
+    row = await _visible_row(ctx, db, ingest_id, visible_projects)
     if not row["target_folder"] or not row["target_filename"]:
         raise ConflictError(
             code="no_target_classification",
@@ -844,9 +865,10 @@ async def approve(
                triage_decision_id = ?,
                updated_at = datetime('now')
          WHERE id = ?
+           AND workspace_id = ?
            AND status = 'awaiting_triage'
         """,
-        (f"approve:{ctx.user_id}", ingest_id),
+        (f"approve:{ctx.user_id}", ingest_id, workspace_id),
     )
     if cursor.rowcount != 1:
         raise ConflictError(
@@ -869,7 +891,8 @@ async def reject(
     Returns ``(response, project_slug)``.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
-    row = await _visible_row(db, ingest_id, visible_projects)
+    workspace_id = require_workspace_ctx(ctx)
+    row = await _visible_row(ctx, db, ingest_id, visible_projects)
     cursor = await db.execute(
         """
         UPDATE ingest_pending
@@ -877,12 +900,13 @@ async def reject(
                triage_decision_id = ?,
                updated_at = datetime('now')
          WHERE id = ?
+           AND workspace_id = ?
            AND status IN (
                'queued', 'parser_waiting', 'parsing', 'classified',
                'awaiting_triage', 'parse_error'
            )
         """,
-        (f"reject:{ctx.user_id}", ingest_id),
+        (f"reject:{ctx.user_id}", ingest_id, workspace_id),
     )
     if cursor.rowcount != 1:
         raise ConflictError(code="cannot_reject", message="Item cannot be rejected")
@@ -907,7 +931,8 @@ async def delete(
     adapter's broadcast.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
-    row = await _visible_row(db, ingest_id, visible_projects)
+    workspace_id = require_workspace_ctx(ctx)
+    row = await _visible_row(ctx, db, ingest_id, visible_projects)
     project_slug = row["project_slug"]
     project_root = project_root_for(project_slug)
 
@@ -933,7 +958,12 @@ async def delete(
         target = project_root / target_folder / target_filename
         _safe_unlink(target)
 
-    await db.execute("DELETE FROM ingest_pending WHERE id = ?", (ingest_id,))
+    cursor = await db.execute(
+        "DELETE FROM ingest_pending WHERE workspace_id = ? AND id = ?",
+        (workspace_id, ingest_id),
+    )
+    if cursor.rowcount != 1:
+        raise NotFoundError(code="ingest_not_found", message="Ingest item not found")
     await db.commit()
     return project_slug
 
@@ -951,7 +981,8 @@ async def classify_force(
     queued|parse_error) so the adapter's scheduled ``parse_pending`` re-runs.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
-    row = await _visible_row(db, ingest_id, visible_projects)
+    workspace_id = require_workspace_ctx(ctx)
+    row = await _visible_row(ctx, db, ingest_id, visible_projects)
     if row["status"] not in {"queued", "parse_error", "awaiting_triage", "classified"}:
         raise ConflictError(
             code="invalid_state_for_classify",
@@ -964,8 +995,9 @@ async def classify_force(
                error_message = NULL,
                updated_at = datetime('now')
          WHERE id = ?
+           AND workspace_id = ?
         """,
-        (ingest_id,),
+        (ingest_id, workspace_id),
     )
     await db.commit()
     return IngestDecisionResponse(id=ingest_id, status="parser_waiting")
@@ -980,7 +1012,8 @@ async def reparse_single(
 ) -> IngestDecisionResponse:
     """Re-parse a single row without changing project_slug (operator+)."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
-    row = await _visible_row(db, ingest_id, visible_projects)
+    workspace_id = require_workspace_ctx(ctx)
+    row = await _visible_row(ctx, db, ingest_id, visible_projects)
     if row["status"] not in {"parse_error", "awaiting_triage"}:
         raise ValidationError(
             code="invalid_state_for_reparse",
@@ -993,8 +1026,9 @@ async def reparse_single(
                error_message = NULL,
                updated_at = datetime('now')
          WHERE id = ?
+           AND workspace_id = ?
         """,
-        (ingest_id,),
+        (ingest_id, workspace_id),
     )
     await db.commit()
     return IngestDecisionResponse(id=ingest_id, status="parser_waiting")
@@ -1010,11 +1044,12 @@ async def reparse_batch(
     """Select all rows with ``target_status`` for re-parse (admin+).
 
     Returns ``(response, ids)`` so the adapter can fan out
-    ``asyncio.create_task(parse_pending(id))`` per row.
+    ``asyncio.create_task(parse_pending(id, workspace_id))`` per row.
     """
     require_role_ctx(ctx, "admin", "super_admin")
-    clauses = ["status = ?"]
-    params: list[Any] = [target_status]
+    workspace_id = require_workspace_ctx(ctx)
+    clauses = ["workspace_id = ?", "status = ?"]
+    params: list[Any] = [workspace_id, target_status]
     if visible_projects is not None:
         if not visible_projects:
             return IngestReparseBatchResponse(queued_count=0, status=target_status), []
@@ -1064,8 +1099,11 @@ async def patch_pending(
     adapter reproduces the exact legacy ``detail`` bodies tests pin.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
 
     ingest_id = row["id"]
+    if row["workspace_id"] != workspace_id:
+        raise NotFoundError(code="ingest_not_found", message="Ingest item not found")
 
     async with db.execute(
         """
@@ -1073,10 +1111,11 @@ async def patch_pending(
           FROM ingest_pending
          WHERE sha256 = ?
            AND project_slug = ?
+           AND workspace_id = ?
            AND id != ?
          LIMIT 1
         """,
-        (row["sha256"], new_slug, ingest_id),
+        (row["sha256"], new_slug, workspace_id, ingest_id),
     ) as cursor:
         duplicate = await cursor.fetchone()
     if duplicate is not None:
@@ -1162,18 +1201,20 @@ async def patch_pending(
                    file_path = ?,
                    updated_at = strftime('%Y-%m-%d %H:%M:%f','now')
              WHERE id = ?
+               AND workspace_id = ?
             """,
-            (new_slug, str(new_path), ingest_id),
+            (new_slug, str(new_path), ingest_id, workspace_id),
         )
 
         await db.execute(
             """
             INSERT INTO ingest_change_history
-                (ingest_pending_id, field_name, old_value, new_value,
+                (workspace_id, ingest_pending_id, field_name, old_value, new_value,
                  changed_by, source_ip, user_agent)
-            VALUES (?, 'project_slug', ?, ?, ?, ?, ?)
+            VALUES (?, ?, 'project_slug', ?, ?, ?, ?, ?)
             """,
             (
+                workspace_id,
                 ingest_id,
                 row["project_slug"],
                 new_slug,
@@ -1186,7 +1227,7 @@ async def patch_pending(
         await db.commit()
     except sqlite3.IntegrityError as exc:
         staging.unlink(missing_ok=True)
-        if "ingest_pending.sha256, ingest_pending.project_slug" in str(exc):
+        if "ingest_pending.workspace_id, ingest_pending.sha256" in str(exc):
             raise DetailedServiceError(
                 code="target_sha_collision",
                 message=(
@@ -1225,5 +1266,5 @@ async def patch_pending(
         ) from exc
     await asyncio.to_thread(old_path.unlink, True)
 
-    refreshed = await _load_row(db, ingest_id)
+    refreshed = await _load_row(db, ingest_id, workspace_id)
     return _row_to_item(refreshed)

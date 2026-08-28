@@ -3,7 +3,7 @@
 
 Same template as ``tasks.py`` / ``learnings.py``: the Node HTTP proxy
 (``get``/``post``/``del`` -> ``:8100``) is replaced by an in-process
-``await graph_uc.<fn>(LOCAL_CTX, db, ...)``. Docstrings are copied VERBATIM from
+``await graph_uc.<fn>(current_mcp_context(), db, ...)``. Docstrings are copied VERBATIM from
 ``core/mcp-pir/index.mjs`` (curated, carry the QUANDO USARLO / NON USARLO /
 RESTITUISCE blocks).
 
@@ -18,12 +18,10 @@ Return typing (S1 F3): reads return ``dict[str, Any]`` / ``list[dict]``; the pin
 mutators (``pin_graph_node`` / ``unpin_graph_node``) return the ``PinOut``/``dict``
 via ``dump()``. ``graph_capabilities`` returns the ``GraphCapabilities`` DTO dump.
 
-Visibility: the MCP surface is local single-user (no ``UserInfo.teams``), so every
-tool passes ``visible_projects=None`` = unrestricted (the same DECISION 1 + DECISION B
-collapse the four-eyes / PR gates take on the local surface, S1 §AUTH). The
-project-scoped 403 / oracle-avoidance 404 enforcement that ``routers/graph.py``
-layers on top (DECISION B) is a multi-tenant transport concern that has no meaning
-for a single operator — the pure use_case data work is what the MCP surface needs.
+Visibility: local stdio resolves to the explicit ``LOCAL_CTX`` compatibility
+principal, while remote MCP resolves a verified tenant/user context and its
+visible-project set. Personal pins always use that current identity; they never
+fall back to the local user on a remote transport.
 
 fastapi-free invariant (the collapse must stay honest — zero fastapi in the MCP
 import path): ``use_cases.graph`` itself is already fastapi-free (it depends only
@@ -48,12 +46,15 @@ SKIPPED (no clean use_case — adapter/fastapi-bound, ported in a later incremen
   * ``graph_pr_impact`` / ``graph_branches`` / ``graph_conflicts`` /
     ``graph_semantic_modules`` — PR-Impact/Codex-lens family; logic was not
     extracted into ``use_cases.graph`` (still router/service-bound).
-  * ``kg_reindex_path`` / ``kg_rebuild`` / ``kg_watcher_control`` — KG control
-    plane; no use_case (systemd / sentinel side effects in the router).
+  * ``kg_rebuild`` / ``kg_watcher_control`` — KG control plane; systemd /
+    sentinel side effects remain router-only.
 """
 from __future__ import annotations
 
+import asyncio
 import re
+import time
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
@@ -62,10 +63,17 @@ from core.api.mcp._adapter import (
     LOCAL_CTX,
     acquire_db,
     acquire_write_db,
+    current_mcp_context,
+    current_visible_projects,
     dump,
+    no_grants_notice,
     raise_mcp_error,
+    require_unambiguous_visible_project,
 )
+from core.api.services import access_grants
+from core.api.use_cases import feedback as feedback_uc
 from core.api.use_cases import graph as graph_uc
+from core.api.use_cases._context import require_role_ctx, require_workspace_ctx
 from core.api.use_cases._errors import ServiceError
 
 # Zod enums -> Literals (mirror the Node tool signatures).
@@ -75,6 +83,7 @@ NeighborRank = Literal["none", "suspect_write"]
 HotspotWindow = Literal["7d", "30d", "total"]
 HotspotTypeFilter = Literal["function", "file", "all"]
 OverviewLevel = Literal["macro", "module"]
+KgReindexMode = Literal["artifact", "cross_project", "both"]
 # edgeTypeEnum (index.mjs) — the 16 relation types valid as edge_types filters.
 EdgeType = Literal[
     "calls", "imports", "defines",
@@ -99,6 +108,7 @@ _CANONICAL_SCOPE_PATTERN = r"^(project|module):artifact:.+$"
 _GRAPH_SCOPE_PATTERN = r"^([a-z0-9][a-z0-9&\-]+|(project|module):artifact:.+)$"
 _PROJECT_SCOPE_RE = re.compile(_PROJECT_PATTERN)
 _CANONICAL_SCOPE_RE = re.compile(_CANONICAL_SCOPE_PATTERN)
+_KG_REINDEX_PATHS_MAX = 25
 
 
 async def _local_no_op_edge_filter(
@@ -129,6 +139,201 @@ def _normalize_graph_scope(scope: str) -> str:
     )
 
 
+def _resolve_kg_projects_root() -> Path:
+    from core.scripts._projects_root import resolve_projects_root
+
+    return resolve_projects_root()
+
+
+def _kg_db_path() -> str:
+    from core.api.config import settings
+
+    return settings.db_path
+
+
+def _normalize_kg_reindex_paths(
+    paths: list[str],
+    *,
+    projects_root: Path,
+    handle_delete: bool,
+) -> list[Path]:
+    if not paths:
+        raise ServiceError(
+            code="kg_paths_required",
+            message="At least one path is required.",
+        )
+    if len(paths) > _KG_REINDEX_PATHS_MAX:
+        raise ServiceError(
+            code="kg_batch_too_large",
+            message=(
+                f"kg_reindex_path accepts at most {_KG_REINDEX_PATHS_MAX} paths "
+                "per call. Split the batch."
+            ),
+        )
+
+    root = projects_root.expanduser().resolve()
+    normalized: list[Path] = []
+    seen: set[str] = set()
+    for raw in paths:
+        value = str(raw).strip()
+        if not value or "\x00" in value:
+            raise ServiceError(
+                code="kg_invalid_path",
+                message="Paths must be non-empty filesystem paths.",
+            )
+
+        if Path(value).is_absolute():
+            if ".." in Path(value).parts:
+                raise ServiceError(
+                    code="kg_invalid_path",
+                    message="Paths must not contain '..'.",
+                )
+            candidate = Path(value)
+        else:
+            rel_value = value.replace("\\", "/")
+            parts = rel_value.split("/")
+            if (
+                any(part in {"", ".", ".."} for part in parts)
+                or rel_value.startswith("~")
+            ):
+                raise ServiceError(
+                    code="kg_invalid_path",
+                    message=(
+                        "Relative paths must be project paths like "
+                        "<slug>/context.md."
+                    ),
+                )
+            candidate = root.joinpath(*parts)
+
+        try:
+            resolved = candidate.expanduser().resolve(strict=False)
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            raise ServiceError(
+                code="kg_path_outside_projects_root",
+                message="Every KG path must stay under the configured projects_root.",
+            ) from None
+
+        if not handle_delete:
+            if not resolved.exists():
+                raise ServiceError(
+                    code="kg_path_missing",
+                    message=(
+                        f"{resolved} does not exist. Pass handle_delete=true only "
+                        "when intentionally clearing a deleted file from the KG."
+                    ),
+                )
+            if not resolved.is_file():
+                raise ServiceError(
+                    code="kg_path_not_file",
+                    message=f"{resolved} is not a file.",
+                )
+
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(resolved)
+
+    return normalized
+
+
+def _merge_kg_incremental_result(
+    target: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    target["nodes_written"] += int(result.get("nodes_written", 0) or 0)
+    target["edges_written"] += int(result.get("edges_written", 0) or 0)
+    target["files_processed"] = max(
+        target["files_processed"],
+        int(result.get("files_processed", 0) or 0),
+    )
+    target["files_skipped_hash_unchanged"] += int(
+        result.get("files_skipped_hash_unchanged", 0) or 0
+    )
+    target["files_skipped_unroutable"] += int(
+        result.get("files_skipped_unroutable", 0) or 0
+    )
+    skipped = result.get("skipped") or []
+    if isinstance(skipped, list):
+        target["skipped"].extend(skipped)
+
+
+def _kg_reindex_paths_sync(
+    *,
+    paths: list[Path],
+    mode: KgReindexMode,
+    handle_delete: bool,
+    skip_hash_gate: bool,
+    aggregate_project_edges: bool,
+    db_path: str,
+    projects_root: Path,
+) -> dict[str, Any]:
+    from core.scripts.populate_artifacts import populate_artifacts_incremental
+    from core.scripts.populate_cross_project import populate_cross_project_incremental
+    from core.scripts.populate_project_nodes import (
+        populate_project_nodes,
+        seed_project_nodes_only,
+    )
+
+    t0 = time.perf_counter()
+    result: dict[str, Any] = {
+        "status": "ok",
+        "mode": mode,
+        "paths": [str(path) for path in paths],
+        "nodes_written": 0,
+        "edges_written": 0,
+        "files_processed": 0,
+        "files_skipped_hash_unchanged": 0,
+        "files_skipped_unroutable": 0,
+        "skipped": [],
+        "project_nodes_written": 0,
+        "aggregate_project_edges": aggregate_project_edges,
+        "project_edges_aggregation_rc": None,
+    }
+
+    project_nodes_written = seed_project_nodes_only(db_path, projects_root)
+    result["project_nodes_written"] = project_nodes_written
+    result["nodes_written"] += project_nodes_written
+
+    if mode in ("artifact", "both"):
+        artifact_result = populate_artifacts_incremental(
+            paths,
+            db_path=db_path,
+            handle_delete=handle_delete,
+            skip_hash_gate=skip_hash_gate,
+            projects_root=projects_root,
+        )
+        result["artifact"] = artifact_result
+        _merge_kg_incremental_result(result, artifact_result)
+
+    if mode in ("cross_project", "both"):
+        cross_project_result = populate_cross_project_incremental(
+            paths,
+            db_path=db_path,
+            handle_delete=handle_delete,
+            skip_hash_gate=skip_hash_gate,
+            projects_root=projects_root,
+        )
+        result["cross_project"] = cross_project_result
+        _merge_kg_incremental_result(result, cross_project_result)
+
+    if aggregate_project_edges:
+        aggregation_rc = populate_project_nodes(db=db_path, projects_root=projects_root)
+        result["project_edges_aggregation_rc"] = aggregation_rc
+        if aggregation_rc != 0:
+            raise ServiceError(
+                code="kg_project_aggregation_failed",
+                message=(
+                    "KG path reindex wrote incremental data, but project edge "
+                    "aggregation failed. Check service logs before trusting graph_*."
+                ),
+            )
+
+    result["latency_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+    return result
+
+
 def register(mcp) -> None:
     """Register the graph (KG) tool group on the shared FastMCP instance."""
 
@@ -149,9 +354,10 @@ def register(mcp) -> None:
         RESTITUISCE: {neighbors[], summary, freshness} cap 200."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
                 # Node proxy hardcodes limit=200 (the surface exposes no limit param).
                 result = await graph_uc.graph_neighbors(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     node_id=node_id,
                     relation=relation,
@@ -162,6 +368,7 @@ def register(mcp) -> None:
                     rank=rank or "none",
                     as_of=as_of,
                 )
+                result = await access_grants.filter_graph_response(db, ctx, result)
                 return dump(result)
         except ServiceError as e:
             raise_mcp_error(e)
@@ -178,14 +385,16 @@ def register(mcp) -> None:
         RESTITUISCE: list of {node_id, touch_count_7d, touch_count_30d, authors[], bus_factor} top N."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
                 result = await graph_uc.graph_hotspots(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     window=window,
                     limit=limit,
                     type_filter=type_filter,
                     project=None,
                 )
+                result = await access_grants.filter_graph_response(db, ctx, result)
                 return dump(result)
         except ServiceError as e:
             raise_mcp_error(e)
@@ -205,8 +414,9 @@ def register(mcp) -> None:
         RESTITUISCE: {direct[], transitive_list[], rank_score, freshness}."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
                 result = await graph_uc.graph_impact(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     node_id=node_id,
                     depth=depth,
@@ -214,6 +424,7 @@ def register(mcp) -> None:
                     edge_types=list(edge_types) if edge_types else None,
                     project=project,
                 )
+                result = await access_grants.filter_graph_response(db, ctx, result)
                 return dump(result)
         except ServiceError as e:
             raise_mcp_error(e)
@@ -229,8 +440,9 @@ def register(mcp) -> None:
         RESTITUISCE: {direct_dependents[], transitive_list[], rank_score, freshness}. Col flag MARVIS_KG_CLAIMS anche claims[]: quanti progetti dipendono DAVVERO da questo (kind=dependents_depends_on) vs quanti lo nominano soltanto (kind=mentioned_by), gia' contati server-side con provenienza e freschezza — riporta quei numeri, non ri-contare le liste."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
                 result = await graph_uc.graph_impact(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     node_id=f"project:artifact:{slug}",
                     depth=depth,
@@ -238,6 +450,7 @@ def register(mcp) -> None:
                     edge_types=["depends_on", "mentions", "refers_to"],
                     project=None,
                 )
+                result = await access_grants.filter_graph_response(db, ctx, result)
                 return dump(result)
         except ServiceError as e:
             raise_mcp_error(e)
@@ -255,13 +468,15 @@ def register(mcp) -> None:
         RESTITUISCE: chain {commits[], PR?, task?, handoffs[], learnings[]} per_category_limit configurabile."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
                 result = await graph_uc.graph_context(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     node_id=node_id,
                     per_category_limit=per_category_limit,
                     project=project,
                 )
+                result = await access_grants.filter_graph_response(db, ctx, result)
                 return dump(result)
         except ServiceError as e:
             raise_mcp_error(e)
@@ -277,10 +492,16 @@ def register(mcp) -> None:
         RESTITUISCE: list of {learning_id, title, prevention, severity, scope_match_score}."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
                 result = await graph_uc.graph_pattern(
-                    LOCAL_CTX, db, scope=scope, limit=limit, project=None,
+                    ctx, db, scope=scope, limit=limit, project=None,
                 )
-                return dump(result)
+                result = await access_grants.filter_graph_response(db, ctx, result)
+                payload = dump(result)
+                # Fase 2 U3 nudge (R6) — gating lives in attach_feedback_nudge.
+                return feedback_uc.attach_feedback_nudge(
+                    payload, has_results=bool(payload.get("learnings"))
+                )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -299,6 +520,68 @@ def register(mcp) -> None:
             raise_mcp_error(e)
 
     @mcp.tool()
+    async def kg_reindex_path(
+        paths: Annotated[
+            list[str],
+            Field(min_length=1, max_length=_KG_REINDEX_PATHS_MAX),
+        ],
+        mode: KgReindexMode = "both",
+        handle_delete: bool = False,
+        skip_hash_gate: bool = False,
+        aggregate_project_edges: bool = True,
+    ) -> dict[str, Any]:
+        """Re-index N paths in the Knowledge Graph synchronously (artifact + cross_project edges).
+
+        QUANDO USARLO: un .md sotto projects_root e' stato modificato esternamente (rsync, sed batch) e vuoi refresh senza aspettare il watcher. Operator+, batch piccolo.
+        QUANDO NON USARLO: NOT per semantic embeddings reindex -> usa reindex/reindex_paths (non graph nodes/edges). NOT per il rebuild completo notturno: NON e' esposto su questa superficie (control plane router/systemd), qui puoi solo reindicizzare i path che passi. NOT per path fuori projects_root.
+        ATTENZIONE: handle_delete=true dichiara che OGNI path passato e' stato cancellato e rimuove il relativo stato KG anche se il file esiste ancora. Per reindicizzare file esistenti lascialo false.
+        FORZA: skip_hash_gate=true forza la rilettura ma registra comunque il nuovo hash.
+        RESTITUISCE: {nodes_written, edges_written, files_processed, files_skipped_hash_unchanged, skipped, project_nodes_written, project_edges_aggregation_rc, latency_ms}."""
+        try:
+            ctx = current_mcp_context()
+            require_role_ctx(ctx, "operator", "admin", "super_admin")
+            projects_root = _resolve_kg_projects_root()
+            normalized_paths = _normalize_kg_reindex_paths(
+                paths,
+                projects_root=projects_root,
+                handle_delete=handle_delete,
+            )
+            root = projects_root.expanduser().resolve()
+            project_slugs: set[str] = set()
+            for path in normalized_paths:
+                relative = path.relative_to(root)
+                if len(relative.parts) < 2:
+                    raise ServiceError(
+                        code="kg_invalid_path",
+                        message=(
+                            "Every KG path must be inside one project directory."
+                        ),
+                    )
+                project_slugs.add(relative.parts[0])
+            async with acquire_db() as db:
+                visible_projects = await current_visible_projects(db, ctx)
+                for project_slug in sorted(project_slugs):
+                    await require_unambiguous_visible_project(
+                        db,
+                        ctx,
+                        project_slug,
+                        visible_projects,
+                    )
+            result = await asyncio.to_thread(
+                _kg_reindex_paths_sync,
+                paths=normalized_paths,
+                mode=mode,
+                handle_delete=handle_delete,
+                skip_hash_gate=skip_hash_gate,
+                aggregate_project_edges=aggregate_project_edges,
+                db_path=_kg_db_path(),
+                projects_root=projects_root,
+            )
+            return dump(result)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
     async def pin_graph_node(
         node_id: Annotated[
             str, Field(min_length=6, max_length=256, pattern=_PIN_NODE_ID_PATTERN)
@@ -308,13 +591,17 @@ def register(mcp) -> None:
         """Save a KG node as a personal bookmark (pin). Idempotent — pinning the same node twice updates the note. Use to bookmark frequently visited nodes (functions, files, tasks). Appears in graph_landing() saved_nodes slice."""
         try:
             async with acquire_write_db(label="mcp.pin_graph_node") as db:
+                ctx = current_mcp_context()
+                workspace_id = require_workspace_ctx(ctx)
+                visible_projects = await current_visible_projects(db, ctx)
                 result = await graph_uc.create_graph_pin(
-                    LOCAL_CTX,
+                    ctx,
                     db,
-                    workspace_id=LOCAL_CTX.workspace_id,
-                    user_id=LOCAL_CTX.user_id,
+                    workspace_id=workspace_id,
+                    user_id=ctx.user_id or ctx.username,
                     node_id=node_id,
                     note=note,
+                    visible_projects=visible_projects,
                 )
                 return dump(result)
         except ServiceError as e:
@@ -329,8 +616,12 @@ def register(mcp) -> None:
         """Remove a personal bookmark (pin) for a KG node. Returns 404 if the pin does not exist for the current user."""
         try:
             async with acquire_write_db(label="mcp.unpin_graph_node") as db:
+                ctx = current_mcp_context()
                 result = await graph_uc.delete_graph_pin(
-                    LOCAL_CTX, db, user_id=LOCAL_CTX.user_id, node_id=node_id,
+                    ctx,
+                    db,
+                    user_id=ctx.user_id or ctx.username,
+                    node_id=node_id,
                 )
                 return dump(result)
         except ServiceError as e:
@@ -341,8 +632,13 @@ def register(mcp) -> None:
         """List all personal KG bookmarks (pins) for the current user, ordered by most recently pinned. Pins on soft-deleted nodes are excluded."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 result = await graph_uc.list_graph_pins(
-                    LOCAL_CTX, db, user_id=LOCAL_CTX.user_id,
+                    ctx,
+                    db,
+                    user_id=ctx.user_id or ctx.username,
+                    visible_projects=visible_projects,
                 )
                 return dump(result)
         except ServiceError as e:
@@ -355,9 +651,11 @@ def register(mcp) -> None:
         """Resolve a file path to its KG node_id. Useful when you have a file path (e.g. 'api/db.py') and need the graph_nodes id for neighbors/impact/context queries. Returns 404 if the file is not indexed or not visible."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 # visible_projects=None -> local single-user sees all (DECISION 1).
                 result = await graph_uc.graph_resolve(
-                    LOCAL_CTX, db, path=path, visible_projects=None,
+                    ctx, db, path=path, visible_projects=visible_projects,
                 )
                 return dump(result)
         except ServiceError as e:
@@ -368,15 +666,22 @@ def register(mcp) -> None:
         """Get the KG landing bundle: top-10 hotspots (30d), last-20 recent artifacts (commits/PRs/tasks/handoffs), and your saved pins. Cached 60s per workspace. Use as the first call when opening the KG explorer or needing a quick project overview."""
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 # The 60s TTLCache is a transport concern living in the HTTP adapter;
                 # the MCP surface computes the slices fresh each call (pass no cache).
                 bundle, _hotspots, _recent, _saved = await graph_uc.graph_landing(
-                    LOCAL_CTX,
+                    ctx,
                     db,
-                    workspace_id=LOCAL_CTX.workspace_id,
-                    user_id=LOCAL_CTX.user_id,
+                    workspace_id=ctx.workspace_id,
+                    user_id=ctx.user_id,
+                    visible_projects=visible_projects,
                 )
-                return dump(bundle)
+                payload = dump(bundle)
+                notice = no_grants_notice(visible_projects)
+                if notice:
+                    payload.update(notice)
+                return payload
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -392,22 +697,30 @@ def register(mcp) -> None:
                 _normalize_graph_scope(scope) if scope is not None else None
             )
             async with acquire_db() as db:
-                # visible_projects=None + a LOCAL no-op edge filter (single-user sees
-                # all). filter_visible_edges (api.visibility) imports fastapi and must
-                # NOT enter the MCP import path; the local injection keeps it out.
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                async def _edge_filter(edge_db, _user, edges):
+                    return await access_grants.filter_visible_edges_for_actor(
+                        edge_db, ctx, edges
+                    )
+
                 # limit mirrors the HTTP Query default (300).
                 result = await graph_uc.graph_overview(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     level=level,
                     scope=normalized_scope,
                     cross_project=cross_project,
                     limit=300,
-                    user=LOCAL_CTX,
-                    visible_projects=None,
-                    filter_visible_edges=_local_no_op_edge_filter,
+                    user=ctx,
+                    visible_projects=visible_projects,
+                    filter_visible_edges=_edge_filter,
                 )
-                return dump(result)
+                payload = dump(result)
+                notice = no_grants_notice(visible_projects)
+                if notice:
+                    payload.update(notice)
+                return payload
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -421,9 +734,10 @@ def register(mcp) -> None:
         try:
             normalized_scope = _normalize_graph_scope(scope)
             async with acquire_db() as db:
-                # visible_projects=None -> local single-user sees all (DECISION 1).
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 result = await graph_uc.graph_orphans(
-                    LOCAL_CTX, db, scope=normalized_scope, visible_projects=None,
+                    ctx, db, scope=normalized_scope, visible_projects=visible_projects,
                 )
                 return dump(result)
         except ServiceError as e:

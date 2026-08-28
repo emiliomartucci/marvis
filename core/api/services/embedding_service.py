@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import struct
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, cast
@@ -49,6 +50,141 @@ def _local_run_semaphore() -> asyncio.Semaphore:
     if _granite_run_semaphore is None:
         _granite_run_semaphore = asyncio.Semaphore(1)
     return _granite_run_semaphore
+
+
+# --- F2: granite_remote (shared embedding sidecar) ---------------------------
+# The sidecar (marvis-embedder.service, loopback) serves native 384-dim Granite
+# vectors to the whole fleet. is_available() is sync + hot, so a short TTL cache
+# avoids probing /healthz on every call; a model_id/revision mismatch degrades to
+# keyword rather than mixing vectors from a different model into the index.
+_embedder_http_client = None  # httpx.AsyncClient | None (lazy singleton)
+_embedder_health_cache: tuple[float, bool] | None = None  # (checked_at_monotonic, ok)
+_EMBEDDER_HEALTH_TTL = 20.0  # seconds
+_EMBEDDER_MAX_TEXTS = 32  # mirror the sidecar query per-request cap
+# The durable hosted reindex contract intentionally uses a much smaller actual
+# document boundary, regardless of the caller's outer collection size.
+_EMBEDDER_MAX_DOCUMENT_TEXTS = 1
+DEFAULT_EMBEDDER_URL = "http://127.0.0.1:8109"
+
+
+class EmbeddingBackpressureError(RuntimeError):
+    """The document lane is full; retry the job without marking the sidecar down."""
+
+
+class EmbeddingInputTooLargeError(RuntimeError):
+    """One document exceeds the sidecar input cap and must be handled per item."""
+
+
+def _embedder_url() -> str:
+    return os.environ.get("MARVIS_EMBEDDER_URL", DEFAULT_EMBEDDER_URL).rstrip("/")
+
+
+def _get_embedder_client():
+    global _embedder_http_client
+    if _embedder_http_client is None:
+        import httpx
+
+        _embedder_http_client = httpx.AsyncClient(
+            base_url=_embedder_url(),
+            timeout=httpx.Timeout(30.0, connect=1.0),
+        )
+    return _embedder_http_client
+
+
+def _sidecar_error_detail(response: object) -> str | None:
+    try:
+        payload = response.json()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - error payloads are advisory only
+        return None
+    if not isinstance(payload, dict):
+        return None
+    detail = payload.get("detail")
+    return detail if isinstance(detail, str) else None
+
+
+def _probe_embedder_health() -> bool:
+    import json as _json
+    import urllib.request
+
+    from core.api.services.embedding_internal import DEFAULT_MODEL, MODEL_REVISION
+
+    try:
+        with urllib.request.urlopen(f"{_embedder_url()}/healthz", timeout=2.0) as resp:
+            if resp.status != 200:
+                return False
+            body = _json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 - any probe failure = not available
+        return False
+    if body.get("status") != "ready":
+        return False
+    if body.get("model_id") != DEFAULT_MODEL or body.get("revision") != MODEL_REVISION:
+        logger.error(
+            "Embedder sidecar model/revision mismatch: got model=%r revision=%r "
+            "expected model=%r revision=%r - refusing to embed (keyword-only)",
+            body.get("model_id"),
+            body.get("revision"),
+            DEFAULT_MODEL,
+            MODEL_REVISION,
+        )
+        return False
+    return True
+
+
+def _embedder_health_ok() -> bool:
+    global _embedder_health_cache
+    now = time.monotonic()
+    if _embedder_health_cache is not None:
+        checked_at, ok = _embedder_health_cache
+        if now - checked_at < _EMBEDDER_HEALTH_TTL:
+            return ok
+    ok = _probe_embedder_health()
+    _embedder_health_cache = (now, ok)
+    return ok
+
+
+async def _embed_granite_remote_texts(
+    texts: list[str],
+    input_type: str,
+) -> list[list[float]]:
+    """Embed via the shared sidecar while preserving its health contract.
+
+    A saturated document lane and a too-large document are actionable request
+    outcomes, not evidence that the shared sidecar is unavailable. Only the
+    remaining transport and HTTP failures poison the short readiness cache.
+    """
+    if not texts:
+        return []
+    global _embedder_health_cache
+    client = _get_embedder_client()
+    raw: list[list[float]] = []
+    request_batch_size = (
+        _EMBEDDER_MAX_TEXTS
+        if input_type == "query"
+        else _EMBEDDER_MAX_DOCUMENT_TEXTS
+    )
+    try:
+        for start in range(0, len(texts), request_batch_size):
+            chunk = texts[start : start + request_batch_size]
+            resp = await client.post(
+                "/embed", json={"texts": chunk, "input_type": input_type}
+            )
+            if (
+                input_type == "document"
+                and resp.status_code == 503
+                and _sidecar_error_detail(resp) == "doc_lane_saturated"
+            ):
+                raise EmbeddingBackpressureError("Embedding document lane is saturated")
+            if input_type == "document" and resp.status_code == 413:
+                raise EmbeddingInputTooLargeError("Embedding document exceeds sidecar limit")
+            resp.raise_for_status()
+            raw.extend(resp.json()["vectors"])
+    except (EmbeddingBackpressureError, EmbeddingInputTooLargeError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - unknown failure -> fail-soft keyword
+        _embedder_health_cache = (time.monotonic(), False)
+        logger.warning("Embedder sidecar request failed: %s", exc)
+        raise RuntimeError("Embedding sidecar unavailable") from exc
+    return [_coerce_dimensions_for_vec_documents(v) for v in raw]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +234,11 @@ def init_embedding_client() -> None:
             client.device,
         )
     if mode == "granite_remote":
-        logger.info("Granite remote embedding mode selected; Phase 2 sidecar pending")
+        _get_embedder_client()  # lazy httpx client, no model warm
+        logger.info(
+            "Granite remote embedding mode: sidecar client initialized (url=%s)",
+            _embedder_url(),
+        )
 
 
 def is_available() -> bool:
@@ -116,6 +256,8 @@ def is_available() -> bool:
         # until a crash is recorded → it reported "available" before the model had
         # ever loaded, letting a dead retriever degrade to keyword-only silently.
         return _get_granite_client().is_available()
+    if mode == "granite_remote":
+        return _embedder_health_ok()
     return False
 
 
@@ -207,7 +349,9 @@ async def embed_texts(
         except Exception:
             logger.exception("Granite dual-mode validation embedding failed")
         return remote_embeddings
-    raise NotImplementedError("Phase 2 sidecar Docker mode")
+    if mode == "granite_remote":
+        return await _embed_granite_remote_texts(texts, input_type=input_type)
+    raise NotImplementedError(f"Unhandled embedding mode: {mode!r}")
 
 
 async def _embed_remote_texts(
@@ -512,11 +656,24 @@ async def refresh_documents_fts_row(
     than the migration resolver (which joins description+tags). Still strictly
     better than the trigger's file_path-only row.
     """
+    # RBAC F4 universal guard: an owner-confidential doc must NEVER carry a
+    # lexical row, whichever embed lane calls us. If documents.confidential=1,
+    # purge any residual fts row (by the stable doc_id column) and never
+    # re-insert. This is the single chokepoint every reindex lane funnels
+    # through, so no lane can re-expose a purged confidential file.
+    try:
+        cur = await db.execute("SELECT confidential FROM documents WHERE id = ?", [doc_id])
+        row = await cur.fetchone()
+        if row is not None and bool(row[0]):
+            await db.execute("DELETE FROM documents_fts WHERE doc_id = ?", [doc_id])
+            return
+    except aiosqlite.OperationalError:
+        pass  # pre-162 DB has no confidential column → normal behavior
     if not force and not fts_bodies_enabled():
         return
     body = (content or title or "")[:_FTS_BODY_MAX_CHARS]
     try:
-        await db.execute("DELETE FROM documents_fts WHERE rowid = ?", [doc_id])
+        await db.execute("DELETE FROM documents_fts WHERE doc_id = ?", [doc_id])
         await db.execute(
             "INSERT INTO documents_fts(rowid, doc_id, title, content) VALUES (?, ?, ?, ?)",
             [doc_id, doc_id, title or "", body],
@@ -597,7 +754,7 @@ async def persist_prose_chunks(
                 "DELETE FROM vec_chunks WHERE chunk_rowid = ?", [rid]
             )
 
-    tokenizer = _get_granite_client().tokenizer()
+    tokenizer = _get_granite_client().tokenizer_only()
     chunks = chunk_prose(content, tokenizer)
     if not chunks:
         cur = await db.execute(
@@ -635,8 +792,30 @@ async def persist_prose_chunks(
 
     raw = content.encode("utf-8")
     texts = [raw[c.span_start : c.span_end].decode("utf-8", "replace") for _, _, c in pending]
-    embeddings = await embed_texts(texts, input_type="document")
-    for (chunk_id, idx, c), vec in zip(pending, embeddings):
+    try:
+        embedded = list(zip(pending, await embed_texts(texts, input_type="document")))
+    except EmbeddingInputTooLargeError:
+        # One oversized chunk must not kill the document — nor, upstream, the
+        # whole reindex job (2026-08-05: one such input killed every full
+        # reindex at the very end, with no name in the log, leaving 32
+        # documents unembedded). Retry chunk-by-chunk, NAME the culprit, keep
+        # the rest.
+        embedded = []
+        for entry, text in zip(pending, texts):
+            try:
+                vec = (await embed_texts([text], input_type="document"))[0]
+            except EmbeddingInputTooLargeError:
+                _, idx, c = entry
+                logger.warning(
+                    "chunk embedding exceeds sidecar limit, skipping: "
+                    "doc_id=%s chunk_idx=%s bytes=%s",
+                    doc_id,
+                    idx,
+                    c.span_end - c.span_start,
+                )
+                continue
+            embedded.append((entry, vec))
+    for (chunk_id, idx, c), vec in embedded:
         await db.execute(
             """INSERT INTO chunks
                  (chunk_id, doc_id, chunk_idx, span_start, span_end, content_hash, vector)
@@ -669,7 +848,7 @@ async def persist_prose_chunks(
                     "INSERT INTO vec_chunks (chunk_rowid, embedding) VALUES (?, ?)",
                     [rid, serialize_f32(list(vec))],
                 )
-    return len(pending)
+    return len(embedded)
 
 
 def aggregate_chunk_hits_to_docs(
@@ -941,6 +1120,23 @@ async def upsert_document(
     row = await cur.fetchone()
     if row and row["content_hash"] == h:
         return False  # unchanged
+
+    # RBAC F4: never re-embed an owner-confidential doc. Purge any residual
+    # vec/fts rows and leave the documents row as the confidential tombstone.
+    try:
+        cols = {str(c[1]) for c in await (await db.execute("PRAGMA table_info(documents)")).fetchall()}
+    except Exception:  # noqa: BLE001
+        cols = set()
+    if row and "confidential" in cols:
+        cur = await db.execute("SELECT confidential FROM documents WHERE id = ?", [row["id"]])
+        conf = await cur.fetchone()
+        if conf is not None and bool(conf[0]):
+            try:
+                await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [row["id"]])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("vec purge (confidential upsert skip) failed doc=%s: %s", row["id"], exc)
+            await db.execute("DELETE FROM documents_fts WHERE doc_id = ?", [row["id"]])
+            return False
 
     embeddings = await embed_texts([content], input_type="document")
     vec_bytes = serialize_f32(embeddings[0])
@@ -1512,19 +1708,57 @@ async def _bm25_documents_search(
     query: str,
     *,
     limit: int,
+    workspace_id: str | None = None,
 ) -> list[_Bm25Hit]:
     q_fts = fts5_safe_query(query)
     if not q_fts:
         return []
     try:
-        cur = await db.execute(
-            """SELECT rowid AS doc_id, bm25(documents_fts) AS score
-               FROM documents_fts
-               WHERE documents_fts MATCH ?
-               ORDER BY score
-               LIMIT ?""",
-            [q_fts, limit],
-        )
+        if workspace_id is None:
+            cur = await db.execute(
+                """SELECT rowid AS doc_id, bm25(documents_fts) AS score
+                   FROM documents_fts
+                   WHERE documents_fts MATCH ?
+                   ORDER BY score
+                   LIMIT ?""",
+                [q_fts, limit],
+            )
+        else:
+            columns = await _document_columns(db)
+            if "workspace_id" not in columns:
+                return []
+            workspace_clause = (
+                "AND d.workspace_id = ?"
+                if "workspace_id" in columns
+                else ""
+            )
+            archived_clause = (
+                "AND COALESCE(d.archived, 0) = 0"
+                if "archived" in columns
+                else ""
+            )
+            confidential_clause = (
+                "AND COALESCE(d.confidential, 0) = 0"
+                if "confidential" in columns
+                else ""
+            )
+            params: list[object] = [q_fts]
+            if workspace_clause:
+                params.append(workspace_id)
+            params.append(limit)
+            cur = await db.execute(
+                f"""SELECT documents_fts.rowid AS doc_id,
+                          bm25(documents_fts) AS score
+                   FROM documents_fts
+                   JOIN documents d ON d.id = documents_fts.rowid
+                   WHERE documents_fts MATCH ?
+                     {workspace_clause}
+                     {archived_clause}
+                     {confidential_clause}
+                   ORDER BY score
+                   LIMIT ?""",
+                params,
+            )
         rows = await cur.fetchall()
     except aiosqlite.OperationalError as exc:
         msg = str(exc).lower()
@@ -1562,11 +1796,16 @@ async def _fetch_document_rows(
     workspace_filter = ""
     params: list[object] = list(doc_ids)
     if "workspace_id" in columns:
-        workspace_filter = "AND COALESCE(workspace_id, 'ws_default') = ?"
+        workspace_filter = "AND workspace_id = ?"
         params.append(workspace_id)
     archived_filter = ""
     if "archived" in columns:
         archived_filter = "AND COALESCE(archived, 0) = 0"
+    # RBAC F4: mirror of the archived filter — a purged owner-confidential doc
+    # must never be retrieved-then-dropped, not even via stale vec/fts rows.
+    confidential_filter = ""
+    if "confidential" in columns:
+        confidential_filter = "AND COALESCE(confidential, 0) = 0"
 
     placeholders = ",".join("?" * len(doc_ids))
     cur = await db.execute(
@@ -1574,7 +1813,8 @@ async def _fetch_document_rows(
             FROM documents
             WHERE id IN ({placeholders})
               {workspace_filter}
-              {archived_filter}""",
+              {archived_filter}
+              {confidential_filter}""",
         params,
     )
     rows = await cur.fetchall()
@@ -1753,6 +1993,7 @@ async def search_by_type(
                 db,
                 query,
                 limit=BM25_FETCH_LIMIT,
+                workspace_id=workspace_id,
             )
 
         candidate_doc_ids = list(

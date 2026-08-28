@@ -15,15 +15,12 @@ import aiosqlite
 from core.api.db import acquire_db, write_db
 from core.api.models import UserInfo
 from core.api.models.brain import (
-    DirectionSource,
     DriftAxis,
     DriftListResponse,
     DriftPatchAction,
     DriftSignal,
     DriftSignalRedacted,
     KnowledgeForm,
-    RuleId,
-    ScopeType,
     Severity,
     SignalState,
     SignalType,

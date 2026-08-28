@@ -8,6 +8,8 @@ import time as _time
 import re
 import uuid as uuid_mod
 from datetime import datetime, timezone
+from functools import wraps
+from inspect import signature as inspect_signature
 from typing import Any
 
 import aiosqlite
@@ -38,11 +40,10 @@ from core.api.models import (
     SessionUpdate,
     UserInfo,
 )
-from core.api.rbac import require_role, require_scope
+from core.api.rbac import require_scope
 from core.api.security import (
     get_current_user,
     get_current_user_or_agent,
-    resolve_session_owner,
 )
 from core.api.services import session_state as session_state_svc
 from core.api.services import opencode_sessions
@@ -57,6 +58,13 @@ from core.api.services.providers import (
 )
 from core.api.services.session_catalog import list_catalog_models, list_provider_definitions
 from core.api.services.session_ops import build_session_start_spec
+from core.api.services.session_operation_leases import (
+    SessionOperationBusy,
+    SessionOperationMissing,
+    acquire_session_operation_lease,
+    release_session_operation_lease,
+    session_operation_lease,
+)
 
 _CONVERSATION_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -75,8 +83,8 @@ async def _table_has_columns(
     table_name: str,
     required_columns: set[str],
 ) -> bool:
-    async with db.execute(f"PRAGMA table_info({table_name})") as cursor:
-        rows = await cursor.fetchall()
+    cursor = await db.execute(f"PRAGMA table_info({table_name})")
+    rows = await cursor.fetchall()
     return required_columns.issubset({row["name"] for row in rows})
 
 
@@ -109,8 +117,8 @@ async def _tmux_user_env_for_session(
         )
 
     async with db.execute(
-        "SELECT uid_index, assigned_uid FROM users WHERE id = ?",
-        [user_id],
+        "SELECT uid_index, assigned_uid FROM users WHERE id = ? AND workspace_id = ?",
+        [user_id, _workspace_for_user(current_user)],
     ) as cursor:
         row = await cursor.fetchone()
 
@@ -185,7 +193,11 @@ def _invalidate_sessions_cache() -> None:
     _sessions_cache_pending_patch_state = None
 
 
-def _patch_sessions_cache_activity_state(session_name: str, state: str) -> bool:
+def _patch_sessions_cache_activity_state(
+    session_name: str,
+    state: str,
+    workspace_id: str | None = None,
+) -> bool:
     """Patch a state-only update into the existing full-list cache.
 
     The cache is unfiltered and RBAC is applied after reads. This helper only
@@ -197,7 +209,14 @@ def _patch_sessions_cache_activity_state(session_name: str, state: str) -> bool:
         _sessions_cache_last_state = "state_patch_no_cache"
         return False
     for session in _sessions_cache:
-        if session.name == session_name:
+        workspace_matches = workspace_id is None or session.workspace_id == workspace_id
+        if (
+            workspace_id == "ws_default"
+            and _allow_legacy_local_session_schema()
+            and session.workspace_id is None
+        ):
+            workspace_matches = True
+        if session.name == session_name and workspace_matches:
             session.activity_state = state
             _sessions_cache_last_state = "state_patched"
             _sessions_cache_pending_patch_state = "state_patched"
@@ -209,6 +228,7 @@ def _patch_sessions_cache_activity_state(session_name: str, state: str) -> bool:
 def _record_sessions_control_event(
     request: Request | None,
     *,
+    workspace_id: str,
     kind: str,
     duration_ms: float,
     metadata: dict[str, Any] | None = None,
@@ -217,11 +237,23 @@ def _record_sessions_control_event(
         return
     app = getattr(request, "app", None)
     app_state = getattr(app, "state", None)
-    collector = getattr(app_state, "terminal_metrics", None)
+    if app_state is None:
+        return
     try:
         from core.api.services.terminal_metrics import TerminalMetricsCollector
     except Exception:
         return
+    if workspace_id == "ws_default":
+        collector = getattr(app_state, "terminal_metrics", None)
+    else:
+        collectors = getattr(app_state, "terminal_metrics_by_workspace", None)
+        if not isinstance(collectors, dict):
+            collectors = {}
+            app_state.terminal_metrics_by_workspace = collectors
+        collector = collectors.get(workspace_id)
+        if not isinstance(collector, TerminalMetricsCollector):
+            collector = TerminalMetricsCollector()
+            collectors[workspace_id] = collector
     if isinstance(collector, TerminalMetricsCollector):
         collector.record_sessions_control_event(
             kind=kind,
@@ -276,14 +308,21 @@ def _start_sessions_cache_refresh_unlocked(
     return task
 
 
-async def _get_sessions_cached(db: aiosqlite.Connection) -> list[SessionInfo]:
+async def _get_sessions_cached(
+    db: aiosqlite.Connection,
+    workspace_id: str | None = None,
+) -> list[SessionInfo]:
     """Return shared sessions with singleflight + stale-while-revalidate.
 
-    The cached value is the unfiltered full session list. RBAC filtering remains
-    request-scoped in list_sessions(), so stale serving cannot leak sessions
-    across users.
+    The legacy cache is used only by explicit local single-user mode. Remote
+    callers bypass it and execute a workspace-scoped sync so cached objects from
+    one workspace can never be reused by another.
     """
     global _sessions_cache_last_state
+    if workspace_id is not None:
+        _sessions_cache_last_state = "workspace_scoped"
+        return await _sync_sessions_read_only(db, workspace_id=workspace_id)
+
     now = _time.monotonic()
     if _sessions_cache is not None and (now - _sessions_cache_ts) < _CACHE_TTL:
         _sessions_cache_last_state = "hit"
@@ -320,8 +359,179 @@ def _can_view_all_sessions(current_user: UserInfo) -> bool:
     )
 
 
+def _workspace_for_user(current_user: UserInfo) -> str:
+    workspace_id = (current_user.workspace_id or "").strip()
+    if workspace_id:
+        return workspace_id
+    if _allow_legacy_local_session_schema():
+        return "ws_default"
+    raise HTTPException(status_code=403, detail="Session not found")
+
+
+def _allow_legacy_local_session_schema() -> bool:
+    return settings.deploy_mode == "core" and not settings.multi_tenant_enabled
+
+
+def _broadcast_session_event(
+    event: str,
+    *,
+    workspace_id: str,
+    **extras: Any,
+):
+    """Keep the historical local manager call while scoping remote broadcasts."""
+    manager = _get_session_manager()
+    if _allow_legacy_local_session_schema():
+        return manager.broadcast_session_event(event, **extras)
+    return manager.broadcast_session_event(
+        event, workspace_id=workspace_id, **extras
+    )
+
+
+async def _sessions_have_workspace(db: aiosqlite.Connection) -> bool:
+    return await _table_has_columns(db, "sessions_meta", {"workspace_id"})
+
+
+async def _require_session_row(
+    db: aiosqlite.Connection,
+    current_user: UserInfo,
+    *,
+    name: str | None = None,
+    session_uuid: str | None = None,
+) -> aiosqlite.Row:
+    """Resolve one session inside the authenticated workspace or return 404."""
+    workspace_id = _workspace_for_user(current_user)
+    if (name is None) == (session_uuid is None):
+        raise ValueError("exactly one session identifier is required")
+    column = "name" if name is not None else "session_uuid"
+    value = name if name is not None else session_uuid
+    has_workspace = await _sessions_have_workspace(db)
+    columns = DB_COLUMNS if has_workspace else "*"
+    if has_workspace and not _allow_legacy_local_session_schema():
+        cursor = await db.execute(
+            f"SELECT {columns} FROM sessions_meta "
+            f"WHERE {column} = ? AND workspace_id = ?",
+            (value, workspace_id),
+        )
+    elif _allow_legacy_local_session_schema():
+        cursor = await db.execute(
+            f"SELECT {columns} FROM sessions_meta WHERE {column} = ?", (value,)
+        )
+    else:
+        raise HTTPException(status_code=503, detail="Session registry unavailable")
+    row = await cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return row
+
+
+def _session_operation(operation: str):
+    """Serialize one Console lifecycle endpoint across API processes."""
+
+    def decorator(func):
+        function_signature = inspect_signature(func)
+
+        @wraps(func)
+        async def wrapped(*args, **kwargs):
+            bound = function_signature.bind_partial(*args, **kwargs)
+            user: UserInfo = bound.arguments["_user"]
+            name: str = bound.arguments["name"]
+            workspace_id = _workspace_for_user(user)
+            route_db = bound.arguments.get("db")
+
+            if route_db is None:
+                async with acquire_db() as read_db:
+                    row = await _require_session_row(
+                        read_db,
+                        user,
+                        name=name,
+                    )
+                    session_uuid = str(row["session_uuid"] or "").strip()
+                if not session_uuid:
+                    raise HTTPException(409, "Session generation unavailable")
+                try:
+                    async with session_operation_lease(
+                        workspace_id=workspace_id,
+                        session_name=name,
+                        session_uuid=session_uuid,
+                        operation=operation,
+                    ):
+                        return await func(*args, **kwargs)
+                except SessionOperationMissing as exc:
+                    raise HTTPException(404, "Session not found") from exc
+                except SessionOperationBusy as exc:
+                    raise HTTPException(
+                        409,
+                        "Session lifecycle operation already in progress",
+                    ) from exc
+
+            row = await _require_session_row(route_db, user, name=name)
+            session_uuid = str(row["session_uuid"] or "").strip()
+            if not session_uuid:
+                raise HTTPException(409, "Session generation unavailable")
+            try:
+                lease = await acquire_session_operation_lease(
+                    route_db,
+                    workspace_id=workspace_id,
+                    session_name=name,
+                    session_uuid=session_uuid,
+                    operation=operation,
+                )
+                await route_db.commit()
+            except SessionOperationMissing as exc:
+                raise HTTPException(404, "Session not found") from exc
+            except SessionOperationBusy as exc:
+                raise HTTPException(
+                    409,
+                    "Session lifecycle operation already in progress",
+                ) from exc
+
+            try:
+                result = await func(*args, **kwargs)
+            except BaseException:
+                await route_db.rollback()
+                await release_session_operation_lease(route_db, lease)
+                await route_db.commit()
+                raise
+            await release_session_operation_lease(route_db, lease)
+            await route_db.commit()
+            return result
+
+        return wrapped
+
+    return decorator
+
+
+async def _require_project_workspace(
+    db: aiosqlite.Connection,
+    current_user: UserInfo,
+    project_slug: str | None,
+) -> None:
+    if not project_slug:
+        return
+    workspace_id = _workspace_for_user(current_user)
+    try:
+        row = await (
+            await db.execute(
+                "SELECT COUNT(DISTINCT workspace_id) AS workspace_count, "
+                "MAX(CASE WHEN workspace_id = ? THEN 1 ELSE 0 END) AS owned "
+                "FROM workspace_projects WHERE project_slug = ?",
+                (workspace_id, project_slug),
+            )
+        ).fetchone()
+    except aiosqlite.Error:
+        if _allow_legacy_local_session_schema():
+            return
+        raise HTTPException(status_code=503, detail="Project registry unavailable")
+    if (
+        row is None
+        or int(row["workspace_count"] or 0) != 1
+        or not bool(row["owned"])
+    ):
+        raise HTTPException(status_code=404, detail="Project not found")
+
+
 DB_COLUMNS = (
-    "name, display_name, pinned, sort_order, group_name, project_slug, session_uuid, "
+    "name, workspace_id, display_name, pinned, sort_order, group_name, project_slug, session_uuid, "
     "created_at, last_active, conversation_id, hibernated, model, launch_model, "
     "permission_preset, theme_mode, bootstrap_message, "
     # PR3: rename 088 — source `last_context_pct` (API field) from
@@ -446,11 +656,25 @@ def _row_value(row: aiosqlite.Row | None, key: str) -> Any:
 async def _fetch_session_meta_row(
     db: aiosqlite.Connection,
     name: str,
+    workspace_id: str | None = None,
 ) -> aiosqlite.Row | None:
-    cursor = await db.execute(
-        f"SELECT {DB_COLUMNS} FROM sessions_meta WHERE name = ?",
-        (name,),
-    )
+    has_workspace = await _sessions_have_workspace(db)
+    columns = DB_COLUMNS if has_workspace else "*"
+    if (
+        workspace_id is not None
+        and has_workspace
+        and not _allow_legacy_local_session_schema()
+    ):
+        cursor = await db.execute(
+            f"SELECT {columns} FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+            (name, workspace_id),
+        )
+    elif workspace_id is not None and not _allow_legacy_local_session_schema():
+        raise HTTPException(status_code=503, detail="Session registry unavailable")
+    else:
+        cursor = await db.execute(
+            f"SELECT {columns} FROM sessions_meta WHERE name = ?", (name,)
+        )
     return await cursor.fetchone()
 
 
@@ -487,21 +711,39 @@ async def _persist_session_create_metadata(
     theme_mode: str | None,
     bootstrap_message: str | None,
 ) -> tuple[str, str, str]:
-    existing = await _fetch_session_meta_row(db, name)
+    workspace_id = _workspace_for_user(current_user)
+    existing = await _fetch_session_meta_row(db, name, workspace_id)
+    has_workspace = await _sessions_have_workspace(db)
+    if existing is None and has_workspace:
+        collision = await (
+            await db.execute(
+                "SELECT 1 FROM sessions_meta WHERE name = ? "
+                "AND (workspace_id IS NULL OR workspace_id != ?)",
+                (name, workspace_id),
+            )
+        ).fetchone()
+        if collision is not None:
+            raise HTTPException(status_code=409, detail="Session already exists")
     now = datetime.now(timezone.utc).isoformat()
     session_uuid = _row_value(existing, "session_uuid") or str(uuid_mod.uuid4())
     created_at = _row_value(existing, "created_at") or now
     owner_id = current_user.user_id or None
 
     try:
+        if has_workspace and _allow_legacy_local_session_schema() and existing:
+            await db.execute(
+                "UPDATE sessions_meta SET workspace_id = ? WHERE name = ?",
+                (workspace_id, name),
+            )
         await db.execute(
             "INSERT OR IGNORE INTO sessions_meta "
-            "(name, session_uuid, created_at, last_active, owner_id, "
+            "(name, workspace_id, session_uuid, created_at, last_active, owner_id, "
             "project_slug, provider, model, launch_model, permission_preset, "
             "theme_mode, bootstrap_message) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name,
+                workspace_id,
                 session_uuid,
                 created_at,
                 now,
@@ -528,7 +770,7 @@ async def _persist_session_create_metadata(
                 permission_preset = ?,
                 theme_mode = ?,
                 bootstrap_message = ?
-            WHERE name = ?""",
+            WHERE name = ? AND workspace_id = ?""",
             (
                 session_uuid,
                 created_at,
@@ -542,24 +784,44 @@ async def _persist_session_create_metadata(
                 theme_mode,
                 bootstrap_message,
                 name,
+                workspace_id,
             ),
         )
     except Exception:
         # Fallback pre-migration: provider/owner/theme columns may not exist yet.
-        await db.execute(
-            "INSERT OR REPLACE INTO sessions_meta "
-            "(name, session_uuid, created_at, last_active, owner_id, project_slug, model) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                name,
-                session_uuid,
-                created_at,
-                now,
-                owner_id,
-                project_slug,
-                selected_model,
-            ),
-        )
+        if has_workspace:
+            await db.execute(
+                "INSERT OR REPLACE INTO sessions_meta "
+                "(name, workspace_id, session_uuid, created_at, last_active, owner_id, project_slug, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    name,
+                    workspace_id,
+                    session_uuid,
+                    created_at,
+                    now,
+                    owner_id,
+                    project_slug,
+                    selected_model,
+                ),
+            )
+        elif _allow_legacy_local_session_schema():
+            await db.execute(
+                "INSERT OR REPLACE INTO sessions_meta "
+                "(name, session_uuid, created_at, last_active, owner_id, project_slug, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    name,
+                    session_uuid,
+                    created_at,
+                    now,
+                    owner_id,
+                    project_slug,
+                    selected_model,
+                ),
+            )
+        else:
+            raise
 
     return session_uuid, created_at, now
 
@@ -632,11 +894,14 @@ def _infer_project_from_command(command: str) -> str | None:
 #      design: it resets on API restart, which only ever delays a deletion.
 RECONCILE_TOMBSTONE_CYCLES = 3
 RECONCILE_MASS_ABSENCE_MIN = 5
-_reconcile_absent_cycles: dict[str, int] = {}
+_LOCAL_RECONCILE_SCOPE = "__local__"
+_reconcile_absent_cycles: dict[tuple[str, str], int] = {}
 
 
 def _reconcile_names_to_delete(
-    tmux_names: set[str], db_names: set[str]
+    tmux_names: set[str],
+    db_names: set[str],
+    workspace_id: str | None = None,
 ) -> list[str]:
     """Return registry rows safe to delete this cycle; mutate the tombstone map.
 
@@ -666,21 +931,29 @@ def _reconcile_names_to_delete(
             )
         return []
 
+    scope = (workspace_id or "").strip() or _LOCAL_RECONCILE_SCOPE
+
     # Trustworthy cycle: live names reset, vanished-from-registry names forgotten.
-    for name in list(_reconcile_absent_cycles):
+    # Counters from other workspaces remain untouched when the hosted
+    # maintenance loop reconciles each registry in sequence.
+    for key in list(_reconcile_absent_cycles):
+        key_scope, name = key
+        if key_scope != scope:
+            continue
         if name in tmux_names or name not in db_names:
-            _reconcile_absent_cycles.pop(name, None)
+            _reconcile_absent_cycles.pop(key, None)
 
     to_delete: list[str] = []
     for name in dead_names:
-        seen = _reconcile_absent_cycles.get(name, 0) + 1
-        _reconcile_absent_cycles[name] = seen
+        key = (scope, name)
+        seen = _reconcile_absent_cycles.get(key, 0) + 1
+        _reconcile_absent_cycles[key] = seen
         if seen >= RECONCILE_TOMBSTONE_CYCLES:
             to_delete.append(name)
     return to_delete
 
 
-async def reconcile_sessions_metadata() -> int:
+async def reconcile_sessions_metadata(workspace_id: str | None = None) -> int:
     """Persist tmux-only sessions and backfill missing stable metadata.
 
     Public session-list reads use the read-only DB pool, so they can expose a
@@ -688,21 +961,48 @@ async def reconcile_sessions_metadata() -> int:
     out of band, performs tmux/process inspection outside the writer lock, then
     applies a small metadata-only write batch.
     """
-    tmux_sessions = await tmux.list_sessions()
-    tmux_names = {s["name"] for s in tmux_sessions}
-    statuses = await tmux.get_all_session_statuses() if tmux_names else {}
+    local_compatibility = _allow_legacy_local_session_schema()
+    workspace_scope = (workspace_id or "").strip() or None
+    if workspace_scope is None and not local_compatibility:
+        logger.warning(
+            "Skipped session reconciliation without exact workspace context"
+        )
+        return 0
 
     async with acquire_db() as db:
-        cursor = await db.execute(
-            "SELECT name, session_uuid, created_at, last_active, project_slug, "
-            "provider, model, launch_model FROM sessions_meta"
+        columns = (
+            "name, session_uuid, created_at, last_active, project_slug, "
+            "provider, model, launch_model, workspace_id"
         )
+        if workspace_scope is not None:
+            cursor = await db.execute(
+                f"SELECT {columns} FROM sessions_meta WHERE workspace_id = ?",
+                (workspace_scope,),
+            )
+        else:
+            cursor = await db.execute(f"SELECT {columns} FROM sessions_meta")
         db_rows = {row["name"]: row for row in await cursor.fetchall()}
+
+    # The exact workspace registry is established before any tmux/process probe.
+    tmux_sessions = await tmux.list_sessions()
+    if workspace_scope is not None:
+        tmux_sessions = [s for s in tmux_sessions if s["name"] in db_rows]
+    tmux_names = {s["name"] for s in tmux_sessions}
+    if workspace_scope is None:
+        statuses = await tmux.get_all_session_statuses() if tmux_names else {}
+    else:
+        status_results = await asyncio.gather(
+            *(tmux.get_session_status(name) for name in tmux_names)
+        )
+        statuses = dict(zip(tmux_names, status_results))
 
     now = datetime.now(timezone.utc).isoformat()
     live_updates: list[dict[str, str | None]] = []
     for name in tmux_names:
         row = db_rows.get(name)
+        if row is None and not local_compatibility:
+            logger.warning("Quarantined unowned tmux session metadata: %s", name)
+            continue
         if (
             row
             and row["session_uuid"]
@@ -740,6 +1040,9 @@ async def reconcile_sessions_metadata() -> int:
         live_updates.append(
             {
                 "name": name,
+                "workspace_id": (
+                    row["workspace_id"] if row else "ws_default"
+                ),
                 "session_uuid": (
                     row["session_uuid"]
                     if row and row["session_uuid"]
@@ -760,23 +1063,35 @@ async def reconcile_sessions_metadata() -> int:
             }
         )
 
-    names_to_delete = _reconcile_names_to_delete(tmux_names, set(db_rows.keys()))
+    names_to_delete = _reconcile_names_to_delete(
+        tmux_names,
+        set(db_rows.keys()),
+        workspace_scope,
+    )
     if not live_updates and not names_to_delete:
         return 0
 
     changed = 0
     async with write_db() as db:
         for dead in names_to_delete:
-            await db.execute("DELETE FROM sessions_meta WHERE name = ?", (dead,))
-            _reconcile_absent_cycles.pop(dead, None)
+            dead_row = db_rows.get(dead)
+            if dead_row is None:
+                continue
+            await db.execute(
+                "DELETE FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+                (dead, dead_row["workspace_id"]),
+            )
+            reconcile_scope = workspace_scope or _LOCAL_RECONCILE_SCOPE
+            _reconcile_absent_cycles.pop((reconcile_scope, dead), None)
             changed += 1
         for item in live_updates:
             await db.execute(
                 "INSERT OR IGNORE INTO sessions_meta "
-                "(name, session_uuid, created_at, last_active, project_slug, provider, model, launch_model) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(name, workspace_id, session_uuid, created_at, last_active, project_slug, provider, model, launch_model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item["name"],
+                    item["workspace_id"],
                     item["session_uuid"],
                     item["created_at"],
                     item["last_active"],
@@ -795,7 +1110,7 @@ async def reconcile_sessions_metadata() -> int:
                     provider = COALESCE(NULLIF(provider, ''), ?),
                     model = COALESCE(NULLIF(model, ''), ?),
                     launch_model = COALESCE(NULLIF(launch_model, ''), ?)
-                WHERE name = ?""",
+                WHERE name = ? AND workspace_id = ?""",
                 (
                     item["session_uuid"],
                     item["created_at"],
@@ -805,6 +1120,7 @@ async def reconcile_sessions_metadata() -> int:
                     item["model"],
                     item["launch_model"],
                     item["name"],
+                    item["workspace_id"],
                 ),
             )
             changed += 1
@@ -825,6 +1141,7 @@ async def _resolve_opencode_session_id(
     *,
     db: aiosqlite.Connection,
     name: str,
+    workspace_id: str,
     launch_dir: str,
     stored_session_id: str | None,
     created_at: str | None,
@@ -837,10 +1154,17 @@ async def _resolve_opencode_session_id(
         created_at,
     )
     if session_id and session_id != stored_session_id:
-        await db.execute(
-            "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-            (session_id, name),
-        )
+        if await _sessions_have_workspace(db):
+            await db.execute(
+                "UPDATE sessions_meta SET conversation_id = ? "
+                "WHERE name = ? AND workspace_id = ?",
+                (session_id, name, workspace_id),
+            )
+        elif _allow_legacy_local_session_schema():
+            await db.execute(
+                "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
+                (session_id, name),
+            )
     return session_id
 
 
@@ -848,6 +1172,7 @@ async def _capture_new_opencode_session_id(
     *,
     db: aiosqlite.Connection,
     name: str,
+    workspace_id: str,
     launch_dir: str,
     launched_at_ms: int,
 ) -> str | None:
@@ -856,10 +1181,17 @@ async def _capture_new_opencode_session_id(
         launched_at_ms,
     )
     if session_id:
-        await db.execute(
-            "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-            (session_id, name),
-        )
+        if await _sessions_have_workspace(db):
+            await db.execute(
+                "UPDATE sessions_meta SET conversation_id = ? "
+                "WHERE name = ? AND workspace_id = ?",
+                (session_id, name, workspace_id),
+            )
+        elif _allow_legacy_local_session_schema():
+            await db.execute(
+                "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
+                (session_id, name),
+            )
     return session_id
 
 
@@ -925,7 +1257,10 @@ def _catalog_response() -> SessionCatalogResponse:
 
 
 async def _sync_sessions_impl(
-    db: aiosqlite.Connection, *, allow_writes: bool
+    db: aiosqlite.Connection,
+    *,
+    allow_writes: bool,
+    workspace_id: str | None = None,
 ) -> list[SessionInfo]:
     """Merge tmux sessions (source of truth) with DB metadata.
 
@@ -935,15 +1270,34 @@ async def _sync_sessions_impl(
     """
     global _sessions_last_sync_timings
     sync_started = _time.perf_counter()
-    tmux_sessions = await tmux.list_sessions()
-    tmux_list_done = _time.perf_counter()
-    tmux_names = {s["name"] for s in tmux_sessions}
-    tmux_map = {s["name"]: s for s in tmux_sessions}
+    local_compatibility = _allow_legacy_local_session_schema()
+    workspace_scope = (workspace_id or "").strip() or None
+    if workspace_scope is None and not local_compatibility:
+        raise HTTPException(status_code=403, detail="Session not found")
 
-    # Get DB metadata
-    cursor = await db.execute(f"SELECT {DB_COLUMNS} FROM sessions_meta")
+    # Get DB metadata. Legacy schemas are accepted only for explicit local OSS.
+    has_workspace = await _sessions_have_workspace(db)
+    if not has_workspace and not local_compatibility:
+        raise HTTPException(status_code=503, detail="Session registry unavailable")
+    select_columns = DB_COLUMNS if has_workspace else "*"
+    if workspace_scope is not None and has_workspace:
+        cursor = await db.execute(
+            f"SELECT {select_columns} FROM sessions_meta WHERE workspace_id = ?",
+            (workspace_scope,),
+        )
+    else:
+        cursor = await db.execute(f"SELECT {select_columns} FROM sessions_meta")
     db_rows = {row["name"]: row for row in await cursor.fetchall()}
     db_read_done = _time.perf_counter()
+
+    # Resolve the authenticated workspace in the registry before invoking tmux.
+    # The tmux service has one shared namespace, so its union listing is filtered
+    # immediately against the exact scoped rows before any per-session probing.
+    tmux_sessions = await tmux.list_sessions()
+    if workspace_scope is not None:
+        tmux_sessions = [s for s in tmux_sessions if s["name"] in db_rows]
+    tmux_list_done = _time.perf_counter()
+    tmux_names = {s["name"] for s in tmux_sessions}
 
     # Dead-row cleanup is intentionally NOT done here. This merge path runs on
     # every session-list read, and under read-lag (a pinned/stale WAL snapshot)
@@ -954,7 +1308,7 @@ async def _sync_sessions_impl(
     # absent for several consecutive trustworthy cycles. (task 018a38e2)
 
     # Auto-register sessions without session_uuid (created from CLI, not Console)
-    if allow_writes:
+    if allow_writes and local_compatibility and workspace_scope is None:
         for name in tmux_names:
             row = db_rows.get(name)
             if row and row["session_uuid"]:
@@ -975,20 +1329,39 @@ async def _sync_sessions_impl(
 
             if row:
                 # Session exists in DB but no UUID — update it
-                await db.execute(
-                    "UPDATE sessions_meta SET session_uuid = ?, project_slug = COALESCE(project_slug, ?) WHERE name = ?",
-                    (new_uuid, project_slug, name),
-                )
+                if has_workspace:
+                    await db.execute(
+                        "UPDATE sessions_meta SET session_uuid = ?, "
+                        "project_slug = COALESCE(project_slug, ?) "
+                        "WHERE name = ? AND workspace_id = 'ws_default'",
+                        (new_uuid, project_slug, name),
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE sessions_meta SET session_uuid = ?, "
+                        "project_slug = COALESCE(project_slug, ?) WHERE name = ?",
+                        (new_uuid, project_slug, name),
+                    )
             else:
                 # Brand new session — full insert
-                await db.execute(
-                    "INSERT OR IGNORE INTO sessions_meta (name, session_uuid, created_at, last_active, project_slug) VALUES (?, ?, ?, ?, ?)",
-                    (name, new_uuid, now, now, project_slug),
-                )
+                if has_workspace:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO sessions_meta "
+                        "(name, workspace_id, session_uuid, created_at, last_active, project_slug) "
+                        "VALUES (?, 'ws_default', ?, ?, ?, ?)",
+                        (name, new_uuid, now, now, project_slug),
+                    )
+                else:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO sessions_meta "
+                        "(name, session_uuid, created_at, last_active, project_slug) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (name, new_uuid, now, now, project_slug),
+                    )
 
             # Update local db_rows cache so the result loop sees the new data
             cursor = await db.execute(
-                f"SELECT {DB_COLUMNS} FROM sessions_meta WHERE name = ?", (name,)
+                f"SELECT {select_columns} FROM sessions_meta WHERE name = ?", (name,)
             )
             updated_row = await cursor.fetchone()
             if updated_row:
@@ -998,9 +1371,19 @@ async def _sync_sessions_impl(
 
     # Get process statuses and metrics via bulk snapshots. This keeps the
     # session-list path O(1) in subprocess calls even with hundreds of panes.
-    statuses = await tmux.get_all_session_statuses()
-    pane_pids = await tmux.get_all_session_pane_pids()
-    process_snapshots = await tmux.get_all_process_snapshots()
+    if workspace_scope is None:
+        statuses = await tmux.get_all_session_statuses()
+        pane_pids = await tmux.get_all_session_pane_pids()
+        process_snapshots = await tmux.get_all_process_snapshots()
+    else:
+        status_results = await asyncio.gather(
+            *(tmux.get_session_status(name) for name in tmux_names)
+        )
+        statuses = dict(zip(tmux_names, status_results))
+        # Avoid fleet-wide pane/process snapshots for remote callers. Those
+        # diagnostics cannot currently be queried by exact workspace.
+        pane_pids = {}
+        process_snapshots = {}
     processes_by_parent = _index_processes_by_parent(process_snapshots)
     status_metrics_done = _time.perf_counter()
 
@@ -1010,7 +1393,7 @@ async def _sync_sessions_impl(
     # when the read pool is busy. (task 018a38e2 — 2026-06-12 read-path flip)
     last_known = (
         {s.name: s for s in _sessions_cache}
-        if not allow_writes and _sessions_cache
+        if workspace_scope is None and not allow_writes and _sessions_cache
         else {}
     )
     result = []
@@ -1034,6 +1417,11 @@ async def _sync_sessions_impl(
         result.append(
             SessionInfo(
                 name=name,
+                workspace_id=(
+                    db_row["workspace_id"]
+                    if db_row and "workspace_id" in db_row.keys()
+                    else None
+                ),
                 display_name=db_row["display_name"] if db_row else None,
                 pinned=bool(db_row["pinned"]) if db_row and db_row["pinned"] else False,
                 sort_order=db_row["sort_order"]
@@ -1158,6 +1546,40 @@ async def _sync_sessions_impl(
         )
     result_build_done = _time.perf_counter()
 
+    def _session_db_scope(session_info: SessionInfo) -> tuple[str, tuple[str, ...]]:
+        if has_workspace:
+            scoped_workspace = session_info.workspace_id or workspace_scope
+            if scoped_workspace is None and local_compatibility:
+                scoped_workspace = "ws_default"
+            if scoped_workspace is None:
+                raise HTTPException(status_code=403, detail="Session not found")
+            return (
+                "name = ? AND workspace_id = ?",
+                (session_info.name, scoped_workspace),
+            )
+        if not local_compatibility:
+            raise HTTPException(status_code=503, detail="Session registry unavailable")
+        return "name = ?", (session_info.name,)
+
+    async def _persist_detected_conversation(
+        session_info: SessionInfo, conversation_id: str
+    ) -> None:
+        where_sql, where_params = _session_db_scope(session_info)
+        if has_workspace:
+            await db.execute(
+                "INSERT OR IGNORE INTO sessions_meta (name, workspace_id) VALUES (?, ?)",
+                where_params,
+            )
+        else:
+            await db.execute(
+                "INSERT OR IGNORE INTO sessions_meta (name) VALUES (?)",
+                (session_info.name,),
+            )
+        await db.execute(
+            f"UPDATE sessions_meta SET conversation_id = ? WHERE {where_sql}",
+            (conversation_id, *where_params),
+        )
+
     if allow_writes:
         # Lightweight metrics refresh for active CLI sessions
         now_ts = datetime.now(timezone.utc)
@@ -1186,13 +1608,8 @@ async def _sync_sessions_impl(
                     new_conv_id = pane_data.session_id
                     if new_conv_id != session_info.conversation_id:
                         session_info.conversation_id = new_conv_id
-                        await db.execute(
-                            "INSERT OR IGNORE INTO sessions_meta (name) VALUES (?)",
-                            (session_info.name,),
-                        )
-                        await db.execute(
-                            "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-                            (new_conv_id, session_info.name),
+                        await _persist_detected_conversation(
+                            session_info, new_conv_id
                         )
 
             # Method 1.5: Stale pane-metrics (session_id is valid even when idle)
@@ -1202,14 +1619,7 @@ async def _sync_sessions_impl(
                 )
                 if stale_sid:
                     session_info.conversation_id = stale_sid
-                    await db.execute(
-                        "INSERT OR IGNORE INTO sessions_meta (name) VALUES (?)",
-                        (session_info.name,),
-                    )
-                    await db.execute(
-                        "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-                        (stale_sid, session_info.name),
-                    )
+                    await _persist_detected_conversation(session_info, stale_sid)
 
             # Method 2: PID-based detection (fallback)
             if not session_info.conversation_id:
@@ -1218,13 +1628,8 @@ async def _sync_sessions_impl(
                     pid_conv_id = claude_metrics.detect_conversation_by_pid(claude_pid)
                     if pid_conv_id:
                         session_info.conversation_id = pid_conv_id
-                        await db.execute(
-                            "INSERT OR IGNORE INTO sessions_meta (name) VALUES (?)",
-                            (session_info.name,),
-                        )
-                        await db.execute(
-                            "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-                            (pid_conv_id, session_info.name),
+                        await _persist_detected_conversation(
+                            session_info, pid_conv_id
                         )
 
             # Method 3: Timestamp-based detection (last resort)
@@ -1237,10 +1642,7 @@ async def _sync_sessions_impl(
                     )
                     if conv_id:
                         session_info.conversation_id = conv_id
-                        await db.execute(
-                            "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-                            (conv_id, session_info.name),
-                        )
+                        await _persist_detected_conversation(session_info, conv_id)
                 if not session_info.conversation_id:
                     continue
 
@@ -1257,9 +1659,10 @@ async def _sync_sessions_impl(
                 real_pct = min(round(pane_data.used_pct, 1), 100.0)
                 session_info.last_context_pct = real_pct
                 session_info.last_context_pct_real = real_pct
+                where_sql, where_params = _session_db_scope(session_info)
                 cursor_meta = await db.execute(
-                    "SELECT last_metrics_at FROM sessions_meta WHERE name = ?",
-                    (session_info.name,),
+                    f"SELECT last_metrics_at FROM sessions_meta WHERE {where_sql}",
+                    where_params,
                 )
                 meta_row = await cursor_meta.fetchone()
                 should_parse = True
@@ -1292,24 +1695,26 @@ async def _sync_sessions_impl(
                         """UPDATE sessions_meta SET
                             model = ?, last_context_pct_real = ?, last_cost_usd = ?,
                             last_message_count = ?, last_metrics_at = datetime('now')
-                        WHERE name = ?""",
+                        WHERE {where_sql}""".format(where_sql=where_sql),
                         (
                             session_info.model,
                             real_pct,
                             session_info.last_cost_usd,
                             session_info.last_message_count,
-                            session_info.name,
+                            *where_params,
                         ),
                     )
                 else:
                     await db.execute(
-                        "UPDATE sessions_meta SET last_context_pct_real = ? WHERE name = ?",
-                        (real_pct, session_info.name),
+                        f"UPDATE sessions_meta SET last_context_pct_real = ? "
+                        f"WHERE {where_sql}",
+                        (real_pct, *where_params),
                     )
             else:
+                where_sql, where_params = _session_db_scope(session_info)
                 cursor_meta = await db.execute(
-                    "SELECT last_metrics_at FROM sessions_meta WHERE name = ?",
-                    (session_info.name,),
+                    f"SELECT last_metrics_at FROM sessions_meta WHERE {where_sql}",
+                    where_params,
                 )
                 meta_row = await cursor_meta.fetchone()
                 last_refresh_epoch = 0.0
@@ -1365,13 +1770,13 @@ async def _sync_sessions_impl(
                         """UPDATE sessions_meta SET
                             model = ?, last_context_pct_real = ?, last_cost_usd = ?,
                             last_message_count = ?, last_metrics_at = datetime('now')
-                        WHERE name = ?""",
+                        WHERE {where_sql}""".format(where_sql=where_sql),
                         (
                             metrics.model,
                             effective_real,
                             metrics.cost_usd,
                             metrics.message_count,
-                            session_info.name,
+                            *where_params,
                         ),
                     )
 
@@ -1428,11 +1833,12 @@ async def _sync_sessions_impl(
     result.sort(key=lambda s: (not s.pinned, s.sort_order, s.name))
     sync_done = _time.perf_counter()
     _sessions_last_sync_timings = {
+        "workspace_id": workspace_scope or "ws_default",
         "allow_writes": allow_writes,
         "session_count": len(result),
-        "tmux_list_ms": (tmux_list_done - sync_started) * 1000,
-        "db_read_ms": (db_read_done - tmux_list_done) * 1000,
-        "status_metrics_ms": (status_metrics_done - db_read_done) * 1000,
+        "db_read_ms": (db_read_done - sync_started) * 1000,
+        "tmux_list_ms": (tmux_list_done - db_read_done) * 1000,
+        "status_metrics_ms": (status_metrics_done - tmux_list_done) * 1000,
         "result_build_ms": (result_build_done - status_metrics_done) * 1000,
         "write_metrics_ms": (write_metrics_done - result_build_done) * 1000,
         "activity_merge_ms": (activity_merge_done - write_metrics_done) * 1000,
@@ -1445,12 +1851,22 @@ async def _sync_sessions_impl(
     return result
 
 
-async def _sync_sessions(db: aiosqlite.Connection) -> list[SessionInfo]:
-    return await _sync_sessions_impl(db, allow_writes=True)
+async def _sync_sessions(
+    db: aiosqlite.Connection,
+    workspace_id: str | None = None,
+) -> list[SessionInfo]:
+    return await _sync_sessions_impl(
+        db, allow_writes=True, workspace_id=workspace_id
+    )
 
 
-async def _sync_sessions_read_only(db: aiosqlite.Connection) -> list[SessionInfo]:
-    return await _sync_sessions_impl(db, allow_writes=False)
+async def _sync_sessions_read_only(
+    db: aiosqlite.Connection,
+    workspace_id: str | None = None,
+) -> list[SessionInfo]:
+    return await _sync_sessions_impl(
+        db, allow_writes=False, workspace_id=workspace_id
+    )
 
 
 @router.get("", response_model=list[SessionInfo])
@@ -1463,10 +1879,22 @@ async def list_sessions(
     """List tmux sessions. Operators see only their own; admins see all."""
     global _sessions_cache_pending_patch_state
     started = _time.perf_counter()
-    sessions = await _get_sessions_cached(db)
+    workspace_id = _workspace_for_user(current_user)
+    if _allow_legacy_local_session_schema():
+        sessions = await _get_sessions_cached(db)
+    else:
+        sessions = await _get_sessions_cached(db, workspace_id=workspace_id)
+    sessions = [
+        session
+        for session in sessions
+        if session.workspace_id == workspace_id
+        or (_allow_legacy_local_session_schema() and session.workspace_id is None)
+    ]
     unfiltered_count = len(sessions)
     cache_state = _sessions_cache_pending_patch_state or _sessions_cache_last_state
     sync_timings = _sessions_last_sync_timings
+    if sync_timings and sync_timings.get("workspace_id") != workspace_id:
+        sync_timings = None
 
     # RBAC: operator/viewer humans are owner-scoped. Only explicit system agent
     # identities retain global visibility on this read endpoint.
@@ -1480,8 +1908,12 @@ async def list_sessions(
         async with db.execute(
             """SELECT DISTINCT tm2.user_id FROM team_members tm1
                JOIN team_members tm2 ON tm1.team_id = tm2.team_id
-               WHERE tm1.user_id = ?""",
-            [current_user.user_id],
+               JOIN teams t ON t.id = tm1.team_id
+               JOIN users u1 ON u1.id = tm1.user_id
+               JOIN users u2 ON u2.id = tm2.user_id
+               WHERE tm1.user_id = ? AND t.workspace_id = ?
+                 AND u1.workspace_id = ? AND u2.workspace_id = ?""",
+            [current_user.user_id, workspace_id, workspace_id, workspace_id],
         ) as cursor:
             member_rows = await cursor.fetchall()
         team_user_ids = {r[0] for r in member_rows}
@@ -1506,6 +1938,7 @@ async def list_sessions(
         metadata["last_sync_session_count"] = sync_timings["session_count"]
     _record_sessions_control_event(
         request,
+        workspace_id=workspace_id,
         kind="list",
         duration_ms=duration_ms,
         metadata=metadata,
@@ -1513,6 +1946,7 @@ async def list_sessions(
     if cache_state == "miss_wait" and sync_timings:
         _record_sessions_control_event(
             request,
+            workspace_id=workspace_id,
             kind="sync",
             duration_ms=float(sync_timings["total_ms"]),
             metadata={
@@ -1544,6 +1978,8 @@ async def create_session(
     the same instruction files, hooks, skills, and MCP config. Project
     selection remains metadata plus extra access directories where supported.
     """
+    workspace_id = _workspace_for_user(current_user)
+    await _require_project_workspace(db, current_user, body.project_slug)
     try:
         launch_spec = build_session_start_spec(
             body.provider,
@@ -1565,9 +2001,26 @@ async def create_session(
     bootstrap_message = _project_bootstrap_message(body.project_slug)
     launched_at_ms = int(_time.time() * 1000)
 
+    scoped_row = await _fetch_session_meta_row(db, body.name, workspace_id)
+    if (
+        await _sessions_have_workspace(db)
+        and not _allow_legacy_local_session_schema()
+    ):
+        foreign_row = await (
+            await db.execute(
+                "SELECT 1 FROM sessions_meta WHERE name = ? "
+                "AND (workspace_id IS NULL OR workspace_id != ?)",
+                (body.name, workspace_id),
+            )
+        ).fetchone()
+        if foreign_row is not None:
+            raise HTTPException(status_code=409, detail="Session already exists")
+
     existing_server = await tmux.resolve_session_server(body.name)
     if existing_server is not None:
-        row = await _fetch_session_meta_row(db, body.name)
+        row = scoped_row
+        if row is None and not _allow_legacy_local_session_schema():
+            raise HTTPException(status_code=409, detail="Session already exists")
         if existing_server != "marvisx" or not _is_claimable_marvisx_orphan(
             row, current_user
         ):
@@ -1587,7 +2040,9 @@ async def create_session(
         )
         await db.commit()
         _invalidate_sessions_cache()
-        asyncio.create_task(_get_session_manager().broadcast_session_event("created"))
+        asyncio.create_task(
+            _broadcast_session_event("created", workspace_id=workspace_id)
+        )
 
         logger.warning(
             "Recovered orphan tmux session metadata: %s "
@@ -1600,6 +2055,7 @@ async def create_session(
         )
         return SessionInfo(
             name=body.name,
+            workspace_id=workspace_id,
             session_uuid=session_uuid,
             created_at=created_at,
             last_active=now,
@@ -1620,12 +2076,20 @@ async def create_session(
         )
 
     tmux_user_env = await _tmux_user_env_for_session(db, current_user)
-    success = await tmux.create_session(
-        body.name,
-        start_command=start_command,
-        tenant_slug=settings.deploy_mode if settings.multi_tenant_enabled else None,
-        user_env=tmux_user_env,
-    )
+    if tmux_user_env is None and not settings.multi_tenant_enabled:
+        success = await tmux.create_session(
+            body.name,
+            start_command=start_command,
+        )
+    else:
+        success = await tmux.create_session(
+            body.name,
+            start_command=start_command,
+            tenant_slug=(
+                settings.deploy_mode if settings.multi_tenant_enabled else None
+            ),
+            user_env=tmux_user_env,
+        )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to create session")
 
@@ -1647,12 +2111,15 @@ async def create_session(
         opencode_session_id = await _capture_new_opencode_session_id(
             db=db,
             name=body.name,
+            workspace_id=workspace_id,
             launch_dir=launch_spec.launch_dir,
             launched_at_ms=launched_at_ms,
         )
     await db.commit()
     _invalidate_sessions_cache()
-    asyncio.create_task(_get_session_manager().broadcast_session_event("created"))
+    asyncio.create_task(
+        _broadcast_session_event("created", workspace_id=workspace_id)
+    )
 
     if bootstrap_message:
         asyncio.create_task(
@@ -1669,6 +2136,7 @@ async def create_session(
     )
     return SessionInfo(
         name=body.name,
+        workspace_id=workspace_id,
         session_uuid=session_uuid,
         created_at=created_at,
         last_active=now,
@@ -1684,9 +2152,11 @@ async def create_session(
 
 
 @router.delete("/{name}", status_code=204)
+@_session_operation("delete")
 async def delete_session(
     name: str,
     _user: UserInfo = Depends(get_current_user),
+    db: aiosqlite.Connection = Depends(get_write_db),
 ):
     """Kill a tmux session."""
     try:
@@ -1694,6 +2164,8 @@ async def delete_session(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    workspace_id = _workspace_for_user(_user)
+    await _require_session_row(db, _user, name=name)
     if not await tmux.session_exists(name):
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -1701,12 +2173,19 @@ async def delete_session(
     if not success:
         raise HTTPException(status_code=500, detail="Failed to kill session")
 
-    async with write_db() as db:
+    if _allow_legacy_local_session_schema():
         await db.execute("DELETE FROM sessions_meta WHERE name = ?", (name,))
-        await db.commit()
+    else:
+        await db.execute(
+            "DELETE FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+            (name, workspace_id),
+        )
+    await db.commit()
 
     _invalidate_sessions_cache()
-    asyncio.create_task(_get_session_manager().broadcast_session_event("destroyed"))
+    asyncio.create_task(
+        _broadcast_session_event("destroyed", workspace_id=workspace_id)
+    )
 
     logger.info("Session deleted: %s", name)
 
@@ -1724,12 +2203,33 @@ async def update_session(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    workspace_id = _workspace_for_user(current_user)
+    session_row = await _require_session_row(db, current_user, name=name)
+    if (
+        _allow_legacy_local_session_schema()
+        and "workspace_id" in session_row.keys()
+        and session_row["workspace_id"] != workspace_id
+    ):
+        await db.execute(
+            "UPDATE sessions_meta SET workspace_id = ? WHERE name = ?",
+            (workspace_id, name),
+        )
+    await _require_project_workspace(db, current_user, body.project_slug)
     if not await tmux.session_exists(name):
         raise HTTPException(status_code=404, detail="Session not found")
 
     # Handle rename if requested
     effective_name = name
     if body.new_name and body.new_name != name:
+        target_row = await (
+            await db.execute(
+                "SELECT 1 FROM sessions_meta WHERE name = ?", (body.new_name,)
+            )
+        ).fetchone()
+        if target_row is not None:
+            raise HTTPException(
+                status_code=409, detail="Target session name already exists"
+            )
         if await tmux.session_exists(body.new_name):
             raise HTTPException(
                 status_code=409, detail="Target session name already exists"
@@ -1737,23 +2237,28 @@ async def update_session(
         success = await tmux.rename_session(name, body.new_name)
         if not success:
             raise HTTPException(status_code=500, detail="Failed to rename session")
-        # session_conversations.session_name FK -> sessions_meta(name) is
-        # ON DELETE CASCADE only (no ON UPDATE CASCADE). With foreign_keys=ON
-        # any single statement in the rename chain trips IntegrityError
-        # mid-transaction even if the final state is consistent. Defer the
-        # FK check to COMMIT so all three UPDATEs land atomically.
-        # Provider-agnostic: same FK chain applies to Claude/OpenCode/Codex.
-        await db.execute("PRAGMA defer_foreign_keys = ON")
+        if _allow_legacy_local_session_schema():
+            await db.execute(
+                "UPDATE session_costs SET workspace_id = ? "
+                "WHERE workspace_id IS NULL AND session_name = ?",
+                (workspace_id, name),
+            )
         await db.execute(
-            "UPDATE session_conversations SET session_name = ? WHERE session_name = ?",
-            (body.new_name, name),
+            "UPDATE sessions_meta SET name = ? WHERE name = ? AND workspace_id = ?",
+            (body.new_name, name, workspace_id),
+        )
+        # Migration 185 uses ON UPDATE CASCADE for this exact composite parent.
+        # The explicit update is a safe fallback when a local SQLite connection
+        # has foreign-key enforcement disabled.
+        await db.execute(
+            "UPDATE session_conversations SET session_name = ? "
+            "WHERE workspace_id = ? AND session_name = ?",
+            (body.new_name, workspace_id, name),
         )
         await db.execute(
-            "UPDATE session_costs SET session_name = ? WHERE session_name = ?",
-            (body.new_name, name),
-        )
-        await db.execute(
-            "UPDATE sessions_meta SET name = ? WHERE name = ?", (body.new_name, name)
+            "UPDATE session_costs SET session_name = ? "
+            "WHERE workspace_id = ? AND session_name = ?",
+            (body.new_name, workspace_id, name),
         )
         # Sync display_name if it was auto-default (== old name). SessionCardV2
         # sidebar uses `display_name || name` as the primary label, so a stale
@@ -1761,8 +2266,8 @@ async def update_session(
         # display_name ≠ old name) by skipping the sync. Plan 2026-05-22.
         await db.execute(
             "UPDATE sessions_meta SET display_name = ? "
-            "WHERE name = ? AND display_name = ?",
-            (body.new_name, body.new_name, name),
+            "WHERE name = ? AND workspace_id = ? AND display_name = ?",
+            (body.new_name, body.new_name, workspace_id, name),
         )
         await db.commit()
         effective_name = body.new_name
@@ -1773,8 +2278,8 @@ async def update_session(
         # an optimistic patch payload instead of forcing a refetch round-trip.
         _delta_cursor = await db.execute(
             "SELECT display_name, provider, model, project_slug "
-            "FROM sessions_meta WHERE name = ?",
-            (effective_name,),
+            "FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+            (effective_name, workspace_id),
         )
         _delta_row = await _delta_cursor.fetchone()
         _now_iso = datetime.now(timezone.utc).isoformat()
@@ -1788,8 +2293,9 @@ async def update_session(
             "updated_at": _now_iso,
         }
         asyncio.create_task(
-            _get_session_manager().broadcast_session_event(
+            _broadcast_session_event(
                 "renamed",
+                workspace_id=workspace_id,
                 old_name=name,
                 new_name=effective_name,
                 session_info=_rename_delta,
@@ -1804,7 +2310,8 @@ async def update_session(
         # Gemini CLI has no /rename; skipped. Rename is still reflected at
         # tmux + Marvis DB level, which is enough for the Console UI.
         _prov_cursor = await db.execute(
-            "SELECT provider FROM sessions_meta WHERE name = ?", (effective_name,)
+            "SELECT provider FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+            (effective_name, workspace_id),
         )
         _prov_row = await _prov_cursor.fetchone()
         _session_provider = (
@@ -1844,14 +2351,14 @@ async def update_session(
                 "last_reasoning_tokens = NULL, "
                 "last_metrics_at = NULL, "
                 "metrics_refreshed_at = NULL "
-                "WHERE name = ?",
-                (effective_name,),
+                "WHERE name = ? AND workspace_id = ?",
+                (effective_name, workspace_id),
             )
 
     # Ensure DB row exists
     await db.execute(
-        "INSERT OR IGNORE INTO sessions_meta (name) VALUES (?)",
-        (effective_name,),
+        "INSERT OR IGNORE INTO sessions_meta (name, workspace_id) VALUES (?, ?)",
+        (effective_name, workspace_id),
     )
 
     # Update metadata fields (use model_fields_set to distinguish "not sent" from "sent as null")
@@ -1879,6 +2386,16 @@ async def update_session(
     if "owner_id" in body.model_fields_set:
         if current_user.system_role not in ("admin", "super_admin"):
             raise HTTPException(403, "Insufficient permissions to change owner_id")
+        if body.owner_id:
+            owner = await (
+                await db.execute(
+                    "SELECT 1 FROM users WHERE id = ? AND workspace_id = ? "
+                    "AND deleted_at IS NULL",
+                    (body.owner_id, workspace_id),
+                )
+            ).fetchone()
+            if owner is None:
+                raise HTTPException(status_code=404, detail="User not found")
         updates.append("owner_id = ?")
         params.append(body.owner_id or None)
 
@@ -1887,19 +2404,22 @@ async def update_session(
     params.append(now)
 
     if updates:
-        params.append(effective_name)
+        params.extend((effective_name, workspace_id))
         await db.execute(
-            f"UPDATE sessions_meta SET {', '.join(updates)} WHERE name = ?",
+            f"UPDATE sessions_meta SET {', '.join(updates)} "
+            "WHERE name = ? AND workspace_id = ?",
             params,
         )
         await db.commit()
         _invalidate_sessions_cache()
-        asyncio.create_task(_get_session_manager().broadcast_session_event("updated"))
+        asyncio.create_task(
+            _broadcast_session_event("updated", workspace_id=workspace_id)
+        )
 
     # Return updated info
     cursor = await db.execute(
-        f"SELECT {DB_COLUMNS} FROM sessions_meta WHERE name = ?",
-        (effective_name,),
+        f"SELECT {DB_COLUMNS} FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+        (effective_name, workspace_id),
     )
     row = await cursor.fetchone()
     session_provider = row["provider"] if row and row["provider"] else "claude"
@@ -1913,6 +2433,7 @@ async def update_session(
 
     return SessionInfo(
         name=effective_name,
+        workspace_id=workspace_id,
         display_name=row["display_name"] if row else None,
         pinned=bool(row["pinned"]) if row and row["pinned"] else False,
         sort_order=row["sort_order"] if row and row["sort_order"] else 0,
@@ -1943,13 +2464,21 @@ async def reorder_sessions(
     db: aiosqlite.Connection = Depends(get_write_db),
 ):
     """Update sort_order for sessions based on position in list."""
+    workspace_id = _workspace_for_user(_user)
+    for name in body.order:
+        await _require_session_row(db, _user, name=name)
     for i, name in enumerate(body.order):
         await db.execute(
-            "UPDATE sessions_meta SET sort_order = ? WHERE name = ?",
-            (i, name),
+            "UPDATE sessions_meta SET sort_order = ? "
+            "WHERE name = ? AND workspace_id = ?",
+            (i, name, workspace_id),
         )
     await db.commit()
-    return await _sync_sessions(db)
+    if _allow_legacy_local_session_schema():
+        sessions = await _sync_sessions_read_only(db)
+    else:
+        sessions = await _sync_sessions_read_only(db, workspace_id=workspace_id)
+    return [session for session in sessions if session.workspace_id == workspace_id]
 
 
 # --- Session state event endpoint (PR1, plan 2026-04-26) ---
@@ -2040,11 +2569,26 @@ async def update_session_state(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    session_name = await session_state_svc.resolve_session_name(db, identifier)
-    if session_name is None:
-        # Don't 404 noisily — hooks can race against tmux session deletion.
-        # 204 silent so hook script doesn't retry-storm.
-        return
+    workspace_id = _workspace_for_user(user)
+    if _allow_legacy_local_session_schema():
+        session_name = await session_state_svc.resolve_session_name(db, identifier)
+        if session_name is None:
+            return
+    elif await _sessions_have_workspace(db):
+        resolved_rows = await (
+            await db.execute(
+                "SELECT name FROM sessions_meta WHERE workspace_id = ? "
+                "AND (name = ? OR conversation_id = ?) LIMIT 2",
+                (workspace_id, identifier, identifier),
+            )
+        ).fetchall()
+        if len(resolved_rows) != 1:
+            # Don't 404 noisily — hooks can race against tmux session deletion.
+            # 204 silent so hook script doesn't retry-storm.
+            return
+        session_name = resolved_rows[0]["name"]
+    else:
+        raise HTTPException(status_code=503, detail="Session registry unavailable")
 
     # Parse + bound-check client timestamp (rejects future spam + stale).
     client_ts = session_state_svc.parse_client_ts(body.ts)
@@ -2052,12 +2596,32 @@ async def update_session_state(
         return  # silent drop — already logged in parse_client_ts
 
     # Rate-limit (priority bucket: terminal events bypass).
-    if not _check_rate_limit(session_name, body.event):
+    rate_limit_key = (
+        session_name
+        if _allow_legacy_local_session_schema()
+        else f"{workspace_id}:{session_name}"
+    )
+    if not _check_rate_limit(rate_limit_key, body.event):
         return  # silent drop, no 429 — hook is fire-and-forget
 
-    state = await session_state_svc.record_state_event(
-        db, session_name, body.provider, body.event, client_ts
-    )
+    if _allow_legacy_local_session_schema():
+        state = await session_state_svc.record_state_event(
+            db, session_name, body.provider, body.event, client_ts
+        )
+    else:
+        state = session_state_svc.map_event_to_state(body.provider, body.event)
+        if state is not None:
+            ts_iso = client_ts.isoformat()
+            cursor = await db.execute(
+                """UPDATE sessions_meta
+                   SET activity_state = ?, activity_state_updated_at = ?
+                   WHERE name = ? AND workspace_id = ?
+                     AND (activity_state_updated_at IS NULL
+                          OR activity_state_updated_at < ?)""",
+                (state, ts_iso, session_name, workspace_id, ts_iso),
+            )
+            if cursor.rowcount == 0:
+                state = None
     await db.commit()
     if state is None:
         # Event ignored or LWW race lost — no broadcast spurious.
@@ -2067,14 +2631,19 @@ async def update_session_state(
     # of forcing the next /sessions caller into a cold tmux+DB sync. If the
     # cache exists but does not contain this resolved session, invalidate once
     # so the frontend fallback full refresh can converge.
-    patched_cache = _patch_sessions_cache_activity_state(session_name, state)
+    patched_cache = _patch_sessions_cache_activity_state(
+        session_name, state, workspace_id=workspace_id
+    )
     if not patched_cache and _sessions_cache is not None:
         _invalidate_sessions_cache()
     # Broadcast inline state payload (M1, julik R1) so frontend can apply
     # delta optimistically without round-tripping back to GET /sessions.
     asyncio.create_task(
-        _get_session_manager().broadcast_session_event(
-            "updated", session_name=session_name, state=state
+        _broadcast_session_event(
+            "updated",
+            workspace_id=workspace_id,
+            session_name=session_name,
+            state=state,
         )
     )
 
@@ -2091,15 +2660,12 @@ async def resurrect_session(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    workspace_id = _workspace_for_user(_user)
+    row = await _require_session_row(db, _user, name=name)
     if await tmux.session_exists(name):
         raise HTTPException(status_code=409, detail="Session is still alive")
 
-    # Read provider from DB to build correct start command
-    cursor = await db.execute(
-        f"SELECT {DB_COLUMNS} FROM sessions_meta WHERE name = ?",
-        (name,),
-    )
-    row = await cursor.fetchone()
+    # Read provider from the already workspace-scoped row.
     launch_spec = build_session_start_spec(
         row["provider"] if row else None,
         row["project_slug"] if row else None,
@@ -2113,6 +2679,7 @@ async def resurrect_session(
         opencode_session_id = await _resolve_opencode_session_id(
             db=db,
             name=name,
+            workspace_id=workspace_id,
             launch_dir=launch_spec.launch_dir,
             stored_session_id=row["conversation_id"] if row else None,
             created_at=row["created_at"] if row else None,
@@ -2127,7 +2694,6 @@ async def resurrect_session(
             theme_mode=row["theme_mode"] if row else None,
         )
     start_cmd = launch_spec.start_command
-    bootstrap_message = None
     launched_at_ms = int(_time.time() * 1000)
 
     success = await tmux.create_session(name, start_command=start_cmd)
@@ -2138,6 +2704,7 @@ async def resurrect_session(
         await _capture_new_opencode_session_id(
             db=db,
             name=name,
+            workspace_id=workspace_id,
             launch_dir=launch_spec.launch_dir,
             launched_at_ms=launched_at_ms,
         )
@@ -2145,14 +2712,16 @@ async def resurrect_session(
     # Update last_active
     now = datetime.now(timezone.utc).isoformat()
     await db.execute(
-        "UPDATE sessions_meta SET last_active = ? WHERE name = ?",
-        (now, name),
+        "UPDATE sessions_meta SET last_active = ? "
+        "WHERE name = ? AND workspace_id = ?",
+        (now, name, workspace_id),
     )
     await db.commit()
 
     logger.info("Session resurrected: %s (provider=%s)", name, session_provider)
     return SessionInfo(
         name=name,
+        workspace_id=workspace_id,
         display_name=row["display_name"] if row else None,
         pinned=bool(row["pinned"]) if row and row["pinned"] else False,
         sort_order=row["sort_order"] if row and row["sort_order"] else 0,
@@ -2185,12 +2754,7 @@ async def get_session_metrics(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    cursor = await db.execute(
-        "SELECT conversation_id, hibernated, auto_hibernate_minutes, provider, project_slug "
-        "FROM sessions_meta WHERE name = ?",
-        (name,),
-    )
-    row = await cursor.fetchone()
+    row = await _require_session_row(db, _user, name=name)
     conv_id = row["conversation_id"] if row else None
     hibernated = bool(row["hibernated"]) if row else False
     auto_hibernate_min = (
@@ -2293,6 +2857,7 @@ async def get_session_metrics(
 
 
 @router.post("/{name}/hibernate", status_code=200)
+@_session_operation("hibernate")
 async def hibernate_session(
     name: str,
     _user: UserInfo = Depends(get_current_user),
@@ -2304,15 +2869,14 @@ async def hibernate_session(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    workspace_id = _workspace_for_user(_user)
+    row = await _require_session_row(db, _user, name=name)
+    has_workspace = await _sessions_have_workspace(db)
+    session_where = "name = ? AND workspace_id = ?" if has_workspace else "name = ?"
+    session_params = (name, workspace_id) if has_workspace else (name,)
     if not await tmux.session_exists(name):
         raise HTTPException(status_code=404, detail="Session not found")
 
-    cursor = await db.execute(
-        "SELECT hibernated, conversation_id, provider, project_slug, launch_model, permission_preset, theme_mode, bootstrap_message, created_at "
-        "FROM sessions_meta WHERE name = ?",
-        (name,),
-    )
-    row = await cursor.fetchone()
     if row and row["hibernated"]:
         raise HTTPException(status_code=409, detail="Session already hibernated")
 
@@ -2346,6 +2910,7 @@ async def hibernate_session(
         conv_id = await _resolve_opencode_session_id(
             db=db,
             name=name,
+            workspace_id=workspace_id,
             launch_dir=launch_spec.launch_dir,
             stored_session_id=conv_id,
             created_at=row["created_at"] if row else None,
@@ -2373,7 +2938,6 @@ async def hibernate_session(
 
     # Update DB
     now = datetime.now(timezone.utc).isoformat()
-    await db.execute("INSERT OR IGNORE INTO sessions_meta (name) VALUES (?)", (name,))
     updates = ["hibernated = 1", "hibernated_at = ?"]
     params: list = [now]
 
@@ -2398,9 +2962,11 @@ async def hibernate_session(
             ]
         )
 
-    params.append(name)
+    params.extend(session_params)
     await db.execute(
-        f"UPDATE sessions_meta SET {', '.join(updates)} WHERE name = ?", params
+        f"UPDATE sessions_meta SET {', '.join(updates)} "
+        f"WHERE {session_where}",
+        params,
     )
     await db.commit()
 
@@ -2414,6 +2980,7 @@ async def hibernate_session(
 
 
 @router.post("/{name}/resume", status_code=200)
+@_session_operation("resume")
 async def resume_session(
     name: str,
     _user: UserInfo = Depends(get_current_user),
@@ -2425,15 +2992,14 @@ async def resume_session(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    workspace_id = _workspace_for_user(_user)
+    row = await _require_session_row(db, _user, name=name)
+    has_workspace = await _sessions_have_workspace(db)
+    session_where = "name = ? AND workspace_id = ?" if has_workspace else "name = ?"
+    session_params = (name, workspace_id) if has_workspace else (name,)
     if not await tmux.session_exists(name):
         raise HTTPException(status_code=404, detail="Session not found")
 
-    cursor = await db.execute(
-        "SELECT hibernated, conversation_id, provider, project_slug, launch_model, permission_preset, theme_mode, bootstrap_message, created_at "
-        "FROM sessions_meta WHERE name = ?",
-        (name,),
-    )
-    row = await cursor.fetchone()
     if not row or not row["hibernated"]:
         raise HTTPException(status_code=409, detail="Session is not hibernated")
 
@@ -2443,7 +3009,6 @@ async def resume_session(
     conv_id = row["conversation_id"]
     launch_model = row["launch_model"] if row else None
     permission_preset = row["permission_preset"] if row else None
-    bootstrap_message = None
 
     if is_claude:
         # Claude: try to detect conversation_id for --resume
@@ -2462,8 +3027,9 @@ async def resume_session(
                     )
             if conv_id:
                 await db.execute(
-                    "UPDATE sessions_meta SET conversation_id = ? WHERE name = ?",
-                    (conv_id, name),
+                    "UPDATE sessions_meta SET conversation_id = ? "
+                    f"WHERE {session_where}",
+                    (conv_id, *session_params),
                 )
 
         project_slug = row["project_slug"] if row else None
@@ -2495,8 +3061,9 @@ async def resume_session(
                 )
                 conv_id = None
                 await db.execute(
-                    "UPDATE sessions_meta SET conversation_id = NULL WHERE name = ?",
-                    (name,),
+                    "UPDATE sessions_meta SET conversation_id = NULL "
+                    f"WHERE {session_where}",
+                    session_params,
                 )
         if conv_id:
             cmd = build_start_command(
@@ -2527,6 +3094,7 @@ async def resume_session(
         conv_id = await _resolve_opencode_session_id(
             db=db,
             name=name,
+            workspace_id=workspace_id,
             launch_dir=launch_spec.launch_dir,
             stored_session_id=conv_id,
             created_at=row["created_at"] if row else None,
@@ -2572,13 +3140,15 @@ async def resume_session(
         conv_id = await _capture_new_opencode_session_id(
             db=db,
             name=name,
+            workspace_id=workspace_id,
             launch_dir=launch_spec.launch_dir,
             launched_at_ms=launched_at_ms,
         )
 
     await db.execute(
-        "UPDATE sessions_meta SET hibernated = 0, hibernated_at = NULL WHERE name = ?",
-        (name,),
+        "UPDATE sessions_meta SET hibernated = 0, hibernated_at = NULL "
+        f"WHERE {session_where}",
+        session_params,
     )
     await db.commit()
 
@@ -2592,6 +3162,7 @@ async def resume_session(
 
 
 @router.post("/{name}/restart", status_code=200)
+@_session_operation("restart")
 async def restart_session(
     name: str,
     _user: UserInfo = Depends(get_current_user),
@@ -2603,23 +3174,21 @@ async def restart_session(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    workspace_id = _workspace_for_user(_user)
+    row = await _require_session_row(db, _user, name=name)
+    has_workspace = await _sessions_have_workspace(db)
+    session_where = "name = ? AND workspace_id = ?" if has_workspace else "name = ?"
+    session_params = (name, workspace_id) if has_workspace else (name,)
     if not await tmux.session_exists(name):
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Detect conversation_id before restarting
-    cursor = await db.execute(
-        "SELECT conversation_id, provider, project_slug, launch_model, permission_preset, theme_mode, bootstrap_message, created_at "
-        "FROM sessions_meta WHERE name = ?",
-        (name,),
-    )
-    row = await cursor.fetchone()
+    # Detect conversation_id from the already workspace-scoped metadata row.
     conv_id = row["conversation_id"] if row else None
     session_provider = row["provider"] if row and row["provider"] else "claude"
     provider_config = get_provider(session_provider)
     is_claude = session_provider == "claude"
     launch_model = row["launch_model"] if row else None
     permission_preset = row["permission_preset"] if row else None
-    bootstrap_message = None
 
     if is_claude and not conv_id:
         claude_pid = await tmux.get_cli_pid(
@@ -2714,6 +3283,7 @@ async def restart_session(
         conv_id = await _resolve_opencode_session_id(
             db=db,
             name=name,
+            workspace_id=workspace_id,
             launch_dir=launch_spec.launch_dir,
             stored_session_id=conv_id,
             created_at=row["created_at"] if row else None,
@@ -2757,6 +3327,7 @@ async def restart_session(
         conv_id = await _capture_new_opencode_session_id(
             db=db,
             name=name,
+            workspace_id=workspace_id,
             launch_dir=launch_spec.launch_dir,
             launched_at_ms=launched_at_ms,
         )
@@ -2777,8 +3348,8 @@ async def restart_session(
                 last_cost_equivalent_pricing_version = NULL,
                 last_message_count = NULL, last_metrics_at = NULL,
                 last_active = ?
-            WHERE name = ?""",
-            (now, name),
+            WHERE {session_where}""".format(session_where=session_where),
+            (now, *session_params),
         )
     else:
         await db.execute(
@@ -2793,8 +3364,8 @@ async def restart_session(
                 last_cost_equivalent_pricing_version = NULL,
                 last_message_count = NULL, last_metrics_at = NULL,
                 last_active = ?
-            WHERE name = ?""",
-            (now, name),
+            WHERE {session_where}""".format(session_where=session_where),
+            (now, *session_params),
         )
     await db.commit()
 
@@ -2812,6 +3383,7 @@ async def restart_session(
 
 
 @router.post("/{name}/complete", status_code=200)
+@_session_operation("complete")
 async def complete_session(
     name: str,
     _user: UserInfo = Depends(get_current_user),
@@ -2826,16 +3398,13 @@ async def complete_session(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Read metadata without holding the writer during tmux/provider I/O.
+    workspace_id = _workspace_for_user(_user)
+    async with acquire_db() as db:
+        row = await _require_session_row(db, _user, name=name)
+
     if not await tmux.session_exists(name):
         raise HTTPException(status_code=404, detail="Session not found")
-
-    # Read metadata without holding the writer during tmux/provider I/O.
-    async with acquire_db() as db:
-        cursor = await db.execute(
-            "SELECT conversation_id, project_slug, working_seconds, provider FROM sessions_meta WHERE name = ?",
-            (name,),
-        )
-        row = await cursor.fetchone()
 
     conv_id = row["conversation_id"] if row else None
     session_provider = row["provider"] if row and row["provider"] else "claude"
@@ -2872,29 +3441,47 @@ async def complete_session(
 
     cost_row = None
     async with write_db() as db:
+        if _allow_legacy_local_session_schema():
+            await db.execute(
+                "UPDATE sessions_meta SET workspace_id = ? WHERE name = ?",
+                (workspace_id, name),
+            )
+            await db.execute(
+                "UPDATE session_costs SET workspace_id = ? "
+                "WHERE workspace_id IS NULL AND session_name = ?",
+                (workspace_id, name),
+            )
         if conv_id:
             await db.execute(
-                "UPDATE session_costs SET completed_at = ? WHERE conversation_id = ?",
-                (now, conv_id),
+                "UPDATE session_costs SET completed_at = ? WHERE conversation_id = ? "
+                "AND workspace_id = ? AND session_name = ?",
+                (now, conv_id, workspace_id, name),
             )
 
-        await db.execute(
-            "UPDATE session_costs SET session_name = NULL WHERE session_name = ? AND completed_at IS NOT NULL",
-            (name,),
-        )
-        await db.execute("DELETE FROM sessions_meta WHERE name = ?", (name,))
-
-        if conv_id:
             cursor = await db.execute(
-                "SELECT cost_usd, input_tokens, output_tokens, message_count FROM session_costs WHERE conversation_id = ?",
-                (conv_id,),
+                "SELECT cost_usd, input_tokens, output_tokens, message_count "
+                "FROM session_costs WHERE conversation_id = ? "
+                "AND workspace_id = ? AND session_name = ?",
+                (conv_id, workspace_id, name),
             )
             cost_row = await cursor.fetchone()
+
+        await db.execute(
+            "UPDATE session_costs SET session_name = NULL WHERE session_name = ? "
+            "AND workspace_id = ? AND completed_at IS NOT NULL",
+            (name, workspace_id),
+        )
+        await db.execute(
+            "DELETE FROM sessions_meta WHERE name = ? AND workspace_id = ?",
+            (name, workspace_id),
+        )
 
         await db.commit()
 
     _invalidate_sessions_cache()
-    asyncio.create_task(_get_session_manager().broadcast_session_event("destroyed"))
+    asyncio.create_task(
+        _broadcast_session_event("destroyed", workspace_id=workspace_id)
+    )
 
     # Build recap from session_costs
     recap: dict = {"conversation_id": conv_id, "completed_at": now}
@@ -2930,14 +3517,11 @@ async def send_message_to_session(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    row = await _require_session_row(db, _user, name=name)
     if not await tmux.session_exists(name):
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Read provider from DB
-    cursor = await db.execute(
-        "SELECT provider FROM sessions_meta WHERE name = ?", (name,)
-    )
-    row = await cursor.fetchone()
+    # Provider comes from the already workspace-scoped row.
     session_provider = row["provider"] if row and row["provider"] else "claude"
     provider_config = get_provider(session_provider)
 
@@ -2972,13 +3556,7 @@ async def get_session_conversation(
     """Read conversation messages from a CC session JSONL."""
     from core.api.services.conversation_reader import read_conversation
 
-    cursor = await db.execute(
-        "SELECT conversation_id, provider FROM sessions_meta WHERE name = ?",
-        (name,),
-    )
-    row = await cursor.fetchone()
-    if not row:
-        raise HTTPException(404, "Session not found")
+    row = await _require_session_row(db, _user, name=name)
     if (row["provider"] or "claude") != "claude":
         raise HTTPException(
             409, "Conversation history is only available for Claude sessions"
@@ -3015,13 +3593,8 @@ async def get_session_by_name(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    cursor = await db.execute(
-        f"SELECT {DB_COLUMNS} FROM sessions_meta WHERE name = ?",
-        (name,),
-    )
-    row = await cursor.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Session not found")
+    workspace_id = _workspace_for_user(_user)
+    row = await _require_session_row(db, _user, name=name)
 
     session_provider = row["provider"] if row["provider"] else "claude"
     alive = await tmux.session_exists(name)
@@ -3042,6 +3615,7 @@ async def get_session_by_name(
 
     return SessionInfo(
         name=name,
+        workspace_id=workspace_id,
         display_name=row["display_name"],
         pinned=bool(row["pinned"]) if row["pinned"] else False,
         sort_order=row["sort_order"] if row["sort_order"] else 0,
@@ -3099,13 +3673,10 @@ async def get_session_by_uuid(
     db: aiosqlite.Connection = Depends(get_db),
 ):
     """Look up a session by its stable UUID (for permalink support)."""
-    cursor = await db.execute(
-        f"SELECT {DB_COLUMNS} FROM sessions_meta WHERE session_uuid = ?",
-        (session_uuid,),
+    workspace_id = _workspace_for_user(_user)
+    row = await _require_session_row(
+        db, _user, session_uuid=session_uuid
     )
-    row = await cursor.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Session not found")
 
     name = row["name"]
     session_provider = row["provider"] if row["provider"] else "claude"
@@ -3127,6 +3698,7 @@ async def get_session_by_uuid(
 
     return SessionInfo(
         name=name,
+        workspace_id=workspace_id,
         display_name=row["display_name"],
         pinned=bool(row["pinned"]) if row["pinned"] else False,
         sort_order=row["sort_order"] if row["sort_order"] else 0,

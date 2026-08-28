@@ -46,7 +46,7 @@ ScopeType = Literal["company", "program", "project"]
 # ---------------------------------------------------------------------------
 
 # Brain v1.2 (2026-05-18) extends with DR8 (direction_misalignment).
-RuleId = Literal["DR1", "DR2", "DR3", "DR4", "DR5", "DR6", "DR7", "DR8"]
+RuleId = Literal["DR1", "DR2", "DR3", "DR4", "DR5", "DR6", "DR7", "DR8", "DR9"]
 
 SignalType = Literal[
     "activity_without_status",
@@ -57,6 +57,7 @@ SignalType = Literal[
     "external_update_unpropagated",
     "claimed_decision_gap",
     "direction_misalignment",
+    "task_superseded",
 ]
 
 KnowledgeForm = Literal[
@@ -185,6 +186,13 @@ class JournalEntry(BaseModel):
     narrative_polished: str | None = None
     cited_evidence_refs: list[str] | None = None
     polish_model: str | None = None
+    # Brain agent-native (decision 2026-07-01): narrative written by the user's
+    # own agent; provenance kept SEPARATE from the cycle's narrative_polished
+    # (migration 158) so the two never overwrite each other. body (deterministic)
+    # is always present, so the surfaced narrative is never null.
+    narrative_agent: str | None = None
+    narrative_agent_at: str | None = None
+    narrative_agent_by: str | None = None
 
 
 class EventsListResponse(BaseModel):
@@ -601,6 +609,7 @@ FindingType = Literal[
     "contradiction",
     "direction_drift",
     "direction_bootstrap",
+    "task_probably_done",
 ]
 
 # Lifecycle states. system-driven: superseded, expired. operator-driven:
@@ -762,6 +771,11 @@ class Finding(BaseModel):
     applied_by_user_id: str | None = None
     expires_at: AwareDatetime
     superseded_by_finding_id: str | None = None
+    # Brain agent-native (decision 2026-07-01): set when the finding was written
+    # by the user's own agent via brain_write_finding; None for findings produced
+    # by the mechanical cycle rules (migration 159). Separate provenance so agent
+    # conclusions are distinguishable and queryable.
+    authored_by_agent: str | None = None
     # CE2 §11.5 — read-time only, never persisted. Populated by
     # findings_reader.list_findings() when the decay setting is enabled.
     recency_factor: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -797,6 +811,11 @@ class FindingsListResponse(BaseModel):
     run_id: str | None = None
     redacted_count: int = 0
     redacted_evidence_count: int = 0
+    # Data-integrity guard: rows that fail the Finding contract at read time
+    # (e.g. a malformed finding_id — the DB PK has no length CHECK) are skipped
+    # instead of 500-ing the page, and counted here so a poison row stays
+    # visible to the caller and drains never silently stall (audit 2026-08-14).
+    malformed_count: int = 0
     total_returned: int = 0
 
 

@@ -38,7 +38,7 @@ from typing import Any
 
 import typer
 
-from core.cli._runtime_ctx import console, emit, err_console
+from core.cli._runtime_ctx import console, emit
 from core.cli.marvis_governance import (
     DEFAULT_PROFILE,
     VALID_PROFILES,
@@ -175,12 +175,16 @@ def _copy_scripts(hooks_dir: Path, *, dry_run: bool) -> list[dict[str, str]]:
     Identical (by hash) → skip. Different → replace ONLY a known Marvis file by
     name; an unknown file with the same name is never touched (it isn't ours).
     """
+    missing = [
+        name for name in _COPY_FILES if not (_INSTALL_HOOKS_DIR / name).is_file()
+    ]
+    if missing:
+        joined = ", ".join(sorted(missing))
+        raise RuntimeError(f"mandatory hook package data missing: {joined}")
+
     actions: list[dict[str, str]] = []
     for name in _COPY_FILES:
         src = _INSTALL_HOOKS_DIR / name
-        if not src.is_file():  # package data missing → record, don't crash
-            actions.append({"file": name, "action": "missing-source"})
-            continue
         dst = hooks_dir / name
         if dst.is_file():
             if _sha256(src) == _sha256(dst):

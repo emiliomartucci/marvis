@@ -17,11 +17,27 @@ from core.api.services.terminal_metrics_dump import (
 router = APIRouter(prefix="/api/v1/terminal", tags=["terminal"])
 
 
-def get_terminal_metrics(request: Request) -> TerminalMetricsCollector:
-    collector = getattr(request.app.state, "terminal_metrics", None)
+def get_terminal_metrics(
+    request: Request, workspace_id: str | None = "ws_default"
+) -> TerminalMetricsCollector:
+    """Return a collector isolated to one authenticated workspace."""
+    workspace_id = (workspace_id or "").strip()
+    if not workspace_id:
+        raise HTTPException(status_code=403, detail="workspace context required")
+    if workspace_id == "ws_default":
+        collector = getattr(request.app.state, "terminal_metrics", None)
+        if not isinstance(collector, TerminalMetricsCollector):
+            collector = TerminalMetricsCollector()
+            request.app.state.terminal_metrics = collector
+        return collector
+    collectors = getattr(request.app.state, "terminal_metrics_by_workspace", None)
+    if not isinstance(collectors, dict):
+        collectors = {}
+        request.app.state.terminal_metrics_by_workspace = collectors
+    collector = collectors.get(workspace_id)
     if not isinstance(collector, TerminalMetricsCollector):
         collector = TerminalMetricsCollector()
-        request.app.state.terminal_metrics = collector
+        collectors[workspace_id] = collector
     return collector
 
 
@@ -37,9 +53,10 @@ class TerminalMetricsBatch(BaseModel):
 
 @router.get("/metrics")
 async def terminal_metrics_snapshot(
-    _user: UserInfo = Depends(require_role("admin", "super_admin", human_only=True)),
-    collector: TerminalMetricsCollector = Depends(get_terminal_metrics),
+    request: Request,
+    user: UserInfo = Depends(require_role("admin", "super_admin", human_only=True)),
 ):
+    collector = get_terminal_metrics(request, user.workspace_id)
     return collector.snapshot()
 
 
@@ -47,9 +64,9 @@ async def terminal_metrics_snapshot(
 async def terminal_metrics_batch(
     payload: TerminalMetricsBatch,
     request: Request,
-    _user: UserInfo = Depends(require_role("admin", "super_admin", human_only=True)),
-    collector: TerminalMetricsCollector = Depends(get_terminal_metrics),
+    user: UserInfo = Depends(require_role("admin", "super_admin", human_only=True)),
 ):
+    collector = get_terminal_metrics(request, user.workspace_id)
     event_count = len(payload.events)
     counter_count = len(payload.counters)
     if event_count == 0 and counter_count == 0:
@@ -59,6 +76,7 @@ async def terminal_metrics_batch(
     await append_terminal_client_events(
         {
             "run_id": payload.run_id,
+            "workspace_id": user.workspace_id,
             "source": payload.source,
             "exported_at": payload.exported_at,
             "event_count": event_count,
@@ -76,9 +94,9 @@ async def terminal_metrics_batch(
 async def terminal_network_probe(
     request: Request,
     bytes_: int = Query(65_536, alias="bytes", ge=0, le=262_144),
-    _user: UserInfo = Depends(require_role("admin", "super_admin", human_only=True)),
-    collector: TerminalMetricsCollector = Depends(get_terminal_metrics),
+    user: UserInfo = Depends(require_role("admin", "super_admin", human_only=True)),
 ):
+    collector = get_terminal_metrics(request, user.workspace_id)
     probe = await run_internet_probe()
     collector.record_internet_probe(
         target=probe["target"],
@@ -97,6 +115,7 @@ async def terminal_network_probe(
     await append_terminal_metrics_record(
         {
             "kind": "network_probe",
+            "workspace_id": user.workspace_id,
             "probe": probe,
             "client_host": response["client_host"],
             "payload_bytes": bytes_,

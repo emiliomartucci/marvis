@@ -1,0 +1,73 @@
+{
+  "schema": "marvis-ci-collection-contract/v1",
+  "primary_python": "3.12",
+  "pytest_suites": [
+    {
+      "path": "core/api/tests",
+      "minimum_collected": 416,
+      "allowed_skips": 0,
+      "allowed_deselections": 0,
+      "required_nodes": [
+        "core/api/tests/test_require_scope_empty_deny.py::test_local_mcp_keeps_agent_context",
+        "core/api/tests/test_require_scope_empty_deny.py::test_server_agent_cannot_promote_to_human",
+        "core/api/tests/test_schema_compatibility.py::test_old_binary_denies_forward_schema",
+        "core/api/tests/test_pr_workflow_e2e.py::test_pr_merge_completes_task",
+        "core/api/tests/test_pr_workflow_e2e.py::test_pr_closed_sets_review_feedback",
+        "core/api/tests/test_pr_workflow_e2e.py::test_webhook_invalid_signature_rejected",
+        "core/api/tests/test_pr_workflow_e2e.py::test_webhook_idempotent_delivery"
+      ]
+    },
+    {
+      "path": "core/cli/tests",
+      "minimum_collected": 29,
+      "allowed_skips": 0,
+      "allowed_deselections": 0,
+      "required_nodes": [
+        "core/cli/tests/test_marvis_console_characterization.py::test_health_payload_without_brain_yields_no_fingerprint",
+        "core/cli/tests/test_marvis_hooks.py::test_installer_copies_exact_canonical_policy",
+        "core/cli/tests/test_marvis_hooks.py::test_installer_fails_before_copy_when_package_data_is_missing",
+        "core/cli/tests/test_marvis_doctor_offline.py::test_offline_empty_model_cache_reports_keyword_fallback"
+      ]
+    }
+  ],
+  "unittest_suites": [
+    {
+      "path": "scripts",
+      "pattern": "test_*.py",
+      "minimum_collected": 144,
+      "allowed_skips": 0,
+      "required_node_suffixes": [
+        "CompatibilityContractTests.test_current_contract_passes",
+        "HookPolicyTests.test_five_representation_policy_passes",
+        "LocalUpgradeTests.test_synthetic_prior_upgrade_and_rollback"
+      ]
+    }
+  ],
+  "markers": {
+    "required": ["asyncio"],
+    "unregistered_allowed": []
+  },
+  "workflow": {
+    "file": ".github/workflows/ci.yml",
+    "required_job": "python-contract",
+    "required_run_fragments": [
+      "pip install -e \".[dev]\"",
+      "python scripts/verify_ci_collection.py",
+      "python scripts/run_ci_contract.py",
+      "python scripts/verify_local_upgrade.py --download --version 0.3.8",
+      "python scripts/verify_public_claims.py"
+    ]
+  },
+  "platform_matrix": {
+    "file": ".github/workflows/e2e-macos.yml",
+    "python_versions": ["3.10", "3.13"],
+    "operating_systems": ["ubuntu-latest", "macos-latest", "windows-latest"],
+    "explicit_exclusions": [
+      {
+        "job": "platform-boundary",
+        "reason_code": "covered-by-public-windows-install-smoke",
+        "condition": false
+      }
+    ]
+  }
+}

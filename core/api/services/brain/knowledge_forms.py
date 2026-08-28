@@ -7,8 +7,6 @@
 # / evidence.tag). No regex on summary text (anti-pattern).
 from __future__ import annotations
 
-from typing import Any
-
 from core.api.models.brain import KnowledgeForm, SignalType
 from core.api.services.brain.cycle_snapshot import DigestEventRow
 

@@ -2,7 +2,7 @@
 """Opportunistic, fail-silent sender of the daily aggregate rollup to the cloud.
 
 Reuses the event client's contract verbatim (``core/telemetry/client.py``): the SAME
-opt-out gate, the SAME random ``install_id``, the SAME fire-and-forget / fail-silent
+consent gate, the SAME random ``install_id``, the SAME fire-and-forget / fail-silent
 discipline. This module never blocks, slows, or errors a ``marvis`` command.
 
 Flow on a ``marvis`` invocation (wired in ``marvis_init._telemetry_root_hook``):

@@ -51,9 +51,11 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 # ---------------------------------------------------------------------------
-# Pytest-asyncio configuration
+# Async backend contract
 # ---------------------------------------------------------------------------
-pytest_plugins = ["anyio"]
+# This workflow exercises aiosqlite and application code that calls asyncio
+# primitives directly.  Running the same cases under Trio is not a supported
+# product surface and produces setup errors before the behavior under test.
 
 
 # ---------------------------------------------------------------------------
@@ -104,41 +106,18 @@ def _make_pr_webhook_payload(
 def tmp_db(tmp_path: Path) -> str:
     """Create a temporary SQLite DB with the full schema applied."""
     db_path = str(tmp_path / "test.db")
+    from core.api.tests._db_fixture import apply_migrations
 
-    # Apply all migrations synchronously
-    from core.api.db import MIGRATIONS_DIR
-
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.row_factory = sqlite3.Row
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_versions "
-        "(version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
-    )
-
-    migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
-    for mf in migration_files:
-        if mf.stem.endswith("_down"):
-            continue
-        version = int(mf.stem.split("_")[0])
-        sql = mf.read_text()
-        # Skip INSERT INTO schema_versions — managed separately
-        conn.executescript(sql)
-        conn.execute("PRAGMA foreign_keys=ON")
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_versions (version) VALUES (?)", (version,)
-            )
-            conn.commit()
-        except Exception:
-            pass
+    apply_migrations(db_path)
 
     # Seed minimum user (marvisx agent with operator role)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     conn.execute(
-        "INSERT OR IGNORE INTO users (id, slug, display_name, type, system_role, created_at, updated_at) "
-        "VALUES ('usr_marvisx', 'marvisx', 'MarvisX', 'agent', 'operator', datetime('now'), datetime('now'))"
+        "INSERT OR IGNORE INTO users "
+        "(id, slug, display_name, type, system_role, workspace_id, created_at, updated_at) "
+        "VALUES ('usr_marvisx', 'marvisx', 'MarvisX', 'agent', 'operator', "
+        "'ws_default', datetime('now'), datetime('now'))"
     )
     conn.commit()
     conn.close()
@@ -146,7 +125,7 @@ def tmp_db(tmp_path: Path) -> str:
 
 
 @pytest.fixture
-def app_with_overrides(tmp_db: str):
+async def app_with_overrides(tmp_db: str):
     """Return the FastAPI app with settings patched for test isolation."""
     from core.api.config import Settings
 
@@ -161,18 +140,24 @@ def app_with_overrides(tmp_db: str):
     )
 
     # Patch settings globally so all modules see the test DB
-    with patch("api.config.settings", test_settings), \
-         patch("api.db.settings", test_settings), \
-         patch("api.routers.tasks.settings", test_settings), \
-         patch("api.routers.pull_requests.settings", test_settings), \
-         patch("api.services.pr_service.settings", test_settings, create=True), \
-         patch("api.services.webhook_service.settings", test_settings), \
-         patch("api.services.task_transitions.settings", test_settings, create=True):
+    with patch("core.api.config.settings", test_settings), \
+         patch("core.api.db.settings", test_settings), \
+         patch("core.api.routers.tasks.settings", test_settings, create=True), \
+         patch("core.api.services.pr_service.settings", test_settings, create=True), \
+         patch("core.api.services.webhook_service.settings", test_settings), \
+         patch("core.api.routers.webhooks.settings", test_settings), \
+         patch("core.api.services.task_transitions.settings", test_settings, create=True):
 
         # Import app AFTER patching settings
         # (app reads settings at import time for CORS etc.)
+        from core.api import db as db_module
         from core.api.main import app
-        yield app, test_settings
+
+        await db_module.init_pool()
+        try:
+            yield app, test_settings
+        finally:
+            await db_module.close_pool()
 
 
 @pytest.fixture
@@ -195,16 +180,18 @@ async def client_with_task(app_with_overrides, tmp_db: str):
         db.row_factory = aiosqlite.Row
         await db.execute(
             "INSERT INTO tasks (id, title, description, status, project, priority, "
-            "created_by, source, created_at, updated_at) "
-            "VALUES (?, ?, ?, 'in_progress', ?, 'medium', 'marvisx', 'manual', ?, ?)",
+            "created_by, source, workspace_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'in_progress', ?, 'medium', 'marvisx', 'manual', "
+            "'ws_default', ?, ?)",
             (task_id, f"E2E Test Task {task_id[:8]}", "Test task for E2E PR workflow",
              TEST_PROJECT, now, now),
         )
         # Insert PR record in 'open' status (post-submit state)
         await db.execute(
             "INSERT INTO pull_requests (id, task_id, project, branch, target, status, "
-            "title, body, worktree_path, created_at) "
-            "VALUES (?, ?, ?, ?, 'main', 'open', 'Test PR', 'Test body', '/tmp/test-worktree', ?)",
+            "title, body, worktree_path, workspace_id, created_at) "
+            "VALUES (?, ?, ?, ?, 'main', 'open', 'Test PR', 'Test body', "
+            "'/tmp/test-worktree', 'ws_default', ?)",
             (pr_id, task_id, TEST_PROJECT, branch, now),
         )
         # Task must be in 'review' for webhook to find it via _find_pr_by_branch
@@ -230,7 +217,7 @@ async def client_with_task(app_with_overrides, tmp_db: str):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_pr_merge_completes_task(client_with_task, tmp_db: str):
     """
     Full path: existing review task + open PR -> webhook(closed, merged=true)
@@ -251,16 +238,32 @@ async def test_pr_merge_completes_task(client_with_task, tmp_db: str):
     }
     # Also mock remove_worktree_async (cleanup step)
     with patch(
-        "api.services.git_ops.merge_branch_async",
+        "core.api.services.pr_service._get_repo_path",
+        new_callable=AsyncMock,
+        return_value="/tmp/test-marvisx-repo",
+    ), patch(
+        "core.api.services.pr_service.changed_paths_for_pr",
+        new_callable=AsyncMock,
+        return_value=[],
+    ), patch(
+        "core.api.services.pr_service.get_merge_conflicts",
+        new_callable=AsyncMock,
+        return_value=[],
+    ), patch(
+        "core.api.services.git_ops.get_branch_head_sha_async",
+        new_callable=AsyncMock,
+        return_value="a" * 40,
+    ), patch(
+        "core.api.services.ci_service.check_required_ci_passes",
+        new_callable=AsyncMock,
+        return_value=[],
+    ), patch(
+        "core.api.services.git_ops.merge_branch_async",
         new_callable=AsyncMock,
         return_value=mock_merge_result,
     ), patch(
-        "api.services.git_ops.remove_worktree_async",
+        "core.api.services.git_ops.remove_worktree_async",
         new_callable=AsyncMock,
-        return_value=None,
-    ), patch(
-        # Disable deploy_command lookup (no project yaml in test env)
-        "api.routers.projects._find_project_entry",
         return_value=None,
     ):
         response = await client.post(
@@ -273,12 +276,11 @@ async def test_pr_merge_completes_task(client_with_task, tmp_db: str):
                 "X-GitHub-Delivery": str(uuid.uuid4()),
             },
         )
+        from core.api.routers import webhooks as webhook_router
+
+        await asyncio.gather(*tuple(webhook_router._background_webhook_tasks))
 
     assert response.status_code == 202, f"Webhook response: {response.text}"
-
-    # BackgroundTasks run after response in ASGI test context —
-    # wait a short time for the background processing to complete.
-    await asyncio.sleep(0.2)
 
     # Verify task.status == completed
     async with aiosqlite.connect(tmp_db) as db:
@@ -310,7 +312,7 @@ async def test_pr_merge_completes_task(client_with_task, tmp_db: str):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_pr_closed_sets_review_feedback(client_with_task, tmp_db: str):
     """
     Full path: existing review task + open PR -> webhook(closed, merged=false, body=reason)
@@ -326,11 +328,11 @@ async def test_pr_closed_sets_review_feedback(client_with_task, tmp_db: str):
     sig = _make_signature(WEBHOOK_SECRET, payload_bytes)
 
     with patch(
-        "api.services.git_ops.remove_worktree_async",
+        "core.api.services.git_ops.remove_worktree_async",
         new_callable=AsyncMock,
         return_value=None,
     ), patch(
-        "api.routers.projects._find_git_path",
+        "core.api.routers.projects._find_git_path",
         return_value=None,  # No real repo needed for close_pr path
     ):
         response = await client.post(
@@ -343,11 +345,11 @@ async def test_pr_closed_sets_review_feedback(client_with_task, tmp_db: str):
                 "X-GitHub-Delivery": str(uuid.uuid4()),
             },
         )
+        from core.api.routers import webhooks as webhook_router
+
+        await asyncio.gather(*tuple(webhook_router._background_webhook_tasks))
 
     assert response.status_code == 202, f"Webhook response: {response.text}"
-
-    # Wait for BackgroundTask to process
-    await asyncio.sleep(0.2)
 
     # Verify task is back to in_progress with review_feedback set
     async with aiosqlite.connect(tmp_db) as db:
@@ -382,7 +384,7 @@ async def test_pr_closed_sets_review_feedback(client_with_task, tmp_db: str):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_webhook_invalid_signature_rejected(app_with_overrides):
     """Webhook with wrong HMAC signature must return 403."""
     app, _ = app_with_overrides
@@ -412,7 +414,7 @@ async def test_webhook_invalid_signature_rejected(app_with_overrides):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_webhook_idempotent_delivery(client_with_task, tmp_db: str):
     """Same delivery_id sent twice must not double-process."""
     client, task_id, branch, pr_id = client_with_task
@@ -435,16 +437,17 @@ async def test_webhook_idempotent_delivery(client_with_task, tmp_db: str):
         "commit_sha": "idempotent123",
     }
 
-    with patch("api.services.git_ops.merge_branch_async", new_callable=AsyncMock, return_value=mock_merge), \
-         patch("api.services.git_ops.remove_worktree_async", new_callable=AsyncMock), \
-         patch("api.routers.projects._find_project_entry", return_value=None):
+    with patch("core.api.services.git_ops.merge_branch_async", new_callable=AsyncMock, return_value=mock_merge), \
+         patch("core.api.services.git_ops.remove_worktree_async", new_callable=AsyncMock), \
+         patch("core.api.routers.projects._find_project_entry", return_value=None):
         r1 = await client.post("/api/v1/webhooks/github", content=payload_bytes, headers=headers)
         r2 = await client.post("/api/v1/webhooks/github", content=payload_bytes, headers=headers)
+        from core.api.routers import webhooks as webhook_router
+
+        await asyncio.gather(*tuple(webhook_router._background_webhook_tasks))
 
     assert r1.status_code == 202
     assert r2.status_code == 202
-
-    await asyncio.sleep(0.3)
 
     # Merge should have been called only once (idempotency guard in webhook_service)
     async with aiosqlite.connect(tmp_db) as db:

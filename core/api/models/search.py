@@ -26,6 +26,9 @@ class SearchHit(BaseModel):
     edge_path: list[str] | None = None
     edge_path_summary: str | None = None
     rrf_score: float | None = None
+    # Current authority route when a historical span names a retired Marvis
+    # repository-lifecycle tool. Kept separate so span line numbers stay exact.
+    authority_notice: str | None = None
     # Memory-freshness v2a Phase 2 (A-span, MARVIS_SEARCH_SPANS): the winning
     # chunk's text expanded to line boundaries ±12 lines, so the agent answers
     # FROM the result without a follow-up Read. None when the flag is off, the

@@ -14,7 +14,7 @@ Three operations (plan §D5):
                                       and re-enqueue
 
 All endpoints require `operator|admin|super_admin`. The pattern mirrors
-`api/routers/automations.py` for naming + RBAC consistency.
+other admin-only routers for naming and RBAC consistency.
 """
 from __future__ import annotations
 

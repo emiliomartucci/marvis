@@ -6,9 +6,9 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from core.api.mcp._adapter import (
-    LOCAL_CTX,
     acquire_db,
     acquire_write_db,
+    current_mcp_context,
     dump,
     mcp_schedule_embed,
     raise_mcp_error,
@@ -46,7 +46,7 @@ def register(mcp) -> None:
         """Create a lightweight todo in the unified queue.
 
         QUANDO USARLO: catturare un promemoria/azione/idea/decisione che deve restare nella coda personale prima di diventare task.
-        QUANDO NON USARLO: NOT per creare lavoro tracciato con PR/owner diretto -> usa create_task. NOT per approvare PR/finding/memory-op -> usa gli endpoint/tool esistenti della coda proprietaria.
+        QUANDO NON USARLO: NOT per creare lavoro tracciato con PR/owner diretto -> usa create_task. NOT per approvare cio' che ha gia' una coda propria: task in review -> approve_task/reject_task, finding -> brain_findings_patch, memory-op -> brain_memory_operations_patch. Le PR e le loro approvazioni vivono su GitHub, fuori da questa superficie.
         RESTITUISCE: todo persistito {id,type,status,fu,project,doer,linked_task_id}."""
         body = TodoCreateRequest(
             text=text,
@@ -56,12 +56,13 @@ def register(mcp) -> None:
             source=source,
         )
         try:
+            ctx = current_mcp_context()
             async with acquire_write_db(label="mcp.create_todo") as db:
                 result = await todos_uc.create_todo(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     body=body,
-                    created_by=LOCAL_CTX.username,
+                    created_by=ctx.username,
                 )
                 return dump(result)
         except ServiceError as e:
@@ -77,12 +78,13 @@ def register(mcp) -> None:
         """List todos with exact filters, including virtual approval items.
 
         QUANDO USARLO: vedere cosa aspetta l'utente, filtrando per status/type/project.
-        QUANDO NON USARLO: NOT per enumerare task tracciati -> usa list_tasks. NOT per agire su approva virtuali -> usa il tool proprietario del PR/finding/memory-op.
-        RESTITUISCE: array di todo; gli approva virtuali hanno virtual=true e origin.kind."""
+        QUANDO NON USARLO: NOT per enumerare task tracciati -> usa list_tasks. NOT per agire sugli approva virtuali: agisci sulla coda originale secondo origin.kind — task_review -> approve_task/reject_task (la PR sta su GitHub, non c'e' un tool PR qui); finding -> brain_findings_patch, poi brain_findings_apply che ritorna guidance e NON scrive; memory_op -> brain_memory_operations_patch, poi brain_memory_operations_apply (idem, solo guidance).
+        RESTITUISCE: array di todo; gli approva virtuali hanno virtual=true e origin.kind (task_review|finding|memory_op)."""
         try:
+            ctx = current_mcp_context()
             async with acquire_db() as db:
                 result = await todos_uc.list_todos(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     status=status,
                     type=type,
@@ -107,7 +109,7 @@ def register(mcp) -> None:
         """Mutate a todo or move it through its type-specific state machine.
 
         QUANDO USARLO: completare/scartare/posticipare/riassegnare un todo, oppure promuovere/delegare quando la state machine lo consente.
-        QUANDO NON USARLO: NOT per modificare approva virtuali: agisci sulla coda originale. NOT per creare task manuali non derivati dal todo -> usa create_task.
+        QUANDO NON USARLO: NOT per modificare approva virtuali: agisci sulla coda originale (approve_task/reject_task, brain_findings_patch, brain_memory_operations_patch). NOT per creare task manuali non derivati dal todo -> usa create_task.
         RESTITUISCE: todo aggiornato con eventuale linked_task_id."""
         body = TodoUpdateRequest(
             **{
@@ -125,9 +127,10 @@ def register(mcp) -> None:
         )
         embed_jobs: list[dict[str, Any]] = []
         try:
+            ctx = current_mcp_context()
             async with acquire_write_db(label="mcp.update_todo") as db:
                 result = await todos_uc.update_todo(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     todo_id=id,
                     body=body,
@@ -153,9 +156,10 @@ def register(mcp) -> None:
         RESTITUISCE: todo in stato delegato con linked_task_id valorizzato."""
         embed_jobs: list[dict[str, Any]] = []
         try:
+            ctx = current_mcp_context()
             async with acquire_write_db(label="mcp.delegate_todo") as db:
                 result = await todos_uc.delegate_todo(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     todo_id=id,
                     body=TodoDelegateRequest(project=project, title=title),

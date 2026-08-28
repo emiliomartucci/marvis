@@ -21,6 +21,7 @@
 # tree under THIS gitignore, so without the negation the icons silently drop
 # from the mirror -> Next export -> wheel (manifest 404s, beta 0.3.9b1).
 !core/console/public/icons/*.png
+!core/api/console_dist/icons/*.png
 *.jpg
 *.jpeg
 *.gif

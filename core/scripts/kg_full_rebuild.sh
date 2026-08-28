@@ -1,4 +1,12 @@
 #!/bin/bash
+# v1.6.0 - 2026-08-04 - Step 9b excuses a repo ast_parser scanned for zero source
+#   files (default-floor repos only; an explicit-floor repo like marvisx stays
+#   checked, since marvisx with no source is a broken checkout). Uses ast_parser's
+#   own python_files+typescript_files count, never a re-derived scan glob.
+# v1.5.0 - 2026-08-03 - Step 9b smoke gate is per-project and fail-closed:
+#   every repo step 8 attempted must end with code nodes, and an empty
+#   attempted set is a red run. The marvisx-only count let any external repo
+#   index zero and still report success.
 # v1.4.0 - 2026-06-22 - Tenant-aware full-rebuild: env-driven DB/projects/repo/venv + per-tenant watcher control + doc-store index step.
 # v1.3.0 - 2026-05-22 - Re-include marvisx monorepo in step 8 code indexing (regression from v1.2.0); fix populate_temporal git cwd + populate_cross_project --marvisx-repo-root (was looking in /data/pir/core/.claude)
 # v1.2.1 - 2026-05-15 - Hot-fix: pass --scan-patterns generic to ast_parser for external repos (marvisx-default api/* + console/src/* missed everything)
@@ -60,6 +68,7 @@ KG_REPO_ROOT="${KG_REPO_ROOT:-${MARVIS_REPO_ROOT:-${HOME}/workspace}}"
 PROJECTS_ROOT="${MARVIS_PROJECTS_ROOT:-${KG_PROJECTS_ROOT:-${KG_PROJECTS_DIR:-/data/projects}}}"
 export MARVIS_PROJECTS_ROOT="$PROJECTS_ROOT"
 WATCHER_WAS_ACTIVE=0
+KG_EPHEMERAL_SRC=""
 
 # --- helpers ---------------------------------------------------------------
 
@@ -110,16 +119,38 @@ restart_watcher_if_needed() {
     fi
 }
 
+cleanup_on_exit() {
+    restart_watcher_if_needed
+    # Remove the ephemeral materialized source (if any). "niente copie locali":
+    # no on-box git checkout of marvisx may survive the rebuild.
+    if [ -n "$KG_EPHEMERAL_SRC" ] && [ -d "$KG_EPHEMERAL_SRC" ]; then
+        rm -rf "$KG_EPHEMERAL_SRC"
+    fi
+}
+
 if [ ! -x "$PYTHON_BIN" ]; then
     echo "ERROR: python executable missing: $PYTHON_BIN" >&2
     exit 1
 fi
 
-trap restart_watcher_if_needed EXIT
+trap cleanup_on_exit EXIT
 
 # --- start -----------------------------------------------------------------
 
 mkdir -p "$LOG_DIR"
+
+# When KG_MATERIALIZE_SOURCE=1 (hosted "niente copie locali"), the git-dependent
+# steps read an EPHEMERAL checkout materialized from the DEPLOYED release's
+# already-verified CI bundle instead of a persistent on-box clone/mirror. The
+# tree carries full history (non-shallow bundle) so `git log`/`git blame`
+# succeed; cleanup_on_exit removes it on any exit.
+if [ "${KG_MATERIALIZE_SOURCE:-0}" = "1" ]; then
+    KG_EPHEMERAL_SRC="$(mktemp -d "${TMPDIR:-/tmp}/kg-src-XXXXXX")"
+    log "==> Materializing ephemeral marvisx source from the deployed release bundle -> $KG_EPHEMERAL_SRC"
+    "$PYTHON_BIN" -m core.hosted_deploy.source_materialize --into "$KG_EPHEMERAL_SRC" 2>&1 | tee -a "$LOG_FILE"
+    KG_REPO_ROOT="$KG_EPHEMERAL_SRC"
+fi
+
 log "==> KG full-rebuild starting"
 log "    db=$DB_PATH projects_root=$PROJECTS_ROOT repo_root=$KG_REPO_ROOT watcher=$WATCHER_UNIT"
 log "    log=$LOG_FILE"
@@ -199,6 +230,14 @@ else
         fi
     done
     log "==> [8/10] populate_code multi-repo (marvisx + KG_EXTERNAL_REPOS_EXTRA)"
+    # Slugs we actually handed to ast_parser. Step 9b verifies each one
+    # produced nodes; a repo skipped for not being a git checkout is not in
+    # here, so the gate never blames a repo the rebuild never touched.
+    declare -a INDEXED_SLUGS=()
+    # Slugs ast_parser positively reported as having zero source files. A
+    # default-floor repo here is excused by the gate as not applicable, so a
+    # docs/config repo added via KG_EXTERNAL_REPOS_EXTRA does not false-red.
+    declare -a EMPTY_SOURCE=()
     for REPO_DIR in "${!KG_EXTERNAL_REPOS[@]}"; do
         PROJECT_SLUG="${KG_EXTERNAL_REPOS[$REPO_DIR]}"
         if [ ! -d "$REPO_DIR/.git" ]; then
@@ -208,39 +247,47 @@ else
         log "  index $PROJECT_SLUG ($REPO_DIR) -> ast_parser"
         # v1.2.1 fix: pass --scan-patterns generic for non-marvisx layouts
         # (default patterns 'api/*.py' 'console/src/*' wouldn't match queue-gateway/, services/)
-        "$PYTHON_BIN" -m core.scripts.ast_parser --db "$DB_PATH" --repo-root "$REPO_DIR" --project "$PROJECT_SLUG" --workers 4 \
-            --scan-patterns '**/*.py' '**/*.ts' '**/*.tsx' 2>&1 | tail -5 | tee -a "$LOG_FILE"
+        # Capture ast_parser's JSON summary from stdout (its logs go to stderr,
+        # tee'd to the log). python_files+typescript_files is its own count of
+        # what it scanned — the source of truth for "did this repo have anything
+        # to index". Re-deriving the scan glob here would just drift from
+        # ast_parser, which is the becf93a5 mistake one layer down.
+        AST_JSON=$("$PYTHON_BIN" -m core.scripts.ast_parser --db "$DB_PATH" --repo-root "$REPO_DIR" --project "$PROJECT_SLUG" --workers 4 \
+            --scan-patterns '**/*.py' '**/*.ts' '**/*.tsx' 2>>"$LOG_FILE") || true
+        printf '%s\n' "$AST_JSON" | tail -12 | tee -a "$LOG_FILE" >/dev/null
+        # Recorded even when ast_parser errors: a crash yields empty JSON, which
+        # parses as "has source" (conservative) and stays checked, so a failed
+        # parse still becomes a zero-node red.
+        INDEXED_SLUGS+=("$PROJECT_SLUG")
+        SRC=$(printf '%s' "$AST_JSON" | "$PYTHON_BIN" -c 'import sys, json
+try:
+    d = json.load(sys.stdin)
+    n = int(d.get("python_files", 0)) + int(d.get("typescript_files", 0))
+    print("EMPTY" if n == 0 else "HAS")
+except Exception:
+    print("HAS")')
+        if [ "$SRC" = "EMPTY" ]; then
+            log "  $PROJECT_SLUG: ast_parser scanned 0 source files -> not applicable"
+            EMPTY_SOURCE+=("$PROJECT_SLUG")
+        fi
     done
 
-    # v1.3.0 smoke gate: prevent the regression from sneaking back. After step 8
-    # we expect at least N marvisx code nodes; below the threshold means
-    # KG_EXTERNAL_REPOS lost its marvisx entry again or ast_parser silently
-    # matched nothing. Threshold sized below current baseline so a slimmer
-    # repo doesn't trip false positives.
+    # v1.5.0 smoke gate: prevent the regression from sneaking back, for every
+    # repo rather than for marvisx alone. Before this, step 8 could index an
+    # external repo into nothing and the run stayed green because the count was
+    # filtered to project_id = 'marvisx'
+    # (docs/audits/2026-05-22-kg-orphan-api-nodes-diagnosis.md F3 fixed the
+    # monorepo case only). The gate also refuses an empty attempted set: a
+    # rebuild that indexed no repo has nothing to be green about.
+    # `set -o pipefail` is on, so the gate's exit status survives the tee.
     MARVISX_CODE_NODES_MIN="${KG_MARVISX_CODE_NODES_MIN:-10000}"
-    ACTUAL=$("$PYTHON_BIN" - "$DB_PATH" <<'PYCOUNT'
-import sqlite3
-import sys
-
-conn = sqlite3.connect(sys.argv[1])
-try:
-    row = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM graph_nodes
-        WHERE project_id = 'marvisx'
-          AND deprecated_at IS NULL
-          AND (id LIKE 'py:%' OR id LIKE 'ts:%')
-        """
-    ).fetchone()
-    print(int(row[0] or 0))
-finally:
-    conn.close()
-PYCOUNT
-)
-    log "==> [9b/10] smoke gate: marvisx code nodes = $ACTUAL (min=$MARVISX_CODE_NODES_MIN)"
-    if [ "$ACTUAL" -lt "$MARVISX_CODE_NODES_MIN" ]; then
-        log "    ERROR: marvisx code KG looks empty — check KG_EXTERNAL_REPOS mapping or ast_parser scan-patterns"
+    log "==> [9b/10] smoke gate: per-project code nodes (marvisx floor=$MARVISX_CODE_NODES_MIN)"
+    if ! "$PYTHON_BIN" -m core.scripts.kg_smoke_gate \
+        --db "$DB_PATH" \
+        --floor "marvisx=$MARVISX_CODE_NODES_MIN" \
+        --attempted ${INDEXED_SLUGS[@]+"${INDEXED_SLUGS[@]}"} \
+        --empty-source ${EMPTY_SOURCE[@]+"${EMPTY_SOURCE[@]}"} 2>&1 | tee -a "$LOG_FILE"; then
+        log "    ERROR: smoke gate failed — check KG_EXTERNAL_REPOS mapping or ast_parser scan-patterns"
         exit 1
     fi
 fi

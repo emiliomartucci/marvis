@@ -3,15 +3,15 @@
 
 Deliberately a SEAM, not a machine (Emilio 2026-05-29: no PRO feature at launch).
 There is NO network call, NO signed cert, NO entitlement fetch here — building that
-now would be dead code gating nothing (the n8n-v2 lesson: they removed gating ceremony
+now would be dead code gating nothing (the retired-integration lesson: removing gating ceremony
 built too early). When the first PRO feature + price exist, THIS is the single place to
 wire the cloud-issued, locally-verified Ed25519 entitlement check (plan Deepening §C).
 
 Two load-bearing rules for whoever lights this up later:
 - **FAIL-OPEN**: a missing / unverifiable / expired entitlement degrades to free
-  (``is_pro`` -> False). The OSS never locks a user out of free functionality.
+  (``is_pro`` -> False). The local runtime never locks a user out of free functionality.
 - **Clean boundary**: free code calls ``is_pro`` and always has a runnable free path;
-  free code must never import a PRO module (keeps the OSS build standalone).
+  free code must never import a PRO module (keeps the public package standalone).
 """
 from __future__ import annotations
 

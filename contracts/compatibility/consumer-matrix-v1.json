@@ -1,0 +1,124 @@
+{
+  "schema": "marvis-consumer-compatibility-matrix/v1",
+  "contract_window": "N/N-1",
+  "current_contract_version": 3,
+  "previous_contract_version": 2,
+  "required_directions": [
+    "n_consumer_n_contract",
+    "n_consumer_n_minus_1_contract",
+    "n_minus_1_consumer_n_contract",
+    "old_binary_forward_schema"
+  ],
+  "n_only_operations": [
+    {
+      "path": "/api/v1/agent-tokens/personal/{token_id}/acknowledge",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/agent_tokens.py::acknowledge_personal_token_rotation"]
+    },
+    {
+      "path": "/api/v1/auth/logout",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/auth.py"]
+    },
+    {
+      "path": "/api/v1/graph/ingest",
+      "method": "post",
+      "surfaces": ["cli", "http", "package_install"],
+      "evidence": ["core/scripts/graph_export_client.py", "core/api/routers/graph_ingest.py::graph_ingest_endpoint"]
+    },
+    {
+      "path": "/api/v1/graph/provenance/{project}",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/graph_ingest.py::graph_provenance_endpoint"]
+    },
+    {
+      "path": "/auth/handoff",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/auth.py"]
+    }
+  ],
+  "n_consumer_n_minus_1_schema_breaks": [
+    {
+      "failure": "schema_property_missing:AgentTokenCreateRequest.expires_in_hours",
+      "surfaces": ["http"],
+      "evidence": ["core/api/models/auth.py", "core/api/routers/agent_tokens.py"]
+    },
+    {
+      "failure": "schema_property_missing:AgentTokenCreateRequest.overlap_minutes",
+      "surfaces": ["http"],
+      "evidence": ["core/api/models/auth.py", "core/api/routers/agent_tokens.py"]
+    },
+    {
+      "failure": "schema_property_missing:AgentTokenCreateRequest.supersedes_id",
+      "surfaces": ["http"],
+      "evidence": ["core/api/models/auth.py", "core/api/routers/agent_tokens.py"]
+    },
+    {
+      "failure": "schema_property_missing:TaskUpdateRequest.expected_updated_at",
+      "surfaces": ["http"],
+      "evidence": ["core/api/models/tasks.py", "core/api/routers/tasks.py"]
+    }
+  ],
+  "rows": [
+    {
+      "surface": "cli",
+      "n_consumer_n_contract": "pass",
+      "n_consumer_n_minus_1_contract": "migration_required",
+      "n_minus_1_consumer_n_contract": "pass",
+      "old_binary_forward_schema": "deny",
+      "evidence": ["core/cli/tests/test_marvis_console_characterization.py", "core/api/db.py:assert_schema_compatible"]
+    },
+    {
+      "surface": "gui",
+      "n_consumer_n_contract": "pass",
+      "n_consumer_n_minus_1_contract": "pass",
+      "n_minus_1_consumer_n_contract": "pass",
+      "old_binary_forward_schema": "deny",
+      "evidence": ["apps/desktop-ui/src", "scripts/validate_local_surfaces.py", "core/api/db.py:assert_schema_compatible"]
+    },
+    {
+      "surface": "local_mcp",
+      "n_consumer_n_contract": "pass",
+      "n_consumer_n_minus_1_contract": "pass",
+      "n_minus_1_consumer_n_contract": "pass",
+      "old_binary_forward_schema": "deny",
+      "evidence": ["core/api/tests/test_require_scope_empty_deny.py", "core/api/mcp/stdio.py", "core/api/db.py:assert_schema_compatible"]
+    },
+    {
+      "surface": "http",
+      "n_consumer_n_contract": "pass",
+      "n_consumer_n_minus_1_contract": "migration_required",
+      "n_minus_1_consumer_n_contract": "pass",
+      "old_binary_forward_schema": "deny",
+      "evidence": ["contracts/compatibility/fixtures/n-contract.json", "contracts/compatibility/fixtures/n-minus-1-contract.json", "core/api/db.py:assert_schema_compatible"]
+    },
+    {
+      "surface": "hooks",
+      "n_consumer_n_contract": "pass",
+      "n_consumer_n_minus_1_contract": "migration_required",
+      "n_minus_1_consumer_n_contract": "migration_required",
+      "old_binary_forward_schema": "not_applicable",
+      "evidence": ["scripts/verify_hook_policy.py", "core/cli/marvis_hooks.py"]
+    },
+    {
+      "surface": "package_install",
+      "n_consumer_n_contract": "pass",
+      "n_consumer_n_minus_1_contract": "migration_required",
+      "n_minus_1_consumer_n_contract": "migration_required",
+      "old_binary_forward_schema": "deny",
+      "evidence": [".github/workflows/e2e-macos.yml", "scripts/verify_local_upgrade.py", "core/api/db.py:assert_schema_compatible"]
+    },
+    {
+      "surface": "persisted_local_data",
+      "n_consumer_n_contract": "pass",
+      "n_consumer_n_minus_1_contract": "migration_required",
+      "n_minus_1_consumer_n_contract": "migration_required",
+      "old_binary_forward_schema": "deny",
+      "evidence": ["scripts/verify_local_upgrade.py", "core/api/services/schema_upgrade.py", "core/api/db.py:assert_schema_compatible"]
+    }
+  ]
+}

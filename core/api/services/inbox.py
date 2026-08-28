@@ -751,7 +751,7 @@ async def ingest_items_batch(
 ) -> InboxIngestBatchResponse:
     """Batch-ingest N items in a single write lock + single commit.
 
-    Rationale: n8n RSS fan-out previously fired N separate POST /ingest requests
+    Rationale: the retired RSS fan-out fired N separate POST /ingest requests
     per poll, each acquiring the process-wide `_write_lock` + doing an fsync.
     With N ~800 this saturated disk IO and stalled readers via busy_timeout
     (see session 2026-04-24 handoff). This endpoint folds that burst into one

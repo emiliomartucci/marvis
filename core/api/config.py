@@ -1,11 +1,12 @@
 # v1.18.0 - 2026-05-16 - KG PR-Impact PRE phase: function cap + branch stale + replay buffer + pr_impact_enabled
 from __future__ import annotations
 
+import ipaddress
 import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.platform import current_user, db_default_path
@@ -13,6 +14,7 @@ from core.platform import current_user, db_default_path
 # Prod (Hetzner/Docker) ships the vec0 loadable at this path; it stays the
 # final fallback so prod keeps working unchanged.
 _VEC0_PATH_PROD_DEFAULT = "/data/pir/lib/vec0"
+_DEV_JWT_SECRET = "dev-secret-change-in-production"
 
 
 def _default_vec0_path() -> str:
@@ -40,6 +42,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",  # ignora env vars non dichiarate
         populate_by_name=True,
+        hide_input_in_errors=True,
     )
 
     pir_env: str = Field(
@@ -62,8 +65,15 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MARVIS_CANARY_BANNER", "PIR_CANARY_BANNER"),
     )
     pir_jwt_secret: str = Field(
-        default="dev-secret-change-in-production",
+        default=_DEV_JWT_SECRET,
         validation_alias=AliasChoices("MARVIS_JWT_SECRET", "PIR_JWT_SECRET"),
+    )
+    trusted_proxy_cidrs: list[str] = Field(
+        # The host-install preset runs Caddy on the same machine and proxies to
+        # the API over loopback.  Trust only those exact peers by default; the
+        # Compose template adds exact /32 proxy container addresses explicitly.
+        default_factory=lambda: ["127.0.0.1/32", "::1/128"],
+        alias="TRUSTED_PROXY_CIDRS",
     )
     pir_admin_password_hash: str = Field(
         default="",
@@ -89,6 +99,20 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MARVIS_DB_BACKUP_DIR", "PIR_DB_BACKUP_DIR"),
     )
     cookie_domain: str | None = Field(default=None, alias="COOKIE_DOMAIN")
+    # report_bug (transport C). Operator holds the SECRET and verifies HMAC;
+    # each tenant sender holds only its own derived TOKEN + the operator URL.
+    bugreport_ingest_secret: str = Field(
+        default="", validation_alias=AliasChoices("MARVIS_BUGREPORT_INGEST_SECRET")
+    )
+    bugreport_ingest_url: str = Field(
+        default="", validation_alias=AliasChoices("MARVIS_BUGREPORT_INGEST_URL")
+    )
+    bugreport_ingest_token: str = Field(
+        default="", validation_alias=AliasChoices("MARVIS_BUGREPORT_INGEST_TOKEN")
+    )
+    bugreport_rate_limit_per_hour: int = Field(
+        default=10, validation_alias=AliasChoices("MARVIS_BUGREPORT_RATE_LIMIT_PER_HOUR")
+    )
     cors_origins_prod: list[str] = Field(
         default_factory=list,
         alias="CORS_ORIGINS_PROD",
@@ -98,6 +122,18 @@ class Settings(BaseSettings):
     jwt_expiry_hours: int = 24
     ws_ticket_ttl_seconds: int = 30
     tasks_api_token: str = ""
+    agent_token_auth_mode: Literal["compatibility", "strict"] = Field(
+        default="compatibility", alias="AGENT_TOKEN_AUTH_MODE"
+    )
+    agent_token_default_lifetime_hours: int = Field(
+        default=720, ge=1, alias="AGENT_TOKEN_DEFAULT_LIFETIME_HOURS"
+    )
+    agent_token_max_lifetime_hours: int = Field(
+        default=2160, ge=1, alias="AGENT_TOKEN_MAX_LIFETIME_HOURS"
+    )
+    agent_token_max_overlap_minutes: int = Field(
+        default=1440, ge=0, alias="AGENT_TOKEN_MAX_OVERLAP_MINUTES"
+    )
     sqlite_busy_timeout_ms: int = 30000  # 30s — backfill/reindex can hold lock >15s
     db_pool_size: int = 8  # bounded connection pool size
     auto_hibernate_enabled: bool = True
@@ -111,6 +147,22 @@ class Settings(BaseSettings):
     inbox_max_metadata_bytes: int = 20000
     inbox_digest_scheduler_interval_seconds: int = 3600
     brain_scheduler_interval_seconds: int = 3600
+    # Fase 2 console-slim: gate the two in-process schedulers at task creation
+    # (mirrors canary_mode). Default True = byte-identical to prior behavior;
+    # set the env var to false on a box that no longer surfaces inbox/brain.
+    inbox_digest_scheduler_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "MARVIS_INBOX_DIGEST_SCHEDULER_ENABLED",
+            "PIR_INBOX_DIGEST_SCHEDULER_ENABLED",
+        ),
+    )
+    brain_scheduler_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "MARVIS_BRAIN_SCHEDULER_ENABLED", "PIR_BRAIN_SCHEDULER_ENABLED"
+        ),
+    )
     brain_run_off_peak_only: bool = Field(
         default=False, alias="BRAIN_RUN_OFF_PEAK_ONLY"
     )
@@ -265,14 +317,6 @@ class Settings(BaseSettings):
         default_factory=list,
         alias="FINDER_SYMLINK_WHITELIST",
     )
-
-    # n8n Integration
-    n8n_webhook_url: str = ""
-    n8n_api_url: str = ""
-    n8n_api_key: str = ""
-    n8n_webhook_secret: str = ""
-    n8n_dispatch_interval: int = 30
-    n8n_max_retry_count: int = 5
 
     # Web Push (VAPID)
     vapid_private_key: str = ""
@@ -512,6 +556,67 @@ class Settings(BaseSettings):
         default=False, alias="MARVIS_FTS_BODIES"
     )
 
+    # Fase 2 mielinizzazione (plan 2026-08-16, v3) — outcome-anchored salience
+    # reinforcement. TRI-STATE flag (R4): "off" = STRUCTURAL branch, the
+    # pre-existing search path runs verbatim (no new query, byte-identical
+    # scores AND response shape); "shadow" = ledger writes + memory_feedback
+    # tool + nudge active, ranking contribution ZERO (read path identical to
+    # off); "on" = effective salience enters the documents-hit ranking
+    # post-fusion (U2). All numeric knobs are config, not code — post-deploy
+    # calibration is part of the contract (KTD10).
+    reinforcement_mode: Literal["off", "shadow", "on"] = Field(
+        default="off", alias="MARVIS_REINFORCEMENT"
+    )
+    # Exponential decay half-life for ledger boosts, in days (R2: contribution
+    # = weight · 2^(−age_days/half_life), computed in application code on the
+    # candidate set only).
+    reinforcement_half_life_days: float = Field(
+        default=30.0, alias="MARVIS_REINFORCEMENT_HALF_LIFE_DAYS"
+    )
+    # Cap on the TOTAL boost contribution per doc: effettiva = base +
+    # clamp(Σ, 0, cap). The lower clamp at 0 is the floor guarantee (KTD6:
+    # misled without positives = no-op on ranking; floor = salience_base).
+    reinforcement_cap_total: float = Field(
+        default=0.3, alias="MARVIS_REINFORCEMENT_CAP_TOTAL"
+    )
+    # Per-boost weights (R8): agent < human, both calibratable post-deploy.
+    reinforcement_weight_agent: float = Field(
+        default=0.05, alias="MARVIS_REINFORCEMENT_WEIGHT_AGENT"
+    )
+    reinforcement_weight_human: float = Field(
+        default=0.15, alias="MARVIS_REINFORCEMENT_WEIGHT_HUMAN"
+    )
+    # ISO timestamp; the read path ignores boosts CREATED BEFORE this epoch —
+    # a ledger reset without DELETE (R4 emended v3).
+    reinforcement_boost_epoch: str | None = Field(
+        default=None, alias="MARVIS_REINFORCEMENT_BOOST_EPOCH"
+    )
+    # Anti-gaming caps on boost accounting (R7), enforced by the U3 feedback
+    # gate against salience_boosts (accepted rows) with rejections recorded in
+    # boost_rejects (mig 174; the legacy mig-046 boost_log stays with the REST
+    # rate-limit): max accepted agent boosts per authenticated principal per
+    # sliding hour; max per doc per day per principal; max DISTINCT principals
+    # per doc per day.
+    reinforcement_agent_hourly_cap: int = Field(
+        default=3, alias="MARVIS_REINFORCEMENT_AGENT_HOURLY_CAP"
+    )
+    reinforcement_agent_doc_daily_cap: int = Field(
+        default=1, alias="MARVIS_REINFORCEMENT_AGENT_DOC_DAILY_CAP"
+    )
+    reinforcement_doc_distinct_daily_cap: int = Field(
+        default=3, alias="MARVIS_REINFORCEMENT_DOC_DISTINCT_DAILY_CAP"
+    )
+    # R10: N distinct misled (distinct principals, or same principal on ≥2
+    # days) within the dedup window → supersede/contradiction proposal (U4).
+    reinforcement_misled_threshold: int = Field(
+        default=2, alias="MARVIS_REINFORCEMENT_MISLED_THRESHOLD"
+    )
+    # R13 tripwire: share of total effective-salience boost mass held by the
+    # top decile of boosted docs above which telemetry flags concentration.
+    reinforcement_top_decile_share_threshold: float = Field(
+        default=0.5, alias="MARVIS_REINFORCEMENT_TOP_DECILE_SHARE_THRESHOLD"
+    )
+
     # Memory-freshness v2a Phase 2 (A-span, DEFAULT OFF). When False the search
     # read path never touches the chunks/vec_chunks sidecars and the response is
     # byte-identical to today (no span_* fields populated). When True (and
@@ -624,6 +729,39 @@ class Settings(BaseSettings):
         default=8, alias="BRAIN_LLM_SEMAPHORE_SIZE"
     )
 
+    @model_validator(mode="after")
+    def validate_security_boundary(self) -> "Settings":
+        """Reject ambiguous proxy policy and weak production signing keys."""
+        for cidr in self.trusted_proxy_cidrs:
+            try:
+                network = ipaddress.ip_network(cidr, strict=True)
+            except ValueError as exc:
+                raise ValueError(
+                    "TRUSTED_PROXY_CIDRS must contain canonical IPv4/IPv6 host routes"
+                ) from exc
+            if network.prefixlen != network.max_prefixlen:
+                raise ValueError(
+                    "TRUSTED_PROXY_CIDRS accepts only exact IPv4 /32 or IPv6 /128 peers"
+                )
+
+        if self.pir_env.strip().lower() == "production":
+            secret = self.pir_jwt_secret
+            if secret == _DEV_JWT_SECRET or len(secret.encode("utf-8")) < 32:
+                raise ValueError(
+                    "production JWT secret must be explicitly configured with "
+                    "at least 32 UTF-8 bytes"
+                )
+        if self.agent_token_default_lifetime_hours > self.agent_token_max_lifetime_hours:
+            raise ValueError(
+                "AGENT_TOKEN_DEFAULT_LIFETIME_HOURS cannot exceed "
+                "AGENT_TOKEN_MAX_LIFETIME_HOURS"
+            )
+        if self.agent_token_auth_mode == "strict" and self.tasks_api_token:
+            raise ValueError(
+                "TASKS_API_TOKEN must be removed before AGENT_TOKEN_AUTH_MODE=strict"
+            )
+        return self
+
     @property
     def cors_origins(self) -> list[str]:
         if self.pir_env == "production":
@@ -687,6 +825,13 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def apply_marvis_settings(*, force: bool = False) -> bool:
+    """Apply the shared runtime settings through the canonical config surface."""
+    from core.api.runtime_settings import apply_marvis_settings as apply_runtime_settings
+
+    return apply_runtime_settings(force=force)
 
 
 def _resolve_repo_parents() -> list[Path]:

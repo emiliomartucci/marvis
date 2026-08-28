@@ -2172,53 +2172,6 @@ export async function createHumanCostEntry(
   });
 }
 
-// --- Automations (n8n) ---
-
-export async function listAutomations(
-  opts?: { signal?: AbortSignal }
-): Promise<{ workflows: import("./types").N8nWorkflow[]; count: number }> {
-  return fetchAPI("/api/v1/automations", { signal: opts?.signal });
-}
-
-export async function triggerAutomation(
-  workflowId: string,
-  data?: Record<string, unknown>
-): Promise<{ triggered: boolean; workflow_id: string; result: unknown }> {
-  return fetchAPI(`/api/v1/automations/${encodeURIComponent(workflowId)}/trigger`, {
-    method: "POST",
-    body: JSON.stringify({ data }),
-  });
-}
-
-export async function listExecutions(
-  params?: { workflow_id?: string; status?: string; limit?: number },
-  opts?: { signal?: AbortSignal }
-): Promise<{ executions: import("./types").N8nExecution[]; count: number }> {
-  const searchParams = new URLSearchParams();
-  if (params?.workflow_id) searchParams.set("workflow_id", params.workflow_id);
-  if (params?.status) searchParams.set("status", params.status);
-  if (params?.limit) searchParams.set("limit", String(params.limit));
-  const qs = searchParams.toString();
-  return fetchAPI(withQuery("/api/v1/automations/executions", qs), {
-    signal: opts?.signal,
-  });
-}
-
-export async function listOutboxEvents(
-  params?: { event_type?: string; project?: string; dispatched?: boolean; limit?: number },
-  opts?: { signal?: AbortSignal }
-): Promise<{ events: import("./types").OutboxEvent[]; count: number }> {
-  const searchParams = new URLSearchParams();
-  if (params?.event_type) searchParams.set("event_type", params.event_type);
-  if (params?.project) searchParams.set("project", params.project);
-  if (params?.dispatched !== undefined) searchParams.set("dispatched", String(params.dispatched));
-  if (params?.limit) searchParams.set("limit", String(params.limit));
-  const qs = searchParams.toString();
-  return fetchAPI(withQuery("/api/v1/automations/events", qs), {
-    signal: opts?.signal,
-  });
-}
-
 // --- Notifications ---
 
 export async function listNotifications(

@@ -189,7 +189,7 @@ the README say what is actually true — and a new `marvis guide` teaches an age
 how to organize a repository the Marvis way.
 
 ### Added
-- `marvis guide` — one callable, OSS-clean reference for how Marvis works: concepts (programs › projects › tasks), naming, directory layout, the Knowledge Graph edge types, tags, the frontmatter spec, the Brain, the lifecycle, and how to adopt the shape on an existing repo. `--section` / `--list` / `--json` (`4f838447`).
+- `marvis guide` — one callable, public-package-clean reference for how Marvis works: concepts (programs › projects › tasks), naming, directory layout, the Knowledge Graph edge types, tags, the frontmatter spec, the Brain, the lifecycle, and how to adopt the shape on an existing repo. `--section` / `--list` / `--json` (`4f838447`).
 - Enriched `projects/_template` scaffold — the full mold an agent copies onto a repo: `context.md`, `memory/handoff.md`, worked `docs/{brainstorms,plans,solutions}` examples, and `input`/`output` READMEs, each with its frontmatter shown (`7c0d9671`).
 - `marvis init` and `marvis doctor` now point your agent at an existing folder and tell it to adopt it non-destructively via `marvis guide` (`ee174dbf`).
 - `marvis brain enable` / `disable` / `status` — a supported toggle for the Brain (`brain_enabled`), so moving it out of shadow mode no longer requires a direct DB write that the governance hooks block. Closes #7.
@@ -233,7 +233,7 @@ cross-OS test matrix moved to free public CI.
 
 ## [v0.3.5] - 2026-06-03
 
-The "make it alive" release: a clean OSS install now reflects, schedules, and
+The "make it alive" release: a clean local install now reflects, schedules, and
 keeps its search index fresh on its own, with explicit consent, and installs on
 Windows.
 
@@ -244,7 +244,7 @@ Windows.
 - `marvis init` now asks three consent questions — reflection cost-mode (free/full/off), an opt-in autonomy timer, and governance-hook install — and wires the answers. Non-interactive runs default everything off (`a4e2934`).
 - Self-healing search — a first query over an empty index returns `index-building`, kicks off a background build, and a retry returns results; the auto-build defers when free RAM is below a safe floor so it never OOMs a laptop (`75ba5c4`).
 - BYOK → brain — the provider key collected at `marvis init` is wired to the reflection gateway at runtime for OpenAI-compatible providers (OpenAI, Anthropic, a self-hosted gateway), so `full` reflection works without a manual env export. Managed deployments keep their env-configured gateway (`3716632`).
-- Deploy: populate OSS deploy template (`de2dcf2`).
+- Deploy: populate the public self-hosted deploy template (`de2dcf2`).
 - Infra: OOM mitigation — `user-1000.slice` MemoryHigh=20G / MemoryMax=24G drop-in + idempotent installer (`f47b9d0a`).
 
 ### Fixed

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# v1.5.0 - 2026-08-27 - Canonicalize package-prefixed internal Python imports
 # v1.4.0 - 2026-04-14 - KG fix edges orfane (task 2a98db4a): DELETE stale edges per re-parsed files before UPSERT
 # v1.3.0 - 2026-04-15 - KG Fase 2.y: discover_files(repo_root, patterns) refactor (PERF-1) + Fase 2.z NODE_ID_RE prefixes
 # v1.2.0 - 2026-04-14 - KG Fase 1g: --incremental mode (parse only specified files)
@@ -248,9 +249,9 @@ def discover_files(
                   scans; or layout-specific subtrees per-project.
 
     Returns:
-        (py_files, ts_files) Path lists. Files are split by suffix (.py vs
-        .ts/.tsx) AFTER the git ls-files call, so callers can pass a single
-        union pattern.
+        (py_files, ts_files) Path lists. Files are split by suffix (.py vs the
+        TS/JS family .ts/.tsx/.mts/.cts/.mjs/.cjs/.js/.jsx) AFTER the git
+        ls-files call, so callers can pass a single union pattern.
     """
     root = repo_root or REPO_ROOT
     if patterns is None:
@@ -274,7 +275,12 @@ def discover_files(
         suffix = line.rsplit(".", 1)[-1].lower() if "." in line else ""
         if suffix == "py":
             py_files.append(root / line)
-        elif suffix in ("ts", "tsx"):
+        elif suffix in ("ts", "tsx", "mts", "cts", "mjs", "cjs", "js", "jsx"):
+            # The tree-sitter TypeScript grammar parses the JS family too, so
+            # ES-module / CommonJS JavaScript (.js/.mjs/.cjs/.mts/.cts/.jsx)
+            # routes to parse_typescript_file. Hosted callers pass Python/TS-only
+            # patterns, so their classification is unchanged; only callers that
+            # ask for a JS pattern (the graph exporter) surface these.
             ts_files.append(root / line)
         # Other extensions silently dropped (caller passed wider pattern).
     return py_files, ts_files
@@ -418,6 +424,24 @@ def _py_collect_imports(root: Node) -> dict[str, str]:
     return table
 
 
+def _py_normalize_internal_import_qn(qualified_name: str) -> str:
+    """Match package-qualified imports to definitions rooted at REPO_ROOT.
+
+    The bundled runtime indexes ``core/`` as its Python root, so a definition
+    in ``api/db.py`` is ``api.db.get_db`` while application imports use
+    ``core.api.db``.  Strip the repository-package prefix only when the first
+    remaining component exists locally; third-party packages stay untouched.
+    """
+    prefix = f"{REPO_ROOT.name}."
+    if not qualified_name.startswith(prefix):
+        return qualified_name
+    candidate = qualified_name[len(prefix):]
+    first_component = candidate.split(".", 1)[0]
+    if not first_component or not (REPO_ROOT / first_component).exists():
+        return qualified_name
+    return candidate
+
+
 def _py_extract_decorators(fn_node: Node, src: bytes) -> tuple[list[str], str | None]:
     """Return (decorators_list, http_verb_or_None).
 
@@ -524,7 +548,10 @@ def parse_python_file(path_str: str) -> tuple[list[dict], list[dict]]:
     if root.has_error:
         logger.warning("Parse error in %s — best-effort extraction", rel_path)
 
-    imports = _py_collect_imports(root)
+    imports = {
+        alias: _py_normalize_internal_import_qn(qualified_name)
+        for alias, qualified_name in _py_collect_imports(root).items()
+    }
 
     # First pass: function defs (with Class.method qualified names)
     func_defs: list[tuple[Node, bool, str]] = list(_py_iter_functions(root))
@@ -611,6 +638,7 @@ def parse_python_file(path_str: str) -> tuple[list[dict], list[dict]]:
     nodes.extend(emitted_call_targets.values())
 
     # Imports → file --imports--> module (stubs namespace py:)
+    seen_module_stubs: set[str] = set()
     for alias, qn in imports.items():
         qn_norm = _norm_qn(qn)
         # Imports outside the repo (site-packages, stdlib) still get stubs — they
@@ -632,6 +660,35 @@ def parse_python_file(path_str: str) -> tuple[list[dict], list[dict]]:
             "source_file": rel_path,
             "source_line": None,
         })
+
+        # Phase 7.4: for `from X import Y` (qn="X.Y"), also emit a module-level
+        # stub `py:module:X` so the bridge sweep can match it to `py:file:X` via
+        # qualified_name equality. Without this, symbol-level stubs (qn="X.Y")
+        # never bridge because no file node has qn="X.Y".
+        # `_dedupe_nodes` ensures stub=False (from the Phase 7.3 internal
+        # companion) wins over stub=True emitted here.
+        dot = qn_norm.rfind(".")
+        if dot > 0:
+            parent_qn = qn_norm[:dot]
+            if parent_qn not in seen_module_stubs:
+                seen_module_stubs.add(parent_qn)
+                parent_module_id = _safe_id("py", "module", parent_qn)
+                nodes.append({
+                    "id": parent_module_id,
+                    "type": "module",
+                    "name": parent_qn.split(".")[-1],
+                    "qualified_name": parent_qn,
+                    "file_path": None,
+                    "line_number": None,
+                    "metadata": {"stub": True, "language": "python"},
+                })
+                edges.append({
+                    "source_id": file_node["id"],
+                    "target_id": parent_module_id,
+                    "relation": "imports",
+                    "source_file": rel_path,
+                    "source_line": None,
+                })
 
     return nodes, edges
 
@@ -1447,9 +1504,13 @@ def _populate_graph_chunked_impl(
         # module is absent (e.g. in a downgrade state).
         try:
             from core.scripts.populate_temporal import mark_stale_nodes
-            stale_result = mark_stale_nodes(db_path=db, stale_days=stale_days)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("stale-check skipped: %s", e)
+        except ImportError:
+            mark_stale_nodes = None
+        if mark_stale_nodes is not None:
+            try:
+                stale_result = mark_stale_nodes(db_path=db, stale_days=stale_days)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("stale-check skipped: %s", e)
 
     out = {
         "db_path": db,

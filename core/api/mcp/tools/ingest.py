@@ -3,7 +3,7 @@
 
 Same TEMPLATE as ``tasks.py`` / ``graph.py``: the Node HTTP proxy
 (``get``/``post``/``patch`` -> ``:8100``) is replaced by an in-process
-``await ingest_uc.<fn>(LOCAL_CTX, db, ...)`` against the read/write pool the
+``await ingest_uc.<fn>(current_mcp_context(), db, ...)`` against the read/write pool the
 tool acquires via ``acquire_db()`` / ``acquire_write_db()``. Docstrings are copied
 VERBATIM from ``core/mcp-pir/index.mjs`` (curated QUANDO USARLO / NON USARLO /
 RESTITUISCE blocks).
@@ -16,24 +16,15 @@ Schema port (Zod -> Pydantic), per S1 F3:
   * ``z.record(z.string(), z.string())`` -> ``dict[str, str] | None``
   * optional                     -> ``X | None = None`` (or ``= <default>``)
 
-Visibility: the MCP surface is local single-user (no ``UserInfo.teams``), so every
-tool passes ``visible_projects=None`` = unrestricted (the same DECISION 1 the
-use_cases / the other groups take). ``LOCAL_CTX`` is ``operator`` so the
-operator+ ``require_role_ctx`` gates inside the use_cases pass.
+Visibility: trusted local stdio resolves the explicit ``ws_default`` local context;
+remote MCP resolves the authenticated workspace and its current visible projects.
+No remote call falls back to the local identity.
 
-FIRE-AND-FORGET SCHEDULING is NOT replicated here (DECISION). The use_cases perform
-the durable DB transition (the source of truth) and return; the HTTP adapter then
-schedules ``parse_pending`` / ``execute_saga`` (``asyncio.create_task``) and emits
-the ``broadcast_ingest_changed`` SSE notification. Both the parser/saga workers and
-the SSE channel are server-lifecycle / transport side-channels — the SAME
-per-surface trade-off the tasks template documents for ``mcp_schedule_embed`` (the
-auto-embed worker, S1 F4). Importing ``parse_pending`` / ``execute_saga`` /
-``broadcast_ingest_changed`` here would ALSO drag fastapi into the MCP import path
-(they transitively import a fastapi module — the use_case keeps them FUNCTION-LOCAL
-for exactly this reason), so they are NOT imported. Net: ``approve`` /
-``reject`` / ``classify`` / ``reparse`` commit the row transition; the actual
-parse/saga execution is driven by the in-process worker wiring the server lifecycle
-owns (parity with the auto-embed F4 no-op).
+POST-TRANSITION SCHEDULING mirrors the HTTP adapter. After the durable use-case
+commit, approve schedules ``execute_saga`` and classify/reparse schedule
+``parse_pending`` with the authenticated workspace. Imports stay function-local
+so importing the MCP registry itself remains lightweight. Recovery remains the
+durable fallback if the process dies after commit and before the task completes.
 
 PATCH transport-boundary replication. ``patch_pending`` (the use_case) owns the
 sha-collision check, containment, atomic move, and the row + change-history writes;
@@ -63,6 +54,7 @@ SKIPPED (no clean fastapi-free use_case):
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -70,9 +62,10 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from core.api.mcp._adapter import (
-    LOCAL_CTX,
     acquire_db,
     acquire_write_db,
+    current_mcp_context,
+    current_visible_projects,
     dump,
     raise_mcp_error,
 )
@@ -101,6 +94,18 @@ PROJECTS_ROOT = Path("/data/projects").resolve()
 _EXTRACTED_TEXT_PREVIEW_CHARS = 240
 _STRUCTURE_KEY_LIMIT = 20
 _CLASSIFICATION_TAG_LIMIT = 8
+
+
+def _schedule_parse(ingest_id: str, workspace_id: str) -> asyncio.Task[None]:
+    from core.api.services.ingest.parser_router import parse_pending
+
+    return asyncio.create_task(parse_pending(ingest_id, workspace_id))
+
+
+def _schedule_saga(ingest_id: str, workspace_id: str) -> asyncio.Task[None]:
+    from core.api.services.ingest.insert_saga import execute_saga
+
+    return asyncio.create_task(execute_saga(ingest_id, workspace_id))
 
 
 def _project_input_root(project_slug: str) -> Path:
@@ -202,13 +207,20 @@ def register(mcp) -> None:
         # all projects (visible_projects=None), so project_filter_visible stays True.
         try:
             async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 result = await ingest_uc.list_pending(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     status=None if status == "all" else status,
                     project_slug=project,
                     limit=limit,
-                    visible_projects=None,
+                    visible_projects=visible_projects,
+                    project_filter_visible=(
+                        project is None
+                        or visible_projects is None
+                        or project in visible_projects
+                    ),
                 )
                 payload = dump(result)
                 if include_content:
@@ -222,22 +234,24 @@ def register(mcp) -> None:
         id: Annotated[str, Field(pattern=_UUID_PATTERN)],
         classification_override: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Approve ingest_pending row → triggers saga move da input/ a target_folder + KG insert. Optional classification_override (logged decision_source=agent_override; backend support post-E5).
+        """Approve ingest_pending row → committa la row a status=approved. Il move del file da input/ a target_folder + l'insert nel KG avvengono in modo ASINCRONO dal worker ingest (server-lifecycle), NON in questa chiamata.
 
         QUANDO USARLO: row in awaiting_triage con target_folder/target_filename validi → approval umano via agent.
-        QUANDO NON USARLO: NOT su row in stato diverso da awaiting_triage (409). NOT per cambiare project_slug -> usa patch_ingest_pending.
-        RESTITUISCE: {id, status:approved} dopo enqueue saga."""
-        # The use_case returns (response, project_slug); the second element feeds the
-        # HTTP adapter's SSE broadcast (a transport side-channel not replicated here,
-        # see module docstring). classification_override is accepted for Node parity
-        # but not forwarded — the use_case signature does not carry it (backend
-        # support is post-E5). The durable status='approved' transition commits here;
-        # the saga is driven by the server-lifecycle worker.
+        QUANDO NON USARLO: NOT su row in stato diverso da awaiting_triage (viene rifiutata). NOT per cambiare project_slug -> usa patch_ingest_pending.
+        NOTA: `classification_override` e' accettato per compatibilita' ma NON inoltrato / no-op su questa superficie (backend support post-E5).
+        RESTITUISCE: {id, status:approved}."""
+        # The use_case returns (response, project_slug). classification_override is
+        # accepted for Node parity but not forwarded — the use_case signature does
+        # not carry it (backend support is post-E5). The durable status='approved'
+        # transition commits before the same-workspace saga is scheduled.
         try:
             async with acquire_write_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 response, _project_slug = await ingest_uc.approve(
-                    LOCAL_CTX, db, ingest_id=id, visible_projects=None,
+                    ctx, db, ingest_id=id, visible_projects=visible_projects,
                 )
+                _schedule_saga(id, ctx.workspace_id)
                 return dump(response)
         except ServiceError as e:
             raise_mcp_error(e)
@@ -245,12 +259,13 @@ def register(mcp) -> None:
     @mcp.tool()
     async def reject_ingest_pending(
         id: Annotated[str, Field(pattern=_UUID_PATTERN)],
-        reason: Annotated[str, Field(max_length=500)],
+        reason: Annotated[str, Field(max_length=500)] | None = None,
     ) -> dict[str, Any]:
         """Reject ingest_pending row → status=rejected, file resta orphan in input/.
 
         QUANDO USARLO: row non vuole essere ingestita (low signal, duplicato, off-topic) → libera la coda triage.
         QUANDO NON USARLO: NOT per cancellare il file fisico (resta orphan in input/). NOT per cambiare project_slug post-rejection -> patch_ingest_pending supporta lo stato rejected.
+        NOTA: `reason` e' opzionale e viene accettato ma NON persistito su questa superficie (la transizione registra solo triage_decision_id).
         RESTITUISCE: {id, status:rejected}."""
         # The use_case `reject` is a soft state transition and does not carry a
         # `reason` arg (the Node `reason` is the HTTP body the legacy router
@@ -258,8 +273,10 @@ def register(mcp) -> None:
         # Accepted on the surface for Node parity. Returns (response, project_slug).
         try:
             async with acquire_write_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 response, _project_slug = await ingest_uc.reject(
-                    LOCAL_CTX, db, ingest_id=id, visible_projects=None,
+                    ctx, db, ingest_id=id, visible_projects=visible_projects,
                 )
                 return dump(response)
         except ServiceError as e:
@@ -281,7 +298,9 @@ def register(mcp) -> None:
         # (sha-collision, containment, atomic move, row + change-history writes).
         try:
             async with acquire_write_db() as db:
-                row = await ingest_uc._load_row(db, id)
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                row = await ingest_uc._visible_row(ctx, db, id, visible_projects)
 
                 allowed_states = ("awaiting_triage", "parse_error", "rejected")
                 if row["status"] not in allowed_states:
@@ -298,15 +317,16 @@ def register(mcp) -> None:
                     # No-op: return the current row so the caller can refresh.
                     return dump(ingest_uc._row_to_item(row))
 
+                ingest_uc._enforce_visibility(new_slug, visible_projects)
                 new_input_root = _project_input_root(new_slug)
                 result = await ingest_uc.patch_pending(
-                    LOCAL_CTX,
+                    ctx,
                     db,
                     row=row,
                     new_slug=new_slug,
                     new_input_root=new_input_root,
                     projects_root=PROJECTS_ROOT,
-                    changed_by=LOCAL_CTX.username,
+                    changed_by=ctx.username,
                     source_ip=None,
                     user_agent="mcp-local",
                 )
@@ -322,16 +342,20 @@ def register(mcp) -> None:
         """Force re-classify ingest_pending row. Phase 1 = deterministic re-parse (parser_router); post P1.5.E5 = trigger Haiku #1 manuale senza cambi MCP/UI.
 
         QUANDO USARLO: classification originale era sbagliata e vuoi rilanciare il classifier (es. dopo training data update).
-        QUANDO NON USARLO: NOT per parse_error (usa reparse_ingest che e' lo stesso path semanticamente). NOT su done/inserted (409 stato non valido).
-        RESTITUISCE: {id, status:parsing}."""
+        QUANDO NON USARLO: NOT per parse_error (usa reparse_ingest che e' lo stesso path semanticamente). NOT su done/inserted (stato non valido, rifiutato).
+        NOTA: `force` e' accettato ma no-op (il re-classify e' sempre forzato; il flag non cambia il comportamento). Il re-parse effettivo lo esegue il worker ingest async; qui la row viene resettata a queued.
+        RESTITUISCE: {id, status:parser_waiting}."""
         # `force` is accepted for Node parity; the Node handler ignores it too (it
         # always POSTs classify-force). The durable status='queued' reset commits
-        # here; the deterministic re-parse is driven by the server-lifecycle worker.
+        # before the deterministic same-workspace re-parse is scheduled.
         try:
             async with acquire_write_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
                 result = await ingest_uc.classify_force(
-                    LOCAL_CTX, db, ingest_id=id, visible_projects=None,
+                    ctx, db, ingest_id=id, visible_projects=visible_projects,
                 )
+                _schedule_parse(id, ctx.workspace_id)
                 return dump(result)
         except ServiceError as e:
             raise_mcp_error(e)
@@ -345,7 +369,7 @@ def register(mcp) -> None:
 
         QUANDO USARLO: row in parse_error → ritenta dopo fix parser/dipendenze. Batch utile per recovery post-deploy.
         QUANDO NON USARLO: NOT con id E status insieme (usa uno o l'altro). NOT per cambiare project_slug -> patch_ingest_pending.
-        RESTITUISCE: single → {id, status:parsing}; batch → {queued_count, status}."""
+        RESTITUISCE: single → {id, status:parser_waiting}; batch → {queued_count, status} (status = target_status, es. parse_error)."""
         if id and status:
             raise_mcp_error(
                 ValidationError(
@@ -356,18 +380,27 @@ def register(mcp) -> None:
         try:
             if id:
                 async with acquire_write_db() as db:
+                    ctx = current_mcp_context()
+                    visible_projects = await current_visible_projects(db, ctx)
                     result = await ingest_uc.reparse_single(
-                        LOCAL_CTX, db, ingest_id=id, visible_projects=None,
+                        ctx, db, ingest_id=id, visible_projects=visible_projects,
                     )
+                    _schedule_parse(id, ctx.workspace_id)
                     return dump(result)
             if status:
-                # The batch read selects the matching ids; the use_case returns
-                # (response, ids). The per-row parse fan-out is the server-lifecycle
-                # worker's job (not replicated here, see module docstring).
+                # The batch read selects matching ids and commits their transitions;
+                # schedule one same-workspace parser task for every returned id.
                 async with acquire_db() as db:
-                    response, _ids = await ingest_uc.reparse_batch(
-                        LOCAL_CTX, db, target_status=status, visible_projects=None,
+                    ctx = current_mcp_context()
+                    visible_projects = await current_visible_projects(db, ctx)
+                    response, ids = await ingest_uc.reparse_batch(
+                        ctx,
+                        db,
+                        target_status=status,
+                        visible_projects=visible_projects,
                     )
+                    for ingest_id in ids:
+                        _schedule_parse(ingest_id, ctx.workspace_id)
                     return dump(response)
             raise_mcp_error(
                 ValidationError(

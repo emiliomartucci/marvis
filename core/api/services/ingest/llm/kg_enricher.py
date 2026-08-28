@@ -127,11 +127,18 @@ def _excerpt_from_node_metadata(node: dict[str, Any]) -> str:
     return str(cls.get("title") or node.get("name") or "")
 
 
-async def _fetch_node(db: Any, node_id: str) -> dict | None:
+async def _fetch_node(
+    db: Any, node_id: str, workspace_id: str
+) -> dict | None:
     async with db.execute(
-        "SELECT id, type, name, qualified_name, project_id, file_path, metadata "
-        "FROM graph_nodes WHERE id = ?",
-        (node_id,),
+        "SELECT gn.id, gn.type, gn.name, gn.qualified_name, gn.project_id, "
+        "gn.file_path, gn.metadata FROM graph_nodes gn "
+        "WHERE gn.id = ? AND gn.project_id IN ("
+        "SELECT wp.project_slug FROM workspace_projects wp "
+        "GROUP BY wp.project_slug "
+        "HAVING COUNT(DISTINCT wp.workspace_id) = 1 "
+        "AND MIN(wp.workspace_id) = ?)",
+        (node_id, workspace_id),
     ) as cursor:
         row = await cursor.fetchone()
     if row is None:
@@ -142,7 +149,9 @@ async def _fetch_node(db: Any, node_id: str) -> dict | None:
     return out
 
 
-async def _fetch_candidates(db: Any, node: dict, limit: int = 30) -> list[dict]:
+async def _fetch_candidates(
+    db: Any, node: dict, workspace_id: str, limit: int = 30
+) -> list[dict]:
     """Pick candidate target nodes for the LLM. Heuristic: same project + recent.
     Plus a slice of cross-project artifacts (for `mentions`/`refers_to` semantics)."""
     project_id = node.get("project_id")
@@ -156,10 +165,17 @@ async def _fetch_candidates(db: Any, node: dict, limit: int = 30) -> list[dict]:
              WHERE project_id = ?
                AND id != ?
                AND deprecated_at IS NULL
+               AND project_id IN (
+                   SELECT wp.project_slug
+                     FROM workspace_projects wp
+                    GROUP BY wp.project_slug
+                   HAVING COUNT(DISTINCT wp.workspace_id) = 1
+                      AND MIN(wp.workspace_id) = ?
+               )
              ORDER BY last_seen_at DESC
              LIMIT ?
             """,
-            (project_id, node.get("id"), limit),
+            (project_id, node.get("id"), workspace_id, limit),
         ) as cursor:
             async for row in cursor:
                 rows.append(dict(row))
@@ -171,20 +187,75 @@ async def _fetch_candidates(db: Any, node: dict, limit: int = 30) -> list[dict]:
          WHERE deprecated_at IS NULL
            AND id != ?
            AND (project_id IS NULL OR project_id != ?)
+           AND project_id IN (
+               SELECT wp.project_slug
+                 FROM workspace_projects wp
+                GROUP BY wp.project_slug
+               HAVING COUNT(DISTINCT wp.workspace_id) = 1
+                  AND MIN(wp.workspace_id) = ?
+           )
          ORDER BY degree DESC
          LIMIT ?
         """,
-        (node.get("id"), project_id or "", max(0, limit - len(rows))),
+        (
+            node.get("id"),
+            project_id or "",
+            workspace_id,
+            max(0, limit - len(rows)),
+        ),
     ) as cursor:
         async for row in cursor:
             rows.append(dict(row))
     return rows
 
 
+async def _fetch_visible_neighbors(
+    db: Any, node_id: str, workspace_id: str, limit: int = 20
+) -> list[dict]:
+    """Return only edges whose two endpoints are uniquely workspace-owned."""
+    cursor = await db.execute(
+        """
+        SELECT e.source_id, e.target_id, e.relation
+          FROM graph_edges e
+          JOIN graph_nodes src ON src.id = e.source_id
+          JOIN graph_nodes dst ON dst.id = e.target_id
+         WHERE (e.source_id = ? OR e.target_id = ?)
+           AND src.project_id IN (
+               SELECT wp.project_slug FROM workspace_projects wp
+                GROUP BY wp.project_slug
+               HAVING COUNT(DISTINCT wp.workspace_id) = 1
+                  AND MIN(wp.workspace_id) = ?
+           )
+           AND dst.project_id IN (
+               SELECT wp.project_slug FROM workspace_projects wp
+                GROUP BY wp.project_slug
+               HAVING COUNT(DISTINCT wp.workspace_id) = 1
+                  AND MIN(wp.workspace_id) = ?
+           )
+         LIMIT ?
+        """,
+        (node_id, node_id, workspace_id, workspace_id, limit),
+    )
+    rows = await cursor.fetchall()
+    return [
+        {
+            "id": (
+                row["target_id"]
+                if row["source_id"] == node_id
+                else row["source_id"]
+            ),
+            "relation": row["relation"],
+        }
+        for row in rows
+    ]
+
+
 async def _call_enricher(
     node: dict,
     neighbors: list[dict],
     candidates: list[dict],
+    *,
+    workspace_id: str,
 ) -> KGEnrichment | None:
     excerpt = (node.get("excerpt") or "")[:EXCERPT_MAX_CHARS]
     sanitized = redact(_sanitize(excerpt, EXCERPT_MAX_CHARS))
@@ -198,35 +269,44 @@ async def _call_enricher(
         feature="ingest_kg_enrichment",
         max_tokens=MAX_OUTPUT_TOKENS,
         timeout=LLM_TIMEOUT_S,
+        idempotency_scope=f"kg-enrich:{workspace_id}:{node.get('id')}",
     )
 
 
-async def enrich_kg_for_node(node_id: str) -> None:
+async def enrich_kg_for_node(node_id: str, workspace_id: str) -> None:
     """Fire-and-forget background task. Never raises — failures logged + skipped."""
     if (os.environ.get("LLM_KG_ENRICHER_ENABLED", "false") or "").strip().lower() != "true":
         return
 
+    workspace_id = workspace_id.strip()
+    if not workspace_id:
+        logger.warning("kg_enricher_workspace_missing node=%s", node_id)
+        return
     enrichment_run_id = str(uuid.uuid4())
     inserted_count = 0
     try:
         # READ phase (read-only pool)
         async with acquire_db() as db:
-            node = await _fetch_node(db, node_id)
+            node = await _fetch_node(db, node_id, workspace_id)
             if node is None:
                 logger.info("kg_enricher_node_missing id=%s", node_id)
                 return
-            # Lazy import to avoid cycle (graph_service is a heavy module).
-            from core.api.services.graph_service import get_neighbors as _get_neighbors
-
-            neighbors = await _get_neighbors(db, node_id, direction="both", limit=20)
-            candidates = await _fetch_candidates(db, node)
+            neighbors = await _fetch_visible_neighbors(
+                db, node_id, workspace_id
+            )
+            candidates = await _fetch_candidates(db, node, workspace_id)
 
         if not candidates:
             logger.info("kg_enricher_no_candidates node=%s", node_id)
-            await _mark_enriched(node_id)
+            await _mark_enriched(node_id, workspace_id)
             return
 
-        enrichment = await _call_enricher(node, neighbors, candidates)
+        enrichment = await _call_enricher(
+            node,
+            neighbors,
+            candidates,
+            workspace_id=workspace_id,
+        )
         if enrichment is None:
             logger.info("kg_enricher_llm_no_result node=%s", node_id)
             return
@@ -236,6 +316,41 @@ async def enrich_kg_for_node(node_id: str) -> None:
 
         # WRITE phase
         async with acquire_write_db() as wdb:
+            from core.api.services.access_grants import (
+                ProjectWorkspaceOwnershipError,
+                require_unique_project_workspace,
+            )
+
+            await require_unique_project_workspace(
+                wdb,
+                project_slug=str(node.get("project_id") or ""),
+                workspace_id=workspace_id,
+                allow_local_single_user=True,
+            )
+            placeholders = ",".join("?" for _ in valid_ids)
+            target_projects = {
+                str(row["id"]): str(row["project_id"] or "")
+                for row in await (
+                    await wdb.execute(
+                        "SELECT id, project_id FROM graph_nodes WHERE id IN ("
+                        + placeholders
+                        + ")",
+                        sorted(valid_ids),
+                    )
+                ).fetchall()
+            }
+            safe_ids: set[str] = set()
+            for target_id, project_slug in target_projects.items():
+                try:
+                    await require_unique_project_workspace(
+                        wdb,
+                        project_slug=project_slug,
+                        workspace_id=workspace_id,
+                        allow_local_single_user=True,
+                    )
+                except ProjectWorkspaceOwnershipError:
+                    continue
+                safe_ids.add(target_id)
             for edge in enrichment.suggested_edges[:MAX_EDGES_PER_NODE]:
                 if edge.relation not in ALLOWED_EDGE_TYPES:
                     continue
@@ -243,7 +358,7 @@ async def enrich_kg_for_node(node_id: str) -> None:
                     continue
                 if edge.target_node_id == node_id:
                     continue
-                if edge.target_node_id not in valid_ids:
+                if edge.target_node_id not in safe_ids:
                     # LLM may hallucinate — skip targets not in the candidate set.
                     continue
                 metadata_json = json.dumps(
@@ -251,6 +366,7 @@ async def enrich_kg_for_node(node_id: str) -> None:
                         "agent": "kg_enricher",
                         "model": LLM_MODEL,
                         "enrichment_run_id": enrichment_run_id,
+                        "workspace_id": workspace_id,
                         "reasoning": edge.reasoning,
                     },
                     ensure_ascii=False,
@@ -285,7 +401,7 @@ async def enrich_kg_for_node(node_id: str) -> None:
                     )
             await wdb.commit()
 
-        await _mark_enriched(node_id)
+        await _mark_enriched(node_id, workspace_id)
         logger.info(
             "kg_enricher_done node=%s edges_inserted=%d run_id=%s",
             node_id, inserted_count, enrichment_run_id,
@@ -294,12 +410,17 @@ async def enrich_kg_for_node(node_id: str) -> None:
         logger.exception("kg_enricher_failed node=%s", node_id)
 
 
-async def _mark_enriched(node_id: str) -> None:
+async def _mark_enriched(node_id: str, workspace_id: str) -> None:
     try:
         async with acquire_write_db() as wdb:
             await wdb.execute(
-                "UPDATE graph_nodes SET kg_enriched_at = datetime('now') WHERE id = ?",
-                (node_id,),
+                "UPDATE graph_nodes SET kg_enriched_at = datetime('now') "
+                "WHERE id = ? AND project_id IN ("
+                "SELECT wp.project_slug FROM workspace_projects wp "
+                "GROUP BY wp.project_slug "
+                "HAVING COUNT(DISTINCT wp.workspace_id) = 1 "
+                "AND MIN(wp.workspace_id) = ?)",
+                (node_id, workspace_id),
             )
             await wdb.commit()
     except Exception:  # noqa: BLE001

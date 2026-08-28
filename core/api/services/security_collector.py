@@ -11,8 +11,6 @@ from datetime import datetime
 
 import aiosqlite
 
-from core.api.config import settings
-
 logger = logging.getLogger(__name__)
 
 VALID_EVENT_TYPES = {"ssh_login", "ssh_failed", "ban_add", "console_login"}

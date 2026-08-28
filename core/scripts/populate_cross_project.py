@@ -2325,13 +2325,12 @@ def populate_cross_project_incremental(
                 _file_state_forget(conn, str(p), populator=None)
                 continue
 
-            if not skip_hash_gate:
-                sha = _file_sha256(p)
-                if _file_state_unchanged(conn, str(p), sha, populator="cross_project"):
-                    results["files_skipped_hash_unchanged"] += 1
-                    continue
-            else:
-                sha = None
+            sha = _file_sha256(p)
+            if not skip_hash_gate and _file_state_unchanged(
+                conn, str(p), sha, populator="cross_project"
+            ):
+                results["files_skipped_hash_unchanged"] += 1
+                continue
 
             edges, new_nodes = _extract_prose_edges_for_file(
                 conn,
@@ -2376,8 +2375,7 @@ def populate_cross_project_incremental(
             results["nodes_written"] += n_nodes
             results["edges_written"] += n_edges
 
-            if sha is not None:
-                _file_state_record(conn, str(p), sha, populator="cross_project")
+            _file_state_record(conn, str(p), sha, populator="cross_project")
 
     finally:
         conn.close()

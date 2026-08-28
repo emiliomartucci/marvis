@@ -50,6 +50,7 @@ class DispatchResult:
 async def dispatch_files_batched(
     file_paths: list[Path],
     *,
+    workspace_id: str,
     projects_root: Path = PROJECTS_ROOT,
     source_kind: str = "manual_upload",
     provenance: IngestProvenance | None = None,
@@ -60,6 +61,8 @@ async def dispatch_files_batched(
     governance columns win; otherwise the legacy ``source_kind`` kwarg applies
     and the ingress columns stay NULL (owner-surface drops).
     """
+    if not workspace_id.strip():
+        raise ValueError("workspace_id is required for ingest dispatch")
     effective_source_kind = provenance.source_kind if provenance else source_kind
     api_key_id = provenance.api_key_id if provenance else None
     source = provenance.source if provenance else None
@@ -70,6 +73,7 @@ async def dispatch_files_batched(
     for path in file_paths:
         ingest_id, outcome = await enqueue_file(
             path,
+            workspace_id=workspace_id,
             projects_root=projects_root,
             source_kind=effective_source_kind,
             api_key_id=api_key_id,

@@ -7,13 +7,26 @@ from pydantic import Field
 from core.api.mcp._adapter import (
     LOCAL_CTX,
     acquire_write_db,
+    current_mcp_context,
     dump,
     raise_mcp_error,
 )
 from core.api.use_cases import onboarding as onboarding_uc
-from core.api.use_cases._errors import ServiceError
+from core.api.use_cases._errors import AuthorizationError, ServiceError
 
 SetupSection = Literal["Identità", "Sorgenti", "Ritmo", "Fonti del brain"]
+
+
+def _require_local_host_context() -> None:
+    if current_mcp_context() is LOCAL_CTX:
+        return
+    raise AuthorizationError(
+        code="local_host_operation_required",
+        message=(
+            "Host filesystem and setup operations are available only through "
+            "trusted local stdio."
+        ),
+    )
 
 
 def register(mcp) -> None:
@@ -30,6 +43,7 @@ def register(mcp) -> None:
         QUANDO NON USARLO: NOT per importare o persistere progetti; questo tool non scrive nulla.
         RESTITUISCE: {root, exclusions, proposals:[{path,name,kind}]}."""
         try:
+            _require_local_host_context()
             return dump(onboarding_uc.scan_workdir(root=root, exclusions=exclusions or []))
         except ServiceError as e:
             raise_mcp_error(e)
@@ -46,6 +60,7 @@ def register(mcp) -> None:
         QUANDO NON USARLO: NOT per scrivere stato derivato (progetti, programmi, tipo code/no-code, relazioni, status). NOT per sezioni non authored.
         RESTITUISCE: {path, content, sections, checkboxes}."""
         try:
+            _require_local_host_context()
             return dump(
                 onboarding_uc.write_setup(
                     section=section,
@@ -64,8 +79,10 @@ def register(mcp) -> None:
         QUANDO NON USARLO: NOT per creare dati reali utente; il seed marca tutto con tag/source_ref demo.
         RESTITUISCE: {project, created, tasks, todos, lang}."""
         try:
+            _require_local_host_context()
+            ctx = current_mcp_context()
             async with acquire_write_db(label="mcp.onboarding.seed_demo") as db:
-                return dump(await onboarding_uc.seed_demo(LOCAL_CTX, db, lang=lang))
+                return dump(await onboarding_uc.seed_demo(ctx, db, lang=lang))
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -77,7 +94,9 @@ def register(mcp) -> None:
         QUANDO NON USARLO: NOT per cancellare progetti o task reali; cancella solo marker/source_ref/tag demo.
         RESTITUISCE: {project, tasks_deleted, todos_deleted, project_deleted}."""
         try:
+            _require_local_host_context()
+            ctx = current_mcp_context()
             async with acquire_write_db(label="mcp.onboarding.teardown_demo") as db:
-                return dump(await onboarding_uc.teardown_demo(LOCAL_CTX, db))
+                return dump(await onboarding_uc.teardown_demo(ctx, db))
         except ServiceError as e:
             raise_mcp_error(e)

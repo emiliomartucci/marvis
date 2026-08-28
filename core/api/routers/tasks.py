@@ -10,11 +10,11 @@ transition logic — including the human-approval four-eyes gate — lives in
 identity into a :class:`CallerContext`, calls the use_case inside
 ``try/except ServiceError`` -> ``to_http``, and owns the transport concerns.
 
-CORNERSTONE — the human-approval gate. The use_case checks ``ctx.is_human_session``
-and raises ``AuthorizationError(code="approval_requires_human")``. This adapter
-fills ``is_human_session`` from the ``pir_session`` cookie and re-raises that ONE
-error as the legacy PLAIN-STRING 403 (``detail`` is a string, not a ``{code,message}``
-dict), preserving the HTTP contract pinned by
+CORNERSTONE — the human-approval gate. This adapter maps the already validated
+principal into ``CallerContext``; raw cookie presence never grants authority.
+The use case re-reads any agent delegation from the database and raises
+``AuthorizationError(code="approval_requires_human")`` when closed. This adapter
+re-raises that one error as the legacy plain-string 403, preserving the contract pinned by
 ``tests/test_tasks.py::test_pending_to_approved_requires_cookie_auth``. Likewise
 the transition + completion guards (``invalid transition`` 422,
 ``review-needs-PR`` 422, ``completed-needs-no-open-PR`` 422,
@@ -64,17 +64,17 @@ from core.api.models import (
     TaskUpdateRequest,
     UserInfo,
 )
+from core.api.models.tasks import TaskVersionConflict
 from core.api.rbac import require_role
 from core.api.routers._adapter import to_http
 from core.api.security import (
-    get_active_delegation,
     get_current_user,
     get_current_user_or_agent,
     resolve_session_owner,
 )
 from core.api.services.graph_service import sync_task_to_graph
 from core.api.services.kg.audit import check_deep_rate_limit, log_kg_deep_access
-from core.api.services.kg.lens import build_kg_context_for_task
+from core.api.services.kg.lens import build_kg_context_for_task, require_kg_visibility
 from core.api.use_cases import tasks as uc
 from core.api.use_cases._context import CallerContext
 from core.api.use_cases._errors import AuthorizationError, ServiceError, ValidationError
@@ -105,7 +105,7 @@ _bg_embed_tasks: set[asyncio.Task] = set()
 def _schedule_embed_task(
     task_id: str, title: str, project: str, status: str, workspace_id: str
 ) -> None:
-    """Fire-and-forget: embed task in background. Silently no-ops if embedder unavailable.
+    """Fire-and-forget: embed task without delaying the request writer.
 
     Thin HTTP-surface seam: the embed body itself lives in the fastapi-free
     ``embedding_service.embed_task_document`` (the SAME helper the MCP surface calls
@@ -115,11 +115,14 @@ def _schedule_embed_task(
     """
     from core.api.services import embedding_service
 
-    if not embedding_service.is_available():
-        return
-
     async def _embed() -> None:
         try:
+            # Local Granite readiness may lazily load ONNX weights.  Running
+            # that synchronous probe in the request task used to retain the
+            # route's DB-writer dependency for roughly a second, blocking
+            # unrelated writes despite this helper's fire-and-forget contract.
+            if not await asyncio.to_thread(embedding_service.is_available):
+                return
             await embedding_service.embed_task_document(
                 task_id=task_id,
                 title=title,
@@ -198,6 +201,26 @@ def _transition_to_http(err: ValidationError) -> HTTPException:
     return HTTPException(status_code=err.http_status, detail=err.message)
 
 
+def _is_validated_human_principal(request: Request, user: UserInfo) -> bool:
+    """Map an already-authenticated HTTP principal to human authority.
+
+    The dual-auth dependency resolves Bearer before cookie. Therefore a Bearer
+    request remains agentic even if an arbitrary ``pir_session`` cookie is also
+    present. The local single-user identity is trusted explicitly because its
+    dependency already enforced loopback access.
+    """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        return False
+    if (
+        user.user_id == "local"
+        and user.username == "local"
+        and user.user_type == "human"
+    ):
+        return True
+    return user.user_type == "human"
+
+
 # ---------------------------------------------------------------------------
 # Endpoints (thin adapters)
 # ---------------------------------------------------------------------------
@@ -249,7 +272,9 @@ async def create_task(
     if session_owner:
         created_by_value = session_owner
 
-    ctx = CallerContext.from_user_info(user, is_human_session=False)
+    ctx = CallerContext.from_user_info(
+        user, is_human_session=_is_validated_human_principal(request, user)
+    )
     try:
         return await uc.create_task(
             ctx,
@@ -346,16 +371,39 @@ async def get_task(
     deep = deep_param if deep_param is not None else settings.kg_http_deep_default
     deep_source = "client" if deep_param is not None else "env"
     if deep:
+        try:
+            require_kg_visibility(ctx, visible_projects)
+        except ServiceError as e:
+            raise to_http(e)
         check_deep_rate_limit(user.username)
         log_kg_deep_access(user.username, "get_task", task_id)
-        result.kg_context = await build_kg_context_for_task(db, task_id, deep=True)
+        result.kg_context = await build_kg_context_for_task(
+            db,
+            task_id,
+            deep=True,
+            ctx=ctx,
+            visible_projects=visible_projects,
+        )
         if result.kg_context and "meta" in result.kg_context:
             result.kg_context["meta"]["deep_effective"] = deep
             result.kg_context["meta"]["deep_default_source"] = deep_source
     return result
 
 
-@router.patch("/{task_id}", response_model=TaskDetailResponse)
+@router.patch(
+    "/{task_id}",
+    response_model=TaskDetailResponse,
+    responses={
+        409: {
+            "model": TaskVersionConflict,
+            "description": (
+                "Task version conflict: expected_updated_at is stale "
+                "(code task_version_conflict). The body carries the task's "
+                "current status and updated_at; refresh the task and retry."
+            ),
+        },
+    },
+)
 async def update_task(
     task_id: str,
     body: TaskUpdateRequest,
@@ -366,17 +414,11 @@ async def update_task(
     """Update a task. Validates status transitions."""
     _check_rate_limit(user.username)
 
-    # CORNERSTONE: the cookie is the only transport signal for "human session".
-    # Fill ctx.is_human_session here; the use_case decides the four-eyes gate.
-    # Super-session (Constitution v2.0 Rule 6): an agent caller with an active
-    # delegation gets ctx.delegation_grant_id so the approve gate honors it.
-    is_human = bool(request.cookies.get("pir_session"))
-    grant_id = None
-    if not is_human and user.user_type == "agent":
-        grant = await get_active_delegation(user.username, db)
-        grant_id = grant["id"] if grant is not None else None
+    # The dependency has already validated the principal. Cookie presence alone
+    # is not authority, and agent delegation is checked from the persisted row
+    # inside the use case at the exact approval decision point.
     ctx = CallerContext.from_user_info(
-        user, is_human_session=is_human, delegation_grant_id=grant_id
+        user, is_human_session=_is_validated_human_principal(request, user)
     )
     try:
         return await uc.update_task(

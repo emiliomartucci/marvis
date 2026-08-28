@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Build deterministic N/N-1 API and schema fixtures.
+
+The committed fixtures retain every HTTP operation plus a digest for every
+component schema. The exact predecessor OpenAPI bytes are also retained so CI
+can reconstruct N-1 without trusting fixture metadata. N-1 is read from an
+exact Git object; no moving branch or hosted filesystem is accepted as input.
+"""
+from __future__ import annotations
+
+import argparse
+from copy import deepcopy
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+from typing import Any
+
+
+HTTP_METHODS = ("delete", "get", "head", "options", "patch", "post", "put")
+FIXTURE_SCHEMA = "marvis-compatibility-fixture/v1"
+
+
+def _canonical(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _sha(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _schema_compatibility_shape(schema: Any) -> dict[str, Any]:
+    """Retain the parts needed to detect a structural N/N-1 break.
+
+    Full OpenAPI documents remain the canonical API artifacts.  Fixtures keep
+    exact whole-schema digests plus an intentionally small structural view so
+    the verifier can distinguish an optional property addition from a removed
+    or silently changed field without checking out the upstream repository.
+    """
+
+    if not isinstance(schema, dict):
+        return {"kind": "opaque", "sha256": _sha(_canonical(schema))}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return {"kind": "opaque", "sha256": _sha(_canonical(schema))}
+
+    envelope = {
+        key: value
+        for key, value in schema.items()
+        if key not in {"properties", "required", "title", "description"}
+    }
+    return {
+        "kind": "object",
+        "envelope_sha256": _sha(_canonical(envelope)),
+        "required": sorted(str(item) for item in schema.get("required", [])),
+        "property_sha256": {
+            str(name): _sha(_canonical(value))
+            for name, value in sorted(properties.items())
+        },
+    }
+
+
+def _required_parameters(path_item: dict[str, Any], operation: dict[str, Any]) -> list[str]:
+    parameters = [*path_item.get("parameters", []), *operation.get("parameters", [])]
+    required: set[str] = set()
+    for parameter in parameters:
+        if not isinstance(parameter, dict) or not parameter.get("required"):
+            continue
+        required.add(f"{parameter.get('in', '')}:{parameter.get('name', '')}")
+    return sorted(required)
+
+
+def _direct_component_refs(value: Any) -> set[str]:
+    refs: set[str] = set()
+    if isinstance(value, dict):
+        reference = value.get("$ref")
+        prefix = "#/components/schemas/"
+        if isinstance(reference, str) and reference.startswith(prefix):
+            name = reference[len(prefix) :].replace("~1", "/").replace("~0", "~")
+            if name:
+                refs.add(name)
+        for child in value.values():
+            refs.update(_direct_component_refs(child))
+    elif isinstance(value, list):
+        for child in value:
+            refs.update(_direct_component_refs(child))
+    return refs
+
+
+def _schema_closure_refs(value: Any, schemas: dict[str, Any]) -> list[str]:
+    pending = sorted(_direct_component_refs(value), reverse=True)
+    seen: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for dependency in sorted(
+            _direct_component_refs(schemas.get(name)), reverse=True
+        ):
+            if dependency not in seen:
+                pending.append(dependency)
+    return sorted(seen)
+
+
+def compact_spec(
+    spec: dict[str, Any],
+    *,
+    contract_version: int,
+    source_ref: str,
+    source_bytes: bytes,
+    consumer_bytes: bytes | None = None,
+) -> dict[str, Any]:
+    raw_schemas = spec.get("components", {}).get("schemas", {})
+    if not isinstance(raw_schemas, dict):
+        raw_schemas = {}
+    operations: dict[str, dict[str, Any]] = {}
+    for path, raw_path_item in sorted(spec.get("paths", {}).items()):
+        if not isinstance(raw_path_item, dict):
+            continue
+        methods: dict[str, Any] = {}
+        for method in HTTP_METHODS:
+            operation = raw_path_item.get(method)
+            if not isinstance(operation, dict):
+                continue
+            responses = operation.get("responses", {})
+            request_refs = _schema_closure_refs(
+                {
+                    "path_parameters": raw_path_item.get("parameters", []),
+                    "parameters": operation.get("parameters", []),
+                    "request_body": operation.get("requestBody"),
+                },
+                raw_schemas,
+            )
+            response_refs = {
+                str(code): _schema_closure_refs(response, raw_schemas)
+                for code, response in sorted(responses.items(), key=lambda item: str(item[0]))
+            }
+            methods[method] = {
+                "deprecated": bool(operation.get("deprecated", False)),
+                "operation_id": operation.get("operationId"),
+                "request_body_required": bool(
+                    isinstance(operation.get("requestBody"), dict)
+                    and operation["requestBody"].get("required")
+                ),
+                "required_parameters": _required_parameters(raw_path_item, operation),
+                "response_codes": sorted(str(code) for code in responses),
+                "request_schema_refs": request_refs,
+                "response_schema_refs": response_refs,
+                "schema_refs": sorted(
+                    set(request_refs)
+                    | {
+                        ref
+                        for refs in response_refs.values()
+                        for ref in refs
+                    }
+                ),
+            }
+        if methods:
+            operations[path] = methods
+
+    schemas: dict[str, str] = {}
+    schema_shapes: dict[str, dict[str, Any]] = {}
+    if raw_schemas:
+        schemas = {
+            name: _sha(_canonical(schema))
+            for name, schema in sorted(raw_schemas.items())
+        }
+        schema_shapes = {
+            name: _schema_compatibility_shape(schema)
+            for name, schema in sorted(raw_schemas.items())
+        }
+
+    fixture: dict[str, Any] = {
+        "schema": FIXTURE_SCHEMA,
+        "contract_version": contract_version,
+        "source_ref": source_ref,
+        "source_openapi_sha256": _sha(source_bytes),
+        "openapi": spec.get("openapi"),
+        "path_count": len(operations),
+        "operation_count": sum(len(methods) for methods in operations.values()),
+        "component_schema_count": len(schemas),
+        "operations": operations,
+        "component_schema_sha256": schemas,
+        "component_schema_compatibility": schema_shapes,
+    }
+    if consumer_bytes is not None:
+        fixture["consumer_openapi_sha256"] = _sha(consumer_bytes)
+    return fixture
+
+
+def _git_object(repo: Path, ref: str, path: str) -> bytes:
+    if len(ref) != 40 or any(ch not in "0123456789abcdef" for ch in ref):
+        raise SystemExit("N-1 ref must be a full lowercase 40-character commit SHA")
+    return subprocess.check_output(
+        ["git", "-C", str(repo), "show", f"{ref}:{path}"],
+        stderr=subprocess.PIPE,
+    )
+
+
+def _write(path: Path, value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False).encode() + b"\n"
+    path.write_bytes(raw)
+    return _sha(raw)
+
+
+def _write_raw(path: Path, raw: bytes) -> str:
+    path.write_bytes(raw)
+    return _sha(raw)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--n-spec", type=Path, required=True)
+    parser.add_argument("--n-consumer-spec", type=Path, required=True)
+    parser.add_argument("--n-source-ref", required=True)
+    parser.add_argument("--n-minus-one-repo", type=Path, required=True)
+    parser.add_argument("--n-minus-one-ref", required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    args = parser.parse_args(argv)
+
+    n_raw = args.n_spec.read_bytes()
+    n_consumer_raw = args.n_consumer_spec.read_bytes()
+    previous_raw = _git_object(
+        args.n_minus_one_repo,
+        args.n_minus_one_ref,
+        "contracts/openapi/marvisx.json",
+    )
+    n_spec = json.loads(n_raw)
+    previous_spec = json.loads(previous_raw)
+
+    current = compact_spec(
+        n_spec,
+        contract_version=3,
+        source_ref=args.n_source_ref,
+        source_bytes=n_raw,
+        consumer_bytes=n_consumer_raw,
+    )
+    current_consumer = compact_spec(
+        json.loads(n_consumer_raw),
+        contract_version=3,
+        source_ref=args.n_source_ref,
+        source_bytes=n_consumer_raw,
+    )
+    previous = compact_spec(
+        previous_spec,
+        contract_version=2,
+        source_ref=args.n_minus_one_ref,
+        source_bytes=previous_raw,
+    )
+
+    broken = deepcopy(previous)
+    first_path = sorted(broken["operations"])[0]
+    first_method = sorted(broken["operations"][first_path])[0]
+    del broken["operations"][first_path][first_method]
+    if not broken["operations"][first_path]:
+        del broken["operations"][first_path]
+    broken["path_count"] = len(broken["operations"])
+    broken["operation_count"] = sum(
+        len(methods) for methods in broken["operations"].values()
+    )
+    broken["deliberate_break"] = {
+        "kind": "operation_removed",
+        "path": first_path,
+        "method": first_method,
+        "baseline": "n-minus-1-contract.json",
+    }
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    digests = {
+        "n-contract.json": _write(args.output_dir / "n-contract.json", current),
+        "n-minus-1-openapi.json": _write_raw(
+            args.output_dir / "n-minus-1-openapi.json", previous_raw
+        ),
+        "n-minus-1-contract.json": _write(
+            args.output_dir / "n-minus-1-contract.json", previous
+        ),
+        "n-consumer-contract.json": _write(
+            args.output_dir / "n-consumer-contract.json", current_consumer
+        ),
+        "deliberate-break.json": _write(
+            args.output_dir / "deliberate-break.json", broken
+        ),
+    }
+    _write(
+        args.output_dir / "manifest.json",
+        {
+            "schema": "marvis-compatibility-fixture-manifest/v1",
+            "files": digests,
+        },
+    )
+    print(
+        "compatibility fixtures written: "
+        f"N={current['operation_count']} operations, "
+        f"N-1={previous['operation_count']} operations"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

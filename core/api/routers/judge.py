@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -218,27 +219,32 @@ async def judge_proposal(
     if judge_mode == "shadow" and verdict_response.verdict != "APPROVE":
         effective_verdict = "APPROVE"
 
-    # Audit log
-    await db.execute(
-        "INSERT INTO audit_log (action, user, resource_type, resource_id, details_json) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (
-            "judge_proposal",
-            current_user.username,
-            "judge",
-            "cross_model",
-            json.dumps({
-                "raw_verdict": verdict_response.verdict,
-                "effective_verdict": effective_verdict,
-                "judge_mode": judge_mode,
-                "total_score": verdict_response.total_score,
-                "proposal": request.proposal[:200],
-                "project": request.project,
-                "criteria_summary": {
-                    c.name: c.score for c in verdict_response.criteria
-                },
-            }),
-        ),
+    # Required evidence contains a digest, never the potentially sensitive or
+    # prompt-injected proposal text itself.
+    from core.api.services.audit import log_audit
+
+    if not db.in_transaction:
+        await db.execute("BEGIN IMMEDIATE")
+    await log_audit(
+        db,
+        action="judge_proposal",
+        user=current_user.username,
+        resource_type="judge",
+        resource_id="cross_model",
+        details={
+            "raw_verdict": verdict_response.verdict,
+            "effective_verdict": effective_verdict,
+            "judge_mode": judge_mode,
+            "total_score": verdict_response.total_score,
+            "proposal_sha256": hashlib.sha256(
+                request.proposal.encode("utf-8")
+            ).hexdigest(),
+            "project": request.project,
+            "criteria_summary": {
+                c.name: c.score for c in verdict_response.criteria
+            },
+        },
+        workspace_id=current_user.workspace_id or "ws_default",
     )
     await db.commit()
 

@@ -15,8 +15,8 @@ Two responsibilities, both transport-thin:
    ``list`` output schema). See ``to_mcp_error`` below for why the returned-dict
    shape was abandoned (verified empirically: a returned dict is success DATA, not
    a protocol ``isError``).
-2. The single-user wiring the tools share: :data:`LOCAL_CTX` (the local operator
-   identity), :func:`dump` (DTO/dict normaliser), and the db acquire helpers
+2. Identity wiring: :data:`LOCAL_CTX` is restricted to trusted local stdio while
+   remote calls resolve a verified token; plus :func:`dump` and DB acquire helpers
    re-exported so ``tools/*.py`` import db access from one place.
 
 The ``ToolError`` import is local to :func:`raise_mcp_error` so the rest of the
@@ -26,13 +26,18 @@ installed (parity with ``server.py``'s function-local SDK import).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
+import re
+import time
 from collections.abc import Mapping
 from typing import Any, Literal, NoReturn
 
-from core.api.use_cases._context import CallerContext
-from core.api.use_cases._errors import ServiceError
+from core.api.use_cases._context import CallerContext, require_workspace_ctx
+from core.api.use_cases._errors import NotFoundError, ServiceError
+from core.api.use_cases._roles import map_sso_role
 
 logger = logging.getLogger(__name__)
 _TOOL_ERROR_RUNTIME: Literal["mcp", "fastmcp"] = "mcp"
@@ -62,47 +67,574 @@ def _env_flag(
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _default_user_id(*, username: str, user_type: str) -> str:
-    if user_type == "agent":
-        slug = username.removeprefix("agent:")
-        return f"usr_{slug}"
-    return username or "local"
-
-
 def _build_local_ctx_from_env(env: Mapping[str, str] | None = None) -> CallerContext:
-    """Build the process-wide MCP identity from env.
+    """Build the fixed local stdio agent identity.
 
-    Hosted/server MCP is agentic by default and must map to a real DB user id
-    (``usr_<slug>``), otherwise FK-backed user-scoped writes such as KG pins
-    fail at runtime. A local OSS install can still opt into the old single-user
-    human semantics with ``MARVIS_MCP_HUMAN_SESSION=1``.
+    ``env`` remains an accepted argument for backwards-compatible tests/callers,
+    but environment values never select a principal, role, workspace, reviewer,
+    or human authority. Remote transports resolve only verified access tokens.
     """
-    source = os.environ if env is None else env
-    is_human_session = _env_flag(
-        "MARVIS_MCP_HUMAN_SESSION", default=False, env=source
-    )
-    default_username = "local" if is_human_session else "marvisx"
-    default_user_type = "human" if is_human_session else "agent"
-    username = source.get("MARVIS_MCP_USERNAME", default_username)
-    user_type = source.get("MARVIS_MCP_USER_TYPE", default_user_type)
-    return CallerContext(
-        username=username,
-        system_role=source.get("MARVIS_MCP_SYSTEM_ROLE", "operator"),
-        user_type=user_type,
-        workspace_id=source.get("MARVIS_MCP_WORKSPACE_ID", "ws_default"),
-        is_human_session=is_human_session,
-        user_id=source.get(
-            "MARVIS_MCP_USER_ID",
-            _default_user_id(username=username, user_type=user_type),
-        ),
-    )
+    del env
+    return CallerContext.local_mcp_agent()
 
 
-# MCP calls are agentic by default, including stdio-over-SSH. Hosted/server MCP
-# keeps task approval in Console/Triage and uses the seeded agent user id for
-# FK-backed writes. Local OSS can opt into the old single-user human semantics
-# with MARVIS_MCP_HUMAN_SESSION=1.
+# Local stdio is agent-context inside the API. A same-account process can still
+# invoke the separately trusted CLI, so this is an authority classification, not
+# a cryptographic same-shell boundary. Remote HTTP calls never fall back to this
+# identity; they require the verified FastMCP access token.
 LOCAL_CTX: CallerContext = _build_local_ctx_from_env()
+_REMOTE_UNAUTHENTICATED_CTX = CallerContext(
+    username="unauthenticated",
+    system_role="viewer",
+    user_type="agent",
+    workspace_id="",
+    user_id="",
+)
+_MCP_TRANSPORT_MODE: Literal["stdio", "http"] | None = None
+
+
+def set_mcp_transport_mode(transport: Literal["stdio", "http"] | None) -> None:
+    """Select whether missing-token calls may use the trusted local principal."""
+    global _MCP_TRANSPORT_MODE
+    _MCP_TRANSPORT_MODE = transport
+
+
+def _no_token_mcp_context() -> CallerContext:
+    if _MCP_TRANSPORT_MODE == "http":
+        return _REMOTE_UNAUTHENTICATED_CTX
+    if _MCP_TRANSPORT_MODE == "stdio":
+        return LOCAL_CTX
+    raw_transport = os.environ.get("MARVIS_MCP_TRANSPORT", "stdio").strip().lower()
+    if raw_transport in {
+        "http",
+        "streamable-http",
+        "streamable_http",
+    }:
+        return _REMOTE_UNAUTHENTICATED_CTX
+    return LOCAL_CTX
+
+
+# Interactive AuthKit OAuth2 tokens carry only org_id/sub/sid — never a `role`
+# claim (empirically verified 2026-07-02: the authorization-code token omits
+# role/roles/permissions; only User Management password-grant tokens include
+# them). Without a fallback EVERY real browser/connector login would default to
+# viewer fleet-wide. When the claim is absent, honor the persisted
+# users.system_role (seeded by provisioning/add_user, by an admin, or by a prior
+# claim-bearing sync). This readonly, TTL-cached lookup keeps the sync identity
+# path off the async DB pool and out of the hot path; it can only RESTORE a role
+# the DB already recorded — never an escalation.
+_DB_ROLE_CACHE: dict[tuple[str, str], tuple[str | None, float]] = {}
+_DB_ROLE_TTL_SECONDS = 30.0
+
+
+def _db_system_role(user_id: str, workspace_id: str) -> str | None:
+    """Persisted ``users.system_role`` for an OAuth person, or None when unknown.
+
+    Readonly + TTL-cached so the sync identity path never blocks on or writes to
+    the DB. Fail-closed: any error or missing row yields None and the caller
+    keeps the viewer default.
+    """
+    if not user_id or user_id == "local" or not workspace_id:
+        return None
+    now = time.monotonic()
+    cache_key = (workspace_id, user_id)
+    cached = _DB_ROLE_CACHE.get(cache_key)
+    if cached is not None and cached[1] > now:
+        return cached[0]
+    role: str | None = None
+    db_path = os.environ.get("MARVIS_DB_PATH")
+    if db_path:
+        import sqlite3
+
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+            try:
+                cur = con.execute(
+                    "SELECT system_role FROM users"
+                    " WHERE id = ? AND workspace_id = ?"
+                    " AND deleted_at IS NULL LIMIT 1",
+                    (user_id, workspace_id),
+                )
+                row = cur.fetchone()
+            finally:
+                con.close()
+            role = str(row[0]) if row and row[0] else None
+            if role and role != "viewer":
+                logger.info(
+                    "oauth role: DB fallback %s -> %s (interactive token lacks role claim)",
+                    user_id,
+                    role,
+                )
+        except Exception:
+            logger.warning(
+                "current_mcp_context: DB role lookup failed for %s",
+                user_id,
+                exc_info=True,
+            )
+            role = None
+    _DB_ROLE_CACHE[cache_key] = (role, now + _DB_ROLE_TTL_SECONDS)
+    return role
+
+
+def _invalidate_db_role_cache(user_id: str, workspace_id: str) -> None:
+    """Drop a cached role so the next request re-reads a freshly-synced row."""
+    _DB_ROLE_CACHE.pop((workspace_id, user_id), None)
+
+
+def _authenticated_mcp_workspace(claims: Mapping[str, Any]) -> str:
+    """Resolve an exact remote workspace or reject ambiguous authentication."""
+    configured = os.environ.get("MARVIS_MCP_WORKSPACE_ID", "").strip()
+    raw_claim = claims.get("workspace_id")
+    claimed = str(raw_claim).strip() if raw_claim is not None else ""
+    if configured and claimed and configured != claimed:
+        raise RuntimeError(
+            "Authenticated MCP workspace claim does not match server configuration"
+        )
+    workspace_id = claimed or configured
+    if not workspace_id:
+        raise RuntimeError(
+            "MARVIS_MCP_WORKSPACE_ID is required for authenticated remote MCP calls"
+        )
+    return workspace_id
+
+
+def current_mcp_context() -> CallerContext:
+    """Resolve the current MCP caller when the transport exposes auth context.
+
+    Static tenant Bearer tokens remain tenant-admin/full-access by design. OAuth
+    tokens carry a person subject and are intentionally least-privilege here; the
+    access_grants predicate resolves their project access.
+    """
+    try:
+        from fastmcp.server.dependencies import get_access_token
+
+        access_token = get_access_token()
+    except Exception:
+        return _no_token_mcp_context()
+    if access_token is None:
+        return _no_token_mcp_context()
+
+    claims = getattr(access_token, "claims", None) or {}
+    client_id = getattr(access_token, "client_id", None) or claims.get("client_id")
+    scopes = tuple(getattr(access_token, "scopes", None) or claims.get("scopes") or ())
+    tenant_id = os.environ.get("TENANT_ID", "").strip()
+    workspace_id = _authenticated_mcp_workspace(claims)
+
+    # StaticTokenVerifier in server.py sets client_id to TENANT_ID and has no
+    # person claim. That token is the tenant admin break-glass/admin path.
+    if client_id and tenant_id and client_id == tenant_id and not claims.get("sub"):
+        return CallerContext(
+            username=f"{tenant_id}:static-bearer",
+            system_role="admin",
+            user_type="agent",
+            workspace_id=workspace_id,
+            scopes=scopes,
+            user_id=f"tenant:{tenant_id}",
+        )
+
+    subject = (
+        claims.get("sub")
+        or claims.get("email")
+        or claims.get("username")
+        or client_id
+        or "unauthenticated"
+    )
+    # Entra tokens carry the stable object id in `oid` — grants must anchor to
+    # it, not the rotating pairwise sub (IMPL §A.0c, security A2). No-op for
+    # WorkOS tokens (no oid claim).
+    user_id = str(claims.get("user_id") or claims.get("oid") or subject or "")
+    raw_role = _role_claim(claims)
+    system_role, role_known = map_sso_role(raw_role)
+    if raw_role is not None and not role_known:
+        logger.warning(
+            "unknown SSO role claim %r for OAuth subject %s; defaulting to viewer",
+            raw_role,
+            subject,
+        )
+    elif raw_role is None:
+        # Interactive AuthKit token: no role claim. Fall back to the persisted
+        # role so a real browser login is not silently downgraded to viewer.
+        db_role = _db_system_role(user_id, workspace_id)
+        if db_role:
+            system_role = db_role
+    # Entra client-credentials (M2M) tokens declare idtyp=app — that caller is
+    # an agent, not a person (IMPL §A.0c). No-op for WorkOS tokens.
+    is_app_token = claims.get("idtyp") == "app"
+    return CallerContext(
+        username=str(subject),
+        system_role=system_role,
+        user_type="agent" if is_app_token else "human",
+        workspace_id=workspace_id,
+        scopes=scopes,
+        user_id=user_id,
+        is_human_session=not is_app_token,
+    )
+
+
+def _role_claim(claims: Mapping[str, Any]) -> object:
+    raw = claims.get("role")
+    if raw is None:
+        roles = claims.get("roles")
+        if isinstance(roles, (list, tuple)) and roles:
+            return roles[0]
+    return raw
+
+
+def _oauth_claims() -> Mapping[str, Any] | None:
+    try:
+        from fastmcp.server.dependencies import get_access_token
+
+        access_token = get_access_token()
+    except Exception:
+        return None
+    if access_token is None:
+        return None
+    claims = getattr(access_token, "claims", None) or {}
+    # The static tenant bearer has no person subject — nothing to sync.
+    if not claims.get("sub"):
+        return None
+    return claims
+
+
+def oauth_user_sync_decision(
+    existing_role: str | None, raw_role: object
+) -> tuple[str, str] | None:
+    """Decide the users-row write for an OAuth person: (action, role) or None.
+
+    No write when the claim is absent/unknown (a defaulted "viewer" must never
+    overwrite a real role), when the row already matches, or when the existing
+    row is super_admin (never down-synced).
+    """
+    mapped, known = map_sso_role(raw_role)
+    if not known:
+        return None
+    if existing_role is None:
+        return ("insert", mapped)
+    if existing_role == "super_admin" or existing_role == mapped:
+        return None
+    return ("update", mapped)
+
+
+# One write per (user, role) per process lifetime; every other call is a
+# single read on the already-open handle.
+_SYNCED_OAUTH_USERS: dict[tuple[str, str], str] = {}
+
+
+async def _available_oauth_slug(
+    db,
+    *,
+    email: str | None,
+    user_id: str,
+    workspace_id: str,
+) -> str:
+    """Keep a readable email slug when free, otherwise bind it to tenant+user."""
+    local_part = email.split("@", 1)[0].lower() if email else ""
+    readable = re.sub(r"[^a-z0-9_-]+", "-", local_part).strip("-")[:50]
+    if readable:
+        cur = await db.execute("SELECT 1 FROM users WHERE slug = ?", (readable,))
+        if await cur.fetchone() is None:
+            return readable
+
+    fallback = "workos-" + hashlib.sha256(
+        f"{workspace_id}\0{user_id}".encode("utf-8")
+    ).hexdigest()[:16]
+    cur = await db.execute("SELECT 1 FROM users WHERE slug = ?", (fallback,))
+    if await cur.fetchone() is not None:
+        raise RuntimeError("OAuth user identity collides with an existing user")
+    return fallback
+
+
+async def sync_oauth_user(db, ctx: CallerContext) -> None:
+    """Display-only drift sync of the ``users`` row for an OAuth person."""
+    if not ctx.is_human_session or not ctx.user_id or ctx.user_id == "local":
+        return
+    claims = _oauth_claims()
+    if claims is None:
+        return
+    workspace_id = require_workspace_ctx(ctx)
+    raw_role = _role_claim(claims)
+    mapped, known = map_sso_role(raw_role)
+    if not known:
+        if raw_role is not None:
+            logger.warning(
+                "sync_oauth_user: unmapped role claim %r for %s — no write",
+                raw_role,
+                ctx.user_id,
+            )
+        return
+    cache_key = (workspace_id, ctx.user_id)
+    if _SYNCED_OAUTH_USERS.get(cache_key) == mapped:
+        return
+    try:
+        cur = await db.execute(
+            "SELECT system_role FROM users WHERE id = ? AND workspace_id = ?"
+            " AND deleted_at IS NULL LIMIT 1",
+            (ctx.user_id, workspace_id),
+        )
+        row = await cur.fetchone()
+    except Exception:
+        logger.warning(
+            "sync_oauth_user: users lookup failed for %s", ctx.user_id, exc_info=True
+        )
+        return
+    existing = str(row[0]) if row is not None else None
+    decision = oauth_user_sync_decision(existing, raw_role)
+    if decision is None:
+        _SYNCED_OAUTH_USERS[cache_key] = mapped
+        return
+    action, role = decision
+    email = claims.get("email") if isinstance(claims.get("email"), str) else None
+    display_name = str(claims.get("name") or email or ctx.username or ctx.user_id)
+    try:
+        async with acquire_write_db(label="mcp.sync_oauth_user") as wdb:
+            if action == "insert":
+                slug = await _available_oauth_slug(
+                    wdb,
+                    email=email,
+                    user_id=ctx.user_id,
+                    workspace_id=workspace_id,
+                )
+                await wdb.execute(
+                    "INSERT INTO users"
+                    " (id, slug, display_name, email, system_role, type,"
+                    " auth_provider, workspace_id)"
+                    " VALUES (?, ?, ?, ?, ?, 'human', 'workos', ?)",
+                    (ctx.user_id, slug, display_name, email, role, workspace_id),
+                )
+                cur = await wdb.execute(
+                    "SELECT id, workspace_id, slug, system_role FROM users"
+                    " WHERE id = ? AND workspace_id = ?"
+                    " AND deleted_at IS NULL LIMIT 1",
+                    (ctx.user_id, workspace_id),
+                )
+                persisted = await cur.fetchone()
+                if persisted is None or tuple(persisted) != (
+                    ctx.user_id,
+                    workspace_id,
+                    slug,
+                    role,
+                ):
+                    raise RuntimeError("OAuth user was not persisted exactly")
+            else:
+                await wdb.execute(
+                    "UPDATE users SET system_role = ?,"
+                    " updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+                    " WHERE id = ? AND workspace_id = ?"
+                    " AND system_role != 'super_admin'",
+                    (role, ctx.user_id, workspace_id),
+                )
+            await wdb.commit()
+        _SYNCED_OAUTH_USERS[cache_key] = mapped
+        _invalidate_db_role_cache(ctx.user_id, workspace_id)
+        logger.info(
+            "sync_oauth_user: %s system_role -> %s (was %s)",
+            ctx.user_id,
+            role,
+            existing,
+        )
+    except Exception:
+        logger.warning(
+            "sync_oauth_user: upsert failed for %s — role stays per-request",
+            ctx.user_id,
+            exc_info=True,
+        )
+
+
+NO_GRANTS_CODE = "no_project_grants"
+NO_GRANTS_MESSAGE = (
+    "Nessun progetto ti è stato concesso su questo tenant — chiedi a un admin "
+    "del tenant un grant di progetto (grant_access) o l'aggiunta a un team."
+)
+
+
+def no_grants_notice(visible_projects: set[str] | None) -> dict[str, str] | None:
+    """Keys to merge into a dict-shaped tool response at zero visibility."""
+    if visible_projects is not None and not visible_projects:
+        return {"notice": NO_GRANTS_CODE, "message": NO_GRANTS_MESSAGE}
+    return None
+
+
+def require_any_grant(visible_projects: set[str] | None) -> None:
+    """List-shaped tools have a fixed output schema: zero visibility raises an
+    actionable error instead of returning a mute empty list."""
+    if visible_projects is not None and not visible_projects:
+        raise ServiceError(code=NO_GRANTS_CODE, message=NO_GRANTS_MESSAGE)
+
+
+def person_user_id(ctx: CallerContext | None = None) -> str | None:
+    """The DB ``users.id`` of the current caller IFF it is a real person, else None.
+
+    Notifications and their notices are per-PERSON (``users.id``). The static tenant
+    Bearer (``user_id='tenant:<id>'``, ``user_type='agent'``), non-person agents, and
+    the stdio ``local``/seeded identity have no personal notification inbox — this
+    guard returns None for all of them so the notices/list/ack surface is simply
+    empty (never an error, never someone else's rows). Shared by the notifications
+    use_case (effective user) and ``attach_notices`` (F4: bearer -> field absent).
+    """
+    resolved = ctx or current_mcp_context()
+    if getattr(resolved, "user_type", None) != "human":
+        return None
+    uid = (getattr(resolved, "user_id", "") or "").strip()
+    if not uid or uid == "local" or uid.startswith("tenant:"):
+        return None
+    return uid
+
+
+async def current_visible_projects(db, ctx: CallerContext | None = None):
+    from core.api.services import access_grants
+
+    resolved = ctx or current_mcp_context()
+    # Chokepoint shared by every visibility-aware tool: keep the person's
+    # users row in sync (drift-only; never blocks the read path).
+    await sync_oauth_user(db, resolved)
+    return await access_grants.visible_projects_for_actor(db, resolved)
+
+
+async def require_unambiguous_visible_project(
+    db,
+    ctx: CallerContext,
+    project_slug: str,
+    visible_projects: set[str] | None,
+) -> None:
+    """Deny remote slug-backed files unless one workspace owns the visible slug.
+
+    Disk-backed project artifacts have no ``workspace_id`` column. Trusted local
+    stdio keeps its single-user filesystem contract; every remote caller must
+    carry an exact workspace, have the slug in its resolved grants, and be the
+    sole owner recorded in ``workspace_projects``. Missing/old schema and shared
+    slugs fail closed without revealing the competing workspace.
+    """
+    if ctx.is_local_os_account:
+        return
+    project = (project_slug or "").strip()
+    if visible_projects is None or project not in visible_projects:
+        raise NotFoundError(code="project_not_found", message="Project not found")
+    from core.api.services.access_grants import require_unique_project_for_actor
+
+    await require_unique_project_for_actor(db, ctx, project)
+
+
+_UNSET_VISIBLE = object()
+
+
+async def attach_notices(
+    db,
+    response,
+    ctx: CallerContext | None = None,
+    *,
+    visible_projects=_UNSET_VISIBLE,
+    project: str | None = None,
+    task: str | None = None,
+):
+    """Merge a ``notices`` summary into a dict-shaped entry-tool response (F4).
+
+    ASYNC on the tool's OWN connection — the entry tools already hold an
+    ``acquire_db()`` handle, so this never opens a (blocking) sync connection.
+    Absent for a bearer/agent caller (no personal inbox, via ``person_user_id``)
+    and absent when nothing actionable is unread, so a caller pays zero token tax
+    when there is nothing to close. Read-time visibility filtered (a revoked-grant
+    project and company-scope brain never even enter the counter). Best-effort: any
+    error omits ``notices`` rather than breaking the entry tool.
+    """
+    if not isinstance(response, dict):
+        return response
+    resolved = ctx or current_mcp_context()
+    uid = person_user_id(resolved)
+    if not uid:
+        return response
+    try:
+        vis = (
+            await current_visible_projects(db, resolved)
+            if visible_projects is _UNSET_VISIBLE
+            else visible_projects
+        )
+        from core.api.use_cases.notifications import count_unread_notices
+
+        counts = await count_unread_notices(
+            resolved,
+            db,
+            effective_user_id=uid,
+            visible_projects=vis,
+            project=project,
+            task=task,
+        )
+    except Exception:  # noqa: BLE001 — notices is additive; never break the tool
+        logger.debug("attach_notices: count failed; omitting notices", exc_info=True)
+        return response
+
+    # F2 onboarding nudge: computed from user_onboarding state (not a
+    # notification row). Aggregated (one kind), surfaced on the cold-start
+    # entries (task is None: session_brief / get_project), never on get_task.
+    onb = None
+    if task is None:
+        try:
+            from core.api.use_cases.onboarding_wizard import onboarding_pending
+
+            onb = await onboarding_pending(
+                db, workspace_id=resolved.workspace_id, user_id=uid
+            )
+        except Exception:  # noqa: BLE001 - additive; never break the tool
+            logger.debug("attach_notices: onboarding count failed; omitting", exc_info=True)
+            onb = None
+
+    kinds = dict(counts)
+    notif_total = sum(counts.values())
+    show_onb = bool(onb) and onb.get("actionable", 0) > 0
+    if show_onb:
+        kinds["onboarding"] = 1
+    total = notif_total + (1 if show_onb else 0)
+    if total <= 0:
+        return response
+
+    hint_parts: list[str] = []
+    if notif_total > 0:
+        hint_parts.append(
+            f"hai {notif_total} cosa/e aperta/e → list_notifications per vederle, "
+            "ack_notification per archiviarle"
+        )
+    if show_onb:
+        hint_parts.append(
+            f"il tutorial non è finito ({onb['remaining']}/{onb['total']}) → "
+            "onboarding_status per riprenderlo, "
+            "onboarding_answer(step_key='all', action='skip') per chiuderlo"
+        )
+    response["notices"] = {
+        "unread": total,
+        "kinds": kinds,
+        "hint": "da Marvis: " + "; ".join(hint_parts) + "; oppure ignora.",
+    }
+    return response
+
+
+def current_user_info(ctx: CallerContext | None = None):
+    """Adapt the resolved MCP caller to a ``UserInfo`` for the brain use_cases.
+
+    The brain read/write use_cases resolve visibility through a ``UserInfo``
+    (``get_visible_projects`` is duck-typed on system_role/user_type/user_id/
+    workspace_id/scopes), whereas the other tool groups pass a pre-resolved
+    ``visible_projects`` set. This is the "ctx -> UserInfo" adapter the brain
+    RBAC fix (2026-07-03) needs.
+
+    Admin / super_admin — and the static tenant bearer, which resolves to
+    ``system_role='admin'`` — return ``None``: the brain services treat
+    ``user is None`` as "no visibility restriction", so the admin/bearer path
+    stays byte-identical to today (no new query, unrestricted). Every other
+    caller (operator/viewer, OAuth person or non-admin agent) gets a real
+    ``UserInfo`` so the services filter by their visible projects.
+    """
+    from core.api.models import UserInfo
+
+    resolved = ctx or current_mcp_context()
+    if resolved.system_role in ("admin", "super_admin"):
+        return None
+    return UserInfo(
+        username=resolved.username,
+        user_id=resolved.user_id,
+        system_role=resolved.system_role,
+        user_type=resolved.user_type,
+        workspace_id=resolved.workspace_id,
+        scopes=list(getattr(resolved, "scopes", ()) or ()),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +853,11 @@ def raise_mcp_error(err: ServiceError) -> NoReturn:
     else:
         from mcp.server.fastmcp.exceptions import ToolError
 
-    raise ToolError(f"{err.code}: {err.message}")
+    suffix = ""
+    if err.context:
+        context = json.dumps(err.context, sort_keys=True, separators=(",", ":"))
+        suffix = f" | {context}"
+    raise ToolError(f"{err.code}: {err.message}{suffix}")
 
 
 def dump(result: Any) -> Any:

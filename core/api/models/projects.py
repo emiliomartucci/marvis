@@ -104,6 +104,10 @@ class ProjectCreateRequest(BaseModel):
     description: str | None = Field(None, max_length=500)
     type: ProjectType = "work"
     scope: str | None = Field(None, max_length=50)
+    owner: str | None = Field(
+        None, max_length=200,
+        description="Optional project-admin identity when a service caller creates on behalf of a person (RBAC F2.6)",
+    )
 
 
 class ProjectCreateResponse(BaseModel):

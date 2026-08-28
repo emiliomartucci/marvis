@@ -576,7 +576,6 @@ def _build_transcript_summary_prompt(
             "duration",
             "chunked",
             "chunk_count",
-            "heypocket",
         }
     }
     excerpt = redact(

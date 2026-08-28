@@ -47,15 +47,12 @@ from core.api.models.brain import (
     MyelinEffect,
     OperationType,
     ProposedWrite,
-    ProposedWriteTarget,
     ScopeTypeL4,
 )
 from core.api.services.brain.compound_bridge import (
-    DEFAULT_TARGET_FOR_OP,
     build_proposed_write_doc_patch,
     build_proposed_write_kg_edge_metric,
     build_proposed_write_task,
-    proposed_write_none,
 )
 from core.api.services.brain.edge_metrics import compute_reinforce_score
 from core.api.visibility import get_visible_projects
@@ -639,10 +636,13 @@ async def _m4_supersede(snapshot: OpSnapshot, *, run_id: str, now: datetime) -> 
 
 async def _m5_provenance(snapshot: OpSnapshot, *, run_id: str, now: datetime) -> list[OperationDraft]:
     """M5 provenance hardening: drift signals on knowledge_form='tribal_memory'
-    or 'unknown' propose a task to attach proper provenance."""
+    propose a task to attach proper provenance. 'unknown' is deliberately
+    excluded: it is the classifier's default for nearly every signal, so
+    including it emits one boilerplate op per signal per cycle with nothing
+    actionable (audit 2026-08-03: only op type ever generated, zero approved)."""
     drafts: list[OperationDraft] = []
     for sig in snapshot.drift_signals:
-        if sig.knowledge_form not in ("tribal_memory", "unknown"):
+        if sig.knowledge_form != "tribal_memory":
             continue
         scope_type, scope_key = sig.scope_type, sig.scope_key  # type: ignore[assignment]
         if scope_type not in ("company", "program", "project", "artifact"):
@@ -753,6 +753,16 @@ async def _m7_contradiction(snapshot: OpSnapshot, *, run_id: str, now: datetime)
         ordered = sorted(members, key=lambda s: s.signal_id)
         first, second = ordered[0], ordered[1]
         if first.observed_direction_ref == second.observed_direction_ref:
+            continue
+        # Suppression (task 01752f08, audit 2026-08-05): two `decision_without_adr`
+        # signals in the same scope are two independently-undocumented decisions,
+        # NOT a mutual contradiction — pairing them fabricated the backlog's
+        # `contradiction_detected` ops. A real contradiction needs conflicting
+        # decisions on the SAME artifact, which the substrate does not yet carry.
+        if (
+            first.signal_type == "decision_without_adr"
+            and second.signal_type == "decision_without_adr"
+        ):
             continue
         if scope_type not in ("company", "program", "project", "artifact"):
             scope_type_lit: ScopeTypeL4 = "company"
@@ -1213,8 +1223,9 @@ async def _resolve_run(
     if run_id:
         row = await (
             await db.execute(
-                "SELECT run_id, cycle_key FROM brain_runs WHERE run_id = ?",
-                (run_id,),
+                "SELECT run_id, cycle_key FROM brain_runs "
+                "WHERE run_id = ? AND workspace_id = ?",
+                (run_id, workspace_id),
             )
         ).fetchone()
         if row is None:
@@ -1391,8 +1402,10 @@ async def fetch_single_operation(
         db.row_factory = aiosqlite.Row
         row = await (
             await db.execute(
-                "SELECT * FROM brain_memory_operations WHERE operation_id = ?",
-                (operation_id,),
+                "SELECT o.* FROM brain_memory_operations o "
+                "JOIN brain_runs r ON r.run_id = o.run_id "
+                "WHERE o.operation_id = ? AND r.workspace_id = ?",
+                (operation_id, workspace_id),
             )
         ).fetchone()
         if row is None:

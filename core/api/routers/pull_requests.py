@@ -7,13 +7,11 @@ error-translation logic lives in :mod:`core.api.use_cases.pull_requests` (pure,
 fastapi-free). Each handler resolves identity into a :class:`CallerContext`, calls
 the use_case inside ``try/except`` -> ``to_http``, and owns the transport concerns.
 
-MERGE HUMAN-GATE — kept at the ``Depends`` layer. ``POST /{task_id}/merge`` and
-``/{task_id}/revert`` keep ``Depends(require_role(..., human_only=True))``.
-``human_only=True`` swaps the auth dependency to cookie-only ``get_current_user``,
-so a Bearer-only agent is rejected with ``401 Not authenticated`` upstream of the
-handler (pinned by the merge-gate regression test ``test_br03_merge_pr_blocked_without_cookie``).
-A use_case receiving a ``ctx`` cannot reproduce that 401, so the gate is NOT moved
-into the domain — it stays exactly where it fires today.
+MERGE/REVERT HUMAN-GATE — enforced twice. ``POST /{task_id}/merge`` and
+``/{task_id}/revert`` keep ``Depends(require_role(..., human_only=True))`` for
+early HTTP rejection. The use case also verifies a validated human session or a
+persisted, active, bounded delegation, so direct/internal callers cannot bypass
+the gate with a constructed ``CallerContext``.
 
 ERROR BOUNDARIES kept in the adapter (legacy body parity):
   * ``MergeConflictError`` (raised inside ``pr_service`` -> propagates through the
@@ -54,7 +52,7 @@ from core.api.rbac import require_role
 from core.api.routers._adapter import to_http
 from core.api.security import get_current_user_or_agent, require_any_auth
 from core.api.services.kg.audit import check_deep_rate_limit, log_kg_deep_access
-from core.api.services.kg.lens import build_kg_context_for_pr
+from core.api.services.kg.lens import build_kg_context_for_pr, require_kg_visibility
 from core.api.use_cases import pull_requests as uc
 from core.api.use_cases._context import CallerContext
 from core.api.use_cases._errors import ServiceError
@@ -164,9 +162,17 @@ async def get_pull_request(
     db: aiosqlite.Connection = Depends(get_db),
 ):
     """Get PR status and diff for a task."""
+    visible_projects = await get_visible_projects(db, user)
     ctx = CallerContext.from_user_info(user, is_human_session=False)
     try:
-        result = await uc.get_pull_request(ctx, db, task_id=task_id)
+        if deep:
+            require_kg_visibility(ctx, visible_projects)
+        result = await uc.get_pull_request(
+            ctx,
+            db,
+            task_id=task_id,
+            visible_projects=visible_projects,
+        )
     except ServiceError as e:
         raise to_http(e)
 
@@ -174,7 +180,13 @@ async def get_pull_request(
     if deep:
         check_deep_rate_limit(user.username)
         log_kg_deep_access(user.username, "get_pull_request", task_id)
-        result["kg_context"] = await build_kg_context_for_pr(db, task_id, deep=True)
+        result["kg_context"] = await build_kg_context_for_pr(
+            db,
+            task_id,
+            deep=True,
+            ctx=ctx,
+            visible_projects=visible_projects,
+        )
     return result
 
 
@@ -203,10 +215,10 @@ async def merge_pull_request(
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin", human_only=True)),
     db: aiosqlite.Connection = Depends(get_write_db),
 ):
-    """Merge PR. Human operator+ authorization required (no agent tokens).
+    """Merge PR. Human operator+ or bounded delegated-agent authority required.
 
-    The human-only gate is the ``human_only=True`` dependency above (cookie-only
-    auth) — it fires upstream of this handler and is NOT duplicated in the use_case.
+    The dependency rejects early; the use case independently verifies persisted
+    human/delegated authority for direct and internal callers.
     """
     ctx = CallerContext.from_user_info(user, is_human_session=True)
     try:
@@ -302,7 +314,7 @@ async def revert_pull_request(
     db: aiosqlite.Connection = Depends(get_write_db),
 ):
     """Revert a merged PR. Creates a new task + new PR with git revert commit.
-    Human operator+ authorization required (cookie-only ``human_only`` dependency)."""
+    Requires human operator+ or bounded delegated-agent authority."""
     ctx = CallerContext.from_user_info(user, is_human_session=True)
     try:
         return await uc.revert_pull_request(ctx, db, task_id=task_id)

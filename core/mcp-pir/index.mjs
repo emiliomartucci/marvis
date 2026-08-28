@@ -300,7 +300,7 @@ server.tool("create_task",
 );
 
 server.tool("update_task",
-  "Mutate an existing Marvis task (status, priority, description, tags, ICE-D, completion_mode).\n\nQUANDO USARLO: transizioni di stato lungo il lifecycle dopo approval (approved -> in_progress -> review -> completed) o rifinitura scoring/description dopo creazione.\nQUANDO NON USARLO: NOT per creare un nuovo task -> usa create_task. NOT per delete permanente -> usa delete_task. NOT per approvare: update_task(status='approved') e' BLOCCATO; usa approve_task per il flusso hosted/MCP.\nRESTITUISCE: task record aggiornato {id, title, status, ...}.",
+  "Mutate an existing Marvis task (status, priority, description, tags, ICE-D, completion_mode).\n\nQUANDO USARLO: transizioni di stato lungo il lifecycle dopo approval (approved -> in_progress -> review -> completed) o rifinitura scoring/description dopo creazione.\nQUANDO NON USARLO: NOT per creare un nuovo task -> usa create_task. NOT per delete permanente -> usa delete_task. NOT per approvare: update_task(status='approved') e' BLOCCATO; usa approve_task per il flusso hosted/MCP.\nCONFLITTO CAS: se passi expected_updated_at e il task e' cambiato nel frattempo, la mutation fallisce con 409 task_version_conflict (body con status/updated_at correnti): rileggi il task e riprova.\nRESTITUISCE: task record aggiornato {id, title, status, ...}.",
   {
     id: z.string().min(1).meta({
       description: "Task UUID",
@@ -324,6 +324,10 @@ server.tool("update_task",
     }),
     completion_mode: z.enum(["pr", "doc", "none"]).optional().meta({
       description: "Change completion mode: pr | doc | none",
+    }),
+    expected_updated_at: z.string().min(1).max(64).optional().meta({
+      description: "Optional mutation version from the last task read (compare-and-set). A stale value returns 409 task_version_conflict with the current status/updated_at; refresh and retry",
+      examples: ["2026-08-27T09:00:00Z"],
     }),
   },
   async ({ id, ...u }) => {
@@ -395,7 +399,7 @@ server.tool("get_handoff",
 // --- Semantic Search ---
 
 server.tool("search",
-  "MEANING-first discovery across tasks, projects, files, handoffs, learnings, inbox and audits.\n\nQUANDO USARLO: discovery per significato, cross-project o concettuale quando non sai l'artefatto esatto.\nQUANDO NON USARLO: ID/slug noto -> get_task/get_project/get_handoff; filtri esatti -> list_tasks/list_handoffs.\nRESTITUISCE: buckets ranked + span evidence; usa span_text prima di aprire file.",
+  "MEANING-first discovery across tasks, projects, files, handoffs, learnings, inbox and audits.\n\nQUANDO USARLO: discovery per significato, cross-project o concettuale quando non sai l'artefatto esatto.\nQUANDO NON USARLO: ID/slug noto -> get_task/get_project/get_handoff; filtri esatti -> list_tasks/list_handoffs.\nPROVA: buckets ranked con span evidence, non stato completo.\nNEXT: apri l'artefatto esatto con get_*/read_file dopo aver scelto il match.\nRESTITUISCE: buckets ranked (tasks/projects/files/handoffs/learnings/inbox_items/audits), ogni hit con doc_id (usato da memory_feedback) + span evidence; usa span_text prima di aprire file. Con reinforcement mode shadow/on e risultati non vuoti, il payload include il campo suggested_next_tool (nudge memory_feedback).",
   {
     q: z.string().min(1).max(500).meta({
       description: "Natural language search query",
@@ -534,68 +538,6 @@ server.tool("get_billing",
   async ({ slug }) => json(await get(`/api/v1/costs/billing/${encodeURIComponent(slug)}`))
 );
 
-// --- Pull Requests ---
-
-server.tool("create_branch",
-  "Atomic create branch + worktree + draft PR (orchestrator-managed).\n\nQUANDO USARLO: hai un task approved/in_progress e ti serve un worktree isolato per iniziare a lavorare. Un'unica call crea branch `feat/task-{uuid}`, worktree in `~/dev/task-{uuid}`, e draft PR row in Marvis. Preferisci su `git worktree add` manuale + register_branch (2-step flow).\nQUANDO NON USARLO: NOT se il worktree esiste gia' (creato manualmente o fuori orchestrator) -> usa register_branch per attaccarlo al task. NOT se il task non e' ancora approved -> il backend risponde 400.\nRESTITUISCE: {task_id, branch_name, worktree_path, status:'draft'} idempotent.",
-  {
-    task_id: z.string().min(1).meta({
-      description: "Task UUID to create branch+worktree for (task must be approved or in_progress)",
-    }),
-  },
-  async ({ task_id }) =>
-    json(await post(`/api/v1/pull_requests/${encodeURIComponent(task_id)}/branch`, {}))
-);
-
-server.tool("register_branch",
-  "Attach an existing git branch/worktree to a task as draft PR record (idempotent).\n\nQUANDO USARLO: il worktree e' stato creato manualmente via `git worktree add` o fuori orchestrator, e serve la PR row Marvis per poter chiamare submit_pr dopo. BOUNDARY: register_branch crea draft; submit_pr promuove draft -> open per review.\nQUANDO NON USARLO: NOT quando vuoi che Marvis crei il worktree per te -> usa endpoint HTTP /api/v1/pull_requests/{task_id}/branch. NOT dopo submit -> il record e' gia' open.\nRESTITUISCE: {task_id, branch_name, worktree_path, status:'draft'} idempotent.",
-  {
-    task_id: z.string().min(1).meta({
-      description: "Task UUID (must be in_progress)",
-    }),
-    branch_name: z.string().min(1).meta({
-      description: "Git branch name",
-      examples: ["feat/task-76c63a9a-..."],
-    }),
-    worktree_path: z.string().optional().meta({
-      description: "Absolute path to worktree directory",
-    }),
-  },
-  async ({ task_id, branch_name, worktree_path }) =>
-    json(await post(`/api/v1/pull_requests/${task_id}/register`, { branch_name, worktree_path }))
-);
-
-server.tool("submit_pr",
-  "Promote a draft PR to open for review (draft -> open, task in_progress -> review).\n\nQUANDO USARLO: SOLO dopo tutti i commit pushati e test_command + build pass locally (Quality Gate 9.3). BOUNDARY: register_branch crea draft; submit_pr promuove draft -> open per review. Poi chiudi il ciclo via approve_pr/request_pr_changes/merge_pr/revert_pr MCP — l'agent NON chiama gh pr merge (Constitution Rule 3).\nQUANDO NON USARLO: NOT senza aver verificato che test + build passano. NOT se il lavoro e' abbandonato -> usa close_pr.\nRESTITUISCE: {pr_status:'open', task_status:'review', submitted_at}.",
-  {
-    task_id: z.string().min(1).meta({
-      description: "Task UUID with an active draft PR",
-    }),
-    title: z.string().min(1).meta({
-      description: "PR title",
-    }),
-    body: z.string().optional().default("").meta({
-      description: "PR description (markdown)",
-    }),
-  },
-  async ({ task_id, title, body }) =>
-    json(await post(`/api/v1/pull_requests/${task_id}/submit`, { title, body }))
-);
-
-server.tool("get_pr",
-  "Get current PR state for a task (status, branch, worktree, review_feedback, commit SHAs).\n\nQUANDO USARLO: verificare 'is my PR still open?' prima di continuare il lavoro, o leggere review_feedback dopo PR rimandato indietro. Usa ?deep=true per includere kg_context inline — risparmia 2-3 tool call aggiuntivi.\nQUANDO NON USARLO: NOT per PR state di piu' task in una call -> usa list_tasks (contiene pr_state).\nRESTITUISCE: {pr_status, branch, worktree_path, review_feedback?, commit_shas[], merged_at?} + kg_context se deep=true.",
-  {
-    task_id: z.string().min(1).meta({
-      description: "Task UUID",
-    }),
-    deep: z.boolean().optional().meta({ description: "Include inline KG context bundle (default true on MCP)" }),
-  },
-  async ({ task_id, deep }) => {
-    const d = effectiveDeep(deep);
-    return json(await get(`/api/v1/pull_requests/${task_id}?deep=${d}`));
-  }
-);
-
 server.tool("triage_docs_change",
   "Run docs governance triage for a proposed docs change and return the deterministic PR label suggestion.\n\nQUANDO USARLO: agent vuole sapere quale label `triage:*` applicare a una diff docs-governance senza shellare il bot GitHub Actions.\nQUANDO NON USARLO: NOT per applicare label su GitHub — questo tool calcola solo la decisione; il workflow o l'operatore applica la label.\nRESTITUISCE: DocsGovernanceTriage payload con pr_label, score, confidence e hard_gates.",
   {
@@ -616,21 +558,6 @@ server.tool("triage_docs_change",
     json(await post("/api/v1/docs_governance/triage", { diff_text, layer, change_type, context }))
 );
 
-server.tool("close_pr",
-  "Abandon a PR without merging (close record + unlink branch).\n\nQUANDO USARLO: il lavoro non serve piu' o deve essere redone da zero (task di solito va in rejected/failed).\nQUANDO NON USARLO: NOT quando il lavoro e' pronto per review -> usa submit_pr. NOT per failure del task (usa update_task status='failed' in parallelo).\nRESTITUISCE: {pr_status:'closed', closed_reason, closed_at}.",
-  {
-    task_id: z.string().min(1).meta({
-      description: "Task UUID",
-    }),
-    reason: z.string().optional().meta({
-      description: "Reason for closing",
-      examples: ["superseded by task X", "approach invalidated"],
-    }),
-  },
-  async ({ task_id, reason }) =>
-    json(await post(`/api/v1/pull_requests/${task_id}/close`, { reason }))
-);
-
 // --- Super-session delegations (Constitution v2.0 Rule 6) ---
 
 server.tool("grant_super_session",
@@ -645,17 +572,6 @@ server.tool("grant_super_session",
   },
   async ({ proof_token, ttl }) =>
     json(await post(`/api/v1/delegations`, { proof_token, ttl }))
-);
-
-server.tool("merge_pr",
-  "Merge an OPEN PR into main (draft -> open via submit_pr first). HUMAN-GATED endpoint: works ONLY while an active super-session grant exists for THIS agent identity (Constitution v2.0 Rule 6) — without a grant the server returns 401/403, exactly as before. This is the MCP surface for EXERCISING a grant: use it instead of hand-rolling a raw HTTP merge script.\n\nQUANDO USARLO: hai un grant super-session attivo (creato con grant_super_session) e un PR gia' OPEN (chiama submit_pr prima se e' ancora draft), il lavoro e' rivisto e i test passano. Catena tipica: create_branch -> commit -> submit_pr -> merge_pr.\nQUANDO NON USARLO: MAI senza grant attivo (fallisce 403, e merge su main e' Constitution Rule 3 human-only); NOT su un PR draft -> usa prima submit_pr; per abbandonare il lavoro -> usa close_pr.\nRESTITUISCE: esito merge dell'API (merge commit + stato task->completed) oppure errore di dominio (409 merge conflict con conflicting_files, 422 no active PR).",
-  {
-    task_id: z.string().min(1).meta({
-      description: "Task UUID whose open PR should be merged into main",
-    }),
-  },
-  async ({ task_id }) =>
-    json(await post(`/api/v1/pull_requests/${task_id}/merge`, {}))
 );
 
 // --- Learnings ---
@@ -1094,46 +1010,6 @@ server.tool("get_monitoring",
   "Live snapshot of MarvisX-01 server health (CPU, memory, disk, systemd services).\n\nQUANDO USARLO: un deploy potrebbe aver rotto qualcosa, o 'is the server healthy right now?'.\nQUANDO NON USARLO: NOT per metriche storiche o time-series -> Grafana/Prometheus diretto. Questo e' point-in-time.\nRESTITUISCE: {cpu_pct, memory:{used,total}, disk:{used,total}, services:[{name,state}]}.",
   {},
   async () => json(await get("/api/v1/monitoring/current"))
-);
-
-// --- Automations (n8n) ---
-
-server.tool("list_automations",
-  "List n8n workflows registered in MarvisX (id, name, active flag) via Marvis proxy.\n\nQUANDO USARLO: scoprire quale workflow_id passare a trigger_automation.\nQUANDO NON USARLO: NOT per run history -> usa list_executions.\nRESTITUISCE: list of {workflow_id, name, active, updated_at}.",
-  {},
-  async () => json(await get("/api/v1/automations"))
-);
-
-server.tool("trigger_automation",
-  "Fire an n8n workflow manually with optional input data.\n\nQUANDO USARLO: un umano chiede esplicitamente di runnare una specifica automation, o un workflow schedulato deve girare out-of-band. Admin-only; side effects reali (email, Airtable, telegram).\nQUANDO NON USARLO: NOT per verificare una run passata -> usa list_executions invece di re-trigger. NOT senza conferma umana (side effects).\nRESTITUISCE: {execution_id, started_at, workflow_id} — poi polla via list_executions.",
-  {
-    workflow_id: z.string().min(1).meta({
-      description: "n8n workflow ID (alphanumeric)",
-    }),
-    data: z.record(z.string(), z.string()).optional().meta({
-      description: "Optional input data for the workflow (key-value strings)",
-    }),
-  },
-  async ({ workflow_id, data }) =>
-    json(await post(`/api/v1/automations/${encodeURIComponent(workflow_id)}/trigger`, { data }))
-);
-
-server.tool("list_executions",
-  "Recent n8n workflow execution records filtered by workflow_id or status.\n\nQUANDO USARLO: debug 'did that cron run?' o 'why did the workflow fail last night?'.\nQUANDO NON USARLO: NOT per workflow catalog -> usa list_automations.\nRESTITUISCE: list of {execution_id, workflow_id, status, started_at, ended_at, error_message?}.",
-  {
-    workflow_id: z.string().optional().meta({
-      description: "Filter by workflow ID",
-    }),
-    status: z.string().optional().meta({
-      description: "Filter by status",
-      examples: ["success", "error", "running"],
-    }),
-    limit: z.number().int().min(1).max(100).optional().default(20).meta({
-      description: "Max results (1-100)",
-    }),
-  },
-  async ({ workflow_id, status, limit }) =>
-    json(await get(`/api/v1/automations/executions${qs({ workflow_id, status, limit })}`))
 );
 
 // --- Finder (share) ---

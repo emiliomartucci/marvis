@@ -34,7 +34,7 @@ import struct
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 logger = logging.getLogger("marvisx.index_source")
 

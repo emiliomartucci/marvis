@@ -17,7 +17,13 @@ from typing import Literal
 
 from watchfiles import Change, DefaultFilter, awatch
 
-from core.api.db import acquire_write_db, close_pool, init_pool
+from core.api.db import acquire_db, acquire_write_db, close_pool, init_pool
+from core.api.security import is_local_single_user_mode
+from core.api.services.access_grants import (
+    ProjectWorkspaceOwnershipError,
+    require_unique_project_workspace,
+    resolve_unique_project_workspace,
+)
 from core.api.services.ingest.events import broadcast_ingest_changed
 from core.api.services.ingest.parser_router import detect_mime, parse_pending
 from core.api.services.ingest.skip_log import log_skip
@@ -180,12 +186,15 @@ EnqueueOutcome = Literal["fresh", "reactivated", "dedup", "invalid"]
 async def enqueue_file(
     path: Path,
     *,
+    workspace_id: str,
     projects_root: Path = PROJECTS_ROOT,
     source_kind: str = "file_drop",
     api_key_id: str | None = None,
     source: str | None = None,
     ingest_policy: str | None = None,
     metadata: dict | None = None,
+    allow_local_single_user: bool = False,
+    resolve_project_owner: bool = False,
 ) -> tuple[str | None, EnqueueOutcome]:
     """Enqueue a file into ingest_pending or audit-skip on collision.
 
@@ -200,12 +209,16 @@ async def enqueue_file(
     governance columns; owner-surface callers (the FS watcher, multipart upload)
     leave them None.
     """
+    workspace_id = workspace_id.strip()
+    if not workspace_id:
+        raise ValueError("workspace_id is required for ingest enqueue")
     if source_kind not in {
         "file_drop",
         "manual_upload",
         "api_upload",
         "terminal_upload",
         "api_ingress",
+        "webhook_ingress",
     }:
         raise ValueError(f"Unsupported ingest source kind: {source_kind}")
     parsed = _project_and_path(path, projects_root)
@@ -214,6 +227,26 @@ async def enqueue_file(
     project_slug, resolved = parsed
     if not resolved.exists() or not resolved.is_file():
         return None, "invalid"
+
+    # Authenticated callers require exact ownership. The filesystem watcher has
+    # no caller context, so it explicitly resolves the slug's sole owner instead
+    # of assigning every observed file to ws_default. Both paths quarantine
+    # unowned/ambiguous remote slugs before hashing attacker-selected bytes.
+    async with acquire_db() as ownership_db:
+        if resolve_project_owner:
+            workspace_id = await resolve_unique_project_workspace(
+                ownership_db,
+                project_slug=project_slug,
+                local_workspace_id=workspace_id,
+                allow_local_single_user=allow_local_single_user,
+            )
+        else:
+            await require_unique_project_workspace(
+                ownership_db,
+                project_slug=project_slug,
+                workspace_id=workspace_id,
+                allow_local_single_user=allow_local_single_user,
+            )
 
     ingest_id = str(uuid.uuid4())
     digest = _sha256(resolved)
@@ -224,18 +257,25 @@ async def enqueue_file(
     existing_status: str | None = None
     dedup_reason = "dedup_sha256"
     async with acquire_write_db() as db:
+        await require_unique_project_workspace(
+            db,
+            project_slug=project_slug,
+            workspace_id=workspace_id,
+            allow_local_single_user=allow_local_single_user,
+        )
         placeholders = ", ".join("?" for _ in PATH_DEDUP_STATUSES)
         async with db.execute(
             """
             SELECT id, status, source_kind, file_path, sha256
               FROM ingest_pending
-             WHERE project_slug = ?
+             WHERE workspace_id = ?
+               AND project_slug = ?
                AND file_path = ?
                AND status IN (""" + placeholders + """)
              ORDER BY created_at ASC
              LIMIT 1
             """,
-            (project_slug, str(resolved), *PATH_DEDUP_STATUSES),
+            (workspace_id, project_slug, str(resolved), *PATH_DEDUP_STATUSES),
         ) as cursor:
             row = await cursor.fetchone()
 
@@ -257,21 +297,23 @@ async def enqueue_file(
                            mime_type = ?,
                            updated_at = datetime('now')
                      WHERE id = ?
+                       AND workspace_id = ?
                     """,
-                    (digest, stat.st_size, mime_type, existing_id),
+                    (digest, stat.st_size, mime_type, existing_id, workspace_id),
                 )
         else:
             await db.execute(
                 """
                 INSERT OR IGNORE INTO ingest_pending
-                    (id, file_path, sha256, project_slug, source_kind, mime_type,
+                    (id, workspace_id, file_path, sha256, project_slug, source_kind, mime_type,
                      file_size_bytes, status, created_at, updated_at,
                      api_key_id, source, ingest_policy, ingress_metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', datetime('now'), datetime('now'),
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', datetime('now'), datetime('now'),
                         ?, ?, ?, ?)
                 """,
                 (
                     ingest_id,
+                    workspace_id,
                     str(resolved),
                     digest,
                     project_slug,
@@ -287,11 +329,12 @@ async def enqueue_file(
             async with db.execute(
                 """
                 SELECT id, status, source_kind, file_path
-                  FROM ingest_pending
-                 WHERE sha256 = ?
+                 FROM ingest_pending
+                 WHERE workspace_id = ?
+                   AND sha256 = ?
                    AND project_slug = ?
                 """,
-                (digest, project_slug),
+                (workspace_id, digest, project_slug),
             ) as cursor:
                 row = await cursor.fetchone()
 
@@ -318,8 +361,16 @@ async def enqueue_file(
                        source_kind = ?,
                        updated_at = datetime('now')
                  WHERE id = ?
+                   AND workspace_id = ?
                 """,
-                (str(resolved), stat.st_size, mime_type, source_kind, existing_id),
+                (
+                    str(resolved),
+                    stat.st_size,
+                    mime_type,
+                    source_kind,
+                    existing_id,
+                    workspace_id,
+                ),
             )
             reactivated = True
         elif (
@@ -339,8 +390,9 @@ async def enqueue_file(
                        mime_type = ?,
                        updated_at = datetime('now')
                  WHERE id = ?
+                   AND workspace_id = ?
                 """,
-                (digest, stat.st_size, mime_type, existing_id),
+                (digest, stat.st_size, mime_type, existing_id, workspace_id),
             )
         await db.commit()
         inserted_id = existing_id
@@ -357,11 +409,12 @@ async def enqueue_file(
     if fresh or reactivated:
         await broadcast_ingest_changed(
             "queued",
+            workspace_id=workspace_id,
             ingest_id=inserted_id,
             project_slug=project_slug,
             status="queued",
         )
-        asyncio.create_task(parse_pending(inserted_id))
+        asyncio.create_task(parse_pending(inserted_id, workspace_id))
     elif inserted_id is not None:
         # UX-6: silent dedup against an existing non-rejected row. Log to
         # ingest_skipped so the frontend "Ignorati" sidebar surfaces it
@@ -369,6 +422,7 @@ async def enqueue_file(
         async with acquire_write_db() as db:
             await log_skip(
                 db,
+                workspace_id=workspace_id,
                 file_path_attempted=str(resolved),
                 project_slug=project_slug,
                 reason="dedup_sha256",
@@ -386,7 +440,13 @@ async def _heartbeat_loop(notifier) -> None:
             notifier.notify("WATCHDOG=1")
 
 
-async def _watch_loop(projects_root: Path, stop_event: asyncio.Event) -> None:
+async def _watch_loop(
+    projects_root: Path,
+    stop_event: asyncio.Event,
+    *,
+    workspace_id: str,
+    allow_local_single_user: bool = False,
+) -> None:
     roots = _watch_roots(projects_root)
     if not roots:
         logger.warning("no ingest input directories found under %s", projects_root)
@@ -413,7 +473,13 @@ async def _watch_loop(projects_root: Path, stop_event: asyncio.Event) -> None:
             try:
                 path = Path(path_str)
                 if await _wait_for_stable_file(path):
-                    await enqueue_file(path, projects_root=projects_root)
+                    await enqueue_file(
+                        path,
+                        workspace_id=workspace_id,
+                        projects_root=projects_root,
+                        allow_local_single_user=allow_local_single_user,
+                        resolve_project_owner=True,
+                    )
             except Exception:
                 logger.exception("failed to enqueue changed file: %s", path_str)
 
@@ -484,9 +550,11 @@ def _scan_roots(
 async def _scan_existing(
     projects_root: Path,
     *,
+    workspace_id: str,
     project_slugs: Iterable[str] = (),
     scan_paths: Iterable[Path] = (),
     max_files: int = DEFAULT_SCAN_MAX_FILES,
+    allow_local_single_user: bool = False,
 ) -> int:
     if max_files < 1:
         raise ValueError("scan max files must be >= 1")
@@ -502,7 +570,13 @@ async def _scan_existing(
                 continue
             seen.add(resolved)
             try:
-                await enqueue_file(resolved, projects_root=projects_root)
+                await enqueue_file(
+                    resolved,
+                    workspace_id=workspace_id,
+                    projects_root=projects_root,
+                    allow_local_single_user=allow_local_single_user,
+                    resolve_project_owner=True,
+                )
             except Exception:
                 logger.exception("failed to enqueue existing file: %s", resolved)
             attempted += 1
@@ -522,6 +596,14 @@ def _positive_int(raw: str) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Marvis file ingest watcher")
     parser.add_argument("--projects-root", default=str(PROJECTS_ROOT))
+    parser.add_argument(
+        "--workspace-id",
+        default=os.environ.get("MARVIS_MCP_WORKSPACE_ID", "ws_default"),
+        help=(
+            "Local single-user fallback identity. Remote rows derive their "
+            "workspace from the slug's unique workspace_projects owner."
+        ),
+    )
     parser.add_argument(
         "--scan-on-start",
         action="store_true",
@@ -570,6 +652,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--scan-only requires --scan-on-start")
     if args.scan_on_start and not (args.scan_project or args.scan_path):
         parser.error("--scan-on-start requires --scan-project or --scan-path")
+    if not args.workspace_id.strip():
+        parser.error("--workspace-id must be non-empty")
     return args
 
 
@@ -581,6 +665,9 @@ async def _async_main(args: argparse.Namespace) -> int:
         return 2
 
     await init_pool()
+    allow_local_single_user = (
+        args.workspace_id.strip() == "ws_default" and is_local_single_user_mode()
+    )
     notifier = sdnotify.SystemdNotifier() if sdnotify else None
     if notifier is not None:
         notifier.notify(f"READY=1\nSTATUS=watching {projects_root}")
@@ -599,21 +686,46 @@ async def _async_main(args: argparse.Namespace) -> int:
         if args.scan_on_start:
             scanned = await _scan_existing(
                 projects_root,
+                workspace_id=args.workspace_id,
                 project_slugs=args.scan_project,
                 scan_paths=args.scan_path,
                 max_files=args.scan_max_files,
+                allow_local_single_user=allow_local_single_user,
             )
             logger.info("bounded startup scan attempted %s file(s)", scanned)
             if args.scan_only:
                 return 0
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(_watch_loop(projects_root, stop_event), name="watch_loop")
-            tg.create_task(_heartbeat_loop(notifier), name="heartbeat_loop")
-            await stop_event.wait()
-            for task in tg._tasks:
+        watch_task = asyncio.create_task(
+            _watch_loop(
+                projects_root,
+                stop_event,
+                workspace_id=args.workspace_id,
+                allow_local_single_user=allow_local_single_user,
+            ),
+            name="watch_loop",
+        )
+        heartbeat_task = asyncio.create_task(
+            _heartbeat_loop(notifier), name="heartbeat_loop"
+        )
+        stop_task = asyncio.create_task(stop_event.wait(), name="stop_wait")
+        service_tasks = (watch_task, heartbeat_task)
+        try:
+            done, _pending = await asyncio.wait(
+                (*service_tasks, stop_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                if task is not stop_task:
+                    await task
+        finally:
+            stop_task.cancel()
+            for task in service_tasks:
                 task.cancel()
-    except* asyncio.CancelledError:
-        pass
+            await asyncio.gather(
+                stop_task,
+                *service_tasks,
+                return_exceptions=True,
+            )
     finally:
         if notifier is not None:
             notifier.notify("STOPPING=1")

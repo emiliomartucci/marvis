@@ -46,12 +46,12 @@ passes the resolved Path (or a resolver bound to it) into the use_case.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
 import tempfile
-import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Literal
 
 import aiofiles
 import aiosqlite
@@ -73,11 +73,12 @@ from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from core.api.db import get_db, get_write_db, write_db
+from core.api.db import acquire_db, get_db, get_write_db, write_db
 from core.api.models import IngestIngressResponse, IngestJsonPayload, UserInfo
 from core.api.rate_limit import limiter
 from core.api.rbac import require_role
 from core.api.routers._adapter import to_http
+from core.api.routers._browser_mutation_denial import agent_only_route
 from core.api.services.ingest.api_key_auth import IngestKeyContext, require_ingest_key
 from core.api.services.ingest.dispatch import IngestProvenance, dispatch_files_batched
 from core.api.services.ingest.events import broadcast_ingest_changed
@@ -89,20 +90,29 @@ from core.api.services.ingest.ingress import (
     check_and_increment_quota,
     check_and_increment_rate,
     claim_idempotency,
+    claim_webhook_nonce,
     decode_json_content,
     finalize_idempotency,
+    parse_webhook_headers,
     json_request_fingerprint,
     multipart_request_fingerprint,
     release_idempotency,
     seconds_to_midnight_utc,
     seconds_to_next_minute,
+    verify_webhook_signature,
+    webhook_project_scope,
+    webhook_workspace_id,
 )
 from core.api.services.ingest.insert_saga import execute_saga
 from core.api.services.ingest.parser_router import parse_pending
 from core.api.services.ingest.parsers.zip_unpacker import ZipContainerError, safe_extract_zip
 from core.api.services.ingest.skip_log import SkipReason, log_skip
+from core.api.services.ingest.watcher import (
+    ProjectWorkspaceOwnershipError,
+    require_unique_project_workspace,
+)
 from core.api.use_cases import ingest_triage as uc
-from core.api.use_cases._context import CallerContext
+from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import ServiceError
 from core.api.visibility import check_project_access, get_visible_projects
 
@@ -140,7 +150,7 @@ router = APIRouter(prefix="/api/v1/ingest", tags=["ingest"])
 # can ``monkeypatch.setattr(ingest_router, "PROJECTS_ROOT", tmp_path)``. The
 # adapter resolves project roots against this value and passes the resolved Path
 # (or a resolver bound to it) into the use_case, keeping the patch seam intact.
-PROJECTS_ROOT = Path("/data/projects").resolve()
+PROJECTS_ROOT = Path(os.environ.get("MARVIS_PROJECTS_ROOT") or os.environ.get("WORKSPACE_ROOT") or "/data/projects").resolve()
 INGEST_UPLOAD_TMP = Path("/tmp/pir-ingest-uploads")
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 MAX_CONTAINER_UPLOAD_BYTES = 512 * 1024 * 1024
@@ -186,6 +196,23 @@ def _ctx(user: UserInfo, *, is_human_session: bool = False) -> CallerContext:
     return CallerContext.from_user_info(user, is_human_session=is_human_session)
 
 
+async def _require_ingest_project_owner(
+    db: aiosqlite.Connection,
+    *,
+    project_slug: str,
+    workspace_id: str,
+) -> None:
+    """Map the shared exact-owner gate to a non-enumerating HTTP 404."""
+    try:
+        await require_unique_project_workspace(
+            db,
+            project_slug=project_slug,
+            workspace_id=workspace_id,
+        )
+    except ProjectWorkspaceOwnershipError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
 # ---------------------------------------------------------------------------
 # Adapter helpers — slug / path guards (bespoke dict bodies, pinned by tests)
 # ---------------------------------------------------------------------------
@@ -204,7 +231,7 @@ def _row_current_path(row: aiosqlite.Row) -> Path:
     return Path(row["file_path"]).resolve()
 
 
-def _project_input_root(project_slug: str) -> Path:
+def _validate_project_slug_format(project_slug: str) -> None:
     # H-D16 — slug regex whitelist (defense in depth before path resolution).
     if not _PROJECT_SLUG_RE.fullmatch(project_slug):
         raise HTTPException(
@@ -216,6 +243,10 @@ def _project_input_root(project_slug: str) -> Path:
                 ),
             },
         )
+
+
+def _project_input_root(project_slug: str) -> Path:
+    _validate_project_slug_format(project_slug)
     project_root = _project_root(project_slug)
     # Containment check — even with regex, refuse anything that escapes
     # PROJECTS_ROOT after symlink resolution.
@@ -275,8 +306,10 @@ async def _visible_row(
     ingest_id: str,
     user: UserInfo,
 ) -> aiosqlite.Row:
+    workspace_id = require_workspace_ctx(_ctx(user))
     async with db.execute(
-        "SELECT * FROM ingest_pending WHERE id = ?", (ingest_id,)
+        "SELECT * FROM ingest_pending WHERE workspace_id = ? AND id = ?",
+        (workspace_id, ingest_id),
     ) as cursor:
         row = await cursor.fetchone()
     if row is None:
@@ -373,14 +406,24 @@ async def _save_upload_to_path(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/upload-folder", response_model=IngestUploadResponse)
+@agent_only_route(router, "/upload-folder", methods=["POST"], response_model=IngestUploadResponse)
 async def upload_ingest_folder(
     project_slug: str = Form(...),
     files: list[UploadFile] = File(...),
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
     db: aiosqlite.Connection = Depends(get_db),
 ) -> IngestUploadResponse:
+    # Syntax is not project-existence evidence and is safe to reject before
+    # visibility.  Valid slugs still pass the 404 access gate before any
+    # filesystem existence check.
+    _validate_project_slug_format(project_slug)
     await check_project_access(project_slug, user, db)
+    workspace_id = require_workspace_ctx(_ctx(user))
+    await _require_ingest_project_owner(
+        db,
+        project_slug=project_slug,
+        workspace_id=workspace_id,
+    )
     input_root = _project_input_root(project_slug)
 
     saved_paths: list[Path] = []
@@ -441,6 +484,7 @@ async def upload_ingest_folder(
             for path, reason, error_message in pending_skip_logs:
                 await log_skip(
                     skip_db,
+                    workspace_id=workspace_id,
                     file_path_attempted=path,
                     project_slug=project_slug,
                     reason=reason,
@@ -450,6 +494,7 @@ async def upload_ingest_folder(
 
     dispatch = await dispatch_files_batched(
         saved_paths,
+        workspace_id=workspace_id,
         projects_root=PROJECTS_ROOT,
         source_kind="manual_upload",
     )
@@ -467,6 +512,104 @@ async def upload_ingest_folder(
         ],
     )
 
+
+
+
+async def handle_signed_webhook_request(request: Request) -> IngestIngressResponse:
+    """Signed webhook ingress for trusted C&I sources (U8)."""
+    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(status_code=400, detail="Content-Type must be application/json.")
+
+    try:
+        webhook_source, timestamp, nonce, signature = parse_webhook_headers(request.headers)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    clen = request.headers.get("content-length")
+    if clen and clen.isdigit() and int(clen) > MAX_JSON_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="JSON body too large.")
+    raw = await request.body()
+    if len(raw) > MAX_JSON_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="JSON body too large.")
+
+    try:
+        workspace_id = webhook_workspace_id()
+        request_sha256 = verify_webhook_signature(raw, timestamp=timestamp, signature=signature)
+    except ServiceError as exc:
+        raise to_http(exc)
+    claimed = await claim_webhook_nonce(
+        workspace_id,
+        webhook_source,
+        nonce,
+        request_sha256,
+    )
+    if not claimed:
+        raise HTTPException(status_code=409, detail="Webhook nonce was already used.")
+
+    try:
+        payload = IngestJsonPayload.model_validate_json(raw)
+    except PydanticValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON payload: {exc.errors()}")
+
+    allowed_projects = webhook_project_scope()
+    if not allowed_projects:
+        raise HTTPException(status_code=401, detail="Webhook project scope is not configured.")
+    if payload.project not in allowed_projects:
+        raise HTTPException(status_code=422, detail="Project is not in this webhook's scope.")
+
+    async with acquire_db() as owner_db:
+        await _require_ingest_project_owner(
+            owner_db,
+            project_slug=payload.project,
+            workspace_id=workspace_id,
+        )
+
+    try:
+        data, filename = decode_json_content(payload.content)
+    except ServiceError as exc:
+        raise to_http(exc)
+
+    input_root = _project_input_root(payload.project)
+    relative_path = _safe_upload_relative_path(filename)
+    if relative_path is None:
+        raise HTTPException(status_code=422, detail="content.filename is unsafe (path traversal / absolute path).")
+    target = _available_target(input_root, relative_path)
+    if target is None:
+        raise HTTPException(status_code=422, detail="content.filename is invalid.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    async with aiofiles.open(target, "wb") as f:
+        await f.write(data)
+
+    source = payload.source or webhook_source
+    provenance = IngestProvenance(
+        source_kind="webhook_ingress",
+        api_key_id=None,
+        source=source,
+        ingest_policy="trusted",
+        metadata=payload.metadata,
+    )
+    dispatch = await dispatch_files_batched(
+        [target],
+        workspace_id=workspace_id,
+        projects_root=PROJECTS_ROOT,
+        provenance=provenance,
+    )
+    return IngestIngressResponse(
+        project=payload.project,
+        source=source,
+        policy="trusted",
+        dry_run=False,
+        would_route="awaiting_triage",
+        queued_items=dispatch.queued_count,
+        dedup_items=len(dispatch.dedup_files),
+        skipped_items=0,
+    )
+
+
+@router.post("/webhook", response_model=IngestIngressResponse, status_code=202)
+async def ingest_signed_webhook(request: Request) -> IngestIngressResponse:
+    return await handle_signed_webhook_request(request)
 
 @router.post("", response_model=IngestIngressResponse)
 @limiter.limit("120/minute")
@@ -542,6 +685,12 @@ async def ingest_unified(
             status_code=403,
             detail="Project not in this key's scope.",
         )
+
+    await _require_ingest_project_owner(
+        db,
+        project_slug=project,
+        workspace_id=ctx.workspace_id,
+    )
 
     policy = ctx.ingest_policy
 
@@ -662,6 +811,7 @@ async def ingest_unified(
         )
         dispatch = await dispatch_files_batched(
             saved_paths,
+            workspace_id=ctx.workspace_id,
             projects_root=PROJECTS_ROOT,
             provenance=provenance,
         )
@@ -689,14 +839,21 @@ async def ingest_unified(
         raise
 
 
-@router.post("/upload-zip", response_model=IngestUploadResponse)
+@agent_only_route(router, "/upload-zip", methods=["POST"], response_model=IngestUploadResponse)
 async def upload_ingest_zip(
     project_slug: str = Form(...),
     archive: UploadFile = File(...),
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
     db: aiosqlite.Connection = Depends(get_db),
 ) -> IngestUploadResponse:
+    _validate_project_slug_format(project_slug)
     await check_project_access(project_slug, user, db)
+    workspace_id = require_workspace_ctx(_ctx(user))
+    await _require_ingest_project_owner(
+        db,
+        project_slug=project_slug,
+        workspace_id=workspace_id,
+    )
     input_root = _project_input_root(project_slug)
     archive_name = PurePosixPath(
         (archive.filename or "upload.zip").replace("\\", "/")
@@ -735,6 +892,7 @@ async def upload_ingest_zip(
 
         dispatch = await dispatch_files_batched(
             saved_paths,
+            workspace_id=workspace_id,
             projects_root=PROJECTS_ROOT,
             source_kind="manual_upload",
         )
@@ -888,7 +1046,7 @@ async def preflight_ingest(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/pending/{ingest_id}/parse", response_model=IngestDecisionResponse)
+@agent_only_route(router, "/pending/{ingest_id}/parse", methods=["POST"], response_model=IngestDecisionResponse)
 async def retry_parse_ingest(
     ingest_id: str,
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
@@ -901,11 +1059,11 @@ async def retry_parse_ingest(
         )
     except ServiceError as err:
         raise _to_http(err)
-    asyncio.create_task(parse_pending(ingest_id))
+    asyncio.create_task(parse_pending(ingest_id, user.workspace_id))
     return result
 
 
-@router.post("/pending/{ingest_id}/approve", response_model=IngestDecisionResponse)
+@agent_only_route(router, "/pending/{ingest_id}/approve", methods=["POST"], response_model=IngestDecisionResponse)
 async def approve_ingest(
     ingest_id: str,
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
@@ -918,9 +1076,10 @@ async def approve_ingest(
         )
     except ServiceError as err:
         raise _to_http(err)
-    asyncio.create_task(execute_saga(ingest_id))
+    asyncio.create_task(execute_saga(ingest_id, user.workspace_id))
     await broadcast_ingest_changed(
         "approved",
+        workspace_id=user.workspace_id,
         ingest_id=ingest_id,
         project_slug=project_slug,
         status="approved",
@@ -928,7 +1087,7 @@ async def approve_ingest(
     return result
 
 
-@router.post("/pending/{ingest_id}/reject", response_model=IngestDecisionResponse)
+@agent_only_route(router, "/pending/{ingest_id}/reject", methods=["POST"], response_model=IngestDecisionResponse)
 async def reject_ingest(
     ingest_id: str,
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
@@ -943,6 +1102,7 @@ async def reject_ingest(
         raise _to_http(err)
     await broadcast_ingest_changed(
         "rejected",
+        workspace_id=user.workspace_id,
         ingest_id=ingest_id,
         project_slug=project_slug,
         status="rejected",
@@ -950,7 +1110,7 @@ async def reject_ingest(
     return result
 
 
-@router.delete("/pending/{ingest_id}", status_code=204)
+@agent_only_route(router, "/pending/{ingest_id}", methods=["DELETE"], status_code=204)
 async def delete_ingest(
     ingest_id: str,
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
@@ -979,6 +1139,7 @@ async def delete_ingest(
         raise _to_http(err)
     await broadcast_ingest_changed(
         "deleted",
+        workspace_id=user.workspace_id,
         ingest_id=ingest_id,
         project_slug=project_slug,
         status="deleted",
@@ -986,7 +1147,7 @@ async def delete_ingest(
     return Response(status_code=204)
 
 
-@router.patch("/pending/{ingest_id}", response_model=IngestPendingItem)
+@agent_only_route(router, "/pending/{ingest_id}", methods=["PATCH"], response_model=IngestPendingItem)
 async def patch_ingest_pending(
     ingest_id: str,
     patch: IngestPendingPatch,
@@ -1080,6 +1241,7 @@ async def patch_ingest_pending(
     # fires after the move + DB writes commit, never on a failed patch).
     await broadcast_ingest_changed(
         "changed",
+        workspace_id=user.workspace_id,
         ingest_id=ingest_id,
         project_slug=new_slug,
         extra={"changes": ["project_slug"]},
@@ -1092,8 +1254,11 @@ async def patch_ingest_pending(
 # E5 Haiku/LLM hooks return 501 today and become functional after E5 deploy.
 
 
-@router.post(
-    "/pending/{ingest_id}/classify-force", response_model=IngestDecisionResponse
+@agent_only_route(
+    router,
+    "/pending/{ingest_id}/classify-force",
+    methods=["POST"],
+    response_model=IngestDecisionResponse,
 )
 async def classify_force_ingest(
     ingest_id: str,
@@ -1113,11 +1278,11 @@ async def classify_force_ingest(
         )
     except ServiceError as err:
         raise _to_http(err)
-    asyncio.create_task(parse_pending(ingest_id))
+    asyncio.create_task(parse_pending(ingest_id, user.workspace_id))
     return result
 
 
-@router.post("/pending/{ingest_id}/reparse", response_model=IngestDecisionResponse)
+@agent_only_route(router, "/pending/{ingest_id}/reparse", methods=["POST"], response_model=IngestDecisionResponse)
 async def reparse_single(
     ingest_id: str,
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
@@ -1135,7 +1300,7 @@ async def reparse_single(
         )
     except ServiceError as err:
         raise _to_http(err)
-    asyncio.create_task(parse_pending(ingest_id))
+    asyncio.create_task(parse_pending(ingest_id, user.workspace_id))
     return result
 
 
@@ -1143,7 +1308,7 @@ class IngestReparseBatchBody(BaseModel):
     status: Literal["parse_error"] = "parse_error"
 
 
-@router.post("/reparse-batch", response_model=IngestReparseBatchResponse)
+@agent_only_route(router, "/reparse-batch", methods=["POST"], response_model=IngestReparseBatchResponse)
 async def reparse_batch(
     body: IngestReparseBatchBody,
     user: UserInfo = Depends(require_role("admin", "super_admin")),
@@ -1166,11 +1331,11 @@ async def reparse_batch(
     except ServiceError as err:
         raise _to_http(err)
     for ingest_id in ids:
-        asyncio.create_task(parse_pending(ingest_id))
+        asyncio.create_task(parse_pending(ingest_id, user.workspace_id))
     return result
 
 
-@router.post("/pending/{ingest_id}/write-frontmatter")
+@agent_only_route(router, "/pending/{ingest_id}/write-frontmatter", methods=["POST"])
 async def write_frontmatter_placeholder(
     ingest_id: str,
     user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),

@@ -32,11 +32,14 @@ _repo_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 _background_tasks: set[asyncio.Task] = set()
 
 
-async def _get_task(db: aiosqlite.Connection, task_id: str) -> aiosqlite.Row:
+async def _get_task(
+    db: aiosqlite.Connection, task_id: str, workspace_id: str
+) -> aiosqlite.Row:
     """Fetch task or raise ValueError."""
     cursor = await db.execute(
-        "SELECT id, status, project FROM tasks WHERE id = ? AND deleted_at IS NULL",
-        (task_id,),
+        "SELECT id, status, project, title, workspace_id, updated_at FROM tasks "
+        "WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL",
+        (task_id, workspace_id),
     )
     row = await cursor.fetchone()
     if not row:
@@ -85,23 +88,25 @@ def _resolve_register_worktree_path(
 
 
 async def _get_active_pr(
-    db: aiosqlite.Connection, task_id: str
+    db: aiosqlite.Connection, task_id: str, workspace_id: str
 ) -> aiosqlite.Row | None:
     """Get active PR (draft/open/merging) for a task."""
     cursor = await db.execute(
-        "SELECT * FROM pull_requests WHERE task_id = ? AND status IN ('draft', 'open', 'merging')",
-        (task_id,),
+        "SELECT * FROM pull_requests WHERE task_id = ? AND workspace_id = ? "
+        "AND status IN ('draft', 'open', 'merging')",
+        (task_id, workspace_id),
     )
     return await cursor.fetchone()
 
 
 async def _get_pr_by_task(
-    db: aiosqlite.Connection, task_id: str
+    db: aiosqlite.Connection, task_id: str, workspace_id: str
 ) -> aiosqlite.Row | None:
     """Get most recent PR for a task (any status)."""
     cursor = await db.execute(
-        "SELECT * FROM pull_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
-        (task_id,),
+        "SELECT * FROM pull_requests WHERE task_id = ? AND workspace_id = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (task_id, workspace_id),
     )
     return await cursor.fetchone()
 
@@ -157,6 +162,10 @@ def _pr_row_to_dict(row: aiosqlite.Row) -> dict:
         "created_at": row["created_at"],
     }
     try:
+        d["workspace_id"] = row["workspace_id"]
+    except (IndexError, KeyError):
+        d["workspace_id"] = None
+    try:
         d["commit_sha"] = row["commit_sha"]
     except (IndexError, KeyError):
         d["commit_sha"] = None
@@ -197,7 +206,9 @@ def _is_missing_pr_branch_error(exc: Exception) -> bool:
     return message.startswith("Branch '") and message.endswith("' not found")
 
 
-async def get_merge_conflicts(project: str, db: aiosqlite.Connection) -> list[dict]:
+async def get_merge_conflicts(
+    project: str, db: aiosqlite.Connection, *, workspace_id: str
+) -> list[dict]:
     """Detect migration number conflicts across open PRs for a project.
 
     Returns list of conflict groups, each with migration_number and ordered tasks.
@@ -205,8 +216,9 @@ async def get_merge_conflicts(project: str, db: aiosqlite.Connection) -> list[di
     """
     cursor = await db.execute(
         "SELECT task_id, branch, target, created_at FROM pull_requests "
-        "WHERE project = ? AND status = 'open' ORDER BY created_at ASC",
-        (project,),
+        "WHERE project = ? AND workspace_id = ? AND status = 'open' "
+        "ORDER BY created_at ASC",
+        (project, workspace_id),
     )
     rows = await cursor.fetchall()
 
@@ -319,10 +331,14 @@ async def _check_main_in_sync(repo_path: str) -> None:
 
 
 async def start_branch(
-    task_id: str, db: aiosqlite.Connection, base_branch: str = "main"
+    task_id: str,
+    db: aiosqlite.Connection,
+    base_branch: str = "main",
+    *,
+    workspace_id: str,
 ) -> dict:
     """Create worktree and PR record. Idempotent."""
-    task = await _get_task(db, task_id)
+    task = await _get_task(db, task_id, workspace_id)
 
     if task["status"] != "in_progress":
         raise ValueError(
@@ -333,7 +349,7 @@ async def start_branch(
     repo_path = await _get_repo_path(db, project)
 
     # Check for existing active PR
-    existing = await _get_active_pr(db, task_id)
+    existing = await _get_active_pr(db, task_id, workspace_id)
     if existing:
         return {
             **_pr_row_to_dict(existing),
@@ -349,8 +365,9 @@ async def start_branch(
     # Insert PR record
     pr_id = str(uuid.uuid4())
     await db.execute(
-        """INSERT INTO pull_requests (id, task_id, project, branch, target, status, worktree_path)
-           VALUES (?, ?, ?, ?, ?, 'draft', ?)""",
+        """INSERT INTO pull_requests
+           (id, task_id, project, branch, target, status, worktree_path, workspace_id)
+           VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)""",
         (
             pr_id,
             task_id,
@@ -358,6 +375,7 @@ async def start_branch(
             wt_info["branch_name"],
             base_branch,
             wt_info["worktree_path"],
+            workspace_id,
         ),
     )
     await db.commit()
@@ -382,10 +400,14 @@ async def start_branch(
 
 
 async def start_branch_short_write(
-    task_id: str, db: aiosqlite.Connection, base_branch: str = "main"
+    task_id: str,
+    db: aiosqlite.Connection,
+    base_branch: str = "main",
+    *,
+    workspace_id: str,
 ) -> dict:
     """Create worktree without holding the SQLite writer during git I/O."""
-    task = await _get_task(db, task_id)
+    task = await _get_task(db, task_id, workspace_id)
 
     if task["status"] != "in_progress":
         raise ValueError(
@@ -395,7 +417,7 @@ async def start_branch_short_write(
     project = task["project"]
     repo_path = await _get_repo_path(db, project)
 
-    existing = await _get_active_pr(db, task_id)
+    existing = await _get_active_pr(db, task_id, workspace_id)
     if existing:
         return {
             **_pr_row_to_dict(existing),
@@ -409,20 +431,21 @@ async def start_branch_short_write(
 
     pr_id = str(uuid.uuid4())
     async with write_db(label="pr.start_branch.record") as wdb:
-        task = await _get_task(wdb, task_id)
+        task = await _get_task(wdb, task_id, workspace_id)
         if task["status"] != "in_progress":
             raise ValueError(
                 f"Task must be in_progress to start branch (current: {task['status']})"
             )
-        existing = await _get_active_pr(wdb, task_id)
+        existing = await _get_active_pr(wdb, task_id, workspace_id)
         if existing:
             return {
                 **_pr_row_to_dict(existing),
                 "already_existed": True,
             }
         await wdb.execute(
-            """INSERT INTO pull_requests (id, task_id, project, branch, target, status, worktree_path)
-               VALUES (?, ?, ?, ?, ?, 'draft', ?)""",
+            """INSERT INTO pull_requests
+               (id, task_id, project, branch, target, status, worktree_path, workspace_id)
+               VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)""",
             (
                 pr_id,
                 task_id,
@@ -430,6 +453,7 @@ async def start_branch_short_write(
                 wt_info["branch_name"],
                 base_branch,
                 wt_info["worktree_path"],
+                workspace_id,
             ),
         )
 
@@ -457,13 +481,15 @@ async def register_branch(
     branch_name: str,
     db: aiosqlite.Connection,
     worktree_path: str | None = None,
+    *,
+    workspace_id: str,
 ) -> dict:
     """Register an externally-created branch/worktree as a draft PR record.
 
     Used when an agent creates a worktree directly via git (not via /branch endpoint).
     Idempotent: returns existing active PR if one exists for the task.
     """
-    task = await _get_task(db, task_id)
+    task = await _get_task(db, task_id, workspace_id)
 
     if task["status"] != "in_progress":
         raise ValueError(
@@ -472,7 +498,7 @@ async def register_branch(
 
     project = task["project"]
     # Check for existing active PR — idempotent
-    existing = await _get_active_pr(db, task_id)
+    existing = await _get_active_pr(db, task_id, workspace_id)
     if existing:
         return {
             **_pr_row_to_dict(existing),
@@ -491,10 +517,19 @@ async def register_branch(
     await db.execute(
         """
         INSERT INTO pull_requests
-            (id, task_id, project, branch, target, status, worktree_path, created_at)
-        VALUES (?, ?, ?, ?, 'main', 'draft', ?, ?)
+            (id, task_id, project, branch, target, status, worktree_path, created_at,
+             workspace_id)
+        VALUES (?, ?, ?, ?, 'main', 'draft', ?, ?, ?)
         """,
-        (pr_id, task_id, project, branch_name, resolved_worktree_path, now),
+        (
+            pr_id,
+            task_id,
+            project,
+            branch_name,
+            resolved_worktree_path,
+            now,
+            workspace_id,
+        ),
     )
     await db.commit()
 
@@ -520,9 +555,11 @@ async def submit_pr(
     body: str,
     db: aiosqlite.Connection,
     submitted_by: str | None = None,
+    *,
+    workspace_id: str,
 ) -> dict:
     """Validate and move PR from draft to open. Calculate diff."""
-    pr = await _get_active_pr(db, task_id)
+    pr = await _get_active_pr(db, task_id, workspace_id)
     if not pr:
         raise ValueError(f"No active PR for task {task_id}")
     if pr["status"] not in ("draft", "open"):
@@ -530,7 +567,7 @@ async def submit_pr(
             f"PR must be in draft or open to submit (current: {pr['status']})"
         )
 
-    task = await _get_task(db, task_id)
+    task = await _get_task(db, task_id, workspace_id)
     repo_path = await _get_repo_path(db, task["project"])
 
     # Calculate diff before starting transaction (I/O outside lock)
@@ -552,15 +589,17 @@ async def submit_pr(
     await db.execute("BEGIN IMMEDIATE")
     try:
         await db.execute(
-            "UPDATE pull_requests SET status = 'open', title = ?, body = ? WHERE id = ?",
-            (title, body, pr["id"]),
+            "UPDATE pull_requests SET status = 'open', title = ?, body = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (title, body, pr["id"], workspace_id),
         )
         # submitted_by column added in migration 038 — graceful fallback
         if submitted_by:
             try:
                 await db.execute(
-                    "UPDATE pull_requests SET submitted_by = ? WHERE id = ?",
-                    (submitted_by, pr["id"]),
+                    "UPDATE pull_requests SET submitted_by = ? "
+                    "WHERE id = ? AND workspace_id = ?",
+                    (submitted_by, pr["id"], workspace_id),
                 )
             except Exception:
                 logger.debug(
@@ -568,11 +607,17 @@ async def submit_pr(
                 )
         if conv_id:
             await db.execute(
-                "UPDATE pull_requests SET conversation_id = ? WHERE id = ?",
-                (conv_id, pr["id"]),
+                "UPDATE pull_requests SET conversation_id = ? "
+                "WHERE id = ? AND workspace_id = ?",
+                (conv_id, pr["id"], workspace_id),
             )
         await validate_and_transition_task(
-            db, task_id, "review", trigger="pr_submit", auto_commit=False
+            db,
+            task_id,
+            "review",
+            trigger="pr_submit",
+            auto_commit=False,
+            workspace_id=workspace_id,
         )
         await db.commit()
     except Exception:
@@ -605,6 +650,7 @@ async def submit_pr(
             target_type="pr",
             target_id=pr["id"],
             payload=pr_payload,
+            workspace_id=workspace_id,
         )
         if event_id:
             await generate_from_event(
@@ -616,6 +662,7 @@ async def submit_pr(
                 "pr",
                 pr["id"],
                 pr_payload,
+                workspace_id=workspace_id,
             )
     except Exception as exc:
         logger.warning(
@@ -627,7 +674,9 @@ async def submit_pr(
     # Detect migration number conflicts with other open PRs (non-blocking warning)
     migration_conflicts: list[str] = []
     try:
-        conflict_groups = await get_merge_conflicts(task["project"], db)
+        conflict_groups = await get_merge_conflicts(
+            task["project"], db, workspace_id=workspace_id
+        )
         for group in conflict_groups:
             task_ids_in_group = [e["task_id"] for e in group["tasks"]]
             if task_id in task_ids_in_group:
@@ -663,9 +712,11 @@ async def submit_pr(
     }
 
 
-async def get_pr_status(task_id: str, db: aiosqlite.Connection) -> dict:
+async def get_pr_status(
+    task_id: str, db: aiosqlite.Connection, *, workspace_id: str
+) -> dict:
     """Return full PR status including diff_summary."""
-    pr = await _get_pr_by_task(db, task_id)
+    pr = await _get_pr_by_task(db, task_id, workspace_id)
     if not pr:
         raise ValueError(f"No PR found for task {task_id}")
 
@@ -675,7 +726,7 @@ async def get_pr_status(task_id: str, db: aiosqlite.Connection) -> dict:
     # Calculate live diff for active PRs
     if pr["status"] in ("draft", "open", "merging"):
         try:
-            task = await _get_task(db, task_id)
+            task = await _get_task(db, task_id, workspace_id)
             repo_path = await _get_repo_path(db, task["project"])
             repo_path_for_labels = repo_path
             diff = await git_ops.get_pr_diff_async(
@@ -692,7 +743,7 @@ async def get_pr_status(task_id: str, db: aiosqlite.Connection) -> dict:
     if pr["status"] in ("open", "merging", "merged"):
         try:
             if repo_path_for_labels is None:
-                task = await _get_task(db, task_id)
+                task = await _get_task(db, task_id, workspace_id)
                 repo_path_for_labels = await _get_repo_path(db, task["project"])
             result["gh_labels"] = await _fetch_github_labels(
                 repo_path_for_labels,
@@ -705,7 +756,12 @@ async def get_pr_status(task_id: str, db: aiosqlite.Connection) -> dict:
 
 
 async def _wait_deploy(
-    proc: asyncio.subprocess.Process, cmd: str, project: str, pr_id: str | None = None
+    proc: asyncio.subprocess.Process,
+    cmd: str,
+    project: str,
+    pr_id: str | None = None,
+    *,
+    workspace_id: str,
 ) -> None:
     """Background: wait for deploy process, record result in PR row."""
 
@@ -719,12 +775,14 @@ async def _wait_deploy(
             async with write_db(label="pr.deploy.record") as db:
                 await db.execute(
                     "UPDATE pull_requests SET deploy_status=?, deploy_output=?, deploy_at=? "
-                    "WHERE id=? AND (deploy_output IS NULL OR deploy_output = '')",
+                    "WHERE id=? AND workspace_id=? "
+                    "AND (deploy_output IS NULL OR deploy_output = '')",
                     (
                         status,
                         output[-2000:],
                         datetime.now(timezone.utc).isoformat(),
                         pr_id,
+                        workspace_id,
                     ),
                 )
         except Exception as exc:
@@ -777,6 +835,7 @@ async def _close_siblings_from_body(
     pr: dict,
     task_project: str,
     primary_task_id: str,
+    workspace_id: str,
 ) -> list[str]:
     """Parse PR body for close/fix/resolve patterns and auto-close matching tasks.
 
@@ -802,9 +861,10 @@ async def _close_siblings_from_body(
         # LIMIT 2 → detect ambiguous prefixes cheaply.
         cursor = await db.execute(
             "SELECT id, status, project FROM tasks "
-            "WHERE (id = ? OR id LIKE ? || '-%') AND deleted_at IS NULL "
+            "WHERE workspace_id = ? AND (id = ? OR id LIKE ? || '-%') "
+            "AND deleted_at IS NULL "
             "LIMIT 2",
-            (ref, ref),
+            (workspace_id, ref, ref),
         )
         rows = await cursor.fetchall()
         if len(rows) != 1:
@@ -835,9 +895,14 @@ async def _close_siblings_from_body(
                     secondary_id,
                     "in_progress",
                     trigger="closed_by_sibling_pr",
+                    workspace_id=workspace_id,
                 )
             await validate_and_transition_task(
-                db, secondary_id, "completed", trigger="closed_by_sibling_pr"
+                db,
+                secondary_id,
+                "completed",
+                trigger="closed_by_sibling_pr",
+                workspace_id=workspace_id,
             )
             closed.append(secondary_id)
         except Exception as exc:
@@ -847,11 +912,70 @@ async def _close_siblings_from_body(
     return closed
 
 
+async def changed_paths_for_pr(repo_path: str, pr) -> list[str] | None:
+    """Repo-relative files a PR touches, or None when we could not find out.
+
+    None is the honest answer to a diff we failed to read, and the CI gate
+    treats it as "assume every required check applies". A diff we cannot see
+    must never become the reason a required check gets waived — that is the
+    same shape of false-green the scoping was added to remove.
+
+    Every failure here degrades to None rather than raising: this runs inside
+    the merge gate, and a scope lookup that explodes would turn a mergeable PR
+    into a stack trace instead of a verdict.
+    """
+    try:
+        branch = pr["branch"]
+        target = pr["target"]
+    except (IndexError, KeyError, TypeError):
+        return None
+    try:
+        diff = await git_ops.get_pr_diff_async(repo_path, branch, target)
+    except Exception as exc:
+        logger.warning(
+            "changed_paths_for_pr: diff failed for %s -> %s: %s", branch, target, exc
+        )
+        return None
+    try:
+        return diff["files"] or None
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+async def changed_paths_for_task(
+    task_id: str,
+    project: str | None,
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
+) -> list[str] | None:
+    """Diff scope for a task's active PR, or None when it cannot be resolved.
+
+    Lets the CI status endpoint reach the same verdict as the merge gate,
+    instead of reporting a block that merging would not honour.
+    """
+    if not project:
+        return None
+    try:
+        pr = await _get_active_pr(db, task_id, workspace_id)
+        if pr is None:
+            return None
+        repo_path = await _get_repo_path(db, project)
+    except Exception as exc:
+        logger.warning("changed_paths_for_task: %s: %s", task_id, exc)
+        return None
+    return await changed_paths_for_pr(repo_path, pr)
+
+
 async def merge_pr(
-    task_id: str, db: aiosqlite.Connection, merger_id: str | None = None
+    task_id: str,
+    db: aiosqlite.Connection,
+    merger_id: str | None = None,
+    *,
+    workspace_id: str,
 ) -> dict:
     """Merge PR. Called by router after human auth check."""
-    pr = await _get_active_pr(db, task_id)
+    pr = await _get_active_pr(db, task_id, workspace_id)
     if not pr:
         raise ValueError(f"No active PR for task {task_id}")
     if pr["status"] != "open":
@@ -866,19 +990,27 @@ async def merge_pr(
     if approved_by is None and merger_id:
         now_approve = datetime.now(timezone.utc).isoformat()
         await db.execute(
-            "UPDATE pull_requests SET approved_by = ?, approved_at = ? WHERE id = ?",
-            (merger_id, now_approve, pr["id"]),
+            "UPDATE pull_requests SET approved_by = ?, approved_at = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (merger_id, now_approve, pr["id"], workspace_id),
         )
         await db.commit()
         logger.info("PR %s: auto-approved by merger %s", pr["id"][:8], merger_id)
 
-    task = await _get_task(db, task_id)
+    task = await _get_task(db, task_id, workspace_id)
     repo_path = await _get_repo_path(db, task["project"])
 
     # Guard: CI required checks must pass before merge
     from core.api.services.ci_service import check_required_ci_passes
 
-    failing_ci = await check_required_ci_passes(task_id, task["project"], db)
+    branch_head_sha = await git_ops.get_branch_head_sha_async(repo_path, pr["branch"])
+    failing_ci = await check_required_ci_passes(
+        task_id,
+        task["project"],
+        db,
+        head_sha=branch_head_sha,
+        changed_paths=await changed_paths_for_pr(repo_path, pr),
+    )
     if failing_ci:
         raise ConflictError(
             code="ci_checks_failing",
@@ -886,7 +1018,9 @@ async def merge_pr(
         )
 
     # Guard: check migration merge-order conflicts before allowing merge
-    conflicts = await get_merge_conflicts(task["project"], db)
+    conflicts = await get_merge_conflicts(
+        task["project"], db, workspace_id=workspace_id
+    )
     for group in conflicts:
         for entry in group["tasks"]:
             if entry["task_id"] == task_id and not entry["can_merge"]:
@@ -898,25 +1032,31 @@ async def merge_pr(
     async with _repo_locks[repo_path]:
         # Lock: set status to merging
         await db.execute(
-            "UPDATE pull_requests SET status = 'merging' WHERE id = ?", (pr["id"],)
+            "UPDATE pull_requests SET status = 'merging' "
+            "WHERE id = ? AND workspace_id = ?",
+            (pr["id"], workspace_id),
         )
         await db.commit()
 
         try:
             merge_result = await git_ops.merge_branch_async(
-                repo_path, pr["branch"], pr["target"]
+                repo_path, branch_head_sha, pr["target"]
             )
         except git_ops.MergeConflictError as exc:
             # Rollback lock
             await db.execute(
-                "UPDATE pull_requests SET status = 'open' WHERE id = ?", (pr["id"],)
+                "UPDATE pull_requests SET status = 'open' "
+                "WHERE id = ? AND workspace_id = ?",
+                (pr["id"], workspace_id),
             )
             await db.commit()
             raise
         except Exception as exc:
             # Rollback lock on any error
             await db.execute(
-                "UPDATE pull_requests SET status = 'open' WHERE id = ?", (pr["id"],)
+                "UPDATE pull_requests SET status = 'open' "
+                "WHERE id = ? AND workspace_id = ?",
+                (pr["id"], workspace_id),
             )
             await db.commit()
             raise git_ops.GitOpsError(f"Merge failed: {exc}") from exc
@@ -945,22 +1085,28 @@ async def merge_pr(
         # Success: update PR
         now = datetime.now(timezone.utc).isoformat()
         await db.execute(
-            "UPDATE pull_requests SET status = 'merged', merged_at = ? WHERE id = ?",
-            (now, pr["id"]),
+            "UPDATE pull_requests SET status = 'merged', merged_at = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (now, pr["id"], workspace_id),
         )
         await db.commit()
 
         # Store commit SHA for future revert
         await db.execute(
-            "UPDATE pull_requests SET commit_sha = ? WHERE id = ?",
-            (merge_result["commit_sha"], pr["id"]),
+            "UPDATE pull_requests SET commit_sha = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (merge_result["commit_sha"], pr["id"], workspace_id),
         )
         await db.commit()
 
         # Auto-transition task to completed
         try:
             await validate_and_transition_task(
-                db, task_id, "completed", trigger="pr_merge"
+                db,
+                task_id,
+                "completed",
+                trigger="pr_merge",
+                workspace_id=workspace_id,
             )
         except ValueError as exc:
             logger.warning(
@@ -974,7 +1120,11 @@ async def merge_pr(
         # regress the merge success.
         try:
             _closed_siblings = await _close_siblings_from_body(
-                db, pr=pr, task_project=task["project"], primary_task_id=task_id
+                db,
+                pr=pr,
+                task_project=task["project"],
+                primary_task_id=task_id,
+                workspace_id=workspace_id,
             )
             if _closed_siblings:
                 logger.info(
@@ -1034,7 +1184,7 @@ async def merge_pr(
     else:
         logger.info("PR %s: no worktree_path, skipping cleanup", pr["id"][:8])
 
-    # Emit pr.merged event for n8n dispatcher
+    # Emit pr.merged for internal event readers.
     try:
         from core.api.services.events import emit_event
 
@@ -1052,6 +1202,7 @@ async def merge_pr(
                 "branch": pr["branch"],
                 "commit_sha": merge_result["commit_sha"],
             },
+            workspace_id=workspace_id,
         )
         await db.commit()
     except Exception:
@@ -1108,7 +1259,13 @@ async def merge_pr(
                     # _wait_deploy logs the systemd-run exit and serves as a fallback
                     # recorder if the wrapper's own DB write fails.
                     t = asyncio.create_task(
-                        _wait_deploy(proc, deploy_cmd, task["project"], pr_id=pr["id"]),
+                        _wait_deploy(
+                            proc,
+                            deploy_cmd,
+                            task["project"],
+                            pr_id=pr["id"],
+                            workspace_id=workspace_id,
+                        ),
                         name=f"deploy-{pr['id'][:8]}",
                     )
                     _background_tasks.add(t)
@@ -1125,13 +1282,20 @@ async def merge_pr(
 
 
 async def _check_reviewer_authorized(
-    pr_row: aiosqlite.Row, reviewer: UserInfo, db: aiosqlite.Connection
+    pr_row: aiosqlite.Row,
+    reviewer: UserInfo,
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
 ) -> None:
     """Raise PermissionError if reviewer is not authorized to review this PR.
 
     Authorization: global admin/super_admin OR team_admin of any team that owns the project.
     """
     from core.api.rbac import check_team_admin
+
+    if (reviewer.workspace_id or "") != workspace_id:
+        raise PermissionError("Reviewer workspace does not match the PR workspace")
 
     if reviewer.system_role in ("admin", "super_admin"):
         return
@@ -1153,13 +1317,17 @@ async def _check_reviewer_authorized(
 
 
 async def approve_pr(
-    task_id: str, reviewer: UserInfo, db: aiosqlite.Connection
+    task_id: str,
+    reviewer: UserInfo,
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
 ) -> dict:
     """Approve PR. Four-eyes gate: reviewer cannot be the submitter.
 
     Authorization: team_admin of the project OR admin/super_admin.
     """
-    pr = await _get_active_pr(db, task_id)
+    pr = await _get_active_pr(db, task_id, workspace_id)
     if not pr:
         raise ValueError(f"No active PR for task {task_id}")
     if pr["status"] != "open":
@@ -1175,17 +1343,23 @@ async def approve_pr(
         raise ValueError("Four-eyes violation: you cannot approve your own PR")
 
     # Authorization check
-    await _check_reviewer_authorized(pr, reviewer, db)
+    await _check_reviewer_authorized(
+        pr, reviewer, db, workspace_id=workspace_id
+    )
 
     now = datetime.now(timezone.utc).isoformat()
     await db.execute(
-        "UPDATE pull_requests SET approved_by = ?, approved_at = ? WHERE id = ?",
-        (reviewer.user_id, now, pr["id"]),
+        "UPDATE pull_requests SET approved_by = ?, approved_at = ? "
+        "WHERE id = ? AND workspace_id = ?",
+        (reviewer.user_id, now, pr["id"], workspace_id),
     )
     await db.commit()
 
     # Re-fetch updated row
-    cursor = await db.execute("SELECT * FROM pull_requests WHERE id = ?", (pr["id"],))
+    cursor = await db.execute(
+        "SELECT * FROM pull_requests WHERE id = ? AND workspace_id = ?",
+        (pr["id"], workspace_id),
+    )
     updated = await cursor.fetchone()
 
     # Emit event (non-blocking)
@@ -1204,6 +1378,7 @@ async def approve_pr(
                 "approved_by": reviewer.username,
                 "project": pr["project"],
             },
+            workspace_id=workspace_id,
         )
     except Exception as exc:
         logger.warning(
@@ -1215,13 +1390,18 @@ async def approve_pr(
 
 
 async def request_changes_pr(
-    task_id: str, reviewer: UserInfo, comment: str, db: aiosqlite.Connection
+    task_id: str,
+    reviewer: UserInfo,
+    comment: str,
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
 ) -> dict:
     """Request changes on PR. Revokes approval and sends task back to in_progress.
 
     Authorization: team_admin of the project OR admin/super_admin.
     """
-    pr = await _get_active_pr(db, task_id)
+    pr = await _get_active_pr(db, task_id, workspace_id)
     if not pr:
         raise ValueError(f"No active PR for task {task_id}")
     if pr["status"] != "open":
@@ -1230,19 +1410,23 @@ async def request_changes_pr(
         )
 
     # Authorization check
-    await _check_reviewer_authorized(pr, reviewer, db)
+    await _check_reviewer_authorized(
+        pr, reviewer, db, workspace_id=workspace_id
+    )
 
     # Atomic: revoke approval + set review_feedback + transition task
     await db.execute("BEGIN IMMEDIATE")
     try:
         await db.execute(
-            "UPDATE pull_requests SET approved_by = NULL, approved_at = NULL WHERE id = ?",
-            (pr["id"],),
+            "UPDATE pull_requests SET approved_by = NULL, approved_at = NULL "
+            "WHERE id = ? AND workspace_id = ?",
+            (pr["id"], workspace_id),
         )
         now_ts = datetime.now(timezone.utc).isoformat()
         await db.execute(
-            "UPDATE tasks SET review_feedback = ?, updated_at = ? WHERE id = ?",
-            (comment or None, now_ts, task_id),
+            "UPDATE tasks SET review_feedback = ?, updated_at = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (comment or None, now_ts, task_id, workspace_id),
         )
         await validate_and_transition_task(
             db,
@@ -1250,6 +1434,7 @@ async def request_changes_pr(
             "in_progress",
             trigger="pr_changes_requested",
             auto_commit=False,
+            workspace_id=workspace_id,
         )
         await db.commit()
     except Exception:
@@ -1257,7 +1442,10 @@ async def request_changes_pr(
         raise
 
     # Re-fetch updated PR row
-    cursor = await db.execute("SELECT * FROM pull_requests WHERE id = ?", (pr["id"],))
+    cursor = await db.execute(
+        "SELECT * FROM pull_requests WHERE id = ? AND workspace_id = ?",
+        (pr["id"], workspace_id),
+    )
     updated = await cursor.fetchone()
 
     # Emit event (non-blocking)
@@ -1277,6 +1465,7 @@ async def request_changes_pr(
                 "project": pr["project"],
                 "comment": comment,
             },
+            workspace_id=workspace_id,
         )
     except Exception as exc:
         logger.warning(
@@ -1289,9 +1478,15 @@ async def request_changes_pr(
     return _pr_row_to_dict(updated)
 
 
-async def close_pr(task_id: str, reason: str, db: aiosqlite.Connection) -> dict:
+async def close_pr(
+    task_id: str,
+    reason: str,
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
+) -> dict:
     """Close PR without merge. Task returns to in_progress with review_feedback set."""
-    pr = await _get_active_pr(db, task_id)
+    pr = await _get_active_pr(db, task_id, workspace_id)
     if not pr:
         raise ValueError(f"No active PR for task {task_id}")
     if pr["status"] not in ("draft", "open"):
@@ -1301,16 +1496,23 @@ async def close_pr(task_id: str, reason: str, db: aiosqlite.Connection) -> dict:
     await db.execute("BEGIN IMMEDIATE")
     try:
         await db.execute(
-            "UPDATE pull_requests SET status = 'closed', closed_reason = ? WHERE id = ?",
-            (reason or None, pr["id"]),
+            "UPDATE pull_requests SET status = 'closed', closed_reason = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (reason or None, pr["id"], workspace_id),
         )
         now_ts = datetime.now(timezone.utc).isoformat()
         await db.execute(
-            "UPDATE tasks SET review_feedback = ?, updated_at = ? WHERE id = ?",
-            (reason or None, now_ts, task_id),
+            "UPDATE tasks SET review_feedback = ?, updated_at = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (reason or None, now_ts, task_id, workspace_id),
         )
         await validate_and_transition_task(
-            db, task_id, "in_progress", trigger="pr_close", auto_commit=False
+            db,
+            task_id,
+            "in_progress",
+            trigger="pr_close",
+            auto_commit=False,
+            workspace_id=workspace_id,
         )
         await db.commit()
     except Exception:
@@ -1320,7 +1522,7 @@ async def close_pr(task_id: str, reason: str, db: aiosqlite.Connection) -> dict:
     # Cleanup worktree (best effort)
     if pr["worktree_path"]:
         try:
-            task_row = await _get_task(db, task_id)
+            task_row = await _get_task(db, task_id, workspace_id)
             repo_path = await _get_repo_path(db, task_row["project"])
             await git_ops.remove_worktree_async(
                 repo_path, pr["worktree_path"], pr["branch"]
@@ -1335,7 +1537,9 @@ async def close_pr(task_id: str, reason: str, db: aiosqlite.Connection) -> dict:
     return {"id": pr["id"], "status": "closed", "closed_reason": reason}
 
 
-async def revert_pr(task_id: str, db: aiosqlite.Connection) -> dict:
+async def revert_pr(
+    task_id: str, db: aiosqlite.Connection, *, workspace_id: str
+) -> dict:
     """Create a revert PR for a completed task with a merged PR.
 
     Creates a new task 'Revert: {title}' + new PR record.
@@ -1343,8 +1547,9 @@ async def revert_pr(task_id: str, db: aiosqlite.Connection) -> dict:
     """
     # Find merged PR
     cursor = await db.execute(
-        "SELECT * FROM pull_requests WHERE task_id = ? AND status = 'merged' ORDER BY merged_at DESC LIMIT 1",
-        (task_id,),
+        "SELECT * FROM pull_requests WHERE task_id = ? AND workspace_id = ? "
+        "AND status = 'merged' ORDER BY merged_at DESC LIMIT 1",
+        (task_id, workspace_id),
     )
     pr = await cursor.fetchone()
     if not pr:
@@ -1356,7 +1561,7 @@ async def revert_pr(task_id: str, db: aiosqlite.Connection) -> dict:
             "PR has no commit_sha stored. Only PRs merged after v1.4.0 can be reverted via this endpoint."
         )
 
-    task = await _get_task(db, task_id)
+    task = await _get_task(db, task_id, workspace_id)
     repo_path = await _get_repo_path(db, task["project"])
 
     revert_branch = f"revert/task-{task_id[:8]}-{commit_sha[:7]}"
@@ -1372,8 +1577,9 @@ async def revert_pr(task_id: str, db: aiosqlite.Connection) -> dict:
     new_task_id = str(uuid.uuid4())
     await db.execute(
         """INSERT INTO tasks
-           (id, title, description, project, status, source, priority, delegation, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'in_progress', 'manual', 'high', 'human', ?, ?)""",
+           (id, title, description, project, status, source, priority, delegation,
+            created_at, updated_at, workspace_id)
+           VALUES (?, ?, ?, ?, 'in_progress', 'manual', 'high', 'human', ?, ?, ?)""",
         (
             new_task_id,
             f"Revert: {task['title']}",
@@ -1381,6 +1587,7 @@ async def revert_pr(task_id: str, db: aiosqlite.Connection) -> dict:
             task["project"],
             now,
             now,
+            workspace_id,
         ),
     )
 
@@ -1388,8 +1595,9 @@ async def revert_pr(task_id: str, db: aiosqlite.Connection) -> dict:
     new_pr_id = str(uuid.uuid4())
     await db.execute(
         """INSERT INTO pull_requests
-           (id, task_id, project, branch, target, status, title, body, commit_sha, created_at)
-           VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
+           (id, task_id, project, branch, target, status, title, body, commit_sha,
+            created_at, workspace_id)
+           VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)""",
         (
             new_pr_id,
             new_task_id,
@@ -1400,6 +1608,7 @@ async def revert_pr(task_id: str, db: aiosqlite.Connection) -> dict:
             f"Reverts commit {commit_sha[:7]}\n\nOriginal task: {task_id}",
             revert_info["commit_sha"],
             now,
+            workspace_id,
         ),
     )
     await db.commit()
@@ -1426,9 +1635,11 @@ async def update_pr(
     db: aiosqlite.Connection,
     title: str | None = None,
     body: str | None = None,
+    *,
+    workspace_id: str,
 ) -> dict:
     """Update PR title/body for draft or open PR."""
-    pr = await _get_active_pr(db, task_id)
+    pr = await _get_active_pr(db, task_id, workspace_id)
     if not pr:
         raise ValueError(f"No active PR for task {task_id}")
     if pr["status"] not in ("draft", "open"):
@@ -1449,13 +1660,18 @@ async def update_pr(
         return _pr_row_to_dict(pr)
 
     params.append(pr["id"])
+    params.append(workspace_id)
     await db.execute(
-        f"UPDATE pull_requests SET {', '.join(updates)} WHERE id = ?",
+        f"UPDATE pull_requests SET {', '.join(updates)} "
+        "WHERE id = ? AND workspace_id = ?",
         params,
     )
     await db.commit()
 
     # Re-fetch
-    cursor = await db.execute("SELECT * FROM pull_requests WHERE id = ?", (pr["id"],))
+    cursor = await db.execute(
+        "SELECT * FROM pull_requests WHERE id = ? AND workspace_id = ?",
+        (pr["id"], workspace_id),
+    )
     updated = await cursor.fetchone()
     return _pr_row_to_dict(updated)

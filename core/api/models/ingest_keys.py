@@ -67,8 +67,8 @@ class IngestJsonContent(BaseModel):
     """Structured JSON content. Exactly one of text / base64 must be set.
 
     `url` (server-side fetch) is deferred to v1.1 — it is an SSRF pivot and
-    unnecessary under the n8n-as-orchestrator model (the client already has the
-    bytes). A payload carrying `url` is rejected with 422.
+    unnecessary when the external client already has the bytes. A payload
+    carrying `url` is rejected with 422.
     """
 
     text: str | None = None

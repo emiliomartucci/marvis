@@ -13,9 +13,8 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
-from core.api.paths import repo_path
+from core.api.paths import api_package_root
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +59,7 @@ def _load_pricing_from_json() -> dict[str, ModelPricing]:
     Falls back to hard-coded table if file missing (e.g. test envs without kb/).
     """
     # kb/ is checked in at runtime root; supports both api/ and core/api/ layouts.
-    kb_dir = repo_path(__file__, "kb")
+    kb_dir = api_package_root(__file__).parent / "kb"
     if kb_dir.is_dir():
         candidates = sorted(kb_dir.glob("claude-pricing-*.json"), reverse=True)
     else:
@@ -201,7 +200,7 @@ def _load_opencode_pricing() -> dict:
     if _OPENCODE_PRICING_CACHE is not None:
         return _OPENCODE_PRICING_CACHE
 
-    kb_dir = repo_path(__file__, "kb")
+    kb_dir = api_package_root(__file__).parent / "kb"
     if kb_dir.is_dir():
         candidates = sorted(kb_dir.glob("opencode-pricing-*.json"), reverse=True)
     else:

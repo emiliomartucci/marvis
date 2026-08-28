@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 
@@ -8,6 +8,8 @@ import { LLMPolishBadge } from "@/components/brain/LLMPolishBadge";
 import { useBrainContext } from "@/components/brain/useBrainContext";
 import { PanelEmpty, PanelLoading } from "@/components/brain/Panels";
 import { fetchJournal } from "@/lib/brain/surfaces";
+import { countDiarioRegistri, countDiarioValueItems } from "@/lib/brain/diarioFirstValue";
+import { emitGuiFirstValue } from "@/lib/guiEvents";
 import {
   shortEventRef,
   whatChangedLabel,
@@ -71,6 +73,18 @@ function makeDecisionResolver(
   };
 }
 
+function currentRoute(): string {
+  if (typeof window === "undefined") return "/ui/brain/diario/";
+  return window.location.pathname || "/ui/brain/diario/";
+}
+
+function isElementVisibleInViewport(element: HTMLElement): boolean {
+  const rect = element.getBoundingClientRect();
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+  return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < viewportHeight && rect.left < viewportWidth;
+}
+
 function JournalSection({ title, items, renderer = fallbackRender, emptyLabel }: JournalSectionProps) {
   if (!items.length) {
     if (!emptyLabel) return null;
@@ -109,6 +123,8 @@ function JournalSection({ title, items, renderer = fallbackRender, emptyLabel }:
 
 function BrainDiarioPageContent() {
   const { cycleKey, scope } = useBrainContext();
+  const articleRef = useRef<HTMLElement | null>(null);
+  const emittedFirstValue = useRef<Set<string>>(new Set());
   // Wave 3.1 deep-link (Emilio 2026-05-19): URL `?scope=...&key=...` override il
   // context globale per rendere il diario condivisibile come permalink. Senza
   // questo, qualunque URL `/brain/diario?...` mostrava sempre lo scope=company
@@ -128,6 +144,7 @@ function BrainDiarioPageContent() {
   useEffect(() => {
     let active = true;
     setLoading(true);
+    setEntry(null);
     async function load() {
       try {
         const resp = await fetchJournal({
@@ -138,6 +155,9 @@ function BrainDiarioPageContent() {
         });
         if (!active) return;
         setEntry((resp.items?.[0] as JournalEntry) ?? null);
+      } catch {
+        if (!active) return;
+        setEntry(null);
       } finally {
         if (active) setLoading(false);
       }
@@ -164,11 +184,8 @@ function BrainDiarioPageContent() {
   })();
   const titles = useEventTitles(decisionIds, cycleKey);
 
-  if (loading) return <PanelLoading message="diario · raccogliendo eventi" />;
-  if (!entry) return <PanelEmpty message="Nessun racconto per questo ciclo" />;
-
-  const view = entry as {
-    body?: Record<string, unknown[]>;
+  const view = entry as (JournalEntry & {
+    body?: Record<string, unknown>;
     scope_type?: string;
     scope_key?: string;
     cycle_key?: string;
@@ -176,9 +193,75 @@ function BrainDiarioPageContent() {
     narrative_polished?: string;
     cited_evidence_refs?: string[];
     polish_model?: string;
-  };
-  const body = view.body ?? {};
-  const narrative = view.narrative_polished ?? "";
+  }) | null;
+  const body = view?.body ?? {};
+  const narrative = view?.narrative_polished ?? "";
+  const hasNarrative = Boolean(narrative.trim());
+  const hasEvents =
+    countDiarioValueItems(body.what_changed) > 0 ||
+    countDiarioValueItems(body.decisions_observed) > 0 ||
+    countDiarioValueItems(body.open_loops) > 0 ||
+    countDiarioValueItems(body.notable_context) > 0 ||
+    countDiarioValueItems(body.tomorrow_watch) > 0 ||
+    countDiarioValueItems(body.sources) > 0;
+  const registriCount = countDiarioRegistri(body, hasNarrative);
+
+  useEffect(() => {
+    if (!entry || !view || registriCount <= 0) return;
+    const key = `${entry.workspace_id}:${entry.entry_id}`;
+    if (emittedFirstValue.current.has(key)) return;
+    const element = articleRef.current;
+    if (!element) return;
+
+    let cancelled = false;
+    let observer: IntersectionObserver | null = null;
+    const send = () => {
+      if (cancelled || emittedFirstValue.current.has(key)) return;
+      emittedFirstValue.current.add(key);
+      emitGuiFirstValue({
+        surface: "brain_diario",
+        route: currentRoute(),
+        cycle_key: view.cycle_key ?? entry.cycle_key,
+        run_id: entry.run_id,
+        entry_id: entry.entry_id,
+        registri_count: registriCount,
+        scope_type: view.scope_type ?? entry.scope_type,
+        scope_key: view.scope_key ?? entry.scope_key,
+      }).catch(() => {
+        emittedFirstValue.current.delete(key);
+      });
+    };
+
+    const sendIfVisible = () => {
+      if (isElementVisibleInViewport(element)) send();
+    };
+
+    if (typeof IntersectionObserver === "undefined") {
+      const frame = window.requestAnimationFrame(sendIfVisible);
+      return () => {
+        cancelled = true;
+        window.cancelAnimationFrame(frame);
+      };
+    }
+
+    observer = new IntersectionObserver((entries) => {
+      if (entries.some((item) => item.isIntersecting)) {
+        observer?.disconnect();
+        send();
+      }
+    }, { threshold: 0.1 });
+    observer.observe(element);
+    sendIfVisible();
+
+    return () => {
+      cancelled = true;
+      observer?.disconnect();
+    };
+  }, [entry, hasEvents, hasNarrative, registriCount, view]);
+
+  if (loading) return <PanelLoading message="diario · raccogliendo eventi" />;
+  if (!entry || !view) return <PanelEmpty message="Nessun racconto per questo ciclo" />;
+
   const decisionRender = makeDecisionResolver(titles);
   const titleRender = makeTitleResolver(titles);
   // Wave 3.1 UX restructure (Emilio feedback 2026-05-19): la narrazione LLM
@@ -187,13 +270,10 @@ function BrainDiarioPageContent() {
   // restano accessibili come "Dettagli evento" collapsible — chiuso default,
   // power-user mode. Fallback senza polish: messaggio "Polish in corso" +
   // struttura grezza per non perdere la vista durante backfill.
-  const hasNarrative = Boolean(narrative.trim());
-  const hasEvents =
-    ((body.what_changed as unknown[]) ?? []).length > 0 ||
-    ((body.decisions_observed as unknown[]) ?? []).length > 0 ||
-    ((body.sources as unknown[]) ?? []).length > 0;
   return (
     <article
+      ref={articleRef}
+      data-testid="brain-diario-first-value"
       className="flex flex-col gap-6 border border-pir-border bg-[hsl(var(--pir-surface-1))] p-6"
       style={{ borderRadius: "2px" }}
     >

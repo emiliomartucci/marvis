@@ -52,12 +52,20 @@ class TeamMemberResponse(BaseModel):
     joined_at: str
 
 
+TeamProjectRole = Literal["member", "viewer"]
+TeamProjectClearance = Literal["public", "internal"]
+
+
 class TeamProjectAssignRequest(BaseModel):
     project: str = Field(..., min_length=1, max_length=100)
     is_public: bool = False
+    role: TeamProjectRole = "member"
+    clearance: TeamProjectClearance = "internal"
 
 
 class TeamProjectResponse(BaseModel):
     project: str
     is_public: bool
     assigned_at: str
+    role: TeamProjectRole = "member"
+    clearance: TeamProjectClearance = "internal"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from core.api.services import providers
@@ -22,17 +23,21 @@ def test_opencode_provider_uses_dedicated_launcher_and_double_enter():
         opencode_theme_mode="dark",
         session_name="console-opencode",
     )
-    assert "/var/marvisx/.opencode/bin" in command
+    runtime_home = providers._runtime_home()
+    assert os.path.join(runtime_home, ".opencode", "bin") in command
     assert "bash -ic" not in command
     assert providers._OPENCODE_LAUNCHER in command
     assert "OPENCODE_CONFIG_CONTENT=" in command
     assert "OPENCODE_TUI_CONFIG=" in command
     assert "OPENCODE_STATE_DIR=" in command
     assert "tui.dark.json" in command
-    assert (
-        "/var/marvisx/.local/state/opencode-marvisx-console/console-opencode"
-        in command
-    )
+    assert os.path.join(
+        runtime_home,
+        ".local",
+        "state",
+        "opencode-marvisx-console",
+        "console-opencode",
+    ) in command
     assert "--model openai/gpt-5.4" in command
     assert command.endswith(
         f"{providers._OPENCODE_LAUNCHER} /tmp/project --model openai/gpt-5.4"
@@ -83,7 +88,6 @@ def test_opencode_launcher_loads_provider_and_mcp_envs():
         "GEMINI_API_KEY",
         "TASKS_API_TOKEN",
         "PIR_API_URL",
-        "N8N_API_URL",
         "EXA_API_KEY",
         "GOOGLE_OAUTH_CLIENT_ID",
         "GOOGLE_OAUTH_CLIENT_SECRET",
@@ -107,21 +111,17 @@ def test_opencode_launcher_loads_provider_and_mcp_envs():
 
 
 def test_opencode_tui_defaults_and_custom_themes_are_valid_json():
-    repo_root = Path(__file__).resolve().parents[2]
-    tui = json.loads((repo_root / "tui.json").read_text())
+    api_root = Path(providers._OPENCODE_LAUNCHER).resolve().parents[1]
+    runtime_root = api_root / "opencode-runtime"
+    tui = json.loads((runtime_root / "tui.json").read_text())
     assert tui["scroll_speed"] == 3
     assert tui["scroll_acceleration"] == {"enabled": True}
 
-    runtime_tui = json.loads(
-        (repo_root / "api" / "opencode-runtime" / "tui.json").read_text()
-    )
-    assert runtime_tui == tui
-
     runtime_dark_tui = json.loads(
-        (repo_root / "api" / "opencode-runtime" / "tui.dark.json").read_text()
+        (runtime_root / "tui.dark.json").read_text()
     )
     runtime_light_tui = json.loads(
-        (repo_root / "api" / "opencode-runtime" / "tui.light.json").read_text()
+        (runtime_root / "tui.light.json").read_text()
     )
     assert runtime_dark_tui["theme"] == "marvisx-dark"
     assert runtime_light_tui["theme"] == "marvisx-light"
@@ -129,10 +129,6 @@ def test_opencode_tui_defaults_and_custom_themes_are_valid_json():
     assert runtime_light_tui["scroll_acceleration"] == {"enabled": True}
 
     for name in ("marvisx.json", "marvisx-dark.json", "marvisx-light.json"):
-        root_theme = json.loads((repo_root / ".opencode" / "themes" / name).read_text())
-        runtime_theme = json.loads(
-            (repo_root / "api" / "opencode-runtime" / "themes" / name).read_text()
-        )
-        assert root_theme == runtime_theme
+        runtime_theme = json.loads((runtime_root / "themes" / name).read_text())
         assert runtime_theme["$schema"] == "https://opencode.ai/theme.json"
         assert "theme" in runtime_theme

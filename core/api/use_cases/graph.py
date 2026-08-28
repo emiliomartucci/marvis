@@ -76,7 +76,7 @@ from core.api.models.graph_ux import (
     ResolveOut,
 )
 from core.api.services import graph_ranker, graph_service
-from core.api.use_cases._context import CallerContext
+from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import NotFoundError, ServiceError, ValidationError
 
 class _PinWriteFailedError(ServiceError):
@@ -104,6 +104,29 @@ SHARE_FUNCTION_DEFAULT_HOURS: int = 24
 
 # Node ID regex for path params (same as PinIn field pattern)
 _NODE_ID_RE = re.compile(r"^[a-z]+:[a-z]+:.+$")
+
+_CODE_GRAPH_RECOVERY_HINT = (
+    "Next actions: (1) call guide() if tool routing is unclear, then "
+    "session_brief(slug=<project_slug>) to confirm the project and repository "
+    "boundary; (2) if this is missing or recently changed code, regenerate the "
+    "graph from the real local repository with marvis-graph-export, or use "
+    "marvis-index-action in CI. The hosted tenant receives graph nodes, edges "
+    "and provenance, never source code. Do not clone or checkout source on the "
+    "hosted tenant, and do not use reindex_paths: it refreshes hosted documents, "
+    "not the code graph."
+)
+
+
+def _missing_graph_node_message(node_id: str, *, as_of: str | None = None) -> str:
+    """Return one graph-only-safe recovery contract for missing read nodes."""
+    temporal = f" at as_of={as_of!r}" if as_of else ""
+    return (
+        f"Node not found in the accessible knowledge graph: {node_id!r}{temporal}. "
+        "Check the node_id format '{lang}:{type}:{qualified_name}', or use "
+        "graph_resolve(path=<repo-relative-path>) / search(q=<name>) to correct "
+        "a stale or mistyped id. "
+        f"{_CODE_GRAPH_RECOVERY_HINT}"
+    )
 
 # Orphan sub-cluster color map (deterministic by folder prefix)
 _ORPHAN_COLORS: dict[str, str] = {
@@ -670,6 +693,7 @@ async def graph_neighbors(
     Visibility (project) is enforced by the adapter (DECISION B). 422 (ValidationError)
     on malformed inputs; 404 (NotFoundError) if the node does not exist at ``as_of``.
     """
+    workspace_id = require_workspace_ctx(ctx)
     from core.api.config import settings
     with_freshness = settings.temporal_memory_enabled
     try:
@@ -683,7 +707,7 @@ async def graph_neighbors(
             project=project,
             edge_types=edge_types,
             with_freshness=with_freshness,
-            workspace_id=ctx.workspace_id or "ws_default",
+            workspace_id=workspace_id,
         )
     except ValueError as e:
         raise ValidationError(code="invalid_request", message=str(e))
@@ -699,15 +723,7 @@ async def graph_neighbors(
         if not exists:
             raise NotFoundError(
                 code="node_not_found",
-                message=(
-                    f"Node not found in the knowledge graph: {node_id!r}"
-                    + (f" (at as_of={as_of!r})" if as_of else "")
-                    + ". Reason: no row in graph_nodes with this id (and, if as_of was given, "
-                    "not in the historical state at that timestamp). "
-                    "Fix: (1) verify node_id format: '{lang}:{type}:{qualified_name}'; "
-                    "(2) use mcp__marvis__search to find similar ids; "
-                    "(3) if the code was recently added, run scripts/populate_knowledge_graph.py to index it."
-                ),
+                message=_missing_graph_node_message(node_id, as_of=as_of),
             )
 
     response: dict = {
@@ -765,6 +781,7 @@ async def graph_hotspots(
 
     Visibility enforced by the adapter (DECISION B). 422 on malformed inputs.
     """
+    require_workspace_ctx(ctx)
     try:
         graph_service.validate_project(project)
         hotspots = await graph_service.get_hotspots(
@@ -801,6 +818,7 @@ async def graph_impact(
     Visibility enforced by the adapter (DECISION B). 422 on malformed inputs,
     404 if the node does not exist.
     """
+    require_workspace_ctx(ctx)
     try:
         graph_service.validate_node_id(node_id)
         graph_service.validate_project(project)
@@ -811,14 +829,7 @@ async def graph_impact(
     if not await graph_service.node_exists_at(db, node_id):
         raise NotFoundError(
             code="node_not_found",
-            message=(
-                f"Node not found in the knowledge graph: {node_id!r}. "
-                "Reason: no row in graph_nodes with this id. "
-                "Fix: (1) verify format '{lang}:{type}:{qualified_name}' "
-                "(e.g. 'py:function:api.db.get_db'); "
-                "(2) use mcp__marvis__search(q=<substring>) to find similar ids; "
-                "(3) run scripts/populate_knowledge_graph.py if the code was recently added."
-            ),
+            message=_missing_graph_node_message(node_id),
         )
 
     try:
@@ -858,6 +869,7 @@ async def graph_context(
     Visibility enforced by the adapter (DECISION B). 422 on malformed inputs,
     404 if the node does not exist.
     """
+    require_workspace_ctx(ctx)
     try:
         graph_service.validate_node_id(node_id)
         graph_service.validate_project(project)
@@ -867,14 +879,7 @@ async def graph_context(
     if not await graph_service.node_exists_at(db, node_id):
         raise NotFoundError(
             code="node_not_found",
-            message=(
-                f"Node not found in the knowledge graph: {node_id!r}. "
-                "Reason: no row in graph_nodes with this id. "
-                "Fix: (1) verify format '{lang}:{type}:{qualified_name}' "
-                "(e.g. 'py:function:api.db.get_db'); "
-                "(2) use mcp__marvis__search(q=<substring>) to find similar ids; "
-                "(3) run scripts/populate_knowledge_graph.py if the code was recently added."
-            ),
+            message=_missing_graph_node_message(node_id),
         )
 
     try:
@@ -898,6 +903,7 @@ async def graph_pattern(
 
     Visibility enforced by the adapter (DECISION B). 422 on malformed inputs.
     """
+    require_workspace_ctx(ctx)
     try:
         graph_service.validate_project(project)
         return await graph_service.graph_pattern(
@@ -967,6 +973,7 @@ async def lookup_function_node(
     db: aiosqlite.Connection,
     *,
     qualified_name: str,
+    visible_projects: set[str] | None = None,
 ) -> aiosqlite.Row:
     """Look up the live ``type='function'`` node row for a qualified_name.
 
@@ -975,7 +982,7 @@ async def lookup_function_node(
     """
     db.row_factory = aiosqlite.Row
     cur = await db.execute(
-        "SELECT id, type, name, qualified_name, file_path, line_number, "
+        "SELECT id, type, name, qualified_name, file_path, line_number, project_id, "
         "touch_count_total, touch_count_7d, touch_count_30d, "
         "touch_authors, touch_last_at "
         "FROM graph_nodes "
@@ -993,18 +1000,23 @@ async def lookup_function_node(
                 "Reason: no graph_nodes row with type='function' + this qualified_name (live view excludes deprecated nodes). "
                 "Fix: (1) check for typos in the dotted path (e.g. 'api.db.get_db' not 'api.db.get_DB'); "
                 "(2) search alternates with mcp__marvis__search(q=<name substring>); "
-                "(3) re-index with scripts/populate_knowledge_graph.py if the function is freshly added; "
-                "(4) query with as_of=<past timestamp> if the function was recently deprecated."
+                "(3) query with as_of=<past timestamp> if the function was recently deprecated. "
+                f"{_CODE_GRAPH_RECOVERY_HINT}"
             ),
         )
+    if (
+        visible_projects is not None
+        and node_row["project_id"] not in visible_projects
+    ):
+        raise NotFoundError(code="function_not_found", message="Not found")
     if not node_row["file_path"]:
         raise NotFoundError(
             code="function_no_file_path",
             message=(
                 f"Function {qualified_name!r} has no file_path recorded in graph_nodes. "
                 "Reason: the node was indexed without a source file (legacy/partial import). "
-                "Fix: re-run scripts/populate_knowledge_graph.py with the ast_parser to fill in file_path, "
-                "or use mcp__marvis__share_file if you already know the file manually."
+                "The code graph must be regenerated from the real repository. "
+                f"{_CODE_GRAPH_RECOVERY_HINT}"
             ),
         )
     return node_row
@@ -1071,6 +1083,7 @@ async def graph_landing(
     *,
     workspace_id: str,
     user_id: str,
+    visible_projects: set[str] | None = None,
     hotspots_cached: list[HotspotItem] | None = None,
     recent_cached: list[RecentItem] | None = None,
     pins_cached: list[PinOut] | None = None,
@@ -1081,20 +1094,36 @@ async def graph_landing(
     slices in; this function computes the misses and returns the bundle PLUS the
     (possibly freshly-computed) slices so the adapter can repopulate its cache.
     """
+    authenticated_workspace = require_workspace_ctx(ctx)
+    if workspace_id != authenticated_workspace:
+        raise NotFoundError(code="not_found", message="Not found")
     db.row_factory = aiosqlite.Row
+
+    visible_clause = ""
+    visible_params: tuple[str, ...] = ()
+    if visible_projects is not None:
+        if not visible_projects:
+            visible_clause = " AND 0"
+        else:
+            ordered_projects = tuple(sorted(visible_projects))
+            placeholders = ",".join("?" for _ in ordered_projects)
+            visible_clause = f" AND project_id IN ({placeholders})"
+            visible_params = ordered_projects
 
     # --- Hotspots slice ---
     hotspots = hotspots_cached
     if hotspots is None:
         cur = await db.execute(
-            """
+            f"""
             SELECT id, type, name, qualified_name,
                    touch_count_30d, touch_authors
             FROM graph_nodes
             WHERE deprecated_at IS NULL
+            {visible_clause}
             ORDER BY touch_count_30d DESC, touch_last_at DESC
             LIMIT 10
-            """
+            """,
+            visible_params,
         )
         rows = await cur.fetchall()
         hotspots = []
@@ -1115,14 +1144,16 @@ async def graph_landing(
     recent = recent_cached
     if recent is None:
         cur = await db.execute(
-            """
+            f"""
             SELECT id, type, name, created_at
             FROM graph_nodes
             WHERE type IN ('commit', 'pr', 'task', 'handoff')
               AND deprecated_at IS NULL
+              {visible_clause}
             ORDER BY created_at DESC
             LIMIT 20
-            """
+            """,
+            visible_params,
         )
         rows = await cur.fetchall()
         recent = []
@@ -1141,16 +1172,17 @@ async def graph_landing(
     saved = pins_cached
     if saved is None:
         cur = await db.execute(
-            """
+            f"""
             SELECT p.node_id, p.pinned_at, p.note,
                    n.deprecated_at AS node_deprecated_at
             FROM kg_pins p
             JOIN graph_nodes n ON n.id = p.node_id
-            WHERE p.user_id = ?
+            WHERE p.workspace_id = ? AND p.user_id = ?
               AND n.deprecated_at IS NULL
+              {visible_clause.replace('project_id', 'n.project_id')}
             ORDER BY p.pinned_at DESC
             """,
-            (user_id,),
+            (authenticated_workspace, user_id, *visible_params),
         )
         rows = await cur.fetchall()
         saved = [
@@ -1172,22 +1204,35 @@ async def list_graph_pins(
     db: aiosqlite.Connection,
     *,
     user_id: str,
+    visible_projects: set[str] | None = None,
 ) -> list[PinOut]:
     """List all pins for the current user, ordered by pinned_at DESC.
 
     Pins on soft-deleted nodes are excluded (JOIN graph_nodes WHERE deprecated_at IS NULL).
     """
+    workspace_id = require_workspace_ctx(ctx)
+    visible_clause = ""
+    visible_params: tuple[str, ...] = ()
+    if visible_projects is not None:
+        if not visible_projects:
+            visible_clause = " AND 0"
+        else:
+            ordered_projects = tuple(sorted(visible_projects))
+            placeholders = ",".join("?" for _ in ordered_projects)
+            visible_clause = f" AND n.project_id IN ({placeholders})"
+            visible_params = ordered_projects
     db.row_factory = aiosqlite.Row
     cur = await db.execute(
-        """
+        f"""
         SELECT p.node_id, p.pinned_at, p.note
         FROM kg_pins p
         JOIN graph_nodes n ON n.id = p.node_id
-        WHERE p.user_id = ?
+        WHERE p.workspace_id = ? AND p.user_id = ?
           AND n.deprecated_at IS NULL
+          {visible_clause}
         ORDER BY p.pinned_at DESC
         """,
-        (user_id,),
+        (workspace_id, user_id, *visible_params),
     )
     rows = await cur.fetchall()
     return [
@@ -1209,6 +1254,7 @@ async def create_graph_pin(
     user_id: str,
     node_id: str,
     note: str | None,
+    visible_projects: set[str] | None = None,
 ) -> PinOut:
     """Upsert a node pin for the current user.
 
@@ -1218,10 +1264,15 @@ async def create_graph_pin(
 
     404 (NotFoundError) when the node does not exist / is soft-deleted.
     """
-    # Verify the node exists (not soft-deleted)
+    authenticated_workspace = require_workspace_ctx(ctx)
+    if workspace_id != authenticated_workspace:
+        raise NotFoundError(code="not_found", message="Not found")
+
+    # Verify the node exists, is live, and belongs to a visible project.
     db.row_factory = aiosqlite.Row
     cur = await db.execute(
-        "SELECT id FROM graph_nodes WHERE id = ? AND deprecated_at IS NULL LIMIT 1",
+        "SELECT id, project_id FROM graph_nodes "
+        "WHERE id = ? AND deprecated_at IS NULL LIMIT 1",
         (node_id,),
     )
     node_row = await cur.fetchone()
@@ -1234,6 +1285,11 @@ async def create_graph_pin(
                 "Fix: verify node_id format and that the node is in the live graph."
             ),
         )
+    if (
+        visible_projects is not None
+        and node_row["project_id"] not in visible_projects
+    ):
+        raise NotFoundError(code="node_not_found", message="Not found")
 
     # UPSERT — ON CONFLICT updates note and pinned_at
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%f") + "Z"
@@ -1245,7 +1301,7 @@ async def create_graph_pin(
             note = excluded.note,
             pinned_at = excluded.pinned_at
         """,
-        (workspace_id, user_id, node_id, now, note),
+        (authenticated_workspace, user_id, node_id, now, note),
     )
     # get_write_db() documents "caller must commit" — flush WAL immediately so
     # the write is visible to the read-pool without waiting for periodic flush.
@@ -1254,8 +1310,9 @@ async def create_graph_pin(
     # Fetch back the stored row
     db.row_factory = aiosqlite.Row
     cur = await db.execute(
-        "SELECT node_id, pinned_at, note FROM kg_pins WHERE user_id = ? AND node_id = ? LIMIT 1",
-        (user_id, node_id),
+        "SELECT node_id, pinned_at, note FROM kg_pins "
+        "WHERE workspace_id = ? AND user_id = ? AND node_id = ? LIMIT 1",
+        (authenticated_workspace, user_id, node_id),
     )
     row = await cur.fetchone()
     if row is None:
@@ -1288,6 +1345,7 @@ async def delete_graph_pin(
     does not exist for this user. Commits the delete. The adapter invalidates
     the pins cache (transport).
     """
+    workspace_id = require_workspace_ctx(ctx)
     # Validate node_id format
     if not _NODE_ID_RE.match(node_id):
         raise ValidationError(
@@ -1298,8 +1356,9 @@ async def delete_graph_pin(
     # Check existence first (to return proper 404)
     db.row_factory = aiosqlite.Row
     cur = await db.execute(
-        "SELECT id FROM kg_pins WHERE user_id = ? AND node_id = ? LIMIT 1",
-        (user_id, node_id),
+        "SELECT id FROM kg_pins WHERE workspace_id = ? "
+        "AND user_id = ? AND node_id = ? LIMIT 1",
+        (workspace_id, user_id, node_id),
     )
     existing = await cur.fetchone()
     if existing is None:
@@ -1309,8 +1368,8 @@ async def delete_graph_pin(
         )
 
     await db.execute(
-        "DELETE FROM kg_pins WHERE user_id = ? AND node_id = ?",
-        (user_id, node_id),
+        "DELETE FROM kg_pins WHERE workspace_id = ? AND user_id = ? AND node_id = ?",
+        (workspace_id, user_id, node_id),
     )
     # get_write_db() documents "caller must commit" — flush WAL immediately so
     # the deletion is visible to the read-pool without waiting for periodic flush.
@@ -1364,7 +1423,15 @@ async def graph_resolve(
         if row is not None:
             break
     if row is None:
-        raise NotFoundError(code="not_found", message="Not found")
+        raise NotFoundError(
+            code="node_not_found",
+            message=(
+                f"Code path not found in the accessible knowledge graph: {path!r}. "
+                "The path may be mistyped, not indexed yet, or absent from the "
+                "current graph. "
+                f"{_CODE_GRAPH_RECOVERY_HINT}"
+            ),
+        )
 
     # --- RBAC visibility check (404, not 403) ---
     project_id = row["project_id"]
@@ -1693,6 +1760,7 @@ async def mark_node_verified(
     *,
     node_id: str,
     verified_at: str | None = None,
+    visible_projects: set[str] | None = None,
 ) -> dict:
     """Stamp graph_nodes.last_verified_at = now (REINFORCE apply).
 
@@ -1706,11 +1774,17 @@ async def mark_node_verified(
     except ValueError as e:
         raise ValidationError(code="invalid_request", message=str(e))
     db.row_factory = aiosqlite.Row
+    require_workspace_ctx(ctx)
     cur = await db.execute(
-        "SELECT id FROM graph_nodes WHERE id = ? AND deprecated_at IS NULL LIMIT 1",
+        "SELECT id, project_id FROM graph_nodes "
+        "WHERE id = ? AND deprecated_at IS NULL LIMIT 1",
         (node_id,),
     )
-    if await cur.fetchone() is None:
+    node = await cur.fetchone()
+    if node is None or (
+        visible_projects is not None
+        and node["project_id"] not in visible_projects
+    ):
         raise NotFoundError(
             code="node_not_found",
             message=(
@@ -1735,6 +1809,7 @@ async def mark_edge_superseded(
     relation: str,
     superseded_by: str | None = None,
     invalid_at: str | None = None,
+    visible_projects: set[str] | None = None,
 ) -> dict:
     """Soft-invalidate an asserted edge: set valid_until = now (+ optional
     superseded_by audit pointer). SUPERSEDE / CONTRADICTION apply.
@@ -1756,14 +1831,24 @@ async def mark_edge_superseded(
                 f"Allowed: {list(graph_service.EDGE_TYPES)}."
             ),
         )
+    require_workspace_ctx(ctx)
     db.row_factory = aiosqlite.Row
     cur = await db.execute(
-        "SELECT id FROM graph_edges "
-        "WHERE source_id = ? AND target_id = ? AND relation = ? LIMIT 1",
+        "SELECT e.id, source.project_id AS source_project, "
+        "target.project_id AS target_project FROM graph_edges e "
+        "JOIN graph_nodes source ON source.id = e.source_id "
+        "JOIN graph_nodes target ON target.id = e.target_id "
+        "WHERE e.source_id = ? AND e.target_id = ? AND e.relation = ? LIMIT 1",
         (source_id, target_id, relation),
     )
     row = await cur.fetchone()
-    if row is None:
+    if row is None or (
+        visible_projects is not None
+        and (
+            row["source_project"] not in visible_projects
+            or row["target_project"] not in visible_projects
+        )
+    ):
         raise NotFoundError(
             code="edge_not_found",
             message=(

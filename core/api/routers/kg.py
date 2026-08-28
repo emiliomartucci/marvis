@@ -35,12 +35,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 import aiosqlite
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from core.api.db import get_write_db
 from core.api.models import UserInfo
 from core.api.rbac import require_role
+from core.api.security import is_local_single_user_mode, is_loopback_request
 from core.api.services.kg import manual_edges
 from core.api.services.kg_watcher_control import (
     WatcherSentinelError,
@@ -52,6 +53,18 @@ from core.api.services.kg_watcher_control import (
 logger = logging.getLogger("api.routers.kg")
 
 router = APIRouter(prefix="/api/v1/kg", tags=["kg"])
+
+_LOCAL_HOST_DETAIL = (
+    "This host-global KG control operation is available only to the trusted "
+    "local OSS loopback runtime."
+)
+
+
+def _require_local_host_request(request: Request) -> None:
+    if is_local_single_user_mode() and is_loopback_request(request):
+        return
+    raise HTTPException(status_code=403, detail=_LOCAL_HOST_DETAIL)
+
 
 # Resolve paths matching deploy layout: scripts/ at /data/pir/scripts/.
 SCRIPTS_ROOT = Path("/data/pir")
@@ -269,7 +282,11 @@ async def delete_manual_project_edge(
     return ManualProjectEdgeDeleteResponse(deleted=deleted, edge=_manual_edge_out(edge))
 
 
-@router.post("/reindex_path", response_model=ReindexPathResponse)
+@router.post(
+    "/reindex_path",
+    response_model=ReindexPathResponse,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def reindex_path(
     req: ReindexPathRequest,
     _=Depends(require_role("operator")),
@@ -320,7 +337,11 @@ async def reindex_path(
     )
 
 
-@router.post("/rebuild", response_model=RebuildResponse)
+@router.post(
+    "/rebuild",
+    response_model=RebuildResponse,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def trigger_rebuild(
     req: RebuildRequest,
     _=Depends(require_role("operator")),
@@ -351,7 +372,11 @@ async def trigger_rebuild(
     return RebuildResponse(status="queued", job_id=str(uuid.uuid4()))
 
 
-@router.post("/watcher_control", response_model=WatcherControlResponse)
+@router.post(
+    "/watcher_control",
+    response_model=WatcherControlResponse,
+    dependencies=[Depends(_require_local_host_request)],
+)
 async def watcher_control(
     req: WatcherControlRequest,
     _=Depends(require_role("operator")),
