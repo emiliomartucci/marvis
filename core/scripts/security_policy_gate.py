@@ -9,6 +9,7 @@ that contract and never claims that a review happened.
 from __future__ import annotations
 
 import json
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,8 +17,15 @@ from typing import Any
 
 POLICY_PATH = Path("contracts/security/protected_paths.json")
 EXPECTED_SCHEMA = "marvis-security-protected-paths/v1"
-REQUIRED_GROUPS = {"self_protection", "hooks", "projections", "authentication"}
+REQUIRED_GROUPS = {
+    "self_protection",
+    "hooks",
+    "projections",
+    "authentication",
+    "public_claims",
+}
 WORKFLOW_PATH = Path(".github/workflows/security-policy-gate.yml")
+PUBLIC_CLAIMS_PATH = Path("core/scripts/quality-gates/verify_public_claims.py")
 
 
 def _load_json(path: Path, errors: list[str]) -> dict[str, Any] | None:
@@ -269,6 +277,23 @@ def _validate_hook_parity(root: Path, policy: dict[str, Any], errors: list[str])
             )
 
 
+def _validate_public_claims(root: Path, errors: list[str]) -> None:
+    path = root / PUBLIC_CLAIMS_PATH
+    spec = importlib.util.spec_from_file_location("_marvis_public_claims_gate", path)
+    if spec is None or spec.loader is None:
+        errors.append("public claims gate is not importable")
+        return
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        module.verify_source(root)
+    except Exception as exc:  # fail closed on invalid claims or an unreadable gate
+        errors.append(f"public claims gate failed: {exc}")
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
 def validate_repository(root: Path) -> list[str]:
     root = root.resolve()
     errors: list[str] = []
@@ -304,6 +329,7 @@ def validate_repository(root: Path) -> list[str]:
         _validate_codeowners(root, declared_paths, owners, errors)
     _validate_workflow(root, declared_paths, errors)
     _validate_hook_parity(root, policy, errors)
+    _validate_public_claims(root, errors)
     return errors
 
 

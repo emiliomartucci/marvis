@@ -264,7 +264,7 @@ def lite_cmd(
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit pure JSON to stdout."),
 ) -> None:
-    """Use OSS-lite governance: safety blocks, process rules warn."""
+    """Use lite local governance: safety blocks, process rules warn."""
     _set_profile("lite", settings=settings, json_out=json_out)
 
 

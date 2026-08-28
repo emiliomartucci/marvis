@@ -1,5 +1,5 @@
 # v1.0.0 - 2026-05-27 - S2 F5: `marvis telemetry` on/off/status/log
-"""``marvis telemetry on|off|status|log`` — the opt-out control surface.
+"""``marvis telemetry on|off|status|log`` — the opt-in control surface.
 
 Registered onto the SAME Typer ``app`` as ``marvis init`` via ``register(app)``,
 exactly like ``marvis_hooks`` / ``marvis_mcp`` / ``marvis_runtime``.
@@ -39,7 +39,7 @@ def register(app: typer.Typer) -> None:
         telemetry_app,
         name="telemetry",
         rich_help_panel=_PANEL_TELEMETRY,
-        help="Turn anonymous telemetry on / off / inspect (opt-out, no PII).",
+        help="Turn anonymous telemetry on / off / inspect (opt-in, no PII).",
     )
 
 
@@ -162,7 +162,7 @@ def status_cmd(
             "DO_NOT_TRACK (set → off)",
             "MARVIS_TELEMETRY in {0,off,false} → off | log → show-don't-send | else fall through",
             "settings.yaml telemetry: false → off",
-            "default → on",
+            "default → off",
         ],
         "settings": str(settings_path),
         "endpoint": _tc._endpoint(),

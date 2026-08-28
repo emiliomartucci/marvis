@@ -64,10 +64,6 @@ def _pytest_suite(root: Path, suite: dict[str, Any], report: Path) -> dict[str, 
     return totals
 
 
-class _Result(unittest.TextTestResult):
-    pass
-
-
 def _unittest_suite(root: Path, suite: dict[str, Any]) -> dict[str, int]:
     absolute = root / str(suite["path"])
     sys.path.insert(0, str(absolute))
@@ -75,7 +71,7 @@ def _unittest_suite(root: Path, suite: dict[str, Any]) -> dict[str, int]:
         tests = unittest.defaultTestLoader.discover(
             str(absolute), pattern=str(suite["pattern"])
         )
-        runner = unittest.TextTestRunner(verbosity=2, resultclass=_Result)
+        runner = unittest.TextTestRunner(verbosity=2)
         result = runner.run(tests)
     finally:
         sys.path.pop(0)

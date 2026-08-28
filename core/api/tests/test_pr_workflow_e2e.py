@@ -51,9 +51,11 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 # ---------------------------------------------------------------------------
-# Pytest-asyncio configuration
+# Async backend contract
 # ---------------------------------------------------------------------------
-pytest_plugins = ["anyio"]
+# This workflow exercises aiosqlite and application code that calls asyncio
+# primitives directly.  Running the same cases under Trio is not a supported
+# product surface and produces setup errors before the behavior under test.
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +217,7 @@ async def client_with_task(app_with_overrides, tmp_db: str):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_pr_merge_completes_task(client_with_task, tmp_db: str):
     """
     Full path: existing review task + open PR -> webhook(closed, merged=true)
@@ -310,7 +312,7 @@ async def test_pr_merge_completes_task(client_with_task, tmp_db: str):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_pr_closed_sets_review_feedback(client_with_task, tmp_db: str):
     """
     Full path: existing review task + open PR -> webhook(closed, merged=false, body=reason)
@@ -382,7 +384,7 @@ async def test_pr_closed_sets_review_feedback(client_with_task, tmp_db: str):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_webhook_invalid_signature_rejected(app_with_overrides):
     """Webhook with wrong HMAC signature must return 403."""
     app, _ = app_with_overrides
@@ -412,7 +414,7 @@ async def test_webhook_invalid_signature_rejected(app_with_overrides):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_webhook_idempotent_delivery(client_with_task, tmp_db: str):
     """Same delivery_id sent twice must not double-process."""
     client, task_id, branch, pr_id = client_with_task

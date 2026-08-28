@@ -1,4 +1,4 @@
-"""Receipt-backed offline schema commands for the OSS single-user runtime."""
+"""Receipt-backed offline schema commands for the local single-user runtime."""
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version

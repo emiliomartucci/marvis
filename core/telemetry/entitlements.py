@@ -9,9 +9,9 @@ wire the cloud-issued, locally-verified Ed25519 entitlement check (plan Deepenin
 
 Two load-bearing rules for whoever lights this up later:
 - **FAIL-OPEN**: a missing / unverifiable / expired entitlement degrades to free
-  (``is_pro`` -> False). The OSS never locks a user out of free functionality.
+  (``is_pro`` -> False). The local runtime never locks a user out of free functionality.
 - **Clean boundary**: free code calls ``is_pro`` and always has a runnable free path;
-  free code must never import a PRO module (keeps the OSS build standalone).
+  free code must never import a PRO module (keeps the public package standalone).
 """
 from __future__ import annotations
 

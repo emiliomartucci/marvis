@@ -57,6 +57,11 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 ALLOWED_MODES = {"100644", "100755"}
 # Hard cap independent of the map, so a map typo cannot lift it.
 ABSOLUTE_MAX_FILE_BYTES = 20971520
+# Bound hostile candidates before their bytes are retained for classification.
+# The verified payload is ~12 MiB; raising either ceiling is a reviewed
+# importer-policy change, never something a bundle can request for itself.
+ABSOLUTE_MAX_PAYLOAD_BYTES = 268435456
+ABSOLUTE_MAX_MANIFEST_BYTES = 8388608
 MIGRATIONS_PREFIX = "migrations/"
 MAP_PATH_RULES = ("managed_areas", "oss_owned_areas")
 APPROVED_PRESERVE_KEY = "approved_preserve_paths"
@@ -300,7 +305,12 @@ def _safe_relative(base: Path, relative: str) -> Path:
     return target
 
 
-def load_bundle(bundle: Path, expected: dict) -> dict:
+def load_bundle(
+    bundle: Path,
+    expected: dict,
+    *,
+    max_file_bytes: int = ABSOLUTE_MAX_FILE_BYTES,
+) -> dict:
     """Verify bundle structure, identities, and every payload byte.
 
     Returns the verified state used by all modes. Any inconsistency raises
@@ -316,6 +326,12 @@ def load_bundle(bundle: Path, expected: dict) -> dict:
     payload_manifest_path = manifests / "payload.json"
     consumer_manifest_path = manifests / "oss.json"
     try:
+        for manifest_path in (payload_manifest_path, consumer_manifest_path):
+            if manifest_path.stat().st_size > ABSOLUTE_MAX_MANIFEST_BYTES:
+                raise ImportRefused(
+                    f"bundle manifest exceeds {ABSOLUTE_MAX_MANIFEST_BYTES} bytes: "
+                    f"{manifest_path.name}"
+                )
         payload_manifest_bytes = payload_manifest_path.read_bytes()
         consumer_manifest_bytes = consumer_manifest_path.read_bytes()
         payload_manifest = json.loads(payload_manifest_bytes.decode("utf-8"))
@@ -370,6 +386,7 @@ def load_bundle(bundle: Path, expected: dict) -> dict:
     seen: dict[str, dict] = {}
     casefold: dict[str, str] = {}
     records: list[dict] = []
+    payload_bytes = 0
     for entry in files_raw:
         if not isinstance(entry, dict):
             raise ImportRefused("payload file entry must be an object")
@@ -388,12 +405,24 @@ def load_bundle(bundle: Path, expected: dict) -> dict:
         declared_sha = entry.get("sha256")
         if not isinstance(declared_sha, str) or not SHA256_RE.match(declared_sha):
             raise ImportRefused(f"{path}: sha256 must be a 64-hex digest")
+        declared_size = entry.get("size")
+        if not isinstance(declared_size, int) or isinstance(declared_size, bool) or declared_size < 0:
+            raise ImportRefused(f"{path}: size must be a non-negative integer")
+        if declared_size > max_file_bytes:
+            raise ImportRefused(f"{path}: exceeds max_file_bytes before payload read")
+        payload_bytes += declared_size
+        if payload_bytes > ABSOLUTE_MAX_PAYLOAD_BYTES:
+            raise ImportRefused(
+                f"bundle payload exceeds {ABSOLUTE_MAX_PAYLOAD_BYTES} bytes before payload read"
+            )
         target = _safe_relative(payload_root, path)
         if not target.is_file():
             raise ImportRefused(f"payload file missing from bundle: {path}")
+        if target.stat().st_size > max_file_bytes:
+            raise ImportRefused(f"{path}: on-disk payload exceeds max_file_bytes before read")
         content = target.read_bytes()
-        if len(content) != entry.get("size"):
-            raise ImportRefused(f"{path}: size mismatch (manifest {entry.get('size')}, actual {len(content)})")
+        if len(content) != declared_size:
+            raise ImportRefused(f"{path}: size mismatch (manifest {declared_size}, actual {len(content)})")
         actual_sha = sha256_bytes(content)
         if actual_sha != declared_sha:
             raise ImportRefused(f"{path}: payload bytes do not match manifest sha256")
@@ -957,7 +986,11 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         ownership, _ = load_ownership_map(ownership_path)
-        bundle_state = load_bundle(bundle, expected)
+        bundle_state = load_bundle(
+            bundle,
+            expected,
+            max_file_bytes=ownership["max_file_bytes"],
+        )
         classification = classify(bundle_state, ownership, repo)
         dirty = worktree_dirty(repo)
         importable = sorted(

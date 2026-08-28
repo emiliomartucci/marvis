@@ -1,5 +1,5 @@
 # v1.0.0 - 2026-05-28 - S1b: `marvis doctor` — install-health self-diagnostic
-"""``marvis doctor`` — diagnose the MarvisX OSS installation and print
+"""``marvis doctor`` — diagnose the local MarvisX installation and print
 actionable remediation for every failure.
 
 Registered onto the SAME Typer ``app`` as ``marvis init`` via ``register(app)``,
@@ -625,11 +625,11 @@ def _check_connectivity(*, offline: bool) -> CheckResult:
         )
 
 
-def _check_granite_model() -> list[CheckResult]:
+def _check_granite_model(*, offline: bool = False) -> list[CheckResult]:
     """Check whether the Granite embedding model is present in the HF cache and
     whether available RAM meets the documented floor.
 
-    Granite is the OSS-only embedding model (ibm-granite/granite-embedding-97m-multilingual-r2,
+    Granite is the local-runtime embedding model (ibm-granite/granite-embedding-97m-multilingual-r2,
     384-dim). MiniLM has been removed as a fallback; machines below MIN_RAM_GB
     receive an actionable warning instead of a silent model swap.
 
@@ -660,7 +660,7 @@ def _check_granite_model() -> list[CheckResult]:
                         "Free memory by closing other applications, or run "
                         "MarvisX on a machine that meets the RAM requirement. "
                         f"Local Granite embedding needs roughly {MIN_RAM_GB} GB "
-                        "available (MarvisX OSS is Granite-only by design)."
+                        "available (the local runtime is Granite-only by design)."
                     ),
                 )
             )
@@ -712,8 +712,12 @@ def _check_granite_model() -> list[CheckResult]:
                 found_snapshot = snap
                 break
 
+    model_offline = offline or any(
+        os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    )
     pre_download_fix = (
-        "Pre-download to avoid first-run latency (torch-free):\n"
+        "Provision the pinned model before entering offline mode:\n"
         "  python -c \""
         "from huggingface_hub import snapshot_download; "
         f"snapshot_download('{GRANITE_MODEL_ID}', "
@@ -732,6 +736,12 @@ def _check_granite_model() -> list[CheckResult]:
             )
         )
     elif model_cache.exists():
+        behavior = (
+            "Offline mode keeps semantic search disabled and uses keyword fallback; "
+            "no download is attempted."
+            if model_offline
+            else "The missing files will be fetched automatically on first use."
+        )
         results.append(
             CheckResult(
                 name="granite_model_cache",
@@ -739,20 +749,27 @@ def _check_granite_model() -> list[CheckResult]:
                 detail=(
                     f"Granite model dir exists at {model_cache} but the ONNX graph "
                     f"+ tokenizer ({', '.join(required)}) are missing or incomplete. "
-                    "They will be fetched automatically on first use."
+                    f"{behavior}"
                 ),
                 fix=pre_download_fix,
             )
         )
     else:
+        behavior = (
+            "Offline mode uses the observable keyword fallback; no download is attempted."
+            if model_offline
+            else (
+                "The ONNX graph + tokenizer will be fetched automatically on "
+                "first use (one-time download)."
+            )
+        )
         results.append(
             CheckResult(
                 name="granite_model_cache",
                 level="warning",
                 detail=(
                     f"Granite model not yet downloaded to {model_cache}. "
-                    "The ONNX graph + tokenizer will be fetched automatically on "
-                    "first use (one-time download)."
+                    f"{behavior}"
                 ),
                 fix=pre_download_fix,
             )
@@ -1064,7 +1081,7 @@ def doctor_cmd(
         checks.append(_check_mcp_double_registration())
     checks.extend(_check_data_files())
     checks.append(_check_connectivity(offline=offline))
-    checks.extend(_check_granite_model())
+    checks.extend(_check_granite_model(offline=offline))
     checks.extend(_check_semantic_search())
     checks.extend(_check_graph_freshness())
 

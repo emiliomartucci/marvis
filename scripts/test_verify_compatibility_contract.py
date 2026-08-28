@@ -10,7 +10,8 @@ from verify_compatibility_contract import CompatibilityError, verify
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_REF = "429cf2500996672c2449a4f34fee427e7f598620"
+SOURCE_REF = "1245a57f18aa74a69ed7db6b42fc4516b7ae1e8b"
+PAYLOAD_SHA256 = "dd9083bd517b52d08175c31d26647aba552b1408be0196007521d669effab465"
 
 
 class CompatibilityContractTests(unittest.TestCase):
@@ -23,6 +24,10 @@ class CompatibilityContractTests(unittest.TestCase):
             "contracts/engine-pin.yaml",
             "core/api/db.py",
             "core/api/mcp/stdio.py",
+            "core/api/routers/agent_tokens.py",
+            "core/api/routers/auth.py",
+            "core/api/routers/graph_ingest.py",
+            "core/api/services/schema_upgrade.py",
             "core/api/tests/test_require_scope_empty_deny.py",
             "core/api/tests/test_schema_compatibility.py",
             "core/cli/marvis_hooks.py",
@@ -47,6 +52,7 @@ class CompatibilityContractTests(unittest.TestCase):
     def test_current_contract_passes(self) -> None:
         result = verify(ROOT, expected_source_ref=SOURCE_REF)
         self.assertEqual(result["source_ref"], SOURCE_REF)
+        self.assertEqual(result["projection_payload_sha256"], PAYLOAD_SHA256)
         self.assertGreater(result["n_operations"], result["n_minus_1_operations"])
 
     def test_manifest_tamper_fails_closed(self) -> None:
@@ -92,6 +98,16 @@ class CompatibilityContractTests(unittest.TestCase):
         matrix["rows"][0]["evidence"] = "core/api/db.py::does_not_exist"
         path.write_text(json.dumps(matrix, sort_keys=True, indent=2) + "\n")
         with self.assertRaisesRegex(CompatibilityError, "evidence symbol missing"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_projection_payload_digest_is_required(self) -> None:
+        root = self._copy()
+        path = root / "contracts/engine-pin.yaml"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(PAYLOAD_SHA256, "not-a-digest"),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(CompatibilityError, "projection payload digest"):
             verify(root, expected_source_ref=SOURCE_REF)
 
 

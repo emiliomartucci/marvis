@@ -1,4 +1,4 @@
-"""`marvis init` — interactive bootstrap wizard for OSS users.
+"""`marvis init` — interactive bootstrap wizard for local open-core users.
 
 Walks the user through 5 prompts (BSL / storage / BYOK / first project /
 recap) reusing `core.wizard` shared lib so the CLI and the Console
@@ -413,12 +413,12 @@ def _bootstrap_schema(state: WizardState) -> str | None:
     """Create + migrate the local SQLite DB so `marvis status` is green after init.
 
     The install path (this wizard) is the canonical first step; nothing else runs
-    the schema for an OSS single-user runtime (the FastAPI lifespan + the API
+    the schema for a local single-user runtime (the FastAPI lifespan + the API
     container's init.sh do it for the managed deployment, but neither runs here).
     Without this, a clean machine has ``db_ok:false`` until something migrates.
 
     Migration 016 seeds the admin user and REQUIRES a password
-    (``PIR_ADMIN_PASSWORD_HASH`` / ``PIR_PASSWORD``). In OSS single-user there is
+    (``PIR_ADMIN_PASSWORD_HASH`` / ``PIR_PASSWORD``). In local single-user mode there is
     NO login — the runtime acts as the local operator (``LOCAL_CTX``), no JWT is
     ever issued, so the seed password is never used to authenticate. We therefore
     generate a RANDOM throwaway password purely to satisfy the seed (same idea as
@@ -624,7 +624,7 @@ def _root(
     This is also the centralized telemetry chokepoint: every ``marvis`` invocation
     flows through here, so we emit a single anonymous ``cli_command`` event (the
     subcommand NAME only — a low-cardinality token, never args/paths) and show the
-    one-time opt-out notice. The opt-out gate lives inside ``emit()`` /
+    one-time consent notice. The consent gate lives inside ``emit()`` /
     ``maybe_first_run_notice()`` (the single enforcement point); both are
     fail-silent, so telemetry can never block, slow, or error the command.
     """
@@ -666,7 +666,7 @@ def _telemetry_root_hook(invoked_subcommand: str | None) -> None:
         _telemetry.emit("cli_command", {"command": invoked_subcommand or "init"})
 
         # Opportunistic daily aggregate rollup (provision + send), throttled 24h,
-        # detached + fail-silent — same opt-out gate as emit(). Never blocks the command.
+        # detached + fail-silent — same consent gate as emit(). Never blocks the command.
         from core.telemetry import sender as _sender
 
         _sender.maybe_send_rollup()
@@ -945,7 +945,7 @@ from core.cli.marvis_mcp import register as _register_mcp  # noqa: E402
 
 _register_mcp(app)
 
-# `marvis telemetry on/off/status/log` — the anonymous opt-out telemetry control.
+# `marvis telemetry on/off/status/log` — the anonymous opt-in telemetry control.
 from core.cli.marvis_telemetry import register as _register_telemetry  # noqa: E402
 
 _register_telemetry(app)

@@ -33,6 +33,16 @@ class PublicClaimTests(unittest.TestCase):
         violations = _check_text("METADATA", "MarvisX OSS runtime")
         self.assertEqual(violations[0].rule, "inaccurate license claim")
 
+    def test_inaccurate_telemetry_default_is_rejected(self) -> None:
+        for copy in (
+            "Anonymous telemetry is opt-out.",
+            "Telemetry is default-on.",
+            "default → on",
+        ):
+            with self.subTest(copy=copy):
+                violations = _check_text("public-copy", copy)
+                self.assertEqual(violations[0].rule, "inaccurate telemetry default")
+
     def test_built_metadata_is_checked(self) -> None:
         with tempfile.TemporaryDirectory(prefix="marvis-claims-") as raw:
             wheel = Path(raw) / "sample-1.0-py3-none-any.whl"
@@ -45,6 +55,33 @@ class PublicClaimTests(unittest.TestCase):
                 archive.writestr("sample-1.0.dist-info/METADATA", metadata.as_string())
             with self.assertRaisesRegex(PublicClaimError, "audit claim"):
                 verify_artifact(wheel)
+
+    def test_built_metadata_requires_bsl_license(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="marvis-claims-") as raw:
+            wheel = Path(raw) / "sample-1.0-py3-none-any.whl"
+            metadata = Message()
+            metadata["Metadata-Version"] = "2.4"
+            metadata["Name"] = "sample"
+            metadata["Version"] = "1.0"
+            metadata["License"] = "Apache-2.0"
+            metadata.set_payload("A source-available local runtime.")
+            with ZipFile(wheel, "w", compression=ZIP_DEFLATED) as archive:
+                archive.writestr("sample-1.0.dist-info/METADATA", metadata.as_string())
+            with self.assertRaisesRegex(PublicClaimError, "package license"):
+                verify_artifact(wheel)
+
+    def test_built_metadata_accepts_bsl_license(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="marvis-claims-") as raw:
+            wheel = Path(raw) / "sample-1.0-py3-none-any.whl"
+            metadata = Message()
+            metadata["Metadata-Version"] = "2.4"
+            metadata["Name"] = "sample"
+            metadata["Version"] = "1.0"
+            metadata["License"] = "BSL-1.1"
+            metadata.set_payload("A source-available local runtime.")
+            with ZipFile(wheel, "w", compression=ZIP_DEFLATED) as archive:
+                archive.writestr("sample-1.0.dist-info/METADATA", metadata.as_string())
+            self.assertEqual(verify_artifact(wheel)["license"], "BSL-1.1")
 
 
 if __name__ == "__main__":

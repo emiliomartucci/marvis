@@ -26,6 +26,13 @@ if str(DEFAULT_ROOT) not in sys.path:
 CONTRACT_SCHEMA = "marvis-prior-distributions/v1"
 BACKUP_MANIFEST_SCHEMA = "marvis-local-backup-manifest/v1"
 REPORT_SCHEMA = "marvis-local-upgrade-verification/v1"
+_SURFACE_PATHS = {
+    "database": Path("console.db"),
+    "settings": Path("vault/settings.yaml"),
+    "project_tree": Path("projects"),
+    "vault_state": Path("vault/byok.vault"),
+    "hook_state": Path("project/.claude"),
+}
 
 
 class UpgradeVerificationError(RuntimeError):
@@ -133,15 +140,9 @@ def _wheel_version_and_migrations(wheel: Path, destination: Path) -> tuple[str, 
 
 
 def _surface_manifest(root: Path, artifact: PriorDistribution, artifact_sha: str) -> dict[str, Any]:
-    surfaces = {
-        "database": root / "console.db",
-        "settings": root / "vault/settings.yaml",
-        "project_tree": root / "projects",
-        "vault_state": root / "vault/byok.vault",
-        "hook_state": root / "project/.claude",
-    }
     entries = []
-    for name, path in surfaces.items():
+    for name, relative_path in _SURFACE_PATHS.items():
+        path = root / relative_path
         entries.append(
             {
                 "surface": name,
@@ -185,10 +186,9 @@ def _surface_manifest(root: Path, artifact: PriorDistribution, artifact_sha: str
 
 def _surface_digests(root: Path) -> dict[str, str]:
     return {
-        "settings": _tree_digest(root / "vault/settings.yaml"),
-        "project_tree": _tree_digest(root / "projects"),
-        "vault_state": _tree_digest(root / "vault/byok.vault"),
-        "hook_state": _tree_digest(root / "project/.claude"),
+        name: _tree_digest(root / relative_path)
+        for name, relative_path in _SURFACE_PATHS.items()
+        if name != "database"
     }
 
 

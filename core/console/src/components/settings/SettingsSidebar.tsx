@@ -115,7 +115,7 @@ export default function SettingsSidebar() {
           Settings
         </div>
         <div className="mt-0.5 font-mono text-[10px] tracking-[0.02em] text-pir-text-muted">
-          oss · single-org
+          local · single-org
         </div>
       </div>
 

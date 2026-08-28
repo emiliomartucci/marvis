@@ -152,17 +152,15 @@ def status_cmd(
     llm = settings_data.get("llm") or {}
     byok = bool(_vault_state() or llm.get("provider"))
     # Real EFFECTIVE state: reuse the same precedence `marvis telemetry status`
-    # uses (DO_NOT_TRACK / MARVIS_TELEMETRY env, then settings.yaml, default ON).
-    # The old inline check read only settings.yaml with a wrong default (off),
-    # so status showed "off" even when telemetry was actually ON.
+    # uses (DO_NOT_TRACK / MARVIS_TELEMETRY env, then settings.yaml, default OFF).
     try:
         from core.telemetry.client import _enabled as _telemetry_enabled
 
         telemetry = bool(_telemetry_enabled())
     except Exception:  # noqa: BLE001 — status must never crash
-        telemetry = bool(settings_data.get("telemetry", {}).get("enabled", True)) if isinstance(
+        telemetry = bool(settings_data.get("telemetry", {}).get("enabled", False)) if isinstance(
             settings_data.get("telemetry"), dict
-        ) else bool(settings_data.get("telemetry", True))
+        ) else bool(settings_data.get("telemetry", False))
 
     result = {
         "db_ok": db_ok,
@@ -807,7 +805,7 @@ def approve_cmd(
 
     Pure thin adapter: it calls ``ingest_triage.approve`` on the item as-is — no
     hand-rolled SQL (no-fork: surfaces are adapters over use_cases, never raw
-    queries). In OSS single-user there is no human-only gate
+    queries). In the local single-user runtime there is no human-only gate
     (``is_human_session=True``), so no second permission model is needed.
 
     DEFERRED: overriding the routing (target_folder/target_filename) before
@@ -847,7 +845,7 @@ def audit_cmd(
 ) -> None:
     """Local action trail (newest first). Read-only.
 
-    Uses the local-admin context: the OSS single user is the sole operator, so it
+    Uses the local-admin context: the local single user is the sole operator, so it
     legitimately reads its own complete trail (the operator-narrowed audit slice
     would otherwise hide everything but learnings).
     """

@@ -29,13 +29,13 @@ The entry shape is correct by construction (these are documented recurring bugs)
   * ``"args"`` = the ARRAY ``["-m", "core.api.mcp.server"]`` — NEVER a single
     string ``"python -m core.api.mcp.server"`` as ``command`` (Claude Code would
     ``spawn`` a literal binary by that name → ENOENT, issue #590).
-  * config (db path / OSS flag) flows via ``args`` flags, NOT via ``env``: the
+  * config (database path / local-runtime flag) flows via ``args`` flags, NOT via ``env``: the
     ``env`` of ``.mcp.json`` is an unreliable path to a stdio child (issue #38381).
     The entry ships ``"env": {}`` and the server reads ``~/.marvis/settings.yaml``
     on its own (the ``_apply_settings`` path), so no env coupling is needed.
 
 Note: two keys → the host spawns the server process once PER key (two stdio
-children). For an OSS single-user install this is harmless (SQLite WAL handles
+children). For a local single-user install this is harmless (SQLite WAL handles
 the concurrent readers; the busy-timeout covers the rare concurrent write). It is
 the inherent cost of exposing two prefixes from one ``.mcp.json`` and ends when
 the legacy ``pir`` key is retired.

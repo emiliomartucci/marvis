@@ -21,8 +21,10 @@ ROOT = Path(__file__).resolve().parents[1]
 class CICollectionContractTests(unittest.TestCase):
     def test_current_collection_and_workflows_pass(self) -> None:
         result = verify(ROOT)
-        self.assertGreaterEqual(result["pytest_collected"], 442)
-        self.assertGreaterEqual(result["unittest_collected"], 112)
+        # 416 API + 29 CLI tests from a clean checkout.  Keep this independent
+        # from generated Console assets and other local build by-products.
+        self.assertGreaterEqual(result["pytest_collected"], 445)
+        self.assertGreaterEqual(result["unittest_collected"], 128)
 
     def test_lowered_collection_floor_is_not_a_bypass(self) -> None:
         with tempfile.TemporaryDirectory(prefix="marvis-ci-contract-") as raw:

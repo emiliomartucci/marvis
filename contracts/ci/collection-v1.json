@@ -4,24 +4,29 @@
   "pytest_suites": [
     {
       "path": "core/api/tests",
-      "minimum_collected": 415,
+      "minimum_collected": 416,
       "allowed_skips": 0,
       "allowed_deselections": 0,
       "required_nodes": [
         "core/api/tests/test_require_scope_empty_deny.py::test_local_mcp_keeps_agent_context",
         "core/api/tests/test_require_scope_empty_deny.py::test_server_agent_cannot_promote_to_human",
-        "core/api/tests/test_schema_compatibility.py::test_old_binary_denies_forward_schema"
+        "core/api/tests/test_schema_compatibility.py::test_old_binary_denies_forward_schema",
+        "core/api/tests/test_pr_workflow_e2e.py::test_pr_merge_completes_task",
+        "core/api/tests/test_pr_workflow_e2e.py::test_pr_closed_sets_review_feedback",
+        "core/api/tests/test_pr_workflow_e2e.py::test_webhook_invalid_signature_rejected",
+        "core/api/tests/test_pr_workflow_e2e.py::test_webhook_idempotent_delivery"
       ]
     },
     {
       "path": "core/cli/tests",
-      "minimum_collected": 27,
+      "minimum_collected": 29,
       "allowed_skips": 0,
       "allowed_deselections": 0,
       "required_nodes": [
         "core/cli/tests/test_marvis_console_characterization.py::test_health_payload_without_brain_yields_no_fingerprint",
         "core/cli/tests/test_marvis_hooks.py::test_installer_copies_exact_canonical_policy",
-        "core/cli/tests/test_marvis_hooks.py::test_installer_fails_before_copy_when_package_data_is_missing"
+        "core/cli/tests/test_marvis_hooks.py::test_installer_fails_before_copy_when_package_data_is_missing",
+        "core/cli/tests/test_marvis_doctor_offline.py::test_offline_empty_model_cache_reports_keyword_fallback"
       ]
     }
   ],
@@ -29,7 +34,7 @@
     {
       "path": "scripts",
       "pattern": "test_*.py",
-      "minimum_collected": 112,
+      "minimum_collected": 128,
       "allowed_skips": 0,
       "required_node_suffixes": [
         "CompatibilityContractTests.test_current_contract_passes",

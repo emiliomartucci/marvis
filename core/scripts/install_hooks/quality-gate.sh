@@ -6,10 +6,14 @@
 
 set -euo pipefail
 
-source "$(dirname "$0")/_config.sh"
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -r "$HOOK_DIR/_config.sh" ]; then
+  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Hook dependency missing: _config.sh; blocked fail-closed."}}'
+  exit 0
+fi
+source "$HOOK_DIR/_config.sh"
 
 INPUT=$(cat)
-HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "$HOOK_DIR/safety_bridge.py" ]; then
   # Self-contained install: `marvis hooks install` ships safety_bridge.py here.
   BRIDGE="$HOOK_DIR/safety_bridge.py"

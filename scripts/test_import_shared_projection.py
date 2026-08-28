@@ -7,6 +7,7 @@ sentinel, undeclared overlap, missing shared path, deterministic repeat run).
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 import import_shared_projection as isp  # noqa: E402
@@ -202,7 +204,7 @@ def make_args(repo: Path, bundle: Path, **overrides):
         "report": None,
     }
     defaults.update(overrides)
-    return type("Args", (), defaults)
+    return argparse.Namespace(**defaults)
 
 
 def bundle_expectations(bundle: Path) -> dict[str, str]:
@@ -316,6 +318,31 @@ class ImportGateTest(unittest.TestCase):
         bundle = build_bundle(self.base, green_files())
         (bundle / "payload/core/api/smuggled.py").write_bytes(b"x = 1\n")
         self.refused(make_args(self.repo, bundle))
+
+    def test_declared_payload_over_file_limit_is_refused_before_read(self) -> None:
+        bundle = build_bundle(self.base, green_files())
+        manifest_path = bundle / "manifests/payload.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"][0]["size"] = isp.ABSOLUTE_MAX_FILE_BYTES + 1
+        manifest_path.write_bytes(isp.canonical_json(manifest))
+
+        with self.assertRaisesRegex(
+            isp.ImportRefused,
+            "exceeds max_file_bytes before payload read",
+        ):
+            isp.load_bundle(bundle, bundle_expectations(bundle))
+
+    def test_declared_payload_over_total_limit_is_refused_before_read(self) -> None:
+        bundle = build_bundle(self.base, green_files())
+
+        with (
+            mock.patch.object(isp, "ABSOLUTE_MAX_PAYLOAD_BYTES", 1),
+            self.assertRaisesRegex(
+                isp.ImportRefused,
+                "bundle payload exceeds 1 bytes before payload read",
+            ),
+        ):
+            isp.load_bundle(bundle, bundle_expectations(bundle))
 
     def test_every_expected_identity_is_required(self) -> None:
         bundle = build_bundle(self.base, green_files())

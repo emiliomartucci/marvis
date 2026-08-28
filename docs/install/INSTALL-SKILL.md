@@ -134,9 +134,9 @@ Record what you found. You will preserve all of it.
 1. Show what you found in the scan and **confirm which projects to onboard**.
 2. Confirm `projects_root` if it is ambiguous.
 3. BYOK provider (reuse `marvis init` step 3 — anthropic / openai / mac_gateway / skip).
-4. **Telemetry: inform, do not ask.** It is anonymous and default-ON. Tell the user it
-   is on and how to turn it off (`MARVIS_TELEMETRY=0`). Do not request permission —
-   it is opt-out, not opt-in (see §8).
+4. **Telemetry: ask before enabling.** It is anonymous and default-OFF. Leave it off
+   unless the user explicitly opts in, and explain the persistent controls
+   (`marvis telemetry on|off`) plus the environment override (`MARVIS_TELEMETRY=0`).
 
 Do not ask aspirational questions (compliance regions, license frameworks, future
 features). Ask only what changes the next install step.
@@ -229,16 +229,15 @@ hook files. Always go through the merge primitives above.
 
 ## 8. Telemetry
 
-MarvisX sends **anonymous, aggregated** usage events by default (which CLI commands run,
-install funnel, KG scale counts, OS + Python version). It sends **no project content, no
-file paths, no PII**. The OSS build runs without our server; telemetry is the only
-phone-home, and it is anonymous by construction.
+MarvisX can send **anonymous, aggregated** usage events after explicit opt-in (which CLI
+commands run, install funnel, KG scale counts, OS + Python version). It sends **no project content, no
+file paths, no PII**. The local open-core build runs without our server and telemetry
+stays disabled unless the user explicitly enables it.
 
-**To turn it off:** set `MARVIS_TELEMETRY=0` in the environment.
+**To keep it explicitly off:** set `MARVIS_TELEMETRY=0` in the environment.
 
-Be transparent with the user about this. Because it is opt-out (not opt-in), do not ask
-permission — just inform them it is on and tell them the off switch. Full detail ships
-in a later slice.
+Be transparent with the user about this. Enabling telemetry is a separate opt-in choice;
+the provisioned offline profile must leave it disabled.
 
 ---
 

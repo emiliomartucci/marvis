@@ -99,6 +99,71 @@ _ALLOW_PATTERNS = [
     "config_sentence_transformers.json",
 ]
 
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _offline_runtime() -> bool:
+    """Return whether model resolution must remain strictly local."""
+
+    return any(
+        os.environ.get(name, "").strip().lower() in _TRUE_VALUES
+        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    )
+
+
+def _cached_snapshot(
+    cache_folder: Path,
+    model_name: str,
+    revision: str,
+    required: tuple[str, ...],
+) -> Path:
+    model_dir = "models--" + model_name.replace("/", "--")
+    # ``snapshot_download`` is called with ``cache_dir=HF_HOME`` below, so its
+    # canonical layout starts directly at ``HF_HOME/models--...``.  Some older
+    # installs populated the default ``HF_HOME/hub`` location instead; accept
+    # that read-only legacy layout without ever asking the Hub in offline mode.
+    candidates = (
+        cache_folder / model_dir / "snapshots" / revision,
+        cache_folder / "hub" / model_dir / "snapshots" / revision,
+    )
+    snapshot = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.is_dir()
+            and all((candidate / relative).is_file() for relative in required)
+        ),
+        None,
+    )
+    if snapshot is not None:
+        return snapshot
+    raise FileNotFoundError(
+        "offline model cache missing for the pinned Granite revision; "
+        "semantic search is disabled and keyword fallback remains available"
+    )
+
+
+def _resolve_snapshot(
+    cache_folder: Path,
+    model_name: str,
+    *,
+    allow_patterns: list[str],
+    required: tuple[str, ...],
+) -> Path:
+    """Resolve exact model bytes without contacting the Hub in offline mode."""
+
+    if _offline_runtime():
+        return _cached_snapshot(cache_folder, model_name, MODEL_REVISION, required)
+    hub = importlib.import_module("huggingface_hub")
+    return Path(
+        hub.snapshot_download(
+            model_name,
+            revision=MODEL_REVISION,
+            cache_dir=str(cache_folder),
+            allow_patterns=allow_patterns,
+        )
+    )
+
 
 class GraniteEmbeddingClient:
     """Lazy torch-free onnxruntime client for local Granite embeddings.
@@ -235,19 +300,18 @@ class GraniteEmbeddingClient:
         with self._load_lock:
             if self._tokenizer_only is not None:
                 return self._tokenizer_only
-            tokenizers_mod = importlib.import_module("tokenizers")
-            hub = importlib.import_module("huggingface_hub")
-            local = hub.snapshot_download(
+            local = _resolve_snapshot(
+                self._cache_folder,
                 self._active_model_name,
-                revision=MODEL_REVISION,
-                cache_dir=str(self._cache_folder),
                 allow_patterns=[
                     "tokenizer.json",
                     "tokenizer_config.json",
                     "special_tokens_map.json",
                     "config.json",
                 ],
+                required=("tokenizer.json",),
             )
+            tokenizers_mod = importlib.import_module("tokenizers")
             tokenizer = tokenizers_mod.Tokenizer.from_file(
                 str(Path(local) / "tokenizer.json")
             )
@@ -346,17 +410,14 @@ class GraniteEmbeddingClient:
             return self._model
 
     def _load_onnx_session(self) -> tuple[Any, Any]:
+        local_path = _resolve_snapshot(
+            self._cache_folder,
+            self._active_model_name,
+            allow_patterns=_ALLOW_PATTERNS,
+            required=(self._onnx_file, "tokenizer.json"),
+        )
         ort = importlib.import_module("onnxruntime")
         tokenizers_mod = importlib.import_module("tokenizers")
-        hub = importlib.import_module("huggingface_hub")
-
-        local = hub.snapshot_download(
-            self._active_model_name,
-            revision=MODEL_REVISION,  # pinned (delta #2)
-            cache_dir=str(self._cache_folder),
-            allow_patterns=_ALLOW_PATTERNS,
-        )
-        local_path = Path(local)
 
         tokenizer = tokenizers_mod.Tokenizer.from_file(str(local_path / "tokenizer.json"))
         tokenizer.enable_truncation(max_length=MAX_LEN)

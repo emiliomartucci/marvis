@@ -13,6 +13,7 @@ on:
       - "core/scripts/install_hooks/**"
       - "migrations/**"
       - "docs/install/INSTALL-SKILL.md"
+      - "core/scripts/quality-gates/verify_public_claims.py"
   push:
     branches: [main]
     paths:
@@ -26,6 +27,7 @@ on:
       - "core/scripts/install_hooks/**"
       - "migrations/**"
       - "docs/install/INSTALL-SKILL.md"
+      - "core/scripts/quality-gates/verify_public_claims.py"
   workflow_dispatch:
 
 permissions:
@@ -71,11 +73,12 @@ jobs:
   # requirements-test.txt) are intentionally not mirrored.
   platform-boundary:
     name: core/platform boundary (enforcement)
-    # CI cost: DISABLED (covered-by-public-windows-install-smoke). This gate can only run on the PRIVATE repo (its test deps
+    # CI cost: DISABLED. This gate can only run on the PRIVATE repo (its test deps
     # — tests/, requirements-test.txt — are intentionally not mirrored to the
     # public repo), so it cannot be moved to the free mirror. The OS-seam is still
     # exercised end-to-end by the real `install-smoke-windows` job on the public
-    # mirror. Re-enable by restoring: if: github.repository != 'emiliomartucci/marvis'
+    # mirror. Reason: covered-by-public-windows-install-smoke. Re-enable by
+    # restoring: if: github.repository != 'emiliomartucci/marvis'
     if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -150,6 +153,15 @@ jobs:
 
       - name: Build wheel and sdist
         run: uv build --wheel --sdist --out-dir dist
+
+      - name: Verify public claims in built artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL="$(find dist -maxdepth 1 -type f -name '*.whl' -print)"
+          SDIST="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print)"
+          test -n "$WHEEL" && test -n "$SDIST"
+          python core/scripts/quality-gates/verify_public_claims.py --artifact "$WHEEL" --artifact "$SDIST"
 
       - name: Smoke installed artifacts from PATH
         shell: bash

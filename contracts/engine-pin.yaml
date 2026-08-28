@@ -1,14 +1,15 @@
 # Engine contract pin — marvis consumes the governed marvisx contract.
 # Separation goal 2026-07-24, U4: marvis is a versioned consumer, no longer a
 # force-mirrored branch copy (the destructive mirror was retired upstream in
-# marvisx PR #176). This tree still derives from the last mirror sync
-# (marvisx @ 56e0b286); from here on, engine updates arrive as explicit,
-# reviewed changes against the pinned contract below.
+# marvisx PR #176). Engine updates now arrive as explicit, reviewed projections
+# from an exact merged source commit and immutable payload digest.
 # Source of truth: marvisx:contracts/openapi/VERSION (profile all-surfaces,
 # breaking gate hard-fail, compatibility window N/N-1).
 engine: marvisx
-contract_version: 1
-engine_ref: c02ee4adba4d5130be4ae6beeb43220c28986bde
+contract_version: 3
+engine_ref: 1245a57f18aa74a69ed7db6b42fc4516b7ae1e8b
+projection_payload_sha256: dd9083bd517b52d08175c31d26647aba552b1408be0196007521d669effab465
+projection_consumer_manifest_sha256: 05a7349ce69d1b8be60f8a5e5086908ed793f181ead853ba8a9222ecf1ae3fb0
 openapi_baseline: marvisx:contracts/openapi/marvisx.json
 compatibility_window: N/N-1
 mirror_lineage: 56e0b286

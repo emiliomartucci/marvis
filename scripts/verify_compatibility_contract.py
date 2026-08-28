@@ -314,6 +314,14 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
     pin = root / "contracts/engine-pin.yaml"
     pinned_ref = expected_source_ref or _simple_yaml_value(pin, "engine_ref")
     pinned_version = int(_simple_yaml_value(pin, "contract_version"))
+    payload_sha256 = _simple_yaml_value(pin, "projection_payload_sha256")
+    consumer_manifest_sha256 = _simple_yaml_value(
+        pin, "projection_consumer_manifest_sha256"
+    )
+    if not HEX_64.fullmatch(payload_sha256):
+        raise CompatibilityError("projection payload digest is invalid")
+    if not HEX_64.fullmatch(consumer_manifest_sha256):
+        raise CompatibilityError("projection consumer manifest digest is invalid")
     if current["source_ref"] != pinned_ref or consumer["source_ref"] != pinned_ref:
         raise CompatibilityError("N fixture source does not match engine pin")
     if current["contract_version"] != pinned_version or consumer["contract_version"] != pinned_version:
@@ -368,6 +376,8 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
     return {
         "source_ref": pinned_ref,
         "contract_version": pinned_version,
+        "projection_payload_sha256": payload_sha256,
+        "projection_consumer_manifest_sha256": consumer_manifest_sha256,
         "n_operations": current["operation_count"],
         "n_minus_1_operations": previous["operation_count"],
         "consumer_operations": consumer["operation_count"],
