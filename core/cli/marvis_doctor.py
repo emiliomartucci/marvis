@@ -42,6 +42,7 @@ from typing import Any, Literal
 
 import typer
 
+from core.api.services import embedding_internal
 from core.cli._runtime_ctx import console
 from core.platform import projects_root_default
 
@@ -54,7 +55,8 @@ _PANEL_DOCTOR = "Diagnostics"
 # Granite embedding model — OSS is Granite-only (ibm-granite/granite-embedding-97m-multilingual-r2).
 # MiniLM fallback has been removed; machines below the RAM floor receive a
 # warning (not a silent model swap).
-GRANITE_MODEL_ID = "ibm-granite/granite-embedding-97m-multilingual-r2"
+GRANITE_MODEL_ID = embedding_internal.DEFAULT_MODEL
+GRANITE_MODEL_REVISION = embedding_internal.MODEL_REVISION
 GRANITE_MODEL_DIMS = 384
 
 # TODO(S0): replace 4 with the measured floor once S0 benchmarks are complete.
@@ -695,32 +697,38 @@ def _check_granite_model(*, offline: bool = False) -> list[CheckResult]:
 
     # --- Model cache check ---
     hf_home = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
-    # HuggingFace Hub stores models under <HF_HOME>/hub/models--<org>--<name>/
-    # snapshots/<revision>/ where "/" in the model id is replaced by "--". The
-    # torch-free engine needs the ONNX graph + tokenizer, so check those files
-    # exist (not just the dir — that was a false-green: the dir can exist with
-    # only a partial download).
+    # The runtime passes HF_HOME as snapshot_download(cache_dir=...), whose
+    # canonical layout starts directly under HF_HOME. Older installations use
+    # HF_HOME/hub; embedding_internal accepts both, but only for the exact
+    # pinned revision. Reuse that resolver so doctor cannot report a snapshot
+    # that the offline runtime will reject.
     model_dir_name = "models--" + GRANITE_MODEL_ID.replace("/", "--")
-    model_cache = hf_home / "hub" / model_dir_name
-    snapshots = model_cache / "snapshots"
-
-    required = ["onnx/model.onnx", "tokenizer.json"]
-    found_snapshot = None
-    if snapshots.is_dir():
-        for snap in snapshots.iterdir():
-            if all((snap / rel).exists() for rel in required):
-                found_snapshot = snap
-                break
-
-    model_offline = offline or any(
-        os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
-        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    model_caches = (hf_home / model_dir_name, hf_home / "hub" / model_dir_name)
+    model_cache = next(
+        (path for path in model_caches if path.exists()),
+        model_caches[0],
     )
+    required = ("onnx/model.onnx", "tokenizer.json")
+    try:
+        found_snapshot = embedding_internal._cached_snapshot(
+            hf_home,
+            GRANITE_MODEL_ID,
+            GRANITE_MODEL_REVISION,
+            required,
+        )
+    except FileNotFoundError:
+        found_snapshot = None
+
+    model_offline = offline or embedding_internal._offline_runtime()
     pre_download_fix = (
         "Provision the pinned model before entering offline mode:\n"
         "  python -c \""
+        "import os; from pathlib import Path; "
         "from huggingface_hub import snapshot_download; "
         f"snapshot_download('{GRANITE_MODEL_ID}', "
+        f"revision='{GRANITE_MODEL_REVISION}', "
+        "cache_dir=str(Path(os.environ.get('HF_HOME', "
+        "'~/.cache/huggingface')).expanduser()), "
         "allow_patterns=['onnx/model.onnx','tokenizer.json','tokenizer_config.json',"
         "'special_tokens_map.json','config.json','1_Pooling/config.json',"
         "'config_sentence_transformers.json'])"
