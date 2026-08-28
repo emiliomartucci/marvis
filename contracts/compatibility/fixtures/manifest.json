@@ -1,8 +1,8 @@
 {
   "files": {
     "deliberate-break.json": "a0eca4cbc4be6aabdf4b167fb6b0e762e35ab980e07af21552efece8351da0eb",
-    "n-consumer-contract.json": "7e5358dfa2898f41260c70d8bf0a7f102b91c3f18930632be2c7d5d417d85936",
-    "n-contract.json": "97425f7b5f453f5a64756fb514185f2d0d992ea564a8e4eba16ed6d1221d5ae3",
+    "n-consumer-contract.json": "0482585107d240421aa042726c8f99e805b44647f5cf9ef78003879af4c54e1c",
+    "n-contract.json": "5f90a089e462e299e8abb53923015725dcfca5f0059640beb9721ceb42065e08",
     "n-minus-1-contract.json": "94bd2d0a5762afa47eb54d6d0b770b1145226224798368af70b8bd6b0c216ffb"
   },
   "schema": "marvis-compatibility-fixture-manifest/v1"

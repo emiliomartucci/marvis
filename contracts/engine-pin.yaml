@@ -7,9 +7,9 @@
 # breaking gate hard-fail, compatibility window N/N-1).
 engine: marvisx
 contract_version: 3
-engine_ref: 1245a57f18aa74a69ed7db6b42fc4516b7ae1e8b
-projection_payload_sha256: dd9083bd517b52d08175c31d26647aba552b1408be0196007521d669effab465
-projection_consumer_manifest_sha256: 05a7349ce69d1b8be60f8a5e5086908ed793f181ead853ba8a9222ecf1ae3fb0
+engine_ref: 9ef5867eaa031095eb094bfb33f3cc6d4445bc8e
+projection_payload_sha256: 9fdb581189da90e84a79b599e64dceb08b5cc093aaf0a4f185a32ca69079cab6
+projection_consumer_manifest_sha256: 0f43d9ed9974448f86708ad32ed0314c2db507be215d1cb24627c7c86505a096
 openapi_baseline: marvisx:contracts/openapi/marvisx.json
 compatibility_window: N/N-1
 mirror_lineage: 56e0b286

@@ -10,8 +10,8 @@ from verify_compatibility_contract import CompatibilityError, verify
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_REF = "1245a57f18aa74a69ed7db6b42fc4516b7ae1e8b"
-PAYLOAD_SHA256 = "dd9083bd517b52d08175c31d26647aba552b1408be0196007521d669effab465"
+SOURCE_REF = "9ef5867eaa031095eb094bfb33f3cc6d4445bc8e"
+PAYLOAD_SHA256 = "9fdb581189da90e84a79b599e64dceb08b5cc093aaf0a4f185a32ca69079cab6"
 
 
 class CompatibilityContractTests(unittest.TestCase):
