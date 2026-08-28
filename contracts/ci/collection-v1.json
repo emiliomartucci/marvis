@@ -56,6 +56,29 @@
       "python scripts/run_ci_contract.py",
       "python scripts/verify_local_upgrade.py --download --version 0.3.8",
       "python scripts/verify_public_claims.py"
+    ],
+    "additional_jobs": [
+      {
+        "job": "desktop-ui",
+        "working_directory": "apps/desktop-ui",
+        "required_run_lines": [
+          "npm ci",
+          "npm run audit:production",
+          "npm run test:build-id",
+          "npx tsc --noEmit -p tsconfig.json",
+          "npx vitest run",
+          "npm run build",
+          "test -f out/index.html",
+          "test -d out/_next"
+        ],
+        "env_run_line": "npm run build",
+        "required_step_env": {
+          "MARVIS_CONSOLE_BUILD_ID": "${{ github.sha }}",
+          "NEXT_PUBLIC_API_URL": "",
+          "NEXT_PUBLIC_LOCAL_MODE": "1",
+          "NEXT_TELEMETRY_DISABLED": "1"
+        }
+      }
     ]
   },
   "platform_matrix": {

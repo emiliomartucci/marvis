@@ -102,6 +102,50 @@ def _workflow(root: Path, contract: dict[str, Any]) -> None:
     if setup_python != [contract["primary_python"]]:
         raise CollectionContractError("primary CI Python row drift")
 
+    for additional in spec.get("additional_jobs", []):
+        job_name = str(additional["job"])
+        job = jobs.get(job_name)
+        if not isinstance(job, dict):
+            raise CollectionContractError(f"required CI job missing: {job_name}")
+        defaults = job.get("defaults", {})
+        working_directory = (
+            defaults.get("run", {}).get("working-directory")
+            if isinstance(defaults, dict) and isinstance(defaults.get("run"), dict)
+            else None
+        )
+        if working_directory != additional.get("working_directory"):
+            raise CollectionContractError(f"CI working directory drift: {job_name}")
+        job_steps = job.get("steps", [])
+        commands = "\n".join(
+            str(step.get("run", "")) for step in job_steps if isinstance(step, dict)
+        )
+        command_lines = {
+            line.strip()
+            for line in commands.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        for line in additional.get("required_run_lines", []):
+            if line not in command_lines:
+                raise CollectionContractError(f"CI run line missing: {line}")
+        env_run_line = str(additional["env_run_line"])
+        env_steps = [
+            step
+            for step in job_steps
+            if isinstance(step, dict)
+            and env_run_line
+            in {
+                line.strip()
+                for line in str(step.get("run", "")).splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            }
+        ]
+        if len(env_steps) != 1 or not isinstance(env_steps[0].get("env"), dict):
+            raise CollectionContractError(f"CI environment step missing: {env_run_line}")
+        step_env = {str(key): str(value) for key, value in env_steps[0]["env"].items()}
+        for key, value in additional.get("required_step_env", {}).items():
+            if step_env.get(key) != value:
+                raise CollectionContractError(f"CI step environment drift: {key}")
+
 
 def _platform_matrix(root: Path, contract: dict[str, Any]) -> None:
     spec = contract["platform_matrix"]
@@ -165,6 +209,9 @@ def verify(root: Path) -> dict[str, Any]:
         "pytest_collected": pytest_count,
         "unittest_collected": unittest_count,
         "required_job": contract["workflow"]["required_job"],
+        "additional_jobs": [
+            item["job"] for item in contract["workflow"].get("additional_jobs", [])
+        ],
         "python_versions": contract["platform_matrix"]["python_versions"],
         "operating_systems": contract["platform_matrix"]["operating_systems"],
     }

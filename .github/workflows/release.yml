@@ -52,14 +52,16 @@ jobs:
       - name: Build the local GUI static export in Docker
         run: |
           set -euo pipefail
+          desktop_source_sha="$(git rev-parse HEAD)"
           docker run --rm \
             -v "$PWD:/repo" \
             -w /repo/apps/desktop-ui \
+            -e MARVIS_CONSOLE_BUILD_ID="$desktop_source_sha" \
             -e NEXT_PUBLIC_API_URL="" \
             -e NEXT_PUBLIC_LOCAL_MODE=1 \
             -e NEXT_TELEMETRY_DISABLED=1 \
             node:22-bookworm \
-            bash -lc 'npm ci && npm run build'
+            bash -lc 'npm ci && npm run test:build-id && npm run audit:production && npm run build'
 
           test -f apps/desktop-ui/out/index.html
           test -d apps/desktop-ui/out/_next
