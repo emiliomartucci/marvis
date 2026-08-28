@@ -8,6 +8,27 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 No changes yet.
 
+## [0.4.1] - candidate
+
+Security and provenance refresh based on the exact merged Plan B product base.
+The release keeps the local CLI, MCP, hooks and packaged GUI contracts while
+updating the shared engine and its regression coverage.
+
+### Security
+
+- Hardened shared identity, authorization, throttling and audit boundaries.
+- Bound the package to deterministic public/shared source provenance.
+
+### Changed
+
+- Removed retired Heypocket, n8n and Reddit runtime integrations; historical
+  database migrations and temporary compatibility tombstones remain.
+- Expanded Python 3.10-3.13, Linux, macOS and Windows install and upgrade proof.
+
+This section describes a release candidate only. Version 0.4.1 is not
+published until the separate tag, PyPI and post-publication acceptance gates
+all succeed.
+
 ## [0.4.0] - 2026-06-19 (stabile)
 
 Prima release stabile: consolida la linea 0.3.9bX in un install pulito validato
