@@ -14,8 +14,9 @@ def resolve_client_ip(
     """Return a canonical client IP without trusting caller-controlled headers.
 
     The socket peer is authoritative unless it belongs to an explicitly
-    configured proxy network. Even then, the forwarded value must be exactly one
-    valid IP address; malformed and chained values fall back to the socket peer.
+    configured exact proxy peer. Even then, the forwarded value must be exactly
+    one valid IP address; malformed and chained values fall back to the socket
+    peer.
     """
     try:
         peer = ipaddress.ip_address(peer_ip or "")
@@ -27,6 +28,11 @@ def resolve_client_ip(
         try:
             network = ipaddress.ip_network(raw_network, strict=True)
         except ValueError:
+            continue
+        # Settings rejects broad networks. Keep this defensive check here too so
+        # direct callers cannot accidentally turn a whole private subnet into a
+        # trusted identity authority.
+        if network.prefixlen != network.max_prefixlen:
             continue
         if peer.version == network.version and peer in network:
             trusted = True

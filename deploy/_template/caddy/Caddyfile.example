@@ -31,25 +31,37 @@
 	# Health probe (used by deploy scripts + uptime monitors)
 	@health path /health
 	handle @health {
-		reverse_proxy {$MARVIS_API_UPSTREAM:127.0.0.1:8100}
+		reverse_proxy {$MARVIS_API_UPSTREAM:127.0.0.1:8100} {
+			header_up -CF-Connecting-IP
+			header_up X-Marvis-Client-IP {http.request.remote.host}
+		}
 	}
 
 	# API surface (FastAPI)
 	@api path /api/*
 	handle @api {
-		reverse_proxy {$MARVIS_API_UPSTREAM:127.0.0.1:8100}
+		reverse_proxy {$MARVIS_API_UPSTREAM:127.0.0.1:8100} {
+			header_up -CF-Connecting-IP
+			header_up X-Marvis-Client-IP {http.request.remote.host}
+		}
 	}
 
 	# Websocket main channel
 	@ws path /ws/*
 	handle @ws {
-		reverse_proxy {$MARVIS_API_UPSTREAM:127.0.0.1:8100}
+		reverse_proxy {$MARVIS_API_UPSTREAM:127.0.0.1:8100} {
+			header_up -CF-Connecting-IP
+			header_up X-Marvis-Client-IP {http.request.remote.host}
+		}
 	}
 
 	# Terminal websocket
 	@terminal path /terminal/*
 	handle @terminal {
-		reverse_proxy {$MARVIS_API_UPSTREAM:127.0.0.1:8100}
+		reverse_proxy {$MARVIS_API_UPSTREAM:127.0.0.1:8100} {
+			header_up -CF-Connecting-IP
+			header_up X-Marvis-Client-IP {http.request.remote.host}
+		}
 	}
 
 	# Console SPA (Next.js) — catch-all

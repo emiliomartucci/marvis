@@ -32,6 +32,28 @@ Lo stack si avvia in tre configurazioni mutuamente combinabili.
 
 `tunnel` e `caddy` non sono mutuamente esclusivi (puoi avere Caddy davanti per LAN e Tunnel per esterno). nginx baseline e Caddy ascoltano su porte diverse, quindi possono coesistere; in produzione di solito ne tieni uno solo.
 
+### Identita' client e rate limit
+
+Il Compose usa per default la rete privata `172.31.251.0/24`; subnet e indirizzi
+sono coordinati dalle variabili `MARVIS_NETWORK_SUBNET` e `MARVIS_*_IPV4` in
+`.env`. L'API accetta `X-Marvis-Client-IP` solo dagli IP esatti di nginx e
+Caddy. Entrambi i proxy sovrascrivono sempre l'header ricevuto dal client. nginx
+accetta invece `CF-Connecting-IP` soltanto dall'IP esatto del container
+cloudflared: una richiesta diretta non puo' falsificare l'indirizzo usato dal
+rate limit.
+
+I preset host con Caddy o Cloudflare Tunnel usano invece i soli peer loopback
+esatti (`127.0.0.1/32`, `::1/128`), inclusi nel default sicuro dell'API; Caddy
+sovrascrive lo stesso header prima del passaggio a `127.0.0.1:8100`, mentre
+cloudflared fornisce `CF-Connecting-IP` allo stesso resolver controllato.
+
+Se avvii piu' istanze sullo stesso host, assegna a ciascuna una subnet non
+sovrapposta e cambia insieme tutte le variabili `MARVIS_*_IPV4`; non usare CIDR
+generici come `172.16.0.0/12`. Nei deploy Caddy installati direttamente
+sull'host, configura esplicitamente come proxy fidato solo il peer reale
+dell'API (normalmente `127.0.0.1/32` o `::1/128`), dopo avere verificato che la
+porta API non sia accessibile ad altri processi non fidati.
+
 ### Caddy + TLS automatica
 
 Per uso locale lascia `PUBLIC_DOMAIN=localhost`: Caddy emette un certificato dalla sua CA interna e non contatta Let's Encrypt.
@@ -151,6 +173,11 @@ Prima di esporre l'istanza su Internet o di caricare dati reali:
 - [ ] Genera un `PIR_JWT_SECRET` reale: `openssl rand -hex 32`.
 - [ ] Imposta `FORCE_PASSWORD_CHANGE_ON_FIRST_LOGIN=true` se condividi l'host.
 - [ ] Aggiorna `CORS_ORIGINS_PROD` con i tuoi domini reali (formato JSON array).
+- [ ] Mantieni `TRUSTED_PROXY_CIDRS` limitato agli IP esatti: un proxy
+      intermedio deve eliminare `CF-Connecting-IP` e sovrascrivere
+      `X-Marvis-Client-IP`; solo cloudflared diretto puo' fornire il primo.
+- [ ] Se coesistono piu' stack, assegna subnet `MARVIS_NETWORK_SUBNET` non
+      sovrapposte e IP interni unici.
 - [ ] Sostituisci tutti i `<<API_KEY>>` / `<<DOMAIN>>` / `<<EMAIL>>` rimasti.
 - [ ] Lockdown firewall a monte: con `tunnel` chiudi `80/443/3000/8100/8080` esterni; con `caddy` apri solo `80/443`.
 - [ ] Backup periodico del volume `sqlite-data` (file `console.db`).

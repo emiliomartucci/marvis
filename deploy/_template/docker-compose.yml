@@ -12,10 +12,14 @@ services:
     environment:
       PIR_DB_PATH: /data/pir/console.db
       DATABASE_URL: sqlite:////data/pir/console.db
+      TRUSTED_PROXY_CIDRS: '["127.0.0.1/32","::1/128","${MARVIS_NGINX_IPV4:-172.31.251.20}/32","${MARVIS_CADDY_IPV4:-172.31.251.40}/32"]'
     volumes:
       - sqlite-data:/data/pir
       - workspace-data:/data/workspace
       - runtime-data:/data/runtime
+    networks:
+      marvis-internal:
+        ipv4_address: ${MARVIS_API_IPV4:-172.31.251.10}
     ports:
       - "${API_PORT:-8100}:8100"
     healthcheck:
@@ -48,6 +52,9 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    networks:
+      marvis-internal:
+        ipv4_address: ${MARVIS_CONSOLE_IPV4:-172.31.251.11}
     ports:
       - "${CONSOLE_PORT:-3000}:3000"
     healthcheck:
@@ -65,8 +72,13 @@ services:
         condition: service_healthy
       console:
         condition: service_started
+    environment:
+      TRUSTED_CLOUDFLARED_IP: ${MARVIS_CLOUDFLARED_IPV4:-172.31.251.30}
     volumes:
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/default.conf:/etc/nginx/templates/default.conf.template:ro
+    networks:
+      marvis-internal:
+        ipv4_address: ${MARVIS_NGINX_IPV4:-172.31.251.20}
     ports:
       - "${NGINX_PORT:-8080}:80"
     healthcheck:
@@ -83,6 +95,9 @@ services:
     depends_on:
       nginx:
         condition: service_healthy
+    networks:
+      marvis-internal:
+        ipv4_address: ${MARVIS_CLOUDFLARED_IPV4:-172.31.251.30}
     command:
       - tunnel
       - --no-autoupdate
@@ -114,6 +129,9 @@ services:
       - ./caddy/Caddyfile.example:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    networks:
+      marvis-internal:
+        ipv4_address: ${MARVIS_CADDY_IPV4:-172.31.251.40}
     ports:
       - "${CADDY_HTTP_PORT:-80}:80"
       - "${CADDY_HTTPS_PORT:-443}:443"
@@ -130,3 +148,9 @@ volumes:
   runtime-data:
   caddy-data:
   caddy-config:
+
+networks:
+  marvis-internal:
+    ipam:
+      config:
+        - subnet: ${MARVIS_NETWORK_SUBNET:-172.31.251.0/24}

@@ -69,7 +69,10 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MARVIS_JWT_SECRET", "PIR_JWT_SECRET"),
     )
     trusted_proxy_cidrs: list[str] = Field(
-        default_factory=list,
+        # The host-install preset runs Caddy on the same machine and proxies to
+        # the API over loopback.  Trust only those exact peers by default; the
+        # Compose template adds exact /32 proxy container addresses explicitly.
+        default_factory=lambda: ["127.0.0.1/32", "::1/128"],
         alias="TRUSTED_PROXY_CIDRS",
     )
     pir_admin_password_hash: str = Field(
@@ -731,11 +734,15 @@ class Settings(BaseSettings):
         """Reject ambiguous proxy policy and weak production signing keys."""
         for cidr in self.trusted_proxy_cidrs:
             try:
-                ipaddress.ip_network(cidr, strict=True)
+                network = ipaddress.ip_network(cidr, strict=True)
             except ValueError as exc:
                 raise ValueError(
-                    "TRUSTED_PROXY_CIDRS must contain canonical IPv4/IPv6 networks"
+                    "TRUSTED_PROXY_CIDRS must contain canonical IPv4/IPv6 host routes"
                 ) from exc
+            if network.prefixlen != network.max_prefixlen:
+                raise ValueError(
+                    "TRUSTED_PROXY_CIDRS accepts only exact IPv4 /32 or IPv6 /128 peers"
+                )
 
         if self.pir_env.strip().lower() == "production":
             secret = self.pir_jwt_secret

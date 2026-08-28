@@ -26,6 +26,7 @@ installed (parity with ``server.py``'s function-local SDK import).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -319,6 +320,30 @@ def oauth_user_sync_decision(
 _SYNCED_OAUTH_USERS: dict[tuple[str, str], str] = {}
 
 
+async def _available_oauth_slug(
+    db,
+    *,
+    email: str | None,
+    user_id: str,
+    workspace_id: str,
+) -> str:
+    """Keep a readable email slug when free, otherwise bind it to tenant+user."""
+    local_part = email.split("@", 1)[0].lower() if email else ""
+    readable = re.sub(r"[^a-z0-9_-]+", "-", local_part).strip("-")[:50]
+    if readable:
+        cur = await db.execute("SELECT 1 FROM users WHERE slug = ?", (readable,))
+        if await cur.fetchone() is None:
+            return readable
+
+    fallback = "workos-" + hashlib.sha256(
+        f"{workspace_id}\0{user_id}".encode("utf-8")
+    ).hexdigest()[:16]
+    cur = await db.execute("SELECT 1 FROM users WHERE slug = ?", (fallback,))
+    if await cur.fetchone() is not None:
+        raise RuntimeError("OAuth user identity collides with an existing user")
+    return fallback
+
+
 async def sync_oauth_user(db, ctx: CallerContext) -> None:
     """Display-only drift sync of the ``users`` row for an OAuth person."""
     if not ctx.is_human_session or not ctx.user_id or ctx.user_id == "local":
@@ -359,19 +384,37 @@ async def sync_oauth_user(db, ctx: CallerContext) -> None:
         return
     action, role = decision
     email = claims.get("email") if isinstance(claims.get("email"), str) else None
-    slug_source = (email.split("@", 1)[0] if email else ctx.user_id).lower()
-    slug = re.sub(r"[^a-z0-9_-]+", "-", slug_source).strip("-") or ctx.user_id.lower()
     display_name = str(claims.get("name") or email or ctx.username or ctx.user_id)
     try:
         async with acquire_write_db(label="mcp.sync_oauth_user") as wdb:
             if action == "insert":
+                slug = await _available_oauth_slug(
+                    wdb,
+                    email=email,
+                    user_id=ctx.user_id,
+                    workspace_id=workspace_id,
+                )
                 await wdb.execute(
-                    "INSERT OR IGNORE INTO users"
+                    "INSERT INTO users"
                     " (id, slug, display_name, email, system_role, type,"
                     " auth_provider, workspace_id)"
                     " VALUES (?, ?, ?, ?, ?, 'human', 'workos', ?)",
                     (ctx.user_id, slug, display_name, email, role, workspace_id),
                 )
+                cur = await wdb.execute(
+                    "SELECT id, workspace_id, slug, system_role FROM users"
+                    " WHERE id = ? AND workspace_id = ?"
+                    " AND deleted_at IS NULL LIMIT 1",
+                    (ctx.user_id, workspace_id),
+                )
+                persisted = await cur.fetchone()
+                if persisted is None or tuple(persisted) != (
+                    ctx.user_id,
+                    workspace_id,
+                    slug,
+                    role,
+                ):
+                    raise RuntimeError("OAuth user was not persisted exactly")
             else:
                 await wdb.execute(
                     "UPDATE users SET system_role = ?,"

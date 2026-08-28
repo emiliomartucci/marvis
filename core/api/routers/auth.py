@@ -169,18 +169,32 @@ async def login(
     """Authenticate by email + password and set httpOnly session cookie."""
     client_ip = resolve_client_ip(
         peer_ip=request.client.host if request.client else None,
-        forwarded_ip=request.headers.get("CF-Connecting-IP"),
+        # nginx/Caddy overwrite the internal header. A host-installed
+        # cloudflared process connects directly over loopback and supplies the
+        # Cloudflare header instead. In both cases the shared resolver accepts
+        # it only when the socket peer is an exact trusted host route.
+        # Prefer Cloudflare's edge-overwritten header for the direct host
+        # tunnel path. nginx/Caddy strip that header before setting the
+        # internal one, so an external caller cannot choose which wins.
+        forwarded_ip=(
+            request.headers.get("CF-Connecting-IP")
+            or request.headers.get("X-Marvis-Client-IP")
+        ),
         trusted_proxy_cidrs=settings.trusted_proxy_cidrs,
     )
     _check_rate_limit(client_ip)
 
-    # Lookup user by email (case-insensitive), human type only
+    # An email is not a workspace selector.  Fetch at most two matches so a
+    # multi-workspace duplicate fails closed instead of authenticating whichever
+    # row SQLite happened to return first.
     async with db.execute(
         "SELECT id, slug, password_hash, workspace_id FROM users "
-        "WHERE lower(email) = lower(?) AND type = 'human' AND deleted_at IS NULL",
+        "WHERE lower(email) = lower(?) AND type = 'human' AND deleted_at IS NULL "
+        "LIMIT 2",
         [body.email],
     ) as cursor:
-        row = await cursor.fetchone()
+        rows = await cursor.fetchall()
+    row = rows[0] if len(rows) == 1 else None
 
     if row is None or not row["password_hash"]:
         # Dummy bcrypt to prevent timing oracle
@@ -216,7 +230,13 @@ async def login(
 
     if await _password_must_change(db, row["id"]):
         serializer = _get_reset_serializer()
-        token = serializer.dumps({"user_id": row["id"], "slug": row["slug"]})
+        token = serializer.dumps(
+            {
+                "user_id": row["id"],
+                "slug": row["slug"],
+                "workspace_id": workspace_id,
+            }
+        )
         return JSONResponse(
             status_code=403,
             content={

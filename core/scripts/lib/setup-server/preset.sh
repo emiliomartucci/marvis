@@ -13,11 +13,10 @@
 set_if_unset() {
   local name="$1"
   local value="$2"
-  local current
-  current="$(eval "printf '%s' \"\${$name-}\"")"
+  local current="${!name-}"
   if [[ -z "$current" ]]; then
-    eval "$name=\$value"
-    export "$name"
+    printf -v "$name" '%s' "$value"
+    export "${name?}"
   fi
 }
 
@@ -47,7 +46,7 @@ apply_preset() {
     dev-local)
       set_if_unset MARVIS_PROXY_MODE "selfsigned"
       set_if_unset MARVIS_DOMAIN "marvis.local"
-      set_if_unset MARVIS_DEPLOY_USER "$USER"
+      set_if_unset MARVIS_DEPLOY_USER "${USER:-$(id -un)}"
       set_if_unset MARVIS_BASE_DIR "$HOME/marvis-dev"
       set_if_unset MARVIS_ENABLE_UFW "0"
       set_if_unset MARVIS_START_TMUX "0"

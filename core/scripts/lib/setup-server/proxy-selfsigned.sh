@@ -60,7 +60,10 @@ ensure_selfsigned() {
   rendered="$(cat <<EOF
 ${domain} {
 \ttls ${cert_path} ${key_path}
-\treverse_proxy /api/* localhost:8100
+\treverse_proxy /api/* localhost:8100 {
+\t\theader_up -CF-Connecting-IP
+\t\theader_up X-Marvis-Client-IP {http.request.remote.host}
+\t}
 \treverse_proxy localhost:3000
 }
 EOF

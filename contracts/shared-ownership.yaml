@@ -16,7 +16,7 @@
 #
 # Authored against OSS base 07821c76b5e890c341eeed80ca2f4002ad482b79
 # (origin/main, 2026-08-27). Final Plan A candidate reviewed at merge SHA
-# 9ef5867eaa031095eb094bfb33f3cc6d4445bc8e.
+# d413f09bf0e43c1929d1c774c77c7eed1d56bf18.
 schema: marvis-shared-ownership/v1
 ownership_map_version: 2
 
