@@ -36,6 +36,7 @@ MANIFEST_SCHEMA = "marvis-public-release-manifest/v1"
 POLICY_PATH = Path("contracts/release/public-release-v1.json")
 WORKFLOW_PATH = Path(".github/workflows/release.yml")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 USES = re.compile(r"(?m)^\s*(?:-\s*)?uses:\s*([^#\s]+)")
 
 
@@ -63,6 +64,47 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ReleasePolicyError(f"JSON root must be an object: {path}")
     return value
+
+
+def _validated_manifest(path: Path) -> dict[str, Any]:
+    manifest = _load_json(path)
+    if manifest.get("schema") != MANIFEST_SCHEMA:
+        raise ReleasePolicyError("unsupported release manifest")
+    claimed = manifest.get("content_digest")
+    unsigned = dict(manifest)
+    unsigned.pop("content_digest", None)
+    if claimed != _sha_bytes(_canonical(unsigned)):
+        raise ReleasePolicyError("release manifest content digest mismatch")
+    return manifest
+
+
+def _manifest_artifacts(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = manifest.get("artifacts")
+    if not isinstance(rows, list) or not rows:
+        raise ReleasePolicyError("release manifest artifact inventory is empty")
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ReleasePolicyError("release manifest artifact inventory is invalid")
+        filename = row.get("filename")
+        size = row.get("size")
+        sha256 = row.get("sha256")
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or PurePosixPath(filename).name != filename
+            or filename in {".", ".."}
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(sha256, str)
+            or not SHA256.fullmatch(sha256)
+        ):
+            raise ReleasePolicyError("release manifest artifact inventory is invalid")
+        if filename in result:
+            raise ReleasePolicyError("release manifest contains duplicate artifact names")
+        result[filename] = row
+    return result
 
 
 def load_policy(root: Path) -> dict[str, Any]:
@@ -115,6 +157,14 @@ def _action_pins(workflow: str) -> dict[str, str]:
         if prior != ref:
             raise ReleasePolicyError(f"action uses two commits in one workflow: {name}")
     return pins
+
+
+def _active_workflow_lines(workflow: str) -> set[str]:
+    return {
+        line.strip()
+        for line in workflow.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
 
 
 def _publisher_coordinates(policy: dict[str, Any]) -> dict[str, str]:
@@ -269,6 +319,7 @@ def validate_static(
         "pip install --require-hashes -r requirements-release.lock",
         "python -m build --no-isolation",
         "release_candidate.py preflight",
+        "release_candidate.py tag-preflight",
         "release_candidate.py pretag",
         "release_candidate.py publish-window",
         "environment: pypi",
@@ -277,8 +328,35 @@ def validate_static(
     missing = [fragment for fragment in required_fragments if fragment not in workflow]
     if missing:
         raise ReleasePolicyError(f"release workflow contract fragments missing: {missing}")
+    active_lines = _active_workflow_lines(workflow)
+    required_lines = {
+        "python scripts/test_release_candidate.py",
+        "run: python scripts/release_candidate.py tag-preflight",
+        'desktop_source_sha="$(git rev-parse HEAD)"',
+        '-e MARVIS_CONSOLE_BUILD_ID="$desktop_source_sha" \\',
+        "bash -lc 'npm ci && npm run test:build-id && npm run audit:production && npm run build'",
+        "python scripts/release_candidate.py registry-download \\",
+        '"$python_bin" scripts/verify_local_upgrade.py \\',
+        '"$marvis" doctor --offline',
+        '"$marvis" hooks install',
+        '"$marvis" mcp register',
+        'assert hooks["fully_installed"] is True',
+        'assert status["db_ok"] is True',
+        'assert mcp["connected"] is True',
+        'assert mcp["tool_count"] > 0',
+        "if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && (needs.build.result != 'success' || needs.release-record.result != 'success' || needs.pypi.result != 'success' || needs.accept.result != 'success') }}",
+        'echo "::error::Refusing to mutate an already-final GitHub Release."',
+        'echo "::error::The failed candidate exists on PyPI; owner verification and yank are required."',
+    }
+    missing_lines = sorted(required_lines - active_lines)
+    if missing_lines:
+        raise ReleasePolicyError(
+            f"release workflow active contract lines missing: {missing_lines}"
+        )
     if "pip install --quiet --upgrade build" in workflow:
         raise ReleasePolicyError("release workflow installs mutable build tooling")
+    if '--force-reinstall "marvisx-cli==0.3.8"' in workflow:
+        raise ReleasePolicyError("release workflow presents package reinstall as data rollback")
     publish_guard = "startsWith(github.ref, 'refs/tags/v')"
     if workflow.count(publish_guard) < 3:
         raise ReleasePolicyError("tag-only release/publish/finalize guards are incomplete")
@@ -346,6 +424,12 @@ def _require_remote_absence(
     except FileNotFoundError:
         return
     raise ReleasePolicyError(f"{label} already exists")
+
+
+def _candidate_pypi_url(policy: dict[str, Any]) -> str:
+    package = urllib.parse.quote(str(policy["package"]), safe="")
+    version = urllib.parse.quote(str(policy["candidate_version"]), safe="")
+    return f"https://pypi.org/pypi/{package}/{version}/json"
 
 
 def _environment_check(policy: dict[str, Any], *, token: str, api_url: str) -> dict[str, Any]:
@@ -447,10 +531,8 @@ def preflight(
         label="candidate GitHub Release",
         token=token,
     )
-    package = urllib.parse.quote(str(policy["package"]), safe="")
-    version = urllib.parse.quote(str(policy["candidate_version"]), safe="")
     _require_remote_absence(
-        f"https://pypi.org/pypi/{package}/{version}/json",
+        _candidate_pypi_url(policy),
         label="candidate PyPI version",
     )
     report.update(
@@ -468,6 +550,40 @@ def preflight(
     return report
 
 
+def tag_preflight(
+    root: Path, *, token: str, api_url: str = "https://api.github.com"
+) -> dict[str, Any]:
+    """Recheck a newly created tag before spending time on its artifact build."""
+
+    report = validate_static(root, tag_build=True)
+    policy = load_policy(root)
+    _strict_external_receipts(policy)
+    environment = _environment_check(policy, token=token, api_url=api_url)
+    remote_tag_sha = _remote_tag_sha(policy, token=token, api_url=api_url)
+    if remote_tag_sha != report["release_source_sha"]:
+        raise ReleasePolicyError("GitHub tag differs from the reviewed release source")
+    repository = str(policy["repository"])
+    tag = urllib.parse.quote(str(policy["candidate_tag"]), safe="")
+    _require_remote_absence(
+        f"{api_url}/repos/{repository}/releases/tags/{tag}",
+        label="candidate GitHub Release",
+        token=token,
+    )
+    _require_remote_absence(
+        _candidate_pypi_url(policy),
+        label="candidate PyPI version",
+    )
+    report.update(
+        {
+            "environment": environment,
+            "remote_tag_sha": remote_tag_sha,
+            "namespace": {"github_release": "absent", "pypi_version": "absent"},
+            "status": "tag_preflight_green",
+        }
+    )
+    return report
+
+
 def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -> dict[str, Any]:
     report = validate_static(root, tag_build=True)
     policy = load_policy(root)
@@ -477,9 +593,11 @@ def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -
     if remote_tag_sha != report["release_source_sha"]:
         raise ReleasePolicyError("GitHub tag differs from the reviewed release source")
     release = _draft_release(policy, token=token, api_url=api_url)
+    _require_remote_absence(
+        _candidate_pypi_url(policy),
+        label="candidate PyPI version",
+    )
     registry = _request_json(f"https://pypi.org/pypi/{policy['package']}/json")
-    if policy["candidate_version"] in (registry.get("releases") or {}):
-        raise ReleasePolicyError("candidate version already exists on PyPI")
     report.update(
         {
             "environment": environment,
@@ -522,8 +640,12 @@ def _distribution_metadata(path: Path) -> tuple[str, str]:
 
 
 def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[str, Any]:
+    resolved_source = str(_git(root, "rev-parse", source_sha))
+    checked_out_source = str(_git(root, "rev-parse", "HEAD"))
+    if not SHA40.fullmatch(resolved_source) or resolved_source != checked_out_source:
+        raise ReleasePolicyError("manifest source is not the exact checked-out commit")
     tag_exists = _tag_target(root, load_policy(root)["candidate_tag"]) is not None
-    static = validate_static(root, head=source_sha, tag_build=tag_exists)
+    static = validate_static(root, head=resolved_source, tag_build=tag_exists)
     policy = load_policy(root)
     artifacts = sorted(
         [*dist.glob("*.whl"), *dist.glob("*.tar.gz")], key=lambda item: item.name
@@ -582,28 +704,13 @@ def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[
 
 
 def verify_manifest(root: Path, manifest_path: Path, dist: Path) -> dict[str, Any]:
-    manifest = _load_json(manifest_path)
-    if manifest.get("schema") != MANIFEST_SCHEMA:
-        raise ReleasePolicyError("unsupported release manifest")
-    claimed = manifest.get("content_digest")
-    unsigned = dict(manifest)
-    unsigned.pop("content_digest", None)
-    if claimed != _sha_bytes(_canonical(unsigned)):
-        raise ReleasePolicyError("release manifest content digest mismatch")
+    manifest = _validated_manifest(manifest_path)
+    claimed = manifest["content_digest"]
     if manifest.get("workflow", {}).get("sha256") != _sha_file(root / WORKFLOW_PATH):
         raise ReleasePolicyError("release workflow changed after artifact build")
     if manifest.get("policy", {}).get("sha256") != _sha_file(root / POLICY_PATH):
         raise ReleasePolicyError("release policy changed after artifact build")
-    rows = manifest.get("artifacts")
-    if not isinstance(rows, list) or not rows:
-        raise ReleasePolicyError("release manifest artifact inventory is empty")
-    try:
-        filenames = [str(row["filename"]) for row in rows]
-    except (KeyError, TypeError) as exc:
-        raise ReleasePolicyError("release manifest artifact inventory is invalid") from exc
-    if len(set(filenames)) != len(filenames):
-        raise ReleasePolicyError("release manifest contains duplicate artifact names")
-    expected = {filename: row for filename, row in zip(filenames, rows, strict=True)}
+    expected = _manifest_artifacts(manifest)
     observed = {path.name: path for path in [*dist.glob("*.whl"), *dist.glob("*.tar.gz")]}
     if set(expected) != set(observed):
         raise ReleasePolicyError("artifact file set differs from release manifest")
@@ -613,6 +720,19 @@ def verify_manifest(root: Path, manifest_path: Path, dist: Path) -> dict[str, An
             raise ReleasePolicyError(f"distribution is a symbolic link: {filename}")
         if path.stat().st_size != row.get("size") or _sha_file(path) != row.get("sha256"):
             raise ReleasePolicyError(f"artifact bytes differ from manifest: {filename}")
+    checked_out_source = str(_git(root, "rev-parse", "HEAD"))
+    if manifest.get("release_source_sha") != checked_out_source:
+        raise ReleasePolicyError("release manifest is not bound to the checked-out commit")
+    rebuilt = build_manifest(root, dist, source_sha=checked_out_source)
+    if manifest != rebuilt:
+        differing = sorted(
+            key
+            for key in set(manifest) | set(rebuilt)
+            if manifest.get(key) != rebuilt.get(key)
+        )
+        raise ReleasePolicyError(
+            f"release manifest identity differs from current candidate: {differing}"
+        )
     allowed_files = set(expected)
     try:
         if manifest_path.parent.resolve() == dist.resolve():
@@ -631,11 +751,19 @@ def verify_manifest(root: Path, manifest_path: Path, dist: Path) -> dict[str, An
     return {"status": "verified", "files": len(expected), "content_digest": claimed}
 
 
-def registry_verify(
-    manifest_path: Path, *, attempts: int = 12, delay_seconds: float = 10.0
-) -> dict[str, Any]:
-    manifest = _load_json(manifest_path)
-    expected = {row["filename"]: row for row in manifest.get("artifacts", [])}
+def _registry_readback(
+    manifest: dict[str, Any], *, attempts: int, delay_seconds: float
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    expected = _manifest_artifacts(manifest)
+    package = manifest.get("package")
+    version = manifest.get("version")
+    if (
+        not isinstance(package, str)
+        or not package
+        or not isinstance(version, str)
+        or not version
+    ):
+        raise ReleasePolicyError("release manifest registry identity is invalid")
     normalized = {
         name: {"size": row["size"], "sha256": row["sha256"]}
         for name, row in expected.items()
@@ -643,29 +771,117 @@ def registry_verify(
     if attempts < 1 or delay_seconds < 0:
         raise ReleasePolicyError("registry retry policy is invalid")
     observed: dict[str, dict[str, Any]] = {}
-    url = f"https://pypi.org/pypi/{manifest['package']}/{manifest['version']}/json"
+    encoded_package = urllib.parse.quote(package, safe="")
+    encoded_version = urllib.parse.quote(version, safe="")
+    url = f"https://pypi.org/pypi/{encoded_package}/{encoded_version}/json"
     for attempt in range(1, attempts + 1):
         try:
             payload = _request_json(url)
         except FileNotFoundError:
             payload = {}
+        urls = payload.get("urls")
+        if not isinstance(urls, list) or any(not isinstance(row, dict) for row in urls):
+            urls = []
         observed = {
-            row["filename"]: {
+            str(row.get("filename") or ""): {
                 "size": row.get("size"),
                 "sha256": (row.get("digests") or {}).get("sha256"),
+                "yanked": bool(row.get("yanked")),
             }
-            for row in payload.get("urls", [])
+            for row in urls
         }
-        if observed == normalized:
-            return {
-                "status": "registry_verified",
-                "files": len(observed),
-                "version": manifest["version"],
-                "attempt": attempt,
-            }
+        normalized_with_yank = {
+            name: {**identity, "yanked": False}
+            for name, identity in normalized.items()
+        }
+        info = payload.get("info") or {}
+        package_matches = str(info.get("name") or "").lower().replace("_", "-") == str(
+            manifest["package"]
+        ).lower().replace("_", "-")
+        version_matches = str(info.get("version") or "") == str(manifest["version"])
+        if (
+            len(urls) == len(expected)
+            and observed == normalized_with_yank
+            and package_matches
+            and version_matches
+        ):
+            return (
+                {
+                    "status": "registry_verified",
+                    "files": len(observed),
+                    "version": manifest["version"],
+                    "attempt": attempt,
+                },
+                payload,
+            )
         if attempt < attempts:
             time.sleep(delay_seconds)
     raise ReleasePolicyError("PyPI file-set readback differs from immutable manifest")
+
+
+def registry_verify(
+    manifest_path: Path, *, attempts: int = 12, delay_seconds: float = 10.0
+) -> dict[str, Any]:
+    manifest = _validated_manifest(manifest_path)
+    report, _ = _registry_readback(
+        manifest, attempts=attempts, delay_seconds=delay_seconds
+    )
+    return report
+
+
+def registry_download(
+    manifest_path: Path,
+    destination: Path,
+    *,
+    attempts: int = 12,
+    delay_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """Download the exact non-yanked PyPI bytes named by the immutable manifest."""
+
+    manifest = _validated_manifest(manifest_path)
+    expected = _manifest_artifacts(manifest)
+    report, payload = _registry_readback(
+        manifest, attempts=attempts, delay_seconds=delay_seconds
+    )
+    if destination.is_symlink():
+        raise ReleasePolicyError("registry download destination is a symbolic link")
+    destination.mkdir(parents=True, exist_ok=True)
+    if any(destination.iterdir()):
+        raise ReleasePolicyError("registry download destination is not empty")
+    remote_rows = {str(row.get("filename") or ""): row for row in payload.get("urls", [])}
+    created: list[Path] = []
+    try:
+        for filename, identity in expected.items():
+            remote = remote_rows[filename]
+            url = str(remote.get("url") or "")
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme != "https" or parsed.hostname != "files.pythonhosted.org":
+                raise ReleasePolicyError(f"PyPI artifact URL is not canonical: {filename}")
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "marvis-release-acceptance"},
+            )
+            target = destination / filename
+            part = destination / f".{filename}.part"
+            with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
+                final = urllib.parse.urlparse(response.geturl())
+                if final.scheme != "https" or final.hostname != "files.pythonhosted.org":
+                    raise ReleasePolicyError(f"PyPI artifact redirected off-host: {filename}")
+                raw = response.read(int(identity["size"]) + 1)
+            if len(raw) != identity["size"] or _sha_bytes(raw) != identity["sha256"]:
+                raise ReleasePolicyError(f"downloaded PyPI bytes differ from manifest: {filename}")
+            part.write_bytes(raw)
+            part.replace(target)
+            created.append(target)
+    except KeyError as exc:
+        for path in [*created, *destination.glob(".*.part")]:
+            path.unlink(missing_ok=True)
+        raise ReleasePolicyError("PyPI artifact URL inventory is incomplete") from exc
+    except (OSError, ReleasePolicyError, urllib.error.URLError):
+        for path in [*created, *destination.glob(".*.part")]:
+            path.unlink(missing_ok=True)
+        raise
+    return {**report, "status": "registry_downloaded", "destination": str(destination)}
 
 
 def publish_window(
@@ -682,7 +898,7 @@ def publish_window(
         raise ReleasePolicyError("workflow run id is invalid")
     policy = load_policy(root)
     _strict_external_receipts(policy, now=now)
-    manifest = _load_json(manifest_path)
+    manifest = _validated_manifest(manifest_path)
     repository = policy["repository"]
     run = _request_json(f"{api_url}/repos/{repository}/actions/runs/{run_id}", token=token)
     created = _parse_time(str(run.get("created_at") or ""))
@@ -707,6 +923,10 @@ def publish_window(
     _draft_release(policy, token=token, api_url=api_url)
     environment = _environment_check(policy, token=token, api_url=api_url)
     verify_manifest(root, manifest_path, dist)
+    _require_remote_absence(
+        _candidate_pypi_url(policy),
+        label="candidate PyPI version",
+    )
     return {
         "status": "publication_window_green",
         "run_id": str(run_id),
@@ -728,6 +948,8 @@ def main(argv: list[str] | None = None) -> int:
     static_parser.add_argument("--trigger-ref")
     pretag_parser = sub.add_parser("pretag")
     pretag_parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
+    tag_preflight_parser = sub.add_parser("tag-preflight")
+    tag_preflight_parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
     preflight_parser = sub.add_parser("preflight")
     preflight_parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
     manifest_parser = sub.add_parser("manifest")
@@ -739,6 +961,9 @@ def main(argv: list[str] | None = None) -> int:
     verify_parser.add_argument("--dist", type=Path, required=True)
     registry_parser = sub.add_parser("registry")
     registry_parser.add_argument("--manifest", type=Path, required=True)
+    registry_download_parser = sub.add_parser("registry-download")
+    registry_download_parser.add_argument("--manifest", type=Path, required=True)
+    registry_download_parser.add_argument("--dest", type=Path, required=True)
     window_parser = sub.add_parser("publish-window")
     window_parser.add_argument("--manifest", type=Path, required=True)
     window_parser.add_argument("--dist", type=Path, required=True)
@@ -757,6 +982,12 @@ def main(argv: list[str] | None = None) -> int:
             if not args.token:
                 raise ReleasePolicyError("GITHUB_TOKEN is required for live pretag checks")
             result = pretag(root, token=args.token)
+        elif args.command == "tag-preflight":
+            if not args.token:
+                raise ReleasePolicyError(
+                    "GITHUB_TOKEN is required for live tag-preflight checks"
+                )
+            result = tag_preflight(root, token=args.token)
         elif args.command == "preflight":
             if not args.token:
                 raise ReleasePolicyError("GITHUB_TOKEN is required for live preflight checks")
@@ -772,6 +1003,10 @@ def main(argv: list[str] | None = None) -> int:
             result = verify_manifest(root, args.manifest.resolve(), args.dist.resolve())
         elif args.command == "registry":
             result = registry_verify(args.manifest.resolve())
+        elif args.command == "registry-download":
+            result = registry_download(
+                args.manifest.resolve(), args.dest.resolve()
+            )
         else:
             if not args.token or not args.run_id:
                 raise ReleasePolicyError("GITHUB_TOKEN and GITHUB_RUN_ID are required")

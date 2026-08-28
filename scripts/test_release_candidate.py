@@ -9,6 +9,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 import release_candidate as candidate
 
@@ -19,6 +20,25 @@ ROOT = Path(__file__).resolve().parents[1]
 class ReleaseCandidateTests(unittest.TestCase):
     def policy(self) -> dict:
         return copy.deepcopy(candidate.load_policy(ROOT))
+
+    def write_manifest(self, path: Path, **values: object) -> dict:
+        manifest = {"schema": candidate.MANIFEST_SCHEMA, **values}
+        manifest["content_digest"] = candidate._sha_bytes(candidate._canonical(manifest))
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest
+
+    def write_release_artifacts(self, dist: Path) -> tuple[Path, Path]:
+        dist.mkdir(parents=True, exist_ok=True)
+        metadata = b"Metadata-Version: 2.1\nName: marvisx-cli\nVersion: 0.4.1\n\n"
+        wheel = dist / "marvisx_cli-0.4.1-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("marvisx_cli-0.4.1.dist-info/METADATA", metadata)
+        sdist = dist / "marvisx_cli-0.4.1.tar.gz"
+        with tarfile.open(sdist, "w:gz") as archive:
+            info = tarfile.TarInfo("marvisx_cli-0.4.1/PKG-INFO")
+            info.size = len(metadata)
+            archive.addfile(info, io.BytesIO(metadata))
+        return wheel, sdist
 
     def verified_external_policy(self, now: datetime) -> dict:
         policy = self.policy()
@@ -52,6 +72,13 @@ class ReleaseCandidateTests(unittest.TestCase):
     def test_unpinned_action_is_rejected(self) -> None:
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "full commit"):
             candidate._action_pins("steps:\n  - uses: actions/checkout@v4\n")
+
+    def test_commented_workflow_command_is_not_active_evidence(self) -> None:
+        lines = candidate._active_workflow_lines(
+            "# python scripts/test_release_candidate.py\nrun: echo ok\n"
+        )
+        self.assertNotIn("python scripts/test_release_candidate.py", lines)
+        self.assertIn("run: echo ok", lines)
 
     def test_tag_build_rejects_another_trigger_tag(self) -> None:
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "another-tag"):
@@ -89,37 +116,37 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_manifest_byte_tamper_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="release-manifest-") as raw:
-            root = Path(raw)
-            (root / ".github/workflows").mkdir(parents=True)
-            (root / "contracts/release").mkdir(parents=True)
-            workflow = root / candidate.WORKFLOW_PATH
-            policy_path = root / candidate.POLICY_PATH
-            workflow.write_bytes((ROOT / candidate.WORKFLOW_PATH).read_bytes())
-            policy_path.write_bytes((ROOT / candidate.POLICY_PATH).read_bytes())
-            dist = root / "dist"
-            dist.mkdir()
-            artifact = dist / "candidate.whl"
-            artifact.write_bytes(b"reviewed")
-            manifest = {
-                "schema": candidate.MANIFEST_SCHEMA,
-                "workflow": {"sha256": candidate._sha_file(workflow)},
-                "policy": {"sha256": candidate._sha_file(policy_path)},
-                "artifacts": [
-                    {
-                        "filename": artifact.name,
-                        "size": artifact.stat().st_size,
-                        "sha256": candidate._sha_file(artifact),
-                    }
-                ],
-            }
-            manifest["content_digest"] = candidate._sha_bytes(
-                candidate._canonical(manifest)
-            )
-            manifest_path = root / "manifest.json"
+            dist = Path(raw) / "dist"
+            artifact, _ = self.write_release_artifacts(dist)
+            manifest = candidate.build_manifest(ROOT, dist)
+            manifest_path = Path(raw) / "manifest.json"
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             artifact.write_bytes(b"tampered")
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "bytes differ"):
-                candidate.verify_manifest(root, manifest_path, dist)
+                candidate.verify_manifest(ROOT, manifest_path, dist)
+
+    def test_manifest_recomputed_identity_tamper_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="release-identity-") as raw:
+            dist = Path(raw) / "dist"
+            self.write_release_artifacts(dist)
+            manifest = candidate.build_manifest(ROOT, dist)
+            manifest["tag"] = "v9.9.9"
+            manifest.pop("content_digest")
+            manifest["content_digest"] = candidate._sha_bytes(
+                candidate._canonical(manifest)
+            )
+            manifest_path = Path(raw) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(candidate.ReleasePolicyError, "identity differs"):
+                candidate.verify_manifest(ROOT, manifest_path, dist)
+
+    def test_manifest_source_must_be_the_checked_out_commit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="release-source-") as raw:
+            dist = Path(raw) / "dist"
+            self.write_release_artifacts(dist)
+            base = self.policy()["plan_b_product_base_sha"]
+            with self.assertRaisesRegex(candidate.ReleasePolicyError, "checked-out"):
+                candidate.build_manifest(ROOT, dist, source_sha=base)
 
     def test_sdist_uses_root_metadata_and_ignores_egg_info_copy(self) -> None:
         metadata = b"Name: marvisx-cli\nVersion: 0.4.1\n\n"
@@ -140,59 +167,32 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_manifest_rejects_unmanifested_release_asset(self) -> None:
         with tempfile.TemporaryDirectory(prefix="release-assets-") as raw:
-            root = Path(raw)
-            (root / ".github/workflows").mkdir(parents=True)
-            (root / "contracts/release").mkdir(parents=True)
-            workflow = root / candidate.WORKFLOW_PATH
-            policy_path = root / candidate.POLICY_PATH
-            workflow.write_bytes((ROOT / candidate.WORKFLOW_PATH).read_bytes())
-            policy_path.write_bytes((ROOT / candidate.POLICY_PATH).read_bytes())
-            dist = root / "dist"
-            dist.mkdir()
-            artifact = dist / "candidate.whl"
-            artifact.write_bytes(b"reviewed")
+            dist = Path(raw) / "dist"
+            self.write_release_artifacts(dist)
             manifest_path = dist / "release-manifest.json"
-            manifest = {
-                "schema": candidate.MANIFEST_SCHEMA,
-                "workflow": {"sha256": candidate._sha_file(workflow)},
-                "policy": {"sha256": candidate._sha_file(policy_path)},
-                "artifacts": [
-                    {
-                        "filename": artifact.name,
-                        "size": artifact.stat().st_size,
-                        "sha256": candidate._sha_file(artifact),
-                    }
-                ],
-            }
-            manifest["content_digest"] = candidate._sha_bytes(
-                candidate._canonical(manifest)
-            )
+            manifest = candidate.build_manifest(ROOT, dist)
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             (dist / "unreviewed-installer.sh").write_text("exit 0\n", encoding="utf-8")
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "file set"):
-                candidate.verify_manifest(root, manifest_path, dist)
+                candidate.verify_manifest(ROOT, manifest_path, dist)
 
     def test_registry_readback_retries_then_matches_exact_bytes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="registry-readback-") as raw:
             manifest_path = Path(raw) / "manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "package": "marvisx-cli",
-                        "version": "0.4.1",
-                        "artifacts": [
-                            {"filename": "a.whl", "size": 7, "sha256": "abc"}
-                        ],
-                    }
-                ),
-                encoding="utf-8",
+            self.write_manifest(
+                manifest_path,
+                package="marvisx-cli",
+                version="0.4.1",
+                artifacts=[{"filename": "a.whl", "size": 7, "sha256": "a" * 64}],
             )
             payload = {
+                "info": {"name": "marvisx-cli", "version": "0.4.1"},
                 "urls": [
                     {
                         "filename": "a.whl",
                         "size": 7,
-                        "digests": {"sha256": "abc"},
+                        "digests": {"sha256": "a" * 64},
+                        "yanked": False,
                     }
                 ]
             }
@@ -206,6 +206,107 @@ class ReleaseCandidateTests(unittest.TestCase):
                 )
             self.assertEqual(report["attempt"], 2)
             sleep.assert_called_once_with(0.01)
+
+    def test_registry_readback_rejects_yanked_candidate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="registry-yanked-") as raw:
+            manifest_path = Path(raw) / "manifest.json"
+            self.write_manifest(
+                manifest_path,
+                package="marvisx-cli",
+                version="0.4.1",
+                artifacts=[{"filename": "a.whl", "size": 7, "sha256": "a" * 64}],
+            )
+            payload = {
+                "info": {"name": "marvisx-cli", "version": "0.4.1"},
+                "urls": [
+                    {
+                        "filename": "a.whl",
+                        "size": 7,
+                        "digests": {"sha256": "a" * 64},
+                        "yanked": True,
+                    }
+                ],
+            }
+            with mock.patch.object(candidate, "_request_json", return_value=payload):
+                with self.assertRaisesRegex(candidate.ReleasePolicyError, "readback"):
+                    candidate.registry_verify(
+                        manifest_path, attempts=1, delay_seconds=0
+                    )
+
+    def test_registry_download_writes_only_verified_pythonhosted_bytes(self) -> None:
+        raw_artifact = b"payload"
+        sha256 = candidate._sha_bytes(raw_artifact)
+        url = "https://files.pythonhosted.org/packages/a/a.whl"
+        with tempfile.TemporaryDirectory(prefix="registry-download-") as raw:
+            root = Path(raw)
+            manifest_path = root / "manifest.json"
+            self.write_manifest(
+                manifest_path,
+                package="marvisx-cli",
+                version="0.4.1",
+                artifacts=[
+                    {"filename": "a.whl", "size": len(raw_artifact), "sha256": sha256}
+                ],
+            )
+            payload = {
+                "info": {"name": "marvisx-cli", "version": "0.4.1"},
+                "urls": [
+                    {
+                        "filename": "a.whl",
+                        "size": len(raw_artifact),
+                        "digests": {"sha256": sha256},
+                        "yanked": False,
+                        "url": url,
+                    }
+                ],
+            }
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = raw_artifact
+            response.geturl.return_value = url
+            destination = root / "download"
+            with mock.patch.object(
+                candidate, "_request_json", return_value=payload
+            ), mock.patch.object(
+                candidate.urllib.request, "urlopen", return_value=response
+            ):
+                report = candidate.registry_download(
+                    manifest_path, destination, attempts=1, delay_seconds=0
+                )
+            self.assertEqual(report["status"], "registry_downloaded")
+            self.assertEqual((destination / "a.whl").read_bytes(), raw_artifact)
+
+    def test_registry_download_rejects_off_host_url(self) -> None:
+        raw_artifact = b"payload"
+        sha256 = candidate._sha_bytes(raw_artifact)
+        with tempfile.TemporaryDirectory(prefix="registry-off-host-") as raw:
+            root = Path(raw)
+            manifest_path = root / "manifest.json"
+            self.write_manifest(
+                manifest_path,
+                package="marvisx-cli",
+                version="0.4.1",
+                artifacts=[
+                    {"filename": "a.whl", "size": len(raw_artifact), "sha256": sha256}
+                ],
+            )
+            payload = {
+                "info": {"name": "marvisx-cli", "version": "0.4.1"},
+                "urls": [
+                    {
+                        "filename": "a.whl",
+                        "size": len(raw_artifact),
+                        "digests": {"sha256": sha256},
+                        "yanked": False,
+                        "url": "https://example.invalid/a.whl",
+                    }
+                ],
+            }
+            with mock.patch.object(candidate, "_request_json", return_value=payload):
+                with self.assertRaisesRegex(candidate.ReleasePolicyError, "canonical"):
+                    candidate.registry_download(
+                        manifest_path, root / "download", attempts=1, delay_seconds=0
+                    )
 
     def test_pretag_rejects_remote_tag_on_another_commit(self) -> None:
         policy = self.policy()
@@ -223,6 +324,26 @@ class ReleaseCandidateTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "reviewed"):
                 candidate.pretag(ROOT, token="masked")
+
+    def test_tag_preflight_requires_unused_release_and_pypi_namespaces(self) -> None:
+        policy = self.policy()
+        reviewed = "a" * 40
+        with mock.patch.object(
+            candidate,
+            "validate_static",
+            return_value={"release_source_sha": reviewed},
+        ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
+            candidate, "_strict_external_receipts"
+        ), mock.patch.object(
+            candidate, "_environment_check", return_value={"name": "pypi"}
+        ), mock.patch.object(
+            candidate, "_remote_tag_sha", return_value=reviewed
+        ), mock.patch.object(candidate, "_require_remote_absence") as absence:
+            report = candidate.tag_preflight(
+                ROOT, token="masked", api_url="https://api.example"
+            )
+        self.assertEqual(report["status"], "tag_preflight_green")
+        self.assertEqual(absence.call_count, 2)
 
     def test_preflight_rejects_source_that_is_not_remote_main_head(self) -> None:
         policy = self.verified_external_policy(
@@ -307,9 +428,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         policy = self.verified_external_policy(now)
         with tempfile.TemporaryDirectory(prefix="approval-window-") as raw:
             manifest_path = Path(raw) / "manifest.json"
-            manifest_path.write_text(
-                json.dumps({"release_source_sha": "a" * 40}), encoding="utf-8"
-            )
+            self.write_manifest(manifest_path, release_source_sha="a" * 40)
             run = {
                 "created_at": (now - timedelta(hours=25)).isoformat(),
                 "head_sha": "a" * 40,
@@ -337,9 +456,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         policy = self.verified_external_policy(now)
         with tempfile.TemporaryDirectory(prefix="approval-tag-") as raw:
             manifest_path = Path(raw) / "manifest.json"
-            manifest_path.write_text(
-                json.dumps({"release_source_sha": "a" * 40}), encoding="utf-8"
-            )
+            self.write_manifest(manifest_path, release_source_sha="a" * 40)
             run = {
                 "created_at": now.isoformat(),
                 "head_sha": "a" * 40,
@@ -354,6 +471,44 @@ class ReleaseCandidateTests(unittest.TestCase):
                 candidate, "_request_json", return_value=run
             ):
                 with self.assertRaisesRegex(candidate.ReleasePolicyError, "another tag"):
+                    candidate.publish_window(
+                        ROOT,
+                        manifest_path,
+                        Path(raw),
+                        token="masked",
+                        run_id="123",
+                        now=now,
+                        api_url="https://api.example",
+                    )
+
+    def test_publication_window_rechecks_pypi_absence_before_upload(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.verified_external_policy(now)
+        with tempfile.TemporaryDirectory(prefix="approval-pypi-") as raw:
+            manifest_path = Path(raw) / "manifest.json"
+            self.write_manifest(manifest_path, release_source_sha="a" * 40)
+            run = {
+                "created_at": now.isoformat(),
+                "head_sha": "a" * 40,
+                "path": str(candidate.WORKFLOW_PATH),
+                "event": "push",
+                "head_branch": policy["candidate_tag"],
+                "head_repository": {"full_name": policy["repository"]},
+            }
+            with mock.patch.object(
+                candidate, "load_policy", return_value=policy
+            ), mock.patch.object(
+                candidate, "_request_json", return_value=run
+            ), mock.patch.object(
+                candidate, "_remote_tag_sha", return_value="a" * 40
+            ), mock.patch.object(candidate, "_draft_release"), mock.patch.object(
+                candidate, "_environment_check", return_value={"name": "pypi"}
+            ), mock.patch.object(candidate, "verify_manifest"), mock.patch.object(
+                candidate,
+                "_require_remote_absence",
+                side_effect=candidate.ReleasePolicyError("candidate PyPI version already exists"),
+            ):
+                with self.assertRaisesRegex(candidate.ReleasePolicyError, "already exists"):
                     candidate.publish_window(
                         ROOT,
                         manifest_path,

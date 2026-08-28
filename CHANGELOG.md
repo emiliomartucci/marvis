@@ -29,10 +29,11 @@ This section describes a release candidate only. Version 0.4.1 is not
 published until the separate tag, PyPI and post-publication acceptance gates
 all succeed.
 
-## [0.4.0] - 2026-06-19 (stabile)
+## [0.4.0] - 2026-06-19 (tentativo fallito, non pubblicato)
 
-Prima release stabile: consolida la linea 0.3.9bX in un install pulito validato
-da QA Fable, senza canale prerelease.
+Il tag e il record GitHub di questo tentativo esistono, ma PyPI non ha mai
+ricevuto la versione. Le note sotto descrivono il contenuto candidato storico,
+non una release consegnata o installabile.
 
 ### Added
 - **`marvis console` (plumbing)** — a local-GUI launcher: ensures the local API is up and opens the browser on the locally served UI. The release pipeline now builds the Console static export and ships it in the wheel; the public GUI launch follows the redesign. Groundwork: the local API can mount and serve a static UI same-origin (CSP kept same-origin).

@@ -52,6 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           pip install --require-hashes -r requirements-release.lock
+          python scripts/test_release_candidate.py
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             python scripts/release_candidate.py static --tag-build --trigger-ref "$GITHUB_REF"
           else
@@ -68,12 +69,19 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python scripts/release_candidate.py preflight
 
+      - name: Recheck the tagged namespace before the expensive build
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/release_candidate.py tag-preflight
+
       - name: Build the local GUI from a digest-pinned image
         run: |
           set -euo pipefail
           desktop_source_sha="$(git rev-parse HEAD)"
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           export SOURCE_DATE_EPOCH
+          desktop_source_sha="$(git rev-parse HEAD)"
           docker run --rm \
             -v "$PWD:/repo" \
             -w /repo/apps/desktop-ui \
@@ -132,6 +140,8 @@ jobs:
 
           WORK="$(mktemp -d)"
           trap 'rm -rf "$WORK"' EXIT
+          export PIP_CACHE_DIR="$RUNNER_TEMP/marvis-release-pip-cache"
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
           python -m venv "$WORK/wheel-venv"
           "$WORK/wheel-venv/bin/pip" install --quiet --no-cache-dir "$WHEEL"
           (
@@ -273,7 +283,7 @@ jobs:
         with:
           name: immutable-release-candidate
           path: release-artifact
-      - name: Re-read PyPI and exercise install, upgrade and rollback
+      - name: Re-read PyPI and exercise install, upgrade and recovery
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -286,17 +296,92 @@ jobs:
             --dist gh-release-readback
           python scripts/release_candidate.py registry \
             --manifest release-artifact/release-manifest.json
+          python scripts/release_candidate.py registry-download \
+            --manifest release-artifact/release-manifest.json \
+            --dest pypi-readback
+          python scripts/release_candidate.py verify \
+            --manifest release-artifact/release-manifest.json \
+            --dist pypi-readback
+
           WORK="$(mktemp -d)"
           trap 'rm -rf "$WORK"' EXIT
-          python -m venv "$WORK/venv"
-          PIP="$WORK/venv/bin/pip"
-          MARVIS="$WORK/venv/bin/marvis"
-          "$PIP" install --quiet --no-cache-dir "marvisx-cli==0.3.8"
-          "$MARVIS" --version | grep -q "0.3.8"
-          "$PIP" install --quiet --no-cache-dir --upgrade "marvisx-cli==${GITHUB_REF_NAME#v}"
-          "$MARVIS" --version | grep -q "${GITHUB_REF_NAME#v}"
-          "$PIP" install --quiet --no-cache-dir --force-reinstall "marvisx-cli==0.3.8"
-          "$MARVIS" --version | grep -q "0.3.8"
+
+          smoke_install() {
+            local artifact="$1"
+            local label="$2"
+            local root="$WORK/$label"
+            python -m venv "$root/venv"
+            local pip="$root/venv/bin/pip"
+            local python_bin="$root/venv/bin/python"
+            local marvis="$root/venv/bin/marvis"
+            if [[ "$artifact" == *.tar.gz ]]; then
+              "$pip" install --quiet --require-hashes \
+                -r requirements-release.lock
+              "$pip" install --quiet --no-build-isolation "$artifact"
+            else
+              "$pip" install --quiet "$artifact"
+            fi
+
+            mkdir -p "$root/vault" "$root/projects" "$root/project"
+            (
+              export PATH="$root/venv/bin:$PATH"
+              export MARVIS_VAULT_DIR="$root/vault"
+              export MARVIS_SETTINGS_PATH="$root/vault/settings.yaml"
+              export MARVIS_DB_PATH="$root/vault/console.db"
+              export MARVIS_PROJECTS_ROOT="$root/projects"
+              export MARVIS_TELEMETRY=0
+              cd "$root/project"
+              git init -q
+              "$marvis" --version | grep -q "${GITHUB_REF_NAME#v}"
+              "$marvis" --help | grep -q "doctor"
+              "$python_bin" -c "import core.api"
+              "$marvis" init --accept-bsl --no-interactive --yes \
+                --projects-root "$root/projects" \
+                --db-backend sqlite \
+                --db-path "$root/vault/console.db" \
+                --llm-provider skip \
+                --project-name "Release Acceptance" \
+                --project-slug "release-acceptance" \
+                --project-type code \
+                --vault-dir "$root/vault"
+              "$marvis" doctor --offline
+              "$marvis" hooks install
+              "$marvis" mcp register
+              "$marvis" status --json > "$root/status.json"
+              "$marvis" hooks status --json > "$root/hooks.json"
+              "$marvis" mcp status --json > "$root/mcp.json"
+              "$python_bin" - \
+                "$root/status.json" \
+                "$root/hooks.json" \
+                "$root/mcp.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          status, hooks, mcp = (
+              json.loads(Path(path).read_text(encoding="utf-8"))
+              for path in sys.argv[1:]
+          )
+          assert status["db_ok"] is True
+          assert hooks["fully_installed"] is True
+          assert mcp["connected"] is True
+          assert mcp["tool_count"] > 0
+          PY
+            )
+
+            if [[ "$label" == "wheel" ]]; then
+              "$python_bin" scripts/verify_local_upgrade.py \
+                --download \
+                --version 0.3.8 \
+                --evidence-dir "$WORK/recovery-evidence"
+            fi
+          }
+
+          WHEEL="$(find pypi-readback -maxdepth 1 -type f -name '*.whl' -print)"
+          SDIST="$(find pypi-readback -maxdepth 1 -type f -name '*.tar.gz' -print)"
+          test -n "$WHEEL" && test -n "$SDIST"
+          smoke_install "$WHEEL" wheel
+          smoke_install "$SDIST" sdist
       - name: Finalize the verified GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -310,7 +395,7 @@ jobs:
 
   contain:
     name: Contain a failed tagged release
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && (needs.release-record.result == 'failure' || needs.pypi.result == 'failure' || needs.accept.result == 'failure') }}
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && (needs.build.result != 'success' || needs.release-record.result != 'success' || needs.pypi.result != 'success' || needs.accept.result != 'success') }}
     needs: [build, release-record, pypi, accept]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -322,11 +407,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" \
-              --draft=true \
-              --prerelease=true \
-              --title "$GITHUB_REF_NAME [FAILED - DO NOT INSTALL]"
+          release_state="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+            --jq '[.draft, .prerelease] | @tsv' 2>/dev/null || true)"
+          if [[ -z "$release_state" ]]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --draft \
+              --prerelease \
+              --title "$GITHUB_REF_NAME [FAILED - DO NOT INSTALL]" \
+              --notes "The tagged release failed before acceptance. The tag and version are burned; use a new version after remediation."
           else
-            echo "No GitHub Release exists; the failed tag remains unpublished."
+            IFS=$'\t' read -r draft prerelease <<< "$release_state"
+            if [[ "$draft" == "true" ]]; then
+              gh release edit "$GITHUB_REF_NAME" \
+                --draft=true \
+                --prerelease=true \
+                --title "$GITHUB_REF_NAME [FAILED - DO NOT INSTALL]"
+            elif [[ "$prerelease" == "true" ]]; then
+              gh release edit "$GITHUB_REF_NAME" \
+                --prerelease=true \
+                --title "$GITHUB_REF_NAME [FAILED - DO NOT INSTALL]"
+            else
+              echo "::error::Refusing to mutate an already-final GitHub Release."
+              exit 1
+            fi
+          fi
+
+          version="${GITHUB_REF_NAME#v}"
+          if curl --silent --show-error --fail \
+            "https://pypi.org/pypi/marvisx-cli/${version}/json" >/dev/null; then
+            echo "::error::The failed candidate exists on PyPI; owner verification and yank are required."
+            exit 1
           fi
