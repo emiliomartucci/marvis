@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
 import re
 from typing import Any
+
+from build_compatibility_fixtures import compact_spec
 
 
 FIXTURE_SCHEMA = "marvis-compatibility-fixture/v1"
@@ -92,6 +95,36 @@ def _validate_fixture(name: str, fixture: dict[str, Any]) -> None:
         raise CompatibilityError(f"{name}: component schema inventory drift")
     if any(not HEX_64.fullmatch(str(value)) for value in digests.values()):
         raise CompatibilityError(f"{name}: invalid component schema digest")
+    for operation in operations.values():
+        refs = operation.get("schema_refs")
+        request_refs = operation.get("request_schema_refs")
+        response_refs = operation.get("response_schema_refs")
+        if (
+            not isinstance(refs, list)
+            or refs != sorted(set(refs))
+            or not all(isinstance(ref, str) and ref for ref in refs)
+            or not isinstance(request_refs, list)
+            or request_refs != sorted(set(request_refs))
+            or not isinstance(response_refs, dict)
+            or set(response_refs) != set(operation.get("response_codes", []))
+        ):
+            raise CompatibilityError(f"{name}: operation schema closure invalid")
+        flattened = set(request_refs)
+        for code_refs in response_refs.values():
+            if (
+                not isinstance(code_refs, list)
+                or code_refs != sorted(set(code_refs))
+                or not all(isinstance(ref, str) and ref for ref in code_refs)
+            ):
+                raise CompatibilityError(f"{name}: response schema closure invalid")
+            flattened.update(code_refs)
+        if refs != sorted(flattened):
+            raise CompatibilityError(f"{name}: operation schema closure union drift")
+        missing = set(refs) - set(shapes)
+        if missing:
+            raise CompatibilityError(
+                f"{name}: operation references missing schemas: {sorted(missing)}"
+            )
 
 
 def _operation_breaks(
@@ -114,14 +147,35 @@ def _operation_breaks(
         set(actual.get("response_codes", []))
     ):
         failures.append("response_code_removed")
+    if not set(expected.get("request_schema_refs", [])).issubset(
+        set(actual.get("request_schema_refs", []))
+    ):
+        failures.append("request_schema_reference_removed")
+    actual_response_refs = actual.get("response_schema_refs", {})
+    for code in sorted(old_success & new_success):
+        if not set(expected.get("response_schema_refs", {}).get(code, [])).issubset(
+            set(actual_response_refs.get(code, []))
+        ):
+            failures.append(f"response_schema_reference_removed:{code}")
     return failures
 
 
-def _schema_breaks(expected: dict[str, Any], actual: dict[str, Any]) -> list[str]:
+def _schema_breaks(
+    expected: dict[str, Any],
+    actual: dict[str, Any],
+    *,
+    names: set[str] | None = None,
+    direction: str = "provider_upgrade",
+) -> list[str]:
     failures: list[str] = []
     old_shapes = expected["component_schema_compatibility"]
     new_shapes = actual["component_schema_compatibility"]
-    for name, old in old_shapes.items():
+    selected = set(old_shapes) if names is None else names
+    for name in sorted(selected):
+        old = old_shapes.get(name)
+        if old is None:
+            failures.append(f"schema_evidence_missing:{name}")
+            continue
         new = new_shapes.get(name)
         if new is None:
             failures.append(f"schema_removed:{name}")
@@ -135,12 +189,22 @@ def _schema_breaks(expected: dict[str, Any], actual: dict[str, Any]) -> list[str
             continue
         if old.get("envelope_sha256") != new.get("envelope_sha256"):
             failures.append(f"schema_envelope_changed:{name}")
-        if not set(new.get("required", [])).issubset(set(old.get("required", []))):
-            failures.append(f"schema_required_added:{name}")
         old_properties = old.get("property_sha256", {})
         new_properties = new.get("property_sha256", {})
-        for prop, digest in old_properties.items():
-            if new_properties.get(prop) != digest:
+        old_required = set(old.get("required", []))
+        new_required = set(new.get("required", []))
+        if direction == "consumer_response":
+            if not old_required.issubset(new_required):
+                failures.append(f"schema_required_response_missing:{name}")
+            compared_properties = set(old_properties) & set(new_properties)
+        else:
+            if not new_required.issubset(old_required):
+                failures.append(f"schema_required_added:{name}")
+            compared_properties = set(old_properties)
+        for prop in sorted(compared_properties):
+            if prop not in new_properties:
+                failures.append(f"schema_property_missing:{name}.{prop}")
+            elif new_properties[prop] != old_properties[prop]:
                 failures.append(f"schema_property_changed:{name}.{prop}")
     return failures
 
@@ -164,9 +228,51 @@ def provider_breaks(
                 expected_operation, actual_operation, consumer_view=consumer_view
             )
         )
-    if not consumer_view:
-        failures.extend(_schema_breaks(expected, actual))
-    return failures
+    schema_names = None
+    if consumer_view:
+        expected_ops = _operations(expected)
+        request_names = {
+            ref
+            for operation in expected_ops.values()
+            for ref in operation.get("request_schema_refs", [])
+        }
+        response_names: set[str] = set()
+        for key, operation in expected_ops.items():
+            actual_operation = actual_ops.get(key)
+            if actual_operation is None:
+                continue
+            shared_success = {
+                code
+                for code in operation.get("response_codes", [])
+                if str(code).startswith("2")
+            } & {
+                code
+                for code in actual_operation.get("response_codes", [])
+                if str(code).startswith("2")
+            }
+            for code in shared_success:
+                response_names.update(
+                    operation.get("response_schema_refs", {}).get(code, [])
+                )
+        failures.extend(
+            _schema_breaks(
+                expected,
+                actual,
+                names=request_names,
+                direction="consumer_request",
+            )
+        )
+        failures.extend(
+            _schema_breaks(
+                expected,
+                actual,
+                names=response_names,
+                direction="consumer_response",
+            )
+        )
+    else:
+        failures.extend(_schema_breaks(expected, actual, names=schema_names))
+    return list(dict.fromkeys(failures))
 
 
 def _python_symbols(path: Path) -> set[str]:
@@ -205,6 +311,7 @@ def _validate_matrix(
     *,
     n_consumer: dict[str, Any],
     previous: dict[str, Any],
+    consumer_previous_breaks: set[str],
 ) -> None:
     if matrix.get("schema") != MATRIX_SCHEMA or matrix.get("contract_window") != "N/N-1":
         raise CompatibilityError("consumer matrix header invalid")
@@ -254,6 +361,41 @@ def _validate_matrix(
         missing = sorted(new_only - declared)
         raise CompatibilityError(f"unclassified N-only operations: {missing}")
 
+    schema_declarations = matrix.get("n_consumer_n_minus_1_schema_breaks")
+    if not isinstance(schema_declarations, list):
+        raise CompatibilityError("N/N-1 schema-break inventory missing")
+    declared_breaks: set[str] = set()
+    for item in schema_declarations:
+        if not isinstance(item, dict):
+            raise CompatibilityError("invalid N/N-1 schema-break row")
+        failure = item.get("failure")
+        if not isinstance(failure, str) or failure in declared_breaks:
+            raise CompatibilityError("invalid or duplicate N/N-1 schema break")
+        declared_breaks.add(failure)
+        surfaces = item.get("surfaces")
+        if (
+            not isinstance(surfaces, list)
+            or not surfaces
+            or not set(surfaces).issubset(EXPECTED_SURFACES)
+        ):
+            raise CompatibilityError(f"schema break has invalid surfaces: {failure}")
+        for surface in surfaces:
+            if by_surface[surface].get("n_consumer_n_minus_1_contract") != "migration_required":
+                raise CompatibilityError(
+                    f"{surface}: declared schema break lacks traced migration"
+                )
+        evidence = item.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            raise CompatibilityError(f"schema break lacks evidence: {failure}")
+        for reference in evidence:
+            _validate_evidence(root, str(reference))
+    if declared_breaks != consumer_previous_breaks:
+        missing = sorted(consumer_previous_breaks - declared_breaks)
+        stale = sorted(declared_breaks - consumer_previous_breaks)
+        raise CompatibilityError(
+            f"N/N-1 schema-break inventory drift: missing={missing}, stale={stale}"
+        )
+
 
 def _validate_trust(root: Path, trust: dict[str, Any]) -> None:
     if trust.get("schema") != TRUST_SCHEMA:
@@ -291,6 +433,7 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         "n-contract.json",
         "n-consumer-contract.json",
         "n-minus-1-contract.json",
+        "n-minus-1-openapi.json",
         "deliberate-break.json",
     }
     if set(manifest["files"]) != expected_files:
@@ -318,21 +461,79 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
     consumer_manifest_sha256 = _simple_yaml_value(
         pin, "projection_consumer_manifest_sha256"
     )
+    previous_ref = _simple_yaml_value(pin, "n_minus_1_ref")
+    previous_openapi_sha256 = _simple_yaml_value(
+        pin, "n_minus_1_openapi_sha256"
+    )
+    deliberate_break_sha256 = _simple_yaml_value(
+        pin, "deliberate_break_fixture_sha256"
+    )
     if not HEX_64.fullmatch(payload_sha256):
         raise CompatibilityError("projection payload digest is invalid")
     if not HEX_64.fullmatch(consumer_manifest_sha256):
         raise CompatibilityError("projection consumer manifest digest is invalid")
+    if not SHA_40.fullmatch(previous_ref):
+        raise CompatibilityError("N-1 source ref is invalid")
+    if not HEX_64.fullmatch(previous_openapi_sha256):
+        raise CompatibilityError("N-1 OpenAPI digest is invalid")
+    if not HEX_64.fullmatch(deliberate_break_sha256):
+        raise CompatibilityError("deliberate-break fixture digest is invalid")
     if current["source_ref"] != pinned_ref or consumer["source_ref"] != pinned_ref:
         raise CompatibilityError("N fixture source does not match engine pin")
     if current["contract_version"] != pinned_version or consumer["contract_version"] != pinned_version:
         raise CompatibilityError("N fixture version does not match engine pin")
-    for name, path, digest_key in (
-        ("N OpenAPI", root / "contracts/openapi/marvisx.json", "source_openapi_sha256"),
-        ("N consumer OpenAPI", root / "contracts/openapi/marvisx-public-shared.json", "source_openapi_sha256"),
+    if previous["source_ref"] != previous_ref or broken["source_ref"] != previous_ref:
+        raise CompatibilityError("N-1 fixture source does not match the external pin")
+    previous_openapi_path = fixtures / "n-minus-1-openapi.json"
+    if (
+        previous["source_openapi_sha256"] != previous_openapi_sha256
+        or broken["source_openapi_sha256"] != previous_openapi_sha256
+        or _sha(previous_openapi_path) != previous_openapi_sha256
     ):
-        fixture = current if name == "N OpenAPI" else consumer
-        if _sha(path) != fixture[digest_key]:
-            raise CompatibilityError(f"{name} bytes do not match fixture")
+        raise CompatibilityError("N-1 fixture OpenAPI does not match the external pin")
+    if _sha(fixtures / "deliberate-break.json") != deliberate_break_sha256:
+        raise CompatibilityError("deliberate-break fixture does not match the external pin")
+
+    n_path = root / "contracts/openapi/marvisx.json"
+    consumer_path = root / "contracts/openapi/marvisx-public-shared.json"
+    n_raw = n_path.read_bytes()
+    consumer_raw = consumer_path.read_bytes()
+    try:
+        rebuilt_current = compact_spec(
+            json.loads(n_raw),
+            contract_version=pinned_version,
+            source_ref=pinned_ref,
+            source_bytes=n_raw,
+            consumer_bytes=consumer_raw,
+        )
+        rebuilt_consumer = compact_spec(
+            json.loads(consumer_raw),
+            contract_version=pinned_version,
+            source_ref=pinned_ref,
+            source_bytes=consumer_raw,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise CompatibilityError("current OpenAPI bytes cannot be compacted") from exc
+    if rebuilt_current != current:
+        raise CompatibilityError("N fixture does not reconstruct from current OpenAPI bytes")
+    if rebuilt_consumer != consumer:
+        raise CompatibilityError(
+            "N consumer fixture does not reconstruct from current OpenAPI bytes"
+        )
+    previous_raw = previous_openapi_path.read_bytes()
+    try:
+        rebuilt_previous = compact_spec(
+            json.loads(previous_raw),
+            contract_version=previous["contract_version"],
+            source_ref=previous_ref,
+            source_bytes=previous_raw,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise CompatibilityError("N-1 OpenAPI bytes cannot be compacted") from exc
+    if rebuilt_previous != previous:
+        raise CompatibilityError(
+            "N-1 fixture does not reconstruct from pinned OpenAPI bytes"
+        )
     if current.get("consumer_openapi_sha256") != consumer.get("source_openapi_sha256"):
         raise CompatibilityError("N fixture is not bound to the consumer OpenAPI bytes")
 
@@ -355,12 +556,34 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
     shared_consumer["operations"] = {
         path: methods for path, methods in shared_consumer["operations"].items() if methods
     }
-    if provider_breaks(shared_consumer, previous, consumer_view=True):
-        raise CompatibilityError("N-1 does not satisfy the shared N consumer operations")
+    consumer_previous_breaks = set(
+        provider_breaks(shared_consumer, previous, consumer_view=True)
+    )
 
     break_info = broken.get("deliberate_break")
     if not isinstance(break_info, dict) or break_info.get("baseline") != "n-minus-1-contract.json":
         raise CompatibilityError("deliberate break declaration missing")
+    break_path = break_info.get("path")
+    break_method = str(break_info.get("method", "")).lower()
+    expected_broken = deepcopy(rebuilt_previous)
+    if (
+        not isinstance(break_path, str)
+        or break_path not in expected_broken["operations"]
+        or break_method not in expected_broken["operations"][break_path]
+    ):
+        raise CompatibilityError("deliberate break target is absent from N-1")
+    del expected_broken["operations"][break_path][break_method]
+    if not expected_broken["operations"][break_path]:
+        del expected_broken["operations"][break_path]
+    expected_broken["path_count"] = len(expected_broken["operations"])
+    expected_broken["operation_count"] = sum(
+        len(methods) for methods in expected_broken["operations"].values()
+    )
+    expected_broken["deliberate_break"] = break_info
+    if expected_broken != broken:
+        raise CompatibilityError(
+            "deliberate breaking fixture does not reconstruct from N-1"
+        )
     break_failures = provider_breaks(previous, broken)
     expected_break = (
         f"operation_removed:{str(break_info.get('method', '')).upper()} "
@@ -370,7 +593,13 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         raise CompatibilityError("deliberate breaking fixture did not fail as declared")
 
     matrix = _load(root / "contracts/compatibility/consumer-matrix-v1.json")
-    _validate_matrix(root, matrix, n_consumer=consumer, previous=previous)
+    _validate_matrix(
+        root,
+        matrix,
+        n_consumer=consumer,
+        previous=previous,
+        consumer_previous_breaks=consumer_previous_breaks,
+    )
     _validate_trust(root, _load(root / "contracts/compatibility/trust-matrix-v1.json"))
 
     return {
@@ -383,6 +612,7 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         "consumer_operations": consumer["operation_count"],
         "n_only_operations": len(set(_operations(consumer)) - set(_operations(previous))),
         "deliberate_breaks_detected": len(break_failures),
+        "declared_n_minus_1_schema_breaks": len(consumer_previous_breaks),
     }
 
 

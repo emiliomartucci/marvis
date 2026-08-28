@@ -41,6 +41,28 @@
       "evidence": ["core/api/routers/auth.py"]
     }
   ],
+  "n_consumer_n_minus_1_schema_breaks": [
+    {
+      "failure": "schema_property_missing:AgentTokenCreateRequest.expires_in_hours",
+      "surfaces": ["http"],
+      "evidence": ["core/api/models/auth.py", "core/api/routers/agent_tokens.py"]
+    },
+    {
+      "failure": "schema_property_missing:AgentTokenCreateRequest.overlap_minutes",
+      "surfaces": ["http"],
+      "evidence": ["core/api/models/auth.py", "core/api/routers/agent_tokens.py"]
+    },
+    {
+      "failure": "schema_property_missing:AgentTokenCreateRequest.supersedes_id",
+      "surfaces": ["http"],
+      "evidence": ["core/api/models/auth.py", "core/api/routers/agent_tokens.py"]
+    },
+    {
+      "failure": "schema_property_missing:TaskUpdateRequest.expected_updated_at",
+      "surfaces": ["http"],
+      "evidence": ["core/api/models/tasks.py", "core/api/routers/tasks.py"]
+    }
+  ],
   "rows": [
     {
       "surface": "cli",

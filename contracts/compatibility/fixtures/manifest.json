@@ -1,9 +1,10 @@
 {
   "files": {
-    "deliberate-break.json": "a0eca4cbc4be6aabdf4b167fb6b0e762e35ab980e07af21552efece8351da0eb",
-    "n-consumer-contract.json": "0482585107d240421aa042726c8f99e805b44647f5cf9ef78003879af4c54e1c",
-    "n-contract.json": "5f90a089e462e299e8abb53923015725dcfca5f0059640beb9721ceb42065e08",
-    "n-minus-1-contract.json": "94bd2d0a5762afa47eb54d6d0b770b1145226224798368af70b8bd6b0c216ffb"
+    "deliberate-break.json": "d9f7ac8eeff95b0cc7f74575a12d90b00676c297bf57c6f4427154383a8f27ec",
+    "n-consumer-contract.json": "86b63ff27365dbb288582262d94d9f42723e3c2c4f0289d7f2b532bf98e25b3f",
+    "n-contract.json": "48701c3ee6346a81cb8b81063315741450f8817808bcf95c43ba258e3c87206d",
+    "n-minus-1-contract.json": "800d5e2be09ca3651a2b8e41ade0c7450ab8133eccc20b549426e994dcfe30fd",
+    "n-minus-1-openapi.json": "0bdc79eceecc90e60f5f705afb7b698561ef1c15d13ecdd18ca013e84a9bfef8"
   },
   "schema": "marvis-compatibility-fixture-manifest/v1"
 }

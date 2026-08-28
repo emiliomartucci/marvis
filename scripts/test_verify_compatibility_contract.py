@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import shutil
 import tempfile
 import unittest
 
-from verify_compatibility_contract import CompatibilityError, verify
+from verify_compatibility_contract import CompatibilityError, provider_breaks, verify
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,9 +25,12 @@ class CompatibilityContractTests(unittest.TestCase):
             "contracts/engine-pin.yaml",
             "core/api/db.py",
             "core/api/mcp/stdio.py",
+            "core/api/models/auth.py",
+            "core/api/models/tasks.py",
             "core/api/routers/agent_tokens.py",
             "core/api/routers/auth.py",
             "core/api/routers/graph_ingest.py",
+            "core/api/routers/tasks.py",
             "core/api/services/schema_upgrade.py",
             "core/api/tests/test_require_scope_empty_deny.py",
             "core/api/tests/test_schema_compatibility.py",
@@ -49,11 +53,24 @@ class CompatibilityContractTests(unittest.TestCase):
                 shutil.copy2(source, target)
         return temp
 
+    @staticmethod
+    def _rewrite_fixture(root: Path, name: str, value: dict) -> str:
+        fixtures = root / "contracts/compatibility/fixtures"
+        path = fixtures / name
+        path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest_path = fixtures / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"][name] = digest
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+        return digest
+
     def test_current_contract_passes(self) -> None:
         result = verify(ROOT, expected_source_ref=SOURCE_REF)
         self.assertEqual(result["source_ref"], SOURCE_REF)
         self.assertEqual(result["projection_payload_sha256"], PAYLOAD_SHA256)
         self.assertGreater(result["n_operations"], result["n_minus_1_operations"])
+        self.assertEqual(result["declared_n_minus_1_schema_breaks"], 4)
 
     def test_manifest_tamper_fails_closed(self) -> None:
         root = self._copy()
@@ -73,13 +90,117 @@ class CompatibilityContractTests(unittest.TestCase):
         broken_path.write_text(json.dumps(baseline, sort_keys=True, indent=2) + "\n")
         manifest_path = fixtures / "manifest.json"
         manifest = json.loads(manifest_path.read_text())
-        import hashlib
-
-        manifest["files"]["deliberate-break.json"] = hashlib.sha256(
+        new_digest = hashlib.sha256(
             broken_path.read_bytes()
         ).hexdigest()
+        manifest["files"]["deliberate-break.json"] = new_digest
         manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
-        with self.assertRaisesRegex(CompatibilityError, "did not fail"):
+        pin_path = root / "contracts/engine-pin.yaml"
+        old_pin = next(
+            line.split(":", 1)[1].strip()
+            for line in pin_path.read_text().splitlines()
+            if line.startswith("deliberate_break_fixture_sha256:")
+        )
+        pin_path.write_text(pin_path.read_text().replace(old_pin, new_digest))
+        with self.assertRaisesRegex(CompatibilityError, "does not reconstruct"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_current_openapi_must_reconstruct_the_committed_fixture(self) -> None:
+        root = self._copy()
+        openapi_path = root / "contracts/openapi/marvisx.json"
+        spec = json.loads(openapi_path.read_text())
+        first_path = sorted(spec["paths"])[0]
+        first_method = next(
+            method
+            for method in ("delete", "get", "head", "options", "patch", "post", "put")
+            if method in spec["paths"][first_path]
+        )
+        del spec["paths"][first_path][first_method]
+        openapi_path.write_text(json.dumps(spec, sort_keys=True, indent=2) + "\n")
+        fixture_path = root / "contracts/compatibility/fixtures/n-contract.json"
+        fixture = json.loads(fixture_path.read_text())
+        fixture["source_openapi_sha256"] = hashlib.sha256(
+            openapi_path.read_bytes()
+        ).hexdigest()
+        self._rewrite_fixture(root, "n-contract.json", fixture)
+
+        with self.assertRaisesRegex(CompatibilityError, "does not reconstruct"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_n_minus_one_identity_cannot_be_self_relabelled(self) -> None:
+        root = self._copy()
+        fixtures = root / "contracts/compatibility/fixtures"
+        previous = json.loads((fixtures / "n-minus-1-contract.json").read_text())
+        previous["source_ref"] = "f" * 40
+        self._rewrite_fixture(root, "n-minus-1-contract.json", previous)
+
+        with self.assertRaisesRegex(CompatibilityError, "external pin"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_consumer_view_detects_referenced_schema_type_change(self) -> None:
+        operation = {
+            "operation_id": "get_item",
+            "required_parameters": [],
+            "request_body_required": False,
+            "response_codes": ["200"],
+            "request_schema_refs": [],
+            "response_schema_refs": {"200": ["Item"]},
+            "schema_refs": ["Item"],
+        }
+        shape = {
+            "kind": "object",
+            "envelope_sha256": "a" * 64,
+            "required": ["value"],
+            "property_sha256": {"value": "b" * 64},
+        }
+        expected = {
+            "operations": {"/items": {"get": operation}},
+            "component_schema_compatibility": {"Item": shape},
+        }
+        changed = json.loads(json.dumps(expected))
+        changed["component_schema_compatibility"]["Item"]["property_sha256"]["value"] = "c" * 64
+
+        failures = provider_breaks(expected, changed, consumer_view=True)
+
+        self.assertIn("schema_property_changed:Item.value", failures)
+
+    def test_consumer_view_checks_dual_use_schema_as_response(self) -> None:
+        operation = {
+            "operation_id": "replace_item",
+            "required_parameters": [],
+            "request_body_required": True,
+            "response_codes": ["200"],
+            "request_schema_refs": ["Item"],
+            "response_schema_refs": {"200": ["Item"]},
+            "schema_refs": ["Item"],
+        }
+        shape = {
+            "kind": "object",
+            "envelope_sha256": "a" * 64,
+            "required": ["value"],
+            "property_sha256": {"value": "b" * 64},
+        }
+        expected = {
+            "operations": {"/items": {"put": operation}},
+            "component_schema_compatibility": {"Item": shape},
+        }
+        changed = json.loads(json.dumps(expected))
+        changed["component_schema_compatibility"]["Item"]["required"] = []
+
+        failures = provider_breaks(expected, changed, consumer_view=True)
+
+        self.assertIn("schema_required_response_missing:Item", failures)
+
+    def test_n_minus_one_schema_type_change_cannot_be_self_certified(self) -> None:
+        root = self._copy()
+        fixtures = root / "contracts/compatibility/fixtures"
+        previous = json.loads((fixtures / "n-minus-1-contract.json").read_text())
+        previous["component_schema_compatibility"]["TaskUpdateRequest"][
+            "property_sha256"
+        ]["status"] = "f" * 64
+        self._rewrite_fixture(root, "n-minus-1-contract.json", previous)
+
+        with self.assertRaisesRegex(CompatibilityError, "does not reconstruct"):
             verify(root, expected_source_ref=SOURCE_REF)
 
     def test_missing_surface_row_is_rejected(self) -> None:

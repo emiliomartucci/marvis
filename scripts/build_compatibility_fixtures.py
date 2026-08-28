@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build deterministic, compact N/N-1 API and schema fixtures.
+"""Build deterministic N/N-1 API and schema fixtures.
 
 The committed fixtures retain every HTTP operation plus a digest for every
-component schema.  They are small enough to review while remaining bound to
-the exact full OpenAPI documents.  N-1 is read from an exact Git object; no
-moving branch or hosted filesystem is accepted as input.
+component schema. The exact predecessor OpenAPI bytes are also retained so CI
+can reconstruct N-1 without trusting fixture metadata. N-1 is read from an
+exact Git object; no moving branch or hosted filesystem is accepted as input.
 """
 from __future__ import annotations
 
@@ -70,6 +70,39 @@ def _required_parameters(path_item: dict[str, Any], operation: dict[str, Any]) -
     return sorted(required)
 
 
+def _direct_component_refs(value: Any) -> set[str]:
+    refs: set[str] = set()
+    if isinstance(value, dict):
+        reference = value.get("$ref")
+        prefix = "#/components/schemas/"
+        if isinstance(reference, str) and reference.startswith(prefix):
+            name = reference[len(prefix) :].replace("~1", "/").replace("~0", "~")
+            if name:
+                refs.add(name)
+        for child in value.values():
+            refs.update(_direct_component_refs(child))
+    elif isinstance(value, list):
+        for child in value:
+            refs.update(_direct_component_refs(child))
+    return refs
+
+
+def _schema_closure_refs(value: Any, schemas: dict[str, Any]) -> list[str]:
+    pending = sorted(_direct_component_refs(value), reverse=True)
+    seen: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for dependency in sorted(
+            _direct_component_refs(schemas.get(name)), reverse=True
+        ):
+            if dependency not in seen:
+                pending.append(dependency)
+    return sorted(seen)
+
+
 def compact_spec(
     spec: dict[str, Any],
     *,
@@ -78,6 +111,9 @@ def compact_spec(
     source_bytes: bytes,
     consumer_bytes: bytes | None = None,
 ) -> dict[str, Any]:
+    raw_schemas = spec.get("components", {}).get("schemas", {})
+    if not isinstance(raw_schemas, dict):
+        raw_schemas = {}
     operations: dict[str, dict[str, Any]] = {}
     for path, raw_path_item in sorted(spec.get("paths", {}).items()):
         if not isinstance(raw_path_item, dict):
@@ -88,6 +124,18 @@ def compact_spec(
             if not isinstance(operation, dict):
                 continue
             responses = operation.get("responses", {})
+            request_refs = _schema_closure_refs(
+                {
+                    "path_parameters": raw_path_item.get("parameters", []),
+                    "parameters": operation.get("parameters", []),
+                    "request_body": operation.get("requestBody"),
+                },
+                raw_schemas,
+            )
+            response_refs = {
+                str(code): _schema_closure_refs(response, raw_schemas)
+                for code, response in sorted(responses.items(), key=lambda item: str(item[0]))
+            }
             methods[method] = {
                 "deprecated": bool(operation.get("deprecated", False)),
                 "operation_id": operation.get("operationId"),
@@ -97,14 +145,23 @@ def compact_spec(
                 ),
                 "required_parameters": _required_parameters(raw_path_item, operation),
                 "response_codes": sorted(str(code) for code in responses),
+                "request_schema_refs": request_refs,
+                "response_schema_refs": response_refs,
+                "schema_refs": sorted(
+                    set(request_refs)
+                    | {
+                        ref
+                        for refs in response_refs.values()
+                        for ref in refs
+                    }
+                ),
             }
         if methods:
             operations[path] = methods
 
     schemas: dict[str, str] = {}
     schema_shapes: dict[str, dict[str, Any]] = {}
-    raw_schemas = spec.get("components", {}).get("schemas", {})
-    if isinstance(raw_schemas, dict):
+    if raw_schemas:
         schemas = {
             name: _sha(_canonical(schema))
             for name, schema in sorted(raw_schemas.items())
@@ -143,6 +200,11 @@ def _git_object(repo: Path, ref: str, path: str) -> bytes:
 
 def _write(path: Path, value: Any) -> str:
     raw = json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False).encode() + b"\n"
+    path.write_bytes(raw)
+    return _sha(raw)
+
+
+def _write_raw(path: Path, raw: bytes) -> str:
     path.write_bytes(raw)
     return _sha(raw)
 
@@ -207,6 +269,9 @@ def main(argv: list[str] | None = None) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     digests = {
         "n-contract.json": _write(args.output_dir / "n-contract.json", current),
+        "n-minus-1-openapi.json": _write_raw(
+            args.output_dir / "n-minus-1-openapi.json", previous_raw
+        ),
         "n-minus-1-contract.json": _write(
             args.output_dir / "n-minus-1-contract.json", previous
         ),
