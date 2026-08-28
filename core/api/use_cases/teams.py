@@ -19,7 +19,6 @@ from core.api.use_cases._errors import (
     AuthorizationError,
     ConflictError,
     NotFoundError,
-    ServiceError,
     ValidationError,
 )
 from core.api.use_cases._roles import ROLE_HIERARCHY
