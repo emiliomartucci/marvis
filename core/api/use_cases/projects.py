@@ -66,8 +66,7 @@ router's import surface, parsed by FastAPI before the use_case is called.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
-import fcntl
+from contextlib import ExitStack, contextmanager
 import logging
 import os
 import time
@@ -97,6 +96,8 @@ from core.api.use_cases._errors import (
     ServiceError,
     ServiceUnavailableError,
 )
+from core.platform.locking import LockUnavailableError, exclusive_file_lock
+
 logger = logging.getLogger(__name__)
 
 # Default data dir for new work projects on the MANAGED deploy.
@@ -178,19 +179,16 @@ def project_creation_guard(data_dir: Path):
             message=f"Data directory does not exist and cannot be created: {data_dir}",
         ) from exc
     lock_path = data_dir / ".project-create.lock"
-    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(lock_path, flags, 0o600)
-    except OSError as exc:
-        raise ServiceUnavailableError(
-            code="project_limit_lock_unavailable",
-            message="Project limit lock is unavailable",
-        ) from exc
-    try:
-        os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(
+                exclusive_file_lock(lock_path, mode=0o600, nofollow=True)
+            )
+        except LockUnavailableError as exc:
+            raise ServiceUnavailableError(
+                code="project_limit_lock_unavailable",
+                message="Project limit lock is unavailable",
+            ) from exc
         entitlement = load_signed_project_entitlement()
         if entitlement is not None and entitlement.project_limit is not None:
             current = _customer_project_count(data_dir)
@@ -213,9 +211,6 @@ def project_creation_guard(data_dir: Path):
                     limit=entitlement.project_limit,
                 )
         yield entitlement
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
 
 
 def data_project_dir() -> Path:

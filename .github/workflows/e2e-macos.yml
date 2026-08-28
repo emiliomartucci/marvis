@@ -161,7 +161,10 @@ jobs:
           WHEEL="$(find dist -maxdepth 1 -type f -name '*.whl' -print)"
           SDIST="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print)"
           test -n "$WHEEL" && test -n "$SDIST"
-          python core/scripts/quality-gates/verify_public_claims.py --artifact "$WHEEL" --artifact "$SDIST"
+          uv run --no-project --python "${{ matrix.python-version }}" \
+            --with "tomli>=2; python_version < '3.11'" \
+            python core/scripts/quality-gates/verify_public_claims.py \
+            --artifact "$WHEEL" --artifact "$SDIST"
 
       - name: Smoke installed artifacts from PATH
         shell: bash

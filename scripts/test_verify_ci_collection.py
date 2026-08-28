@@ -58,6 +58,13 @@ class CICollectionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(CollectionContractError, "OS row missing"):
             _platform_matrix(ROOT, contract)
 
+    def test_min_python_public_claim_gate_provisions_tomli(self) -> None:
+        workflow = (ROOT / ".github/workflows/e2e-macos.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("uv run --no-project", workflow)
+        self.assertIn("tomli>=2; python_version < '3.11'", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

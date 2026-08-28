@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import glob
 import inspect
 import json
@@ -27,6 +26,7 @@ from starlette.requests import Request
 
 from core.api.config import settings
 from core.api.paths import repo_path
+from core.platform.locking import exclusive_file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -944,7 +944,7 @@ def assert_schema_compatible(
 
 @contextmanager
 def _migration_lock(db_path: str):
-    """Cross-process single-runner guard (flock, F7/6733c88c).
+    """Cross-platform single-runner guard (F7/6733c88c).
 
     ``init_pool()`` runs migrations from EVERY entry point (API, MCP, brain,
     CLI, workers) — two processes booting on the same volume must serialize
@@ -955,13 +955,8 @@ def _migration_lock(db_path: str):
         yield
         return
     lock_path = f"{db_path}.migrate.lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with exclusive_file_lock(lock_path, mode=0o644):
         yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
 
 
 def _db_is_fresh(conn: sqlite3.Connection) -> bool:
@@ -1808,7 +1803,7 @@ def run_migrations() -> MigrationResult:
 
     Hardened for unsupervised boots (enterprise kit, IMPL §C dockerization plan):
     allowlisted discovery (F8), older-image guard (F7), fail-closed hot backup
-    pinned outside rotation (P0-1), cross-process flock, per-version post-hooks
+    pinned outside rotation (P0-1), cross-process lock, per-version post-hooks
     preserved (F-2), and a post-run schema re-check that logs the FINAL version.
     """
     migration_files = discover_up_migrations()
