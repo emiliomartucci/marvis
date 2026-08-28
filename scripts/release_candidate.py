@@ -13,7 +13,7 @@ from email.parser import Parser
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -500,13 +500,18 @@ def _distribution_metadata(path: Path) -> tuple[str, str]:
             metadata = Parser().parsestr(archive.read(names[0]).decode("utf-8"))
     elif path.name.endswith(".tar.gz"):
         with tarfile.open(path, "r:gz") as archive:
-            members = [
-                item
-                for item in archive.getmembers()
-                if item.isfile() and item.name.endswith("/PKG-INFO")
-            ]
+            members = []
+            for item in archive.getmembers():
+                member_path = PurePosixPath(item.name)
+                if (
+                    item.isfile()
+                    and len(member_path.parts) == 2
+                    and member_path.name == "PKG-INFO"
+                    and ".." not in member_path.parts
+                ):
+                    members.append(item)
             if len(members) != 1:
-                raise ReleasePolicyError("sdist metadata inventory invalid")
+                raise ReleasePolicyError("sdist root metadata inventory invalid")
             handle = archive.extractfile(members[0])
             if handle is None:
                 raise ReleasePolicyError("sdist metadata unreadable")

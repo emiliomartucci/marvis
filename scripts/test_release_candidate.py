@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timedelta, timezone
+import io
 import json
 from pathlib import Path
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -118,6 +120,23 @@ class ReleaseCandidateTests(unittest.TestCase):
             artifact.write_bytes(b"tampered")
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "bytes differ"):
                 candidate.verify_manifest(root, manifest_path, dist)
+
+    def test_sdist_uses_root_metadata_and_ignores_egg_info_copy(self) -> None:
+        metadata = b"Name: marvisx-cli\nVersion: 0.4.1\n\n"
+        with tempfile.TemporaryDirectory(prefix="release-sdist-") as raw:
+            archive_path = Path(raw) / "marvisx_cli-0.4.1.tar.gz"
+            with tarfile.open(archive_path, "w:gz") as archive:
+                for name in (
+                    "marvisx_cli-0.4.1/PKG-INFO",
+                    "marvisx_cli-0.4.1/marvisx_cli.egg-info/PKG-INFO",
+                ):
+                    info = tarfile.TarInfo(name)
+                    info.size = len(metadata)
+                    archive.addfile(info, io.BytesIO(metadata))
+            self.assertEqual(
+                candidate._distribution_metadata(archive_path),
+                ("marvisx-cli", "0.4.1"),
+            )
 
     def test_manifest_rejects_unmanifested_release_asset(self) -> None:
         with tempfile.TemporaryDirectory(prefix="release-assets-") as raw:
