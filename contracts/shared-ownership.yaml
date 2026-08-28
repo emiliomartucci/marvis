@@ -16,7 +16,7 @@
 #
 # Authored against OSS base 07821c76b5e890c341eeed80ca2f4002ad482b79
 # (origin/main, 2026-08-27). Final Plan A candidate reviewed at merge SHA
-# 4f3b656be26153c8e34b86af74473845e12d6979.
+# 9ef5867eaa031095eb094bfb33f3cc6d4445bc8e.
 schema: marvis-shared-ownership/v1
 ownership_map_version: 2
 
@@ -88,6 +88,13 @@ oss_owned_areas:
   - core/cli/tests/
   # Where the wheel bundles this repo's own GUI export.
   - core/api/console_dist/
+  # Repository lifecycle and local workspace access are OSS adapters. The
+  # public projection deliberately excludes them; a future payload may not
+  # silently claim them merely because their parent core/api/ is managed.
+  - core/api/mcp/tools/pull_requests.py
+  - core/api/mcp/tools/storage.py
+  - core/api/mcp/tools/workspace.py
+  - core/api/services/workspace_tools.py
   # Local decisions and this import's own documentation.
   - docs/decisions/
   - docs/projection/
@@ -114,6 +121,12 @@ deny:
     - core/hosted_deploy/
     - core/hosted_edge/
     - core/hosted_lifecycle/
+    - core/api/agents/analyst/
+    - core/api/agents/devx/
+    - core/api/agents/inboxx/
+    - core/console/src/app/(app)/newsletter/
+    - core/console/src/app/(app)/settings/newsletter/
+    - core/console/src/components/newsletter/
     - projects/tenants/
     - tenants/
     - enterprise-private/
@@ -122,6 +135,39 @@ deny:
     - marvis_enterprise/
     - .claude/
     - .claude-plugin/
+  # Exact Cloud/product files excluded by the producer are denied again here.
+  # The signed consumer manifest is evidence, not permission.
+  forbidden_paths:
+    - core/api/models/account.py
+    - core/api/mcp/backend_server.py
+    - core/api/mcp/internal_identity.py
+    - core/api/mcp/private_backend.py
+    - core/api/mcp/product_events.py
+    - core/api/mcp/root_auth.py
+    - core/api/mcp/root_gateway.py
+    - core/api/mcp/root_tool.py
+    - core/api/mcp/tools/storage.py
+    - core/api/mcp/tools/file_shares.py
+    - core/api/mcp/tools/workspace.py
+    - core/api/routers/account.py
+    - core/api/routers/gui_events.py
+    - core/api/routers/newsletter.py
+    - core/api/services/embedding_backends/remote_backend.py
+    - core/api/services/brain/activation_gate.py
+    - core/api/services/first_value.py
+    - core/api/services/hosted_account_client.py
+    - core/api/services/hosted_entitlements.py
+    - core/api/services/ingest/remote_embed_retry.py
+    - core/api/services/newsletter.py
+    - core/api/services/newsletter_editions.py
+    - core/api/services/product_events.py
+    - core/api/services/workspace_tools.py
+    - core/api/templates/agent_identity.md
+    - core/api/templates/agent_soul_project.md
+    - core/api/templates/agent_soul_system.md
+    - core/api/templates/agent_tools.md
+    - core/api/tenant_handoff_runtime.py
+    - core/api/use_cases/file_shares.py
   forbidden_components:
     - .env
     - .git
@@ -160,6 +206,38 @@ deny:
     - marvis_enterprise
     - workos
     - stripe
+  # core/scripts mixes portable runtime code with private operational tooling.
+  # Only this independently reviewed closure may cross into the OSS product.
+  scoped_allowlists:
+    core/scripts/:
+      prefixes:
+        - core/scripts/export/
+        - core/scripts/install_hooks/
+        - core/scripts/lib/
+        - core/scripts/quality-gates/
+      paths:
+        - core/scripts/_config.sh
+        - core/scripts/_drift_check.py
+        - core/scripts/_frontmatter.py
+        - core/scripts/_graph_writer.py
+        - core/scripts/_projects_root.py
+        - core/scripts/ast_parser.py
+        - core/scripts/graph_export_client.py
+        - core/scripts/hook.py
+        - core/scripts/kg-post-commit.sh
+        - core/scripts/kg_full_rebuild.sh
+        - core/scripts/marvis-init.sh
+        - core/scripts/migrate_spike_node_ids.py
+        - core/scripts/populate_artifacts.py
+        - core/scripts/populate_cross_project.py
+        - core/scripts/populate_inbox_nodes.py
+        - core/scripts/populate_knowledge_graph.py
+        - core/scripts/populate_pr_impact.py
+        - core/scripts/populate_project_nodes.py
+        - core/scripts/populate_touch_counter.py
+        - core/scripts/reparse_failed.py
+        - core/scripts/schema_upgrade.py
+        - core/scripts/safety_bridge.py
 
 # Hard limits and invariants of the import itself.
 policy:

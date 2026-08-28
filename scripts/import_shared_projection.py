@@ -36,9 +36,11 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import unicodedata
 from pathlib import Path, PurePosixPath
 
@@ -67,6 +69,7 @@ MAP_PATH_RULES = ("managed_areas", "oss_owned_areas")
 APPROVED_PRESERVE_KEY = "approved_preserve_paths"
 MAP_DENY_RULES = (
     "forbidden_prefixes",
+    "forbidden_paths",
     "forbidden_components",
     "forbidden_suffixes",
     "forbidden_content_markers",
@@ -155,6 +158,39 @@ def _validate_exact_paths(rules: object, where: str, errors: list[str]) -> list[
     return clean
 
 
+def _validate_scoped_allowlists(
+    raw: object, where: str, errors: list[str]
+) -> dict[str, dict[str, list[str]]]:
+    if not isinstance(raw, dict) or not raw:
+        errors.append(f"{where}: must be a non-empty mapping")
+        return {}
+    clean: dict[str, dict[str, list[str]]] = {}
+    for scope, rules in raw.items():
+        if not isinstance(scope, str) or not scope.endswith("/"):
+            errors.append(f"{where}: scope must be a repository prefix")
+            continue
+        validated_scope = _validate_path_rules([scope], f"{where}.{scope}", errors)
+        if not validated_scope or not isinstance(rules, dict):
+            if not isinstance(rules, dict):
+                errors.append(f"{where}.{scope}: rules must be a mapping")
+            continue
+        paths = _validate_exact_paths(
+            rules.get("paths"), f"{where}.{scope}.paths", errors
+        )
+        prefixes = _validate_path_rules(
+            rules.get("prefixes"), f"{where}.{scope}.prefixes", errors
+        )
+        if any(not prefix.endswith("/") for prefix in prefixes):
+            errors.append(f"{where}.{scope}.prefixes: entries must end with '/'")
+        for candidate in paths + prefixes:
+            if not candidate.startswith(scope):
+                errors.append(
+                    f"{where}.{scope}: allowlisted path is outside its scope: {candidate}"
+                )
+        clean[scope] = {"paths": paths, "prefixes": prefixes}
+    return clean
+
+
 def load_ownership_map(path: Path) -> tuple[dict, list[str]]:
     """Load and validate the ownership map; every structural doubt is an error.
 
@@ -187,7 +223,17 @@ def load_ownership_map(path: Path) -> tuple[dict, list[str]]:
         errors.append("ownership map: deny must be a mapping")
     else:
         for key in MAP_DENY_RULES:
-            deny[key] = _validate_path_rules(deny_raw.get(key), f"ownership map: deny.{key}", errors)
+            validator = (
+                _validate_exact_paths if key == "forbidden_paths" else _validate_path_rules
+            )
+            deny[key] = validator(
+                deny_raw.get(key), f"ownership map: deny.{key}", errors
+            )
+    scoped_allowlists = _validate_scoped_allowlists(
+        deny_raw.get("scoped_allowlists") if isinstance(deny_raw, dict) else None,
+        "ownership map: deny.scoped_allowlists",
+        errors,
+    )
     policy = doc.get("policy")
     if not isinstance(policy, dict):
         errors.append("ownership map: policy must be a mapping")
@@ -231,6 +277,7 @@ def load_ownership_map(path: Path) -> tuple[dict, list[str]]:
     compiled["ownership_map_version"] = doc["ownership_map_version"]
     compiled["max_file_bytes"] = policy["max_file_bytes"]
     compiled[APPROVED_PRESERVE_KEY] = approved_preserve
+    compiled["deny_scoped_allowlists"] = scoped_allowlists
     return compiled, deny
 
 
@@ -532,47 +579,124 @@ def scan_forbidden_imports(files: dict[str, dict], forbidden_roots: list[str]) -
                 return root
         return None
 
-    def _walk(node: ast.AST, guarded: bool, path: str, module: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            # Children of a Try are the guarded ones; the Try's own imports in
-            # `else`/handlers stay guarded too, which matches the exporter's
-            # optional-import semantics closely enough for this consumer check.
-            child_guarded = guarded or isinstance(child, ast.Try)
-            if isinstance(child, ast.Import):
-                for alias in child.names:
-                    if _matches_root(alias.name):
-                        if child_guarded:
-                            seams.append({"path": path, "line": child.lineno, "module": alias.name})
-                        else:
-                            violations.append(
-                                f"unguarded forbidden import {alias.name!r} at {path}:{child.lineno}"
-                            )
-            elif isinstance(child, ast.ImportFrom):
-                target = child.module
-                if child.level:
-                    base = module.split(".")[:-1]
-                    ascend = max(0, child.level - 1)
-                    base = base[: len(base) - ascend] if ascend else base
-                    target = ".".join(base + (target.split(".") if target else []))
-                if _matches_root(target):
-                    if child_guarded:
-                        seams.append({"path": path, "line": child.lineno, "module": target})
-                    else:
-                        violations.append(
-                            f"unguarded forbidden import {target!r} at {path}:{child.lineno}"
-                        )
-            _walk(child, child_guarded, path, module)
+    class _Collector(ast.NodeVisitor):
+        def __init__(self, path: str) -> None:
+            self.path = path
+            raw_module = path[:-3].replace("/", ".")
+            self.is_package = raw_module.endswith(".__init__")
+            self.module = (
+                raw_module.removesuffix(".__init__")
+                if self.is_package
+                else raw_module
+            )
+            self.optional_depth = 0
+
+        @staticmethod
+        def _catches_missing_import(node: ast.Try) -> bool:
+            for handler in node.handlers:
+                if handler.type is None:
+                    return True
+                candidates = (
+                    handler.type.elts
+                    if isinstance(handler.type, ast.Tuple)
+                    else (handler.type,)
+                )
+                if any(
+                    isinstance(item, ast.Name)
+                    and item.id
+                    in {
+                        "ImportError",
+                        "ModuleNotFoundError",
+                        "Exception",
+                        "BaseException",
+                    }
+                    for item in candidates
+                ):
+                    return True
+            return False
+
+        def visit_Try(self, node: ast.Try) -> None:
+            if not self._catches_missing_import(node):
+                self.generic_visit(node)
+                return
+            self.optional_depth += 1
+            for child in node.body:
+                self.visit(child)
+            self.optional_depth -= 1
+            for handler in node.handlers:
+                for child in handler.body:
+                    self.visit(child)
+            for child in (*node.orelse, *node.finalbody):
+                self.visit(child)
+
+        def visit_If(self, node: ast.If) -> None:
+            type_checking = (
+                isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+            ) or (
+                isinstance(node.test, ast.Attribute)
+                and node.test.attr == "TYPE_CHECKING"
+            )
+            if type_checking:
+                for child in node.orelse:
+                    self.visit(child)
+                return
+            self.generic_visit(node)
+
+        def _visit_deferred_body(
+            self, node: ast.FunctionDef | ast.AsyncFunctionDef
+        ) -> None:
+            # A function body defined inside a guarded try runs only when the
+            # function is called later, after the try/except has finished.
+            # It therefore cannot inherit the surrounding optional-import seam.
+            inherited_depth = self.optional_depth
+            self.optional_depth = 0
+            try:
+                for child in node.body:
+                    self.visit(child)
+            finally:
+                self.optional_depth = inherited_depth
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_deferred_body(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_deferred_body(node)
+
+        def _record(self, target: str | None, line: int) -> None:
+            if not _matches_root(target):
+                return
+            if self.optional_depth:
+                seams.append({"path": self.path, "line": line, "module": target})
+            else:
+                violations.append(
+                    f"unguarded forbidden import {target!r} at {self.path}:{line}"
+                )
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                self._record(alias.name, node.lineno)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            target = node.module
+            if node.level:
+                base = self.module.split(".")
+                if not self.is_package:
+                    base = base[:-1]
+                ascend = max(0, node.level - 1)
+                if ascend:
+                    base = base[:-ascend]
+                target = ".".join(base + (target.split(".") if target else []))
+            self._record(target, node.lineno)
 
     for path in sorted(files):
         if not path.endswith(".py"):
             continue
-        module = path[:-3].replace("/", ".")
         try:
             tree = ast.parse(files[path]["content"], filename=path)
         except (SyntaxError, ValueError) as exc:
             violations.append(f"payload Python does not parse: {path}: {exc}")
             continue
-        _walk(tree, False, path, module)
+        _Collector(path).visit(tree)
     return violations, sorted(seams, key=lambda item: (item["path"], item["line"]))
 
 
@@ -590,7 +714,10 @@ def classify(
     already_synced: list[str] = []
     would_overwrite: list[str] = []
     additions: list[str] = []
+    importable: list[str] = []
     deny = ownership
+    declared_imports = set(bundle_state["consumer_import_paths"])
+    declared_preserved = set(bundle_state["consumer_preserved_paths"])
 
     for path in sorted(files):
         entry = files[path]
@@ -600,6 +727,18 @@ def classify(
         for prefix in deny["deny_forbidden_prefixes"]:
             if path.startswith(prefix):
                 violations.append(f"deny: forbidden prefix {prefix!r} selected {path}")
+        if path in deny["deny_forbidden_paths"]:
+            violations.append(f"deny: forbidden exact path selected {path}")
+        for scope, allowlist in deny["deny_scoped_allowlists"].items():
+            if not path.startswith(scope):
+                continue
+            allowed = path in allowlist["paths"] or any(
+                path.startswith(prefix) for prefix in allowlist["prefixes"]
+            )
+            if not allowed:
+                violations.append(
+                    f"deny: path outside scoped allowlist {scope!r}: {path}"
+                )
         for component in pure.parts:
             if component in deny["deny_forbidden_components"]:
                 violations.append(f"deny: forbidden component {component!r} in {path}")
@@ -619,16 +758,28 @@ def classify(
         # Ownership: oss_owned wins over managed (documented ordering), and a
         # path matching neither is an undeclared change to this repository.
         owned_rule = owned_rule_for(path, ownership["oss_owned_areas"])
+        managed_rule = managed_rule_for(path, ownership["managed_areas"])
         if owned_rule is not None:
             if path in ownership[APPROVED_PRESERVE_KEY]:
                 preserved_oss_owned.append(path)
             else:
                 blocked.append({"path": path, "rule": owned_rule, "owner": "marvis"})
             continue
-        managed_rule = managed_rule_for(path, ownership["managed_areas"])
+        if path in declared_preserved:
+            violations.append(
+                f"consumer manifest may preserve only approved OSS-owned paths: {path}"
+            )
+            blocked.append(
+                {"path": path, "rule": managed_rule, "owner": "managed"}
+            )
+            continue
+        if path not in declared_imports:
+            violations.append(f"consumer manifest path has no import disposition: {path}")
+            continue
         if managed_rule is None:
             blocked.append({"path": path, "rule": None, "owner": "undeclared"})
             continue
+        importable.append(path)
 
         # A payload path that casefolds onto a different tracked file would
         # shadow it on case-insensitive filesystems (the default on macOS).
@@ -687,6 +838,7 @@ def classify(
         "already_synced": already_synced,
         "would_overwrite": would_overwrite,
         "additions": additions,
+        "importable": sorted(importable),
         "local_only_in_managed_area": local_only,
         "optional_integration_seams": seams,
         "migrations": migration_state,
@@ -807,6 +959,139 @@ def _destination_is_safe(repo: Path, relative: str) -> Path:
     return destination
 
 
+def _atomic_write(destination: Path, content: bytes, mode: int) -> None:
+    """Replace one file from a same-directory staging file."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_staged = tempfile.mkstemp(
+        prefix=f".{destination.name}.marvis-import-",
+        dir=destination.parent,
+    )
+    staged = Path(raw_staged)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        staged.chmod(mode)
+        os.replace(staged, destination)
+    finally:
+        if staged.exists():
+            staged.unlink()
+
+
+def _write_verified_manifest(destination: Path, manifest: dict) -> bytes:
+    raw = canonical_json(manifest)
+    _atomic_write(destination, raw, 0o600)
+    try:
+        readback = destination.read_bytes()
+    except OSError as exc:
+        raise ImportRefused(f"cannot read back manifest {destination}: {exc}") from exc
+    if readback != raw:
+        raise ImportRefused(f"manifest readback mismatch: {destination}")
+    return raw
+
+
+def _remove_empty_import_parents(repo: Path, entries: list[dict]) -> None:
+    parents = {PurePosixPath(entry["path"]).parent for entry in entries}
+    for path in sorted(parents, key=lambda item: len(item.parts), reverse=True):
+        candidate = repo / path
+        if path != PurePosixPath(".") and candidate.is_dir() and not any(candidate.iterdir()):
+            candidate.rmdir()
+
+
+def _restore_pre_apply(
+    repo: Path,
+    backup_dir: Path,
+    entries: list[dict],
+    pre_apply_tree: str,
+    files: dict[str, dict],
+) -> None:
+    for entry in sorted(entries, key=lambda item: item["path"]):
+        destination = _destination_is_safe(repo, entry["path"])
+        if entry["action"] == "overwritten":
+            prior = backup_dir / "files" / entry["path"]
+            _atomic_write(destination, prior.read_bytes(), int(entry["prior_mode"]))
+        elif destination.exists():
+            destination.unlink()
+    _remove_empty_import_parents(repo, entries)
+    dirty = worktree_dirty(repo)
+    if dirty:
+        raise ImportRefused(
+            f"automatic restore failed: worktree is not clean (first issue: {dirty[0]})"
+        )
+    restored_digest = proposed_tree_digest(repo, files, set())
+    if restored_digest != pre_apply_tree:
+        raise ImportRefused(
+            f"automatic restore tree digest {restored_digest} != pre-apply {pre_apply_tree}"
+        )
+
+
+def _prepare_backup(
+    repo: Path,
+    bundle_state: dict,
+    importable: list[str],
+    backup_dir: Path,
+    pre_apply_tree: str,
+) -> tuple[list[dict], dict]:
+    entries: list[dict] = []
+    prior_contents: dict[str, bytes] = {}
+    for path in importable:
+        destination = _destination_is_safe(repo, path)
+        if destination.exists():
+            prior = destination.read_bytes()
+            prior_contents[path] = prior
+            entries.append(
+                {
+                    "path": path,
+                    "action": "overwritten",
+                    "prior_sha256": sha256_bytes(prior),
+                    "prior_executable": bool(destination.stat().st_mode & 0o111),
+                    "prior_mode": destination.stat().st_mode & 0o777,
+                }
+            )
+        else:
+            entries.append(
+                {
+                    "path": path,
+                    "action": "added",
+                    "prior_sha256": None,
+                    "prior_executable": False,
+                    "prior_mode": None,
+                }
+            )
+
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    files_root = backup_dir / "files"
+    for path, prior in prior_contents.items():
+        backup_path = files_root / path
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(backup_path, prior, 0o600)
+        if sha256_bytes(backup_path.read_bytes()) != sha256_bytes(prior):
+            raise ImportRefused(f"backup readback mismatch before apply: {path}")
+
+    post_records = [
+        {
+            "mode": bundle_state["files"][path]["mode"],
+            "path": path,
+            "sha256": bundle_state["files"][path]["sha256"],
+            "size": bundle_state["files"][path]["size"],
+        }
+        for path in importable
+    ]
+    manifest = {
+        "schema": BACKUP_SCHEMA,
+        "status": "prepared",
+        "source_sha": bundle_state["source_sha"],
+        "payload_sha256": bundle_state["payload_sha256"],
+        "base_head": git_bytes(repo, "rev-parse", "HEAD").decode().strip(),
+        "pre_apply_tree_sha256": pre_apply_tree,
+        "post_apply_readback_digest": payload_digest(post_records),
+        "entries": entries,
+    }
+    _write_verified_manifest(backup_dir / "backup.json", manifest)
+    return entries, manifest
+
+
 def apply_payload(
     repo: Path,
     bundle_state: dict,
@@ -826,123 +1111,186 @@ def apply_payload(
     else:
         raise ImportRefused("backup directory must live outside the repository")
 
-    files_root = backup_dir / "files"
-    entries = []
-    written = 0
-    for path in sorted(importable):
-        entry = bundle_state["files"][path]
-        destination = _destination_is_safe(repo, path)
-        if destination.exists():
-            prior_bytes = destination.read_bytes()
-            (files_root / path).parent.mkdir(parents=True, exist_ok=True)
-            (files_root / path).write_bytes(prior_bytes)
-            entries.append(
-                {
-                    "path": path,
-                    "action": "overwritten",
-                    "prior_sha256": sha256_bytes(prior_bytes),
-                    "prior_executable": bool(destination.stat().st_mode & 0o111),
-                }
-            )
-        else:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            entries.append({"path": path, "action": "added", "prior_sha256": None, "prior_executable": False})
-        destination.write_bytes(entry["content"])
-        destination.chmod(0o755 if entry["mode"] == "100755" else 0o644)
-        # Readback before declaring the write: applied bytes must equal the
-        # verified payload bytes, not merely have been sent to disk.
-        if sha256_bytes(destination.read_bytes()) != entry["sha256"]:
-            raise ImportRefused(f"readback mismatch after write: {path}")
-        expected_executable = entry["mode"] == "100755"
-        if bool(destination.stat().st_mode & 0o111) != expected_executable:
-            raise ImportRefused(f"readback mode mismatch after write: {path}")
-        written += 1
+    try:
+        entries, backup_manifest = _prepare_backup(
+            repo, bundle_state, sorted(importable), backup_dir, pre_apply_tree
+        )
+    except (OSError, ImportRefused) as exc:
+        raise ImportRefused(f"cannot prepare verified backup before apply: {exc}") from exc
 
-    post_records = [
-        {
-            "mode": bundle_state["files"][path]["mode"],
-            "path": path,
-            "sha256": bundle_state["files"][path]["sha256"],
-            "size": bundle_state["files"][path]["size"],
-        }
-        for path in importable
-    ]
-    imported_readback_digest = payload_digest(post_records)
-    backup_manifest = {
-        "schema": BACKUP_SCHEMA,
-        "source_sha": bundle_state["source_sha"],
-        "payload_sha256": bundle_state["payload_sha256"],
-        "base_head": git_bytes(repo, "rev-parse", "HEAD").decode().strip(),
-        "pre_apply_tree_sha256": pre_apply_tree,
-        "post_apply_readback_digest": imported_readback_digest,
-        "entries": entries,
-    }
-    (backup_dir / "backup.json").write_bytes(canonical_json(backup_manifest))
+    written = 0
+    backup_manifest_bytes = b""
+    try:
+        for path in sorted(importable):
+            entry = bundle_state["files"][path]
+            destination = _destination_is_safe(repo, path)
+            _atomic_write(
+                destination,
+                entry["content"],
+                0o755 if entry["mode"] == "100755" else 0o644,
+            )
+            if sha256_bytes(destination.read_bytes()) != entry["sha256"]:
+                raise ImportRefused(f"readback mismatch after write: {path}")
+            expected_executable = entry["mode"] == "100755"
+            if bool(destination.stat().st_mode & 0o111) != expected_executable:
+                raise ImportRefused(f"readback mode mismatch after write: {path}")
+            written += 1
+        backup_manifest["status"] = "applied"
+        backup_manifest_bytes = _write_verified_manifest(
+            backup_dir / "backup.json", backup_manifest
+        )
+    except (OSError, ImportRefused) as exc:
+        try:
+            _restore_pre_apply(
+                repo, backup_dir, entries, pre_apply_tree, bundle_state["files"]
+            )
+            backup_manifest["status"] = "apply_failed_restored"
+            _write_verified_manifest(
+                backup_dir / "backup.json", backup_manifest
+            )
+        except (OSError, ImportRefused) as restore_exc:
+            raise ImportRefused(
+                f"apply failed and automatic restore failed: {restore_exc}"
+            ) from exc
+        raise ImportRefused(f"apply failed; pre-apply tree restored: {exc}") from exc
+
+    imported_readback_digest = backup_manifest["post_apply_readback_digest"]
     return {
         "applied": {
             "files_written": written,
             "readback_imported_files_sha256": imported_readback_digest,
-            "backup_manifest_sha256": sha256_bytes(canonical_json(backup_manifest)),
+            "backup_manifest_sha256": sha256_bytes(backup_manifest_bytes),
             "pre_apply_tree_sha256": pre_apply_tree,
             "backup_entries": len(entries),
         }
     }
 
 
-def rollback_payload(repo: Path, backup_dir: Path, files: dict[str, dict]) -> dict:
+def _validated_backup_entries(
+    repo: Path,
+    backup_dir: Path,
+    manifest: dict,
+    bundle_state: dict,
+) -> list[dict]:
+    if manifest.get("schema") != BACKUP_SCHEMA or manifest.get("status") != "applied":
+        raise ImportRefused("backup manifest is not an applied " + BACKUP_SCHEMA)
+    if manifest.get("source_sha") != bundle_state["source_sha"]:
+        raise ImportRefused("backup manifest source SHA does not match the bundle")
+    if manifest.get("payload_sha256") != bundle_state["payload_sha256"]:
+        raise ImportRefused("backup manifest payload digest does not match the bundle")
+    current_head = git_bytes(repo, "rev-parse", "HEAD").decode().strip()
+    if manifest.get("base_head") != current_head:
+        raise ImportRefused("backup manifest base HEAD does not match the worktree")
+    pre_apply_tree = manifest.get("pre_apply_tree_sha256")
+    if not isinstance(pre_apply_tree, str) or not SHA256_RE.fullmatch(pre_apply_tree):
+        raise ImportRefused("backup manifest pre-apply tree digest is invalid")
+
+    raw_entries = manifest.get("entries")
+    if not isinstance(raw_entries, list):
+        raise ImportRefused("backup manifest entries must be a list")
+    entries: list[dict] = []
+    seen: set[str] = set()
+    files_root = backup_dir / "files"
+    for raw in raw_entries:
+        if not isinstance(raw, dict):
+            raise ImportRefused("backup manifest entry must be an object")
+        path = _validate_output_path(raw.get("path"))
+        if path in seen:
+            raise ImportRefused(f"backup manifest contains duplicate path: {path}")
+        seen.add(path)
+        if path not in bundle_state["files"]:
+            raise ImportRefused(f"backup manifest path is absent from the bundle: {path}")
+        action = raw.get("action")
+        if action not in {"overwritten", "added"}:
+            raise ImportRefused(f"backup manifest action is invalid for {path}")
+        destination = _destination_is_safe(repo, path)
+        if not destination.is_file():
+            raise ImportRefused(f"cannot roll back: {path} no longer exists")
+        payload_entry = bundle_state["files"][path]
+        if sha256_bytes(destination.read_bytes()) != payload_entry["sha256"]:
+            raise ImportRefused(f"cannot roll back: {path} changed after apply")
+        expected_executable = payload_entry["mode"] == "100755"
+        if bool(destination.stat().st_mode & 0o111) != expected_executable:
+            raise ImportRefused(f"cannot roll back: {path} mode changed after apply")
+
+        prior_sha = raw.get("prior_sha256")
+        prior_mode = raw.get("prior_mode")
+        backup_path = files_root / path
+        if action == "overwritten":
+            if not isinstance(prior_sha, str) or not SHA256_RE.fullmatch(prior_sha):
+                raise ImportRefused(f"backup digest is invalid for {path}")
+            if (
+                not isinstance(prior_mode, int)
+                or isinstance(prior_mode, bool)
+                or not 0 <= prior_mode <= 0o777
+            ):
+                raise ImportRefused(f"backup mode is invalid for {path}")
+            safe_backup = _safe_relative(files_root, path)
+            if not safe_backup.is_file():
+                raise ImportRefused(f"backup bytes missing for {path}")
+            if sha256_bytes(safe_backup.read_bytes()) != prior_sha:
+                raise ImportRefused(f"backup bytes failed digest verification for {path}")
+        elif prior_sha is not None or prior_mode is not None or backup_path.exists():
+            raise ImportRefused(f"added-file backup entry carries unexpected prior state: {path}")
+        entries.append(dict(raw))
+
+    records = [
+        {
+            "mode": bundle_state["files"][entry["path"]]["mode"],
+            "path": entry["path"],
+            "sha256": bundle_state["files"][entry["path"]]["sha256"],
+            "size": bundle_state["files"][entry["path"]]["size"],
+        }
+        for entry in entries
+    ]
+    if manifest.get("post_apply_readback_digest") != payload_digest(records):
+        raise ImportRefused("backup manifest post-apply digest is invalid")
+    return entries
+
+
+def _restore_post_apply(
+    repo: Path, entries: list[dict], files: dict[str, dict]
+) -> None:
+    for entry in sorted(entries, key=lambda item: item["path"]):
+        payload_entry = files[entry["path"]]
+        destination = _destination_is_safe(repo, entry["path"])
+        _atomic_write(
+            destination,
+            payload_entry["content"],
+            0o755 if payload_entry["mode"] == "100755" else 0o644,
+        )
+
+
+def rollback_payload(repo: Path, backup_dir: Path, bundle_state: dict) -> dict:
     manifest_path = backup_dir / "backup.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ImportRefused(f"cannot read backup manifest: {exc}") from exc
-    if manifest.get("schema") != BACKUP_SCHEMA:
-        raise ImportRefused("backup manifest schema is not " + BACKUP_SCHEMA)
-    entries = manifest.get("entries")
-    if not isinstance(entries, list):
-        raise ImportRefused("backup manifest entries must be a list")
-
-    # Refuse to roll back onto drifted state: every entry must still be in the
-    # exact post-apply condition, otherwise restoring would destroy work.
-    for entry in entries:
-        path = entry["path"]
-        current = repo / path
-        if not current.is_file():
-            raise ImportRefused(f"cannot roll back: {path} no longer exists")
-        if sha256_bytes(current.read_bytes()) != files[path]["sha256"]:
-            raise ImportRefused(f"cannot roll back: {path} changed after apply")
-        expected_executable = files[path]["mode"] == "100755"
-        if bool(current.stat().st_mode & 0o111) != expected_executable:
-            raise ImportRefused(f"cannot roll back: {path} mode changed after apply")
-
-    restored = removed = 0
-    for entry in sorted(entries, key=lambda item: item["path"]):
-        path = entry["path"]
-        destination = repo / path
-        if entry["action"] == "overwritten":
-            prior = backup_dir / "files" / path
-            if not prior.is_file():
-                raise ImportRefused(f"backup bytes missing for {path}")
-            destination.write_bytes(prior.read_bytes())
-            destination.chmod(0o755 if entry["prior_executable"] else 0o644)
-            restored += 1
-        else:
-            destination.unlink()
-            removed += 1
-    for path in sorted({PurePosixPath(entry["path"]).parent for entry in entries}, reverse=True):
-        candidate = repo / path
-        if path != PurePosixPath(".") and candidate.is_dir() and not any(candidate.iterdir()):
-            candidate.rmdir()
-
-    dirty = worktree_dirty(repo)
-    if dirty:
-        raise ImportRefused(
-            f"rollback verification failed: worktree is not clean (first issue: {dirty[0]})"
+    files = bundle_state["files"]
+    entries = _validated_backup_entries(repo, backup_dir, manifest, bundle_state)
+    applied_manifest = dict(manifest)
+    try:
+        _restore_pre_apply(
+            repo,
+            backup_dir,
+            entries,
+            manifest["pre_apply_tree_sha256"],
+            files,
         )
-    restored_digest = proposed_tree_digest(repo, files, set())
-    if restored_digest != manifest.get("pre_apply_tree_sha256"):
-        raise ImportRefused(
-            f"rollback verification failed: tree digest {restored_digest} != pre-apply {manifest.get('pre_apply_tree_sha256')}"
-        )
+        manifest["status"] = "rolled_back"
+        _write_verified_manifest(manifest_path, manifest)
+    except (OSError, ImportRefused) as exc:
+        try:
+            _restore_post_apply(repo, entries, files)
+            _write_verified_manifest(manifest_path, applied_manifest)
+        except (OSError, ImportRefused) as reapply_exc:
+            raise ImportRefused(
+                f"rollback failed and post-apply restore failed: {reapply_exc}"
+            ) from exc
+        raise ImportRefused(f"rollback failed; post-apply state restored: {exc}") from exc
+    restored = sum(entry["action"] == "overwritten" for entry in entries)
+    removed = sum(entry["action"] == "added" for entry in entries)
     return {"rollback": {"files_restored": restored, "files_removed": removed, "tree_matches_pre_apply": True}}
 
 
@@ -993,11 +1341,7 @@ def run(args: argparse.Namespace) -> int:
         )
         classification = classify(bundle_state, ownership, repo)
         dirty = worktree_dirty(repo)
-        importable = sorted(
-            set(bundle_state["consumer_import_paths"])
-            - {item["path"] for item in classification["blocked"]}
-            - set(classification["preserved_oss_owned"])
-        )
+        importable = classification["importable"]
         compatibility = read_compatibility(repo, bundle)
         identities = {
             "source_sha": bundle_state["source_sha"],
@@ -1036,7 +1380,7 @@ def run(args: argparse.Namespace) -> int:
                 extra.update(apply_payload(repo, bundle_state, importable, args.backup_dir.resolve(), pre_apply))
                 status = "applied"
         elif args.mode == "rollback":
-            extra.update(rollback_payload(repo, args.backup_dir.resolve(), bundle_state["files"]))
+            extra.update(rollback_payload(repo, args.backup_dir.resolve(), bundle_state))
             status = "rolled_back"
 
         report = build_report(

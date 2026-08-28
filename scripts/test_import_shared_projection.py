@@ -42,6 +42,8 @@ deny:
   forbidden_prefixes:
     - core/hosted_control/
     - cloud-operations/
+  forbidden_paths:
+    - core/api/private.py
   forbidden_components:
     - .env
     - secrets
@@ -55,6 +57,12 @@ deny:
   forbidden_imports:
     - core.hosted_lifecycle
     - workos
+  scoped_allowlists:
+    core/scripts/:
+      prefixes:
+        - core/scripts/quality-gates/
+      paths:
+        - core/scripts/safety_bridge.py
 policy:
   never_delete: true
   apply_requires_clean_worktree: true
@@ -151,6 +159,16 @@ def build_bundle(base: Path, files: dict[str, tuple[bytes, str]]) -> Path:
     (manifests / "payload.json").write_bytes(isp.canonical_json(payload_manifest))
     (manifests / "oss.json").write_bytes(isp.canonical_json(oss_manifest))
     return bundle
+
+
+def set_preserved_paths(bundle: Path, paths: list[str]) -> None:
+    manifest_path = bundle / "manifests/oss.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    preserved = sorted(paths)
+    manifest["preserved_overlap_paths"] = preserved
+    manifest["import_paths"] = sorted(set(manifest["import_paths"]) - set(preserved))
+    manifest["import_file_count"] = len(manifest["import_paths"])
+    manifest_path.write_bytes(isp.canonical_json(manifest))
 
 
 def green_files() -> dict[str, tuple[bytes, str]]:
@@ -488,6 +506,15 @@ class ImportGateTest(unittest.TestCase):
     def test_forbidden_prefix_path_denied(self) -> None:
         self.forbidden({"core/hosted_control/ops.py": (b"x = 1\n", "100644")}, "forbidden prefix")
 
+    def test_forbidden_exact_path_denied(self) -> None:
+        self.forbidden({"core/api/private.py": (b"x = 1\n", "100644")}, "forbidden exact path")
+
+    def test_scoped_allowlist_denies_unreviewed_script(self) -> None:
+        self.forbidden(
+            {"core/scripts/deploy-all.sh": (b"#!/bin/sh\n", "100755")},
+            "outside scoped allowlist",
+        )
+
     def test_forbidden_suffix_denied(self) -> None:
         self.forbidden({"core/api/leak.pem": (b"key\n", "100644")}, "forbidden suffix")
 
@@ -528,6 +555,31 @@ class ImportGateTest(unittest.TestCase):
         self.assertEqual(result["violations"], [])
         self.assertEqual(result["optional_integration_seams"], [{"path": "core/api/optional.py", "line": 2, "module": "workos"}])
 
+    def test_unrelated_try_handler_does_not_make_import_optional(self) -> None:
+        content = (
+            b"try:\n"
+            b"    import workos\n"
+            b"except ValueError:\n"
+            b"    workos = None\n"
+        )
+        self.forbidden(
+            {"core/api/not_optional.py": (content, "100644")},
+            "unguarded forbidden import",
+        )
+
+    def test_deferred_function_body_does_not_inherit_optional_try(self) -> None:
+        content = (
+            b"try:\n"
+            b"    def load():\n"
+            b"        import workos\n"
+            b"except ImportError:\n"
+            b"    load = None\n"
+        )
+        self.forbidden(
+            {"core/api/deferred_import.py": (content, "100644")},
+            "unguarded forbidden import",
+        )
+
     # -- ownership ---------------------------------------------------------
 
     def test_oss_owned_collision_blocks_and_apply_refuses(self) -> None:
@@ -560,6 +612,7 @@ class ImportGateTest(unittest.TestCase):
         files = dict(green_files())
         files["README.md"] = (b"upstream readme\n", "100644")
         bundle = build_bundle(self.base, files)
+        set_preserved_paths(bundle, ["README.md"])
         report_path = self.base / "preserve-report.json"
         self.assertEqual(isp.run(make_args(self.repo, bundle, report=report_path)), 0)
         report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -584,6 +637,40 @@ class ImportGateTest(unittest.TestCase):
             apply_report["applied"]["readback_imported_files_sha256"],
             apply_report["identities"]["payload_sha256"],
         )
+
+    def test_preserved_only_apply_can_roll_back_as_noop(self) -> None:
+        ownership_path = self.repo / "contracts/shared-ownership.yaml"
+        ownership_path.write_text(
+            TEST_MAP.replace(
+                "approved_preserve_paths: []",
+                "approved_preserve_paths:\n  - README.md",
+            ),
+            encoding="utf-8",
+        )
+        _git(self.repo, "add", str(ownership_path))
+        _git(self.repo, "commit", "-q", "-m", "approve preserve")
+        bundle = build_bundle(
+            self.base, {"README.md": (b"upstream readme\n", "100644")}
+        )
+        set_preserved_paths(bundle, ["README.md"])
+        backup = self.base / "preserved-only-backup"
+
+        self.assertEqual(
+            isp.run(make_args(self.repo, bundle, mode="apply", backup_dir=backup)),
+            0,
+        )
+        self.assertEqual(
+            isp.run(make_args(self.repo, bundle, mode="rollback", backup_dir=backup)),
+            0,
+        )
+        self.assertEqual((self.repo / "README.md").read_bytes(), b"oss readme\n")
+
+    def test_consumer_cannot_relabel_managed_path_as_preserved(self) -> None:
+        bundle = build_bundle(self.base, green_files())
+        set_preserved_paths(bundle, ["core/api/engine.py"])
+        message = self.refused(make_args(self.repo, bundle))
+        self.assertIn("consumer manifest may preserve only", message)
+        self.assertEqual((self.repo / "core/api/engine.py").read_bytes(), b"ENGINE = 1\n")
 
     def test_preserve_path_outside_oss_ownership_is_invalid(self) -> None:
         ownership_path = self.repo / "contracts/shared-ownership.yaml"
@@ -619,6 +706,19 @@ class ImportGateTest(unittest.TestCase):
         ownership, _ = isp.load_ownership_map(repo_root / "contracts/shared-ownership.yaml")
         self.assertEqual(ownership["ownership_map_version"], 2)
         self.assertIn("core/api/", ownership["managed_areas"])
+
+    def test_forbidden_paths_must_be_exact_files(self) -> None:
+        ownership_path = self.repo / "contracts/shared-ownership.yaml"
+        ownership_path.write_text(
+            TEST_MAP.replace(
+                "    - core/api/private.py",
+                "    - core/api/private/",
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(isp.ImportRefused, "exact paths"):
+            isp.load_ownership_map(ownership_path)
 
     # -- apply / rollback --------------------------------------------------
 
@@ -669,12 +769,93 @@ class ImportGateTest(unittest.TestCase):
         self.refused(make_args(self.repo, bundle, mode="apply", backup_dir=self.base / "backup"))
         self.assertFalse((self.repo / "core" / "evil.py").exists())
 
+    def test_apply_preflights_every_destination_before_first_write(self) -> None:
+        (self.repo / "core/api/sub").symlink_to("../..")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "symlink")
+        files = {
+            "core/api/engine.py": (b"ENGINE = 2\n", "100644"),
+            "core/api/sub/evil.py": (b"x = 1\n", "100644"),
+        }
+        bundle = build_bundle(self.base, files)
+        backup = self.base / "preflight-backup"
+
+        self.refused(make_args(self.repo, bundle, mode="apply", backup_dir=backup))
+
+        self.assertEqual((self.repo / "core/api/engine.py").read_bytes(), b"ENGINE = 1\n")
+        self.assertFalse(backup.exists())
+
+    def test_mid_apply_failure_restores_pre_apply_tree(self) -> None:
+        bundle = build_bundle(self.base, green_files())
+        backup = self.base / "failure-backup"
+        real_atomic_write = isp._atomic_write
+
+        def fail_one_destination(destination: Path, content: bytes, mode: int) -> None:
+            if destination.resolve() == (self.repo / "core/api/new_module.py").resolve():
+                raise OSError("synthetic write failure")
+            real_atomic_write(destination, content, mode)
+
+        with mock.patch.object(isp, "_atomic_write", side_effect=fail_one_destination):
+            self.refused(
+                make_args(self.repo, bundle, mode="apply", backup_dir=backup)
+            )
+
+        self.assertEqual((self.repo / "core/api/engine.py").read_bytes(), b"ENGINE = 1\n")
+        self.assertFalse((self.repo / "core/api/new_module.py").exists())
+        self.assertEqual(
+            json.loads((backup / "backup.json").read_text(encoding="utf-8"))["status"],
+            "apply_failed_restored",
+        )
+        self.assertEqual(subprocess.check_output(["git", "-C", str(self.repo), "status", "--porcelain"]), b"")
+
+    def test_apply_manifest_finalization_failure_restores_pre_apply_tree(self) -> None:
+        bundle = build_bundle(self.base, green_files())
+        backup = self.base / "manifest-failure-backup"
+        real_write_manifest = isp._write_verified_manifest
+
+        def fail_applied_manifest(destination: Path, manifest: dict) -> bytes:
+            if manifest.get("status") == "applied":
+                raise OSError("synthetic manifest finalization failure")
+            return real_write_manifest(destination, manifest)
+
+        with mock.patch.object(
+            isp, "_write_verified_manifest", side_effect=fail_applied_manifest
+        ):
+            self.refused(
+                make_args(self.repo, bundle, mode="apply", backup_dir=backup)
+            )
+
+        self.assertEqual((self.repo / "core/api/engine.py").read_bytes(), b"ENGINE = 1\n")
+        self.assertFalse((self.repo / "core/api/new_module.py").exists())
+        self.assertEqual(
+            json.loads((backup / "backup.json").read_text(encoding="utf-8"))["status"],
+            "apply_failed_restored",
+        )
+        self.assertEqual(
+            subprocess.check_output(["git", "-C", str(self.repo), "status", "--porcelain"]),
+            b"",
+        )
+
     def test_rollback_refuses_drifted_state(self) -> None:
         bundle = build_bundle(self.base, green_files())
         backup = self.base / "backup"
         isp.run(make_args(self.repo, bundle, mode="apply", backup_dir=backup))
         (self.repo / "core/api/engine.py").write_bytes(b"ENGINE = 42\n")
         self.refused(make_args(self.repo, bundle, mode="rollback", backup_dir=backup))
+
+    def test_rollback_validates_all_backup_bytes_before_mutation(self) -> None:
+        bundle = build_bundle(self.base, green_files())
+        backup = self.base / "backup"
+        self.assertEqual(
+            isp.run(make_args(self.repo, bundle, mode="apply", backup_dir=backup)),
+            0,
+        )
+        (backup / "files/core/api/engine.py").write_bytes(b"corrupted\n")
+
+        self.refused(make_args(self.repo, bundle, mode="rollback", backup_dir=backup))
+
+        self.assertEqual((self.repo / "core/api/engine.py").read_bytes(), b"ENGINE = 2\n")
+        self.assertTrue((self.repo / "core/api/new_module.py").exists())
 
     # -- helpers -----------------------------------------------------------
 
