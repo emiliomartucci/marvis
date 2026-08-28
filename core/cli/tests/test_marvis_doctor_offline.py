@@ -32,13 +32,15 @@ def test_offline_empty_model_cache_reports_keyword_fallback(
     assert "fetched automatically" not in cache.detail
 
 
-def test_doctor_accepts_exact_revision_in_runtime_cache_layout(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("cache_prefix", [(), ("hub",)])
+def test_doctor_accepts_exact_revision_in_supported_cache_layouts(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, cache_prefix: tuple[str, ...]
 ) -> None:
     hf_home = tmp_path / "hf-cache"
     model_dir = "models--" + marvis_doctor.GRANITE_MODEL_ID.replace("/", "--")
     snapshot = (
         hf_home
+        .joinpath(*cache_prefix)
         / model_dir
         / "snapshots"
         / marvis_doctor.GRANITE_MODEL_REVISION
