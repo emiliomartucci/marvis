@@ -48,7 +48,21 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop-ui/package-lock.json
       - run: npm ci
+      - name: Production dependency audit
+        run: npm run audit:production
+      - name: Deterministic build-ID contract
+        run: npm run test:build-id
       - name: Type check
         run: npx tsc --noEmit -p tsconfig.json
       - name: Unit tests
         run: npx vitest run
+      - name: Production static build
+        env:
+          MARVIS_CONSOLE_BUILD_ID: ${{ github.sha }}
+          NEXT_PUBLIC_API_URL: ""
+          NEXT_PUBLIC_LOCAL_MODE: "1"
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: |
+          npm run build
+          test -f out/index.html
+          test -d out/_next

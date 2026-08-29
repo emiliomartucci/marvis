@@ -50,6 +50,43 @@ class CICollectionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(CollectionContractError, "Python row drift"):
             _workflow(ROOT, contract)
 
+    def test_desktop_release_build_cannot_leave_ci(self) -> None:
+        contract = json.loads(
+            (ROOT / "contracts/ci/collection-v1.json").read_text(encoding="utf-8")
+        )
+        contract["workflow"]["additional_jobs"][0]["required_run_lines"].append(
+            "missing desktop release gate"
+        )
+        with self.assertRaisesRegex(CollectionContractError, "CI run line missing"):
+            _workflow(ROOT, contract)
+
+    def test_desktop_build_sha_cannot_drift(self) -> None:
+        contract = json.loads(
+            (ROOT / "contracts/ci/collection-v1.json").read_text(encoding="utf-8")
+        )
+        contract["workflow"]["additional_jobs"][0]["required_step_env"][
+            "MARVIS_CONSOLE_BUILD_ID"
+        ] = "main"
+        with self.assertRaisesRegex(CollectionContractError, "step environment drift"):
+            _workflow(ROOT, contract)
+
+    def test_echoed_desktop_build_is_not_a_gate(self) -> None:
+        contract = json.loads(
+            (ROOT / "contracts/ci/collection-v1.json").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory(prefix="marvis-desktop-ci-") as raw:
+            root = Path(raw)
+            shutil.copytree(ROOT / ".github", root / ".github")
+            workflow = root / ".github/workflows/ci.yml"
+            workflow.write_text(
+                workflow.read_text(encoding="utf-8").replace(
+                    "          npm run build\n", "          echo npm run build\n"
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CollectionContractError, "CI run line missing"):
+                _workflow(root, contract)
+
     def test_supported_os_row_cannot_disappear(self) -> None:
         contract = json.loads(
             (ROOT / "contracts/ci/collection-v1.json").read_text(encoding="utf-8")
