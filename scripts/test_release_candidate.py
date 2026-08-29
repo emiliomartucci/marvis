@@ -98,6 +98,12 @@ class ReleaseCandidateTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "invalidated"):
             candidate.validate_static(ROOT)
+        report = candidate.candidate_state_report(ROOT)
+        self.assertEqual(report["status"], "invalidated")
+        self.assertEqual(
+            report["shared_source_sha"],
+            "64e96cb7e90292816296750906db68ec81c4a37e",
+        )
 
     def test_candidate_invalidation_cannot_name_an_unrelated_source(self) -> None:
         policy = self.policy()
@@ -158,6 +164,28 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.assertNotIn("pip install", blocks[job])
         self.assertIn("contents: read", blocks["accept"])
         self.assertNotIn("contents: write", blocks["accept"])
+
+    def test_invalidated_pull_request_skips_every_expensive_release_step(self) -> None:
+        workflow = yaml.safe_load((ROOT / candidate.WORKFLOW_PATH).read_text())
+        steps = workflow["jobs"]["build"]["steps"]
+        protected = {
+            "Run the live pre-tag preflight before the expensive build",
+            "Recheck the tagged namespace before the expensive build",
+            "Build the local GUI from a digest-pinned image",
+            "Fail if a foreign route reached the local artifact",
+            "Build one wheel and one source archive",
+            "Verify packaged claims, completeness and clean install",
+            "Create and re-read the immutable artifact manifest",
+            "Upload the only candidate artifact",
+        }
+        guarded = {step["name"] for step in steps if step.get("name") in protected}
+        self.assertEqual(guarded, protected)
+        for step in steps:
+            if step.get("name") in protected:
+                self.assertIn(
+                    "steps.candidate.outputs.status == 'active'",
+                    str(step.get("if") or ""),
+                )
 
     def test_embedded_workflow_python_is_syntax_valid(self) -> None:
         workflow = (ROOT / candidate.WORKFLOW_PATH).read_text(encoding="utf-8")

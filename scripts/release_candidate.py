@@ -176,6 +176,19 @@ def _candidate_state(
     }
 
 
+def candidate_state_report(root: Path) -> dict[str, Any]:
+    """Return one validated, non-secret release-state classification."""
+    root = root.resolve()
+    policy = load_policy(root)
+    shared_source = _shared_source_coordinates(root, policy)
+    state = _candidate_state(policy, shared_source=shared_source)
+    return {
+        "status": state["status"],
+        "state": state,
+        "shared_source_sha": shared_source["merge_sha"],
+    }
+
+
 def _git(root: Path, *args: str, text: bool = True) -> str | bytes:
     result = subprocess.run(
         ["git", "-C", str(root), *args],
@@ -1942,6 +1955,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("state")
     static_parser = sub.add_parser("static")
     static_parser.add_argument("--tag-build", action="store_true")
     static_parser.add_argument("--trigger-ref")
@@ -1984,7 +1998,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
-        if args.command == "static":
+        if args.command == "state":
+            result = candidate_state_report(root)
+        elif args.command == "static":
             result = validate_static(
                 root,
                 tag_build=args.tag_build,
