@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -26,6 +27,14 @@ ROOT = Path(__file__).resolve().parents[1]
 class ReleaseCandidateTests(unittest.TestCase):
     def policy(self) -> dict:
         return copy.deepcopy(candidate.load_policy(ROOT))
+
+    @contextmanager
+    def active_candidate_for_unit_test(self):
+        """Exercise artifact logic while the real candidate is fail-closed."""
+        with mock.patch.object(
+            candidate, "_candidate_state", return_value={"status": "active"}
+        ), mock.patch.object(candidate, "_path_allowed", return_value=True):
+            yield
 
     def write_manifest(self, path: Path, **values: object) -> dict:
         manifest = {"schema": candidate.MANIFEST_SCHEMA, **values}
@@ -78,36 +87,35 @@ class ReleaseCandidateTests(unittest.TestCase):
         }
         return trusted, watchdog
 
-    def test_real_release_candidate_static_policy(self) -> None:
-        report = candidate.validate_static(ROOT)
-        self.assertEqual(report["status"], "static_green_external_gates_open")
-        self.assertEqual(report["version"], "0.4.1")
-        self.assertEqual(report["release_branch"], "main")
+    def test_real_release_candidate_is_invalidated_by_the_source_advance(self) -> None:
+        policy = self.policy()
+        shared_source = candidate._shared_source_coordinates(ROOT, policy)
+        state = candidate._candidate_state(policy, shared_source=shared_source)
+        self.assertEqual(state["status"], "invalidated")
         self.assertEqual(
-            report["product_base_sha"],
-            "c1a4790100e228a8588e049fbd31233c6da73f88",
+            state["invalidated_by_shared_source_sha"],
+            "64e96cb7e90292816296750906db68ec81c4a37e",
         )
-        self.assertEqual(
-            report["release_foundation"]["candidate_sha"],
-            "2da56bfaff8ea6e0c8744761e40268750d2eeae3",
-        )
-        self.assertEqual(
-            report["release_foundation"]["merge_sha"],
-            "5a37295a084c990c63e824e2019108ee984684aa",
-        )
-        self.assertEqual(
-            report["release_foundation"]["changed_paths"],
-            self.policy()["release_foundation"]["expected_changed_paths"],
-        )
-        self.assertEqual(
-            report["shared_source"]["candidate_sha"],
-            "6c25bebde4d8feee6455994aeca37afc41da4a78",
-        )
-        self.assertEqual(
-            report["shared_source"]["merge_sha"],
-            "962e0fa6bb15ca71e3b20e9c99636aa93c631271",
-        )
-        self.assertEqual(len(report["action_pins"]), 5)
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "invalidated"):
+            candidate.validate_static(ROOT)
+
+    def test_candidate_invalidation_cannot_name_an_unrelated_source(self) -> None:
+        policy = self.policy()
+        policy["candidate_state"]["invalidated_by_shared_source_sha"] = "0" * 40
+        shared_source = candidate._shared_source_coordinates(ROOT, policy)
+        with self.assertRaisesRegex(
+            candidate.ReleasePolicyError, "invalidation evidence is inconsistent"
+        ):
+            candidate._candidate_state(policy, shared_source=shared_source)
+
+    def test_active_candidate_cannot_keep_stale_invalidation_evidence(self) -> None:
+        policy = self.policy()
+        policy["candidate_state"]["status"] = "active"
+        shared_source = candidate._shared_source_coordinates(ROOT, policy)
+        with self.assertRaisesRegex(
+            candidate.ReleasePolicyError, "active candidate state contains stale evidence"
+        ):
+            candidate._candidate_state(policy, shared_source=shared_source)
 
     def test_mutating_workflow_jobs_are_tag_only_and_privilege_minimal(self) -> None:
         workflow = (ROOT / candidate.WORKFLOW_PATH).read_text(encoding="utf-8")
@@ -355,15 +363,17 @@ class ReleaseCandidateTests(unittest.TestCase):
         foundation = candidate._release_foundation_coordinates(ROOT, self.policy())
         with mock.patch.object(
             candidate, "_release_foundation_coordinates", return_value=foundation
+        ), mock.patch.object(
+            candidate, "_candidate_state", return_value={"status": "active"}
         ), mock.patch.object(candidate, "_changed_paths", return_value=["core/api/main.py"]):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "product behavior"):
                 candidate.validate_static(ROOT)
 
     def test_release_source_must_descend_from_exact_foundation(self) -> None:
-        with self.assertRaisesRegex(candidate.ReleasePolicyError, "exact release foundation"):
-            candidate.validate_static(
-                ROOT, head=self.policy()["plan_b_product_base_sha"]
-            )
+        with mock.patch.object(
+            candidate, "_candidate_state", return_value={"status": "active"}
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "exact release foundation"):
+            candidate.validate_static(ROOT, head=self.policy()["plan_b_product_base_sha"])
 
     def test_pyproject_release_delta_rejects_dependency_change(self) -> None:
         base = copy.deepcopy(candidate.tomllib.loads((ROOT / "pyproject.toml").read_text()))
@@ -485,7 +495,9 @@ class ReleaseCandidateTests(unittest.TestCase):
             )
 
     def test_manifest_byte_tamper_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="release-manifest-") as raw:
+        with self.active_candidate_for_unit_test(), tempfile.TemporaryDirectory(
+            prefix="release-manifest-"
+        ) as raw:
             dist = Path(raw) / "dist"
             artifact, _ = self.write_release_artifacts(dist)
             manifest = candidate.build_manifest(ROOT, dist)
@@ -497,7 +509,9 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_manifest_hashes_only_the_post_foundation_release_delta(self) -> None:
         policy = self.policy()
-        with tempfile.TemporaryDirectory(prefix="release-foundation-manifest-") as raw:
+        with self.active_candidate_for_unit_test(), tempfile.TemporaryDirectory(
+            prefix="release-foundation-manifest-"
+        ) as raw:
             dist = Path(raw) / "dist"
             self.write_release_artifacts(dist)
             manifest = candidate.build_manifest(ROOT, dist)
@@ -516,7 +530,9 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertNotIn(".github/workflows/ci.yml", manifest["changed_paths"])
 
     def test_manifest_recomputed_identity_tamper_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="release-identity-") as raw:
+        with self.active_candidate_for_unit_test(), tempfile.TemporaryDirectory(
+            prefix="release-identity-"
+        ) as raw:
             dist = Path(raw) / "dist"
             self.write_release_artifacts(dist)
             manifest = candidate.build_manifest(ROOT, dist)
@@ -556,7 +572,9 @@ class ReleaseCandidateTests(unittest.TestCase):
             )
 
     def test_manifest_rejects_unmanifested_release_asset(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="release-assets-") as raw:
+        with self.active_candidate_for_unit_test(), tempfile.TemporaryDirectory(
+            prefix="release-assets-"
+        ) as raw:
             dist = Path(raw) / "dist"
             self.write_release_artifacts(dist)
             manifest_path = dist / "release-manifest.json"
@@ -569,7 +587,9 @@ class ReleaseCandidateTests(unittest.TestCase):
     def test_acceptance_receipt_binds_registry_and_workflow(self) -> None:
         now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
         policy = self.verified_external_policy(now)
-        with tempfile.TemporaryDirectory(prefix="release-acceptance-") as raw:
+        with self.active_candidate_for_unit_test(), tempfile.TemporaryDirectory(
+            prefix="release-acceptance-"
+        ) as raw:
             root = Path(raw)
             registry_dist = root / "registry"
             github_dist = root / "github"

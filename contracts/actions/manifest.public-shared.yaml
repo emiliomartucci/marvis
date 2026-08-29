@@ -33,6 +33,9 @@ domains:
       callable: acknowledge_rotation
       id: marvis.agent_tokens.acknowledge_rotation
       mutating: true
+    - callable: mint_graph_ingest_token
+      id: marvis.agent_tokens.mint_graph_ingest_token
+      mutating: true
     internal:
     - hash_token
     module: core/api/use_cases/agent_tokens.py

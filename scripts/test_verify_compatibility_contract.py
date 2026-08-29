@@ -11,8 +11,8 @@ from verify_compatibility_contract import CompatibilityError, provider_breaks, v
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_REF = "962e0fa6bb15ca71e3b20e9c99636aa93c631271"
-PAYLOAD_SHA256 = "6f1b5667df2b0a0ec91a2508914761e12c209f622557d7d8b912008849351717"
+SOURCE_REF = "64e96cb7e90292816296750906db68ec81c4a37e"
+PAYLOAD_SHA256 = "ff3ecafbc097f896bf54bdd3b310f286918d301885ce5161e3aa672b09ffdb58"
 
 
 class CompatibilityContractTests(unittest.TestCase):
@@ -25,6 +25,7 @@ class CompatibilityContractTests(unittest.TestCase):
             "contracts/engine-pin.yaml",
             "core/api/db.py",
             "core/api/mcp/stdio.py",
+            "core/api/mcp/tools/agent_tokens.py",
             "core/api/mcp/tools/projects.py",
             "core/api/models/auth.py",
             "core/api/models/tasks.py",

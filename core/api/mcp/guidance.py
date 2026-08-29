@@ -44,11 +44,16 @@ ROUTING_GUIDE: tuple[dict[str, str], ...] = (
     },
     {
         "intent": "code path missing / stale code graph",
-        "tool": "guide() -> session_brief(slug) -> marvis-graph-export or marvis-index-action",
+        "tool": (
+            "guide() -> session_brief(slug) -> mint_graph_ingest_token() -> "
+            "local marvis-graph-export; CI uses marvis-index-action"
+        ),
         "why": (
             "The hosted tenant stores graph nodes, edges and provenance, never source. "
-            "Regenerate from the real local repository or CI; reindex_paths refreshes "
-            "hosted documents, not the code graph."
+            "For local export, pass the minted bearer only as "
+            "MARVIS_GRAPH_INGEST_TOKEN and unset it after upload. Regenerate from "
+            "the real local repository or CI; reindex_paths refreshes hosted "
+            "documents, not the code graph."
         ),
     },
     {
@@ -386,6 +391,7 @@ TOOL_TIERS: dict[str, dict[str, Any]] = {
             "create_learning",
             "update_learning",
             "memory_feedback",
+            "mint_graph_ingest_token",
             # todos
             "create_todo",
             "update_todo",

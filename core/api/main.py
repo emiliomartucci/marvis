@@ -1630,6 +1630,7 @@ async def _resolve_ws_user(ws: WebSocket):
     from core.api.security import (
         TokenPrincipalInvalid,
         TokenStoreUnavailable,
+        _agent_token_route_allowed,
         _legacy_shared_token_enabled,
         _lookup_agent_token,
         _resolve_agent_userinfo,
@@ -1654,6 +1655,12 @@ async def _resolve_ws_user(ws: WebSocket):
             except TokenStoreUnavailable:
                 return None
             if resolved is not None:
+                if not _agent_token_route_allowed(
+                    "WEBSOCKET",
+                    str(ws.scope.get("path") or ""),
+                    resolved,
+                ):
+                    return None
                 try:
                     return await _resolve_agent_userinfo(
                         resolved.agent_name,

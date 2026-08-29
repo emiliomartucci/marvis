@@ -140,6 +140,42 @@ def load_policy(root: Path) -> dict[str, Any]:
     return policy
 
 
+def _candidate_state(
+    policy: dict[str, Any], *, shared_source: dict[str, Any]
+) -> dict[str, str]:
+    """Validate whether the reviewed candidate may still enter release gates."""
+    state = policy.get("candidate_state")
+    if not isinstance(state, dict):
+        raise ReleasePolicyError("candidate state is missing")
+    status = state.get("status")
+    if status == "active":
+        if set(state) != {"status"}:
+            raise ReleasePolicyError("active candidate state contains stale evidence")
+        return {"status": "active"}
+    expected_keys = {
+        "status",
+        "reason",
+        "invalidated_by_shared_source_sha",
+        "required_next_gate",
+    }
+    if status != "invalidated" or set(state) != expected_keys:
+        raise ReleasePolicyError("candidate state is invalid")
+    source_sha = str(state.get("invalidated_by_shared_source_sha") or "")
+    if (
+        state.get("reason") != "shared_source_advanced_after_release_foundation"
+        or source_sha != shared_source["merge_sha"]
+        or state.get("required_next_gate")
+        != "merge_product_projection_then_refresh_release_foundation"
+    ):
+        raise ReleasePolicyError("candidate invalidation evidence is inconsistent")
+    return {
+        "status": "invalidated",
+        "reason": str(state["reason"]),
+        "invalidated_by_shared_source_sha": source_sha,
+        "required_next_gate": str(state["required_next_gate"]),
+    }
+
+
 def _git(root: Path, *args: str, text: bool = True) -> str | bytes:
     result = subprocess.run(
         ["git", "-C", str(root), *args],
@@ -630,6 +666,12 @@ def validate_static(
         raise ReleasePolicyError("Plan B product base is not a full commit")
     release_foundation = _release_foundation_coordinates(root, policy)
     shared_source = _shared_source_coordinates(root, policy)
+    candidate_state = _candidate_state(policy, shared_source=shared_source)
+    if candidate_state["status"] == "invalidated":
+        raise ReleasePolicyError(
+            "release candidate is invalidated; merge the product projection "
+            "and refresh the exact release foundation"
+        )
     receipt_policy = policy.get("external_receipts") or {}
     if (
         receipt_policy.get("schema") != EXTERNAL_RECEIPT_SCHEMA

@@ -23,6 +23,11 @@ from core.api.db import get_db, get_write_db
 from core.api.models import UserInfo
 from core.api.models.auth import AuthMechanism
 from core.api.use_cases._context import CallerContext, find_active_delegation
+from core.api.use_cases.agent_tokens import (
+    GRAPH_INGEST_LOCAL_TOKEN_ID_PREFIX,
+    GRAPH_INGEST_SCOPE,
+    GRAPH_INGEST_TOKEN_ID_PREFIX,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +114,7 @@ def _valid_static_agent_names() -> set[str]:
     (e.g. seeded via migration) authenticate via get_valid_agent_names().
     """
     return _VALID_AGENT_NAMES | set(settings.static_agent_identities)
+
 
 # In-memory cache for dynamic agent names from DB
 _agent_names_cache: set[str] = set()
@@ -552,6 +558,48 @@ class AgentTokenPrincipal:
     expires_at: str | None
     rotation_family_id: str
     credential_kind: str
+    local_runtime: bool
+
+
+_GRAPH_INGEST_ONLY_SCOPES = (GRAPH_INGEST_SCOPE,)
+_GRAPH_INGEST_METHOD = "POST"
+_GRAPH_INGEST_PATH = "/api/v1/graph/ingest"
+
+
+def _agent_token_route_allowed(
+    method: str,
+    path: str,
+    principal: AgentTokenPrincipal,
+) -> bool:
+    """Whether this token class may authenticate the requested transport route."""
+    if not principal.token_id.startswith(GRAPH_INGEST_TOKEN_ID_PREFIX):
+        return True
+    return (
+        principal.scopes == _GRAPH_INGEST_ONLY_SCOPES
+        and method.upper() == _GRAPH_INGEST_METHOD
+        and path == _GRAPH_INGEST_PATH
+    )
+
+
+def _enforce_agent_token_route(
+    request: Request,
+    principal: AgentTokenPrincipal,
+) -> None:
+    """Keep the dedicated graph-ingest credential out of every other route."""
+    if _agent_token_route_allowed(
+        request.method,
+        str(request.scope.get("path") or ""),
+        principal,
+    ):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"This credential is restricted to {_GRAPH_INGEST_METHOD} "
+            f"{_GRAPH_INGEST_PATH} and "
+            "cannot authenticate this route."
+        ),
+    )
 
 
 def _parse_lifecycle_time(value: object) -> datetime | None:
@@ -681,6 +729,15 @@ async def _lookup_agent_token(
     if credential_kind == "individual" and principal["id"] != principal_id:
         return None
 
+    local_runtime = row["id"].startswith(GRAPH_INGEST_LOCAL_TOKEN_ID_PREFIX)
+    if local_runtime and (
+        principal["id"] != "local"
+        or principal["slug"] != "local"
+        or workspace_id != "ws_default"
+        or not row["id"].startswith(GRAPH_INGEST_TOKEN_ID_PREFIX)
+    ):
+        return None
+
     return AgentTokenPrincipal(
         token_id=row["id"],
         principal_id=principal["id"],
@@ -692,6 +749,7 @@ async def _lookup_agent_token(
         expires_at=row["expires_at"],
         rotation_family_id=rotation_family_id or row["id"],
         credential_kind=credential_kind,
+        local_runtime=local_runtime,
     )
 
 
@@ -727,7 +785,10 @@ async def _resolve_agent_userinfo(
             raise TokenPrincipalInvalid("token principal no longer resolves")
     else:
         valid_names = await get_valid_agent_names(db)
-        if agent_name not in valid_names and agent_name not in _valid_static_agent_names():
+        if (
+            agent_name not in valid_names
+            and agent_name not in _valid_static_agent_names()
+        ):
             agent_name = "agent"
         async with db.execute(
             "SELECT id, slug, system_role, display_name, type FROM users "
@@ -765,6 +826,12 @@ async def _bind_agent_token_principal(
     db: aiosqlite.Connection,
 ) -> UserInfo:
     """Bind verified token identity and its non-secret lifecycle reference."""
+    _enforce_agent_token_route(request, principal)
+    if principal.local_runtime and not is_loopback_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="This local graph credential only accepts loopback requests.",
+        )
     request.state.agent_token_id = principal.token_id
     request.state.agent_token_rotation_family_id = principal.rotation_family_id
     try:
@@ -783,10 +850,16 @@ async def _bind_agent_token_principal(
             status_code=401,
             detail="The token principal is no longer active in this workspace.",
         ) from exc
+    # A dedicated graph credential is deliberately less privileged than the
+    # principal that minted it.  The route gate above limits the credential to
+    # graph ingest; cap its role too so an admin-backed MCP service can never
+    # carry admin authority into project-access decisions.
+    if principal.token_id.startswith(GRAPH_INGEST_TOKEN_ID_PREFIX):
+        user = user.model_copy(update={"system_role": "operator"})
     return _bind_authenticated_request(
         request,
         user,
-        auth_mechanism="agent_token",
+        auth_mechanism="local" if principal.local_runtime else "agent_token",
     )
 
 
@@ -835,8 +908,10 @@ async def get_current_user_or_agent(
             return await _bind_agent_token_principal(request, result, db)
 
         # 2. Legacy single shared token fallback — bound to ws_default (P1-3 review fix)
-        if _legacy_shared_token_enabled() and settings.tasks_api_token and secrets.compare_digest(
-            bearer_token, settings.tasks_api_token
+        if (
+            _legacy_shared_token_enabled()
+            and settings.tasks_api_token
+            and secrets.compare_digest(bearer_token, settings.tasks_api_token)
         ):
             agent_name = request.headers.get("x-agent-name", "agent")
             return _bind_authenticated_request(
@@ -1019,8 +1094,10 @@ async def get_agent_user(
     #    "agent:"-prefixed username that diverged from the exercise path
     #    (get_active_delegation lookup would miss). The shared resolver gives a
     #    DB-backed identity with user_type="agent" and the bare agent slug.
-    if _legacy_shared_token_enabled() and settings.tasks_api_token and secrets.compare_digest(
-        bearer_token, settings.tasks_api_token
+    if (
+        _legacy_shared_token_enabled()
+        and settings.tasks_api_token
+        and secrets.compare_digest(bearer_token, settings.tasks_api_token)
     ):
         agent_name = request.headers.get("x-agent-name", "agent")
         return _bind_authenticated_request(
