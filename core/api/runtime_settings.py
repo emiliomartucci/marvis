@@ -79,14 +79,13 @@ def apply_marvis_settings(*, force: bool = False) -> bool:
         from core.api import config as config_mod
         from core.api.routers.projects import _set_project_dirs
 
+        # Explicit process configuration wins over the persisted settings
+        # file.  Normalize the winning value once, then keep every consumer
+        # aligned with it.
         effective_projects_root = (
             os.environ.get("MARVIS_PROJECTS_ROOT") or projects_root
         )
         projects_root_path = Path(effective_projects_root).expanduser().resolve()
-        # Migration hooks and filesystem services consume the effective root
-        # through this process-local contract.  Keep it aligned with the
-        # router roots so ``marvis schema upgrade`` cannot silently migrate a
-        # different/default project tree from the one in settings.yaml.
         os.environ["MARVIS_PROJECTS_ROOT"] = str(projects_root_path)
         _set_project_dirs([projects_root_path])
 

@@ -51,7 +51,8 @@
         "CompatibilityContractTests.test_n_client_against_n_minus_one_mcp_requires_migration",
         "HookPolicyTests.test_five_representation_policy_passes",
         "LocalUpgradeTests.test_synthetic_prior_upgrade_and_rollback",
-        "LocalUpgradeTests.test_cli_upgrade_uses_settings_projects_root_without_environment"
+        "LocalUpgradeTests.test_cli_upgrade_uses_settings_projects_root_without_environment",
+        "LocalUpgradeTests.test_runtime_settings_preserve_explicit_projects_root"
       ]
     }
   ],

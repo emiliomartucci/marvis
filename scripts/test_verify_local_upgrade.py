@@ -184,6 +184,56 @@ class LocalUpgradeTests(unittest.TestCase):
                 else:
                     os.environ["PIR_PASSWORD"] = original_password
 
+    def test_runtime_settings_preserve_explicit_projects_root(self) -> None:
+        from core.api import config as config_mod
+        from core.api import runtime_settings
+        from core.api.routers import projects as projects_router
+
+        with tempfile.TemporaryDirectory(prefix="marvis-settings-precedence-") as raw:
+            root = Path(raw)
+            settings_root = root / "settings-projects"
+            explicit_root = root / "explicit-projects"
+            settings_root.mkdir()
+            explicit_root.mkdir()
+            settings_path = root / "settings.yaml"
+            settings_path.write_text(
+                "storage:\n"
+                f"  projects_root: {settings_root}\n",
+                encoding="utf-8",
+            )
+
+            original_settings_path = os.environ.get("MARVIS_SETTINGS_PATH")
+            original_projects_root = os.environ.get("MARVIS_PROJECTS_ROOT")
+            original_applied = runtime_settings._applied
+            original_project_dirs = list(projects_router.PROJECT_DIRS)
+            original_repo_parents = list(config_mod.ALLOWED_REPO_PARENTS)
+            try:
+                os.environ["MARVIS_SETTINGS_PATH"] = str(settings_path)
+                os.environ["MARVIS_PROJECTS_ROOT"] = str(explicit_root)
+                runtime_settings._applied = False
+                config_mod.ALLOWED_REPO_PARENTS[:] = []
+
+                self.assertTrue(runtime_settings.apply_marvis_settings(force=True))
+                resolved = explicit_root.resolve()
+                self.assertEqual(os.environ["MARVIS_PROJECTS_ROOT"], str(resolved))
+                self.assertEqual(projects_router.PROJECT_DIRS, [resolved])
+                self.assertIn(resolved, config_mod.ALLOWED_REPO_PARENTS)
+                self.assertNotIn(
+                    settings_root.resolve(), config_mod.ALLOWED_REPO_PARENTS
+                )
+            finally:
+                runtime_settings._applied = original_applied
+                projects_router._set_project_dirs(original_project_dirs)
+                config_mod.ALLOWED_REPO_PARENTS[:] = original_repo_parents
+                if original_settings_path is None:
+                    os.environ.pop("MARVIS_SETTINGS_PATH", None)
+                else:
+                    os.environ["MARVIS_SETTINGS_PATH"] = original_settings_path
+                if original_projects_root is None:
+                    os.environ.pop("MARVIS_PROJECTS_ROOT", None)
+                else:
+                    os.environ["MARVIS_PROJECTS_ROOT"] = original_projects_root
+
 
 if __name__ == "__main__":
     unittest.main()
