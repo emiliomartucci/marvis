@@ -294,7 +294,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         with mock.patch.object(
             candidate,
             "_git",
-            side_effect=["core/api/main.py", "release-artifact/packages/a.whl"],
+            side_effect=["M\tcore/api/main.py", "release-artifact/packages/a.whl"],
         ), self.assertRaisesRegex(candidate.ReleasePolicyError, "source tree"):
             candidate._require_release_controls_committed(
                 ROOT,
@@ -322,7 +322,28 @@ class ReleaseCandidateTests(unittest.TestCase):
         with mock.patch.object(
             candidate,
             "_git",
-            side_effect=["core/api/console_dist/.gitkeep", "build/lib/generated.py"],
+            side_effect=[
+                "M\tcore/api/console_dist/index.html",
+                "build/lib/generated.py",
+            ],
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "source tree"):
+            candidate._require_release_controls_committed(ROOT, "a" * 40)
+
+    def test_release_source_tree_allows_only_deleted_console_placeholder(self) -> None:
+        with mock.patch.object(
+            candidate,
+            "_git",
+            side_effect=[
+                "D\tcore/api/console_dist/.gitkeep",
+                "core/api/console_dist/index.html",
+            ],
+        ):
+            candidate._require_release_controls_committed(ROOT, "a" * 40)
+
+        with mock.patch.object(
+            candidate,
+            "_git",
+            side_effect=["M\tcore/api/console_dist/.gitkeep", ""],
         ), self.assertRaisesRegex(candidate.ReleasePolicyError, "source tree"):
             candidate._require_release_controls_committed(ROOT, "a" * 40)
 

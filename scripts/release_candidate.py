@@ -56,6 +56,7 @@ GENERATED_RELEASE_PREFIXES = (
     "pypi-readback/",
     "release-artifact/",
 )
+GENERATED_TRACKED_DELETIONS = frozenset({"core/api/console_dist/.gitkeep"})
 _FILE_CHUNK_BYTES = 1024 * 1024
 _TRUSTED_PUBLISHER_RECEIPT_ENV = "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT"
 _APPROVAL_WATCHDOG_RECEIPT_ENV = "MARVIS_APPROVAL_WATCHDOG_RECEIPT"
@@ -225,11 +226,15 @@ def _changed_paths(root: Path, base: str, head: str) -> list[str]:
 
 
 def _require_release_controls_committed(root: Path, resolved_head: str) -> None:
-    tracked_dirty = {
-        line
-        for line in str(_git(root, "diff", "--name-only", resolved_head, "--")).splitlines()
-        if line
-    }
+    tracked_changes: dict[str, str] = {}
+    for line in str(
+        _git(root, "diff", "--name-status", resolved_head, "--")
+    ).splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2 or not fields[0] or any(not path for path in fields[1:]):
+            raise ReleasePolicyError("tracked source-change inventory is invalid")
+        for path in fields[1:]:
+            tracked_changes[path] = fields[0]
     untracked = {
         line
         for line in str(
@@ -242,7 +247,14 @@ def _require_release_controls_committed(root: Path, resolved_head: str) -> None:
         for path in untracked
         if not path.startswith(GENERATED_RELEASE_PREFIXES)
     }
-    unexpected = sorted(tracked_dirty | unexpected_untracked)
+    allowed_tracked_deletions = {
+        path
+        for path, status in tracked_changes.items()
+        if status == "D" and path in GENERATED_TRACKED_DELETIONS
+    }
+    unexpected = sorted(
+        (set(tracked_changes) - allowed_tracked_deletions) | unexpected_untracked
+    )
     if unexpected:
         raise ReleasePolicyError(
             f"release source tree differs from the checked-out commit: {unexpected}"
