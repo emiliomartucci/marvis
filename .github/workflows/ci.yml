@@ -23,6 +23,8 @@ jobs:
       - run: pip install -e ".[dev]"
       - name: Checked test collection (paths, counts, markers, matrices)
         run: python scripts/verify_ci_collection.py
+      - name: Release candidate state (no build or publish)
+        run: python scripts/release_candidate.py state
       - name: Required Python suites (zero unexplained skips)
         run: python scripts/run_ci_contract.py
       - name: Immutable 0.3.8 upgrade and rollback
