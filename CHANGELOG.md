@@ -8,10 +8,33 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 No changes yet.
 
-## [0.4.0] - 2026-06-19 (stabile)
+## [0.4.1] - candidate
 
-Prima release stabile: consolida la linea 0.3.9bX in un install pulito validato
-da QA Fable, senza canale prerelease.
+Security and provenance refresh based on the exact merged Plan B product base
+and the separately pinned CI evidence foundation from PR #54. The release
+keeps the local CLI, MCP, hooks and packaged GUI contracts while updating the
+shared engine and its regression coverage.
+
+### Security
+
+- Hardened shared identity, authorization, throttling and audit boundaries.
+- Bound the package to deterministic public/shared source provenance.
+
+### Changed
+
+- Removed retired Heypocket, n8n and Reddit runtime integrations; historical
+  database migrations and temporary compatibility tombstones remain.
+- Expanded Python 3.10-3.13, Linux, macOS and Windows install and upgrade proof.
+
+This section describes a release candidate only. Version 0.4.1 is not
+published until the separate tag, PyPI and post-publication acceptance gates
+all succeed.
+
+## [0.4.0] - 2026-06-19 (tentativo fallito, non pubblicato)
+
+Il tag e il record GitHub di questo tentativo esistono, ma PyPI non ha mai
+ricevuto la versione. Le note sotto descrivono il contenuto candidato storico,
+non una release consegnata o installabile.
 
 ### Added
 - **`marvis console` (plumbing)** — a local-GUI launcher: ensures the local API is up and opens the browser on the locally served UI. The release pipeline now builds the Console static export and ships it in the wheel; the public GUI launch follows the redesign. Groundwork: the local API can mount and serve a static UI same-origin (CSP kept same-origin).

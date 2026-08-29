@@ -1,0 +1,82 @@
+{
+  "schema": "marvis-public-release-policy/v1",
+  "package": "marvisx-cli",
+  "repository": "emiliomartucci/marvis",
+  "release_branch": "main",
+  "plan_b_product_base_sha": "c1a4790100e228a8588e049fbd31233c6da73f88",
+  "release_foundation": {
+    "repository": "emiliomartucci/marvis",
+    "pull_request": 54,
+    "candidate_sha": "2da56bfaff8ea6e0c8744761e40268750d2eeae3",
+    "merge_sha": "5a37295a084c990c63e824e2019108ee984684aa",
+    "expected_changed_paths": [
+      ".github/workflows/ci.yml",
+      "scripts/test_validate_local_surfaces.py",
+      "scripts/test_verify_ci_collection.py",
+      "scripts/validate_local_surfaces.py"
+    ]
+  },
+  "shared_source": {
+    "repository": "emiliomartucci/marvisx",
+    "pull_request": 314,
+    "candidate_sha": "6c25bebde4d8feee6455994aeca37afc41da4a78",
+    "merge_sha": "962e0fa6bb15ca71e3b20e9c99636aa93c631271",
+    "engine_pin": "contracts/engine-pin.yaml"
+  },
+  "candidate_version": "0.4.1",
+  "candidate_tag": "v0.4.1",
+  "historical_failed_version": "0.4.0",
+  "approval_deadline_hours": 24,
+  "allowed_release_delta": [
+    ".github/workflows/release.yml",
+    "CHANGELOG.md",
+    "contracts/ci/collection-v1.json",
+    "contracts/release/",
+    "docs/releases/",
+    "pyproject.toml",
+    "requirements-release.in",
+    "requirements-release.lock",
+    "scripts/release_candidate.py",
+    "scripts/test_release_candidate.py"
+  ],
+  "github_environment": {
+    "name": "pypi",
+    "required_reviewer_login": "emiliomartucci",
+    "prevent_self_review": false,
+    "can_admins_bypass": false,
+    "deployment_branch_policy": null
+  },
+  "trusted_publisher": {
+    "project": "marvisx-cli",
+    "owner": "emiliomartucci",
+    "repository": "marvis",
+    "workflow": "release.yml",
+    "environment": "pypi"
+  },
+  "approval_watchdog": {
+    "repository": "emiliomartucci/marvis",
+    "workflow": "release.yml",
+    "environment": "pypi",
+    "candidate_tag": "v0.4.1",
+    "approval_deadline_hours": 24,
+    "late_approval_upload_guard": true
+  },
+  "external_receipts": {
+    "trusted_publisher_variable": "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT",
+    "approval_watchdog_variable": "MARVIS_APPROVAL_WATCHDOG_RECEIPT",
+    "schema": "marvis-external-release-receipt/v1"
+  },
+  "build": {
+    "python": "3.13",
+    "node_image": "node:22-bookworm@sha256:8a34c4ab3ea2c5cd194f07e317b2a8f09461d3c8b05c4e34c8ccd56d56024c4d",
+    "requirements": "requirements-release.lock",
+    "source_date_epoch": "release_source_commit_time"
+  },
+  "action_pins": {
+    "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
+    "actions/download-artifact": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    "actions/setup-python": "a26af69be951a213d495a4c3e4e4022e16d87065",
+    "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+    "pypa/gh-action-pypi-publish": "dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
+  }
+}
