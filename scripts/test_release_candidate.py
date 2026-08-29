@@ -537,11 +537,15 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_manifest_hashes_only_the_post_foundation_release_delta(self) -> None:
         policy = self.policy()
-        with self.active_candidate_for_unit_test(), tempfile.TemporaryDirectory(
-            prefix="release-foundation-manifest-"
-        ) as raw:
+        shared_source = candidate._shared_source_coordinates(ROOT, policy)
+        state = candidate._candidate_state(policy, shared_source=shared_source)
+        with tempfile.TemporaryDirectory(prefix="release-foundation-manifest-") as raw:
             dist = Path(raw) / "dist"
             self.write_release_artifacts(dist)
+            if state["status"] == "invalidated":
+                with self.assertRaisesRegex(candidate.ReleasePolicyError, "invalidated"):
+                    candidate.build_manifest(ROOT, dist)
+                return
             manifest = candidate.build_manifest(ROOT, dist)
         expected_delta = candidate._git(
             ROOT,
