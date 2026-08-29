@@ -87,27 +87,46 @@ class ReleaseCandidateTests(unittest.TestCase):
         }
         return trusted, watchdog
 
-    def test_real_release_candidate_is_invalidated_by_the_source_advance(self) -> None:
-        policy = self.policy()
-        shared_source = candidate._shared_source_coordinates(ROOT, policy)
-        state = candidate._candidate_state(policy, shared_source=shared_source)
-        self.assertEqual(state["status"], "invalidated")
+    def test_real_release_candidate_static_policy(self) -> None:
+        report = candidate.validate_static(ROOT)
+        self.assertEqual(report["status"], "static_green_external_gates_open")
+        self.assertEqual(report["version"], "0.4.1")
+        self.assertEqual(report["release_branch"], "main")
         self.assertEqual(
-            state["invalidated_by_shared_source_sha"],
+            report["product_base_sha"],
+            "1e8f3977bd1085e358c34e4b08bdcca058130757",
+        )
+        self.assertEqual(
+            report["release_foundation"]["candidate_sha"],
+            "110317349c3f650cd3043b82080bfe991edcf0ee",
+        )
+        self.assertEqual(
+            report["release_foundation"]["merge_sha"],
+            "bab84da1a4c104b6ab273dc5166752c97dac5a1b",
+        )
+        self.assertEqual(
+            report["release_foundation"]["changed_paths"],
+            self.policy()["release_foundation"]["expected_changed_paths"],
+        )
+        self.assertEqual(
+            report["shared_source"]["candidate_sha"],
+            "4efd50cbe6b70c0febdd6b9ea0b812aa7d71569d",
+        )
+        self.assertEqual(
+            report["shared_source"]["merge_sha"],
             "64e96cb7e90292816296750906db68ec81c4a37e",
         )
-        with self.assertRaisesRegex(candidate.ReleasePolicyError, "invalidated"):
-            candidate.validate_static(ROOT)
-        report = candidate.candidate_state_report(ROOT)
-        self.assertEqual(report["status"], "invalidated")
-        self.assertEqual(
-            report["shared_source_sha"],
-            "64e96cb7e90292816296750906db68ec81c4a37e",
-        )
+        self.assertEqual(len(report["action_pins"]), 5)
+        self.assertEqual(candidate.candidate_state_report(ROOT)["status"], "active")
 
     def test_candidate_invalidation_cannot_name_an_unrelated_source(self) -> None:
         policy = self.policy()
-        policy["candidate_state"]["invalidated_by_shared_source_sha"] = "0" * 40
+        policy["candidate_state"] = {
+            "status": "invalidated",
+            "reason": "shared_source_advanced_after_release_foundation",
+            "invalidated_by_shared_source_sha": "0" * 40,
+            "required_next_gate": "merge_product_projection_then_refresh_release_foundation",
+        }
         shared_source = candidate._shared_source_coordinates(ROOT, policy)
         with self.assertRaisesRegex(
             candidate.ReleasePolicyError, "invalidation evidence is inconsistent"
@@ -116,7 +135,7 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_active_candidate_cannot_keep_stale_invalidation_evidence(self) -> None:
         policy = self.policy()
-        policy["candidate_state"]["status"] = "active"
+        policy["candidate_state"]["reason"] = "stale"
         shared_source = candidate._shared_source_coordinates(ROOT, policy)
         with self.assertRaisesRegex(
             candidate.ReleasePolicyError, "active candidate state contains stale evidence"
@@ -242,7 +261,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         expected = policy["release_foundation"]
         pull = {
             "state": "closed",
-            "merged_at": "2026-08-29T13:06:26Z",
+            "merged_at": "2026-08-29T15:01:11Z",
             "head": {"sha": expected["candidate_sha"]},
             "merge_commit_sha": expected["merge_sha"],
         }
@@ -250,7 +269,7 @@ class ReleaseCandidateTests(unittest.TestCase):
             report = candidate._release_foundation_readback(
                 ROOT, policy, token="masked", api_url="https://api.example"
             )
-        self.assertEqual(report["pull_request"], 54)
+        self.assertEqual(report["pull_request"], 56)
         self.assertEqual(
             report["changed_paths"], expected["expected_changed_paths"]
         )
