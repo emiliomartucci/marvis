@@ -11,9 +11,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from validate_local_surfaces import (  # noqa: E402
+    FRAMEWORK_HTML_ROUTES,
+    declared_routes,
     foreign_routes,
     local_nav_routes,
     validate,
+    validate_built_routes,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -221,6 +224,45 @@ class TestPerimeterIsClosed(unittest.TestCase):
         strangers = set(foreign_routes(REPO_ROOT))
         for route in ("/terminal/", "/settings/users/", "/monitoring/"):
             self.assertNotIn(route, strangers, f"{route} must not live in the local product")
+
+    def test_built_artifact_accepts_owned_settings_and_rejects_foreign_routes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="local-artifact-") as raw:
+            bundle = Path(raw)
+            for route in declared_routes(REPO_ROOT) | FRAMEWORK_HTML_ROUTES:
+                target = (
+                    bundle / "index.html"
+                    if route == "/"
+                    else bundle / route.strip("/") / "index.html"
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("<!doctype html>\n", encoding="utf-8")
+
+            self.assertEqual(validate_built_routes(REPO_ROOT, bundle), [])
+            self.assertTrue((bundle / "settings/llm/index.html").is_file())
+
+            foreign = bundle / "settings/users/index.html"
+            foreign.parent.mkdir(parents=True)
+            foreign.write_text("<!doctype html>\n", encoding="utf-8")
+            errors = validate_built_routes(REPO_ROOT, bundle)
+            self.assertTrue(
+                any(
+                    "/settings/users/" in error and "outside" in error
+                    for error in errors
+                ),
+                errors,
+            )
+
+    def test_built_artifact_rejects_a_missing_declared_route(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="local-artifact-") as raw:
+            bundle = Path(raw)
+            (bundle / "index.html").write_text("<!doctype html>\n", encoding="utf-8")
+            errors = validate_built_routes(REPO_ROOT, bundle)
+            self.assertTrue(
+                any("/universe/" in error and "missing" in error for error in errors),
+                errors,
+            )
 
 
 if __name__ == "__main__":

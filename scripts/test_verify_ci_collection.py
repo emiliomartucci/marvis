@@ -6,6 +6,8 @@ import shutil
 import tempfile
 import unittest
 
+import yaml
+
 from run_ci_contract import _DESELECTED_RE
 from verify_ci_collection import (
     CollectionContractError,
@@ -49,6 +51,19 @@ class CICollectionContractTests(unittest.TestCase):
         contract["primary_python"] = "3.11"
         with self.assertRaisesRegex(CollectionContractError, "Python row drift"):
             _workflow(ROOT, contract)
+
+    def test_release_ancestry_job_cannot_return_to_a_shallow_checkout(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        )
+        steps = workflow["jobs"]["python-contract"]["steps"]
+        checkout = [
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        ]
+        self.assertEqual(len(checkout), 1)
+        self.assertEqual(checkout[0].get("with", {}).get("fetch-depth"), 0)
 
     def test_desktop_release_build_cannot_leave_ci(self) -> None:
         contract = json.loads(
