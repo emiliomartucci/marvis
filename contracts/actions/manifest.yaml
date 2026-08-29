@@ -41,8 +41,9 @@ domains:
     module: core/api/use_cases/agent_tokens.py
     # Token lifecycle is HTTP-only: neither the Python MCP registrar
     # (core/api/mcp/tools/__init__.py) nor the Node MCP (core/mcp-pir) ships
-    # a token tool, so the inherited cli-mcp default would advertise four
-    # callable actions with no tool behind them. The cli-mcp:none overrides
+    # token lifecycle tools, so the inherited cli-mcp default would advertise
+    # four callable actions with no tool behind them. The route-confined graph
+    # credential is the only action registered on that surface. The overrides
     # are enforced by tests/contracts/test_actions_manifest.py.
     actions:
       - id: marvis.agent_tokens.create
@@ -65,6 +66,9 @@ domains:
         mutating: true
         availability:
           cli-mcp: none
+      - id: marvis.agent_tokens.mint_graph_ingest_token
+        callable: mint_graph_ingest_token
+        mutating: true
     internal:
       - hash_token
   audit:

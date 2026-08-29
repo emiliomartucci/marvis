@@ -52,15 +52,27 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-release.lock
 
+      - name: Install the immutable release gate
+        run: pip install --require-hashes -r requirements-release.lock
+
+      - name: Classify the reviewed candidate state
+        id: candidate
+        run: |
+          set -euo pipefail
+          status="$(python scripts/release_candidate.py state | python -c 'import json, sys; print(json.load(sys.stdin)["status"])')"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
       - name: Validate release-only source and immutable inputs
         run: |
           set -euo pipefail
-          pip install --require-hashes -r requirements-release.lock
           python scripts/test_release_candidate.py
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "${{ steps.candidate.outputs.status }}" == "active" && "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
             python scripts/release_candidate.py static --tag-build --trigger-ref "$GITHUB_REF"
-          else
+          elif [[ "${{ steps.candidate.outputs.status }}" == "active" ]]; then
             python scripts/release_candidate.py static
+          elif [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+            echo "::error::The release candidate is invalidated; only pull-request validation may stop before build."
+            exit 1
           fi
           python scripts/validate_surfaces.py
           python scripts/validate_local_surfaces.py
@@ -68,7 +80,7 @@ jobs:
           python scripts/verify_public_claims.py
 
       - name: Run the live pre-tag preflight before the expensive build
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+        if: ${{ steps.candidate.outputs.status == 'active' && github.event_name == 'workflow_dispatch' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -77,7 +89,7 @@ jobs:
             > release-artifact/dispatch-preflight.json
 
       - name: Recheck the tagged namespace before the expensive build
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ steps.candidate.outputs.status == 'active' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -86,6 +98,7 @@ jobs:
             > release-artifact/tag-preflight.json
 
       - name: Build the local GUI from a digest-pinned image
+        if: ${{ steps.candidate.outputs.status == 'active' }}
         run: |
           set -euo pipefail
           desktop_source_sha="$(git rev-parse HEAD)"
@@ -108,9 +121,11 @@ jobs:
           cp -a apps/desktop-ui/out/. core/api/console_dist/
 
       - name: Fail if a foreign route reached the local artifact
+        if: ${{ steps.candidate.outputs.status == 'active' }}
         run: python scripts/validate_local_surfaces.py --bundle core/api/console_dist
 
       - name: Build one wheel and one source archive
+        if: ${{ steps.candidate.outputs.status == 'active' }}
         run: |
           set -euo pipefail
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
@@ -119,6 +134,7 @@ jobs:
             --outdir release-artifact/packages
 
       - name: Verify packaged claims, completeness and clean install
+        if: ${{ steps.candidate.outputs.status == 'active' }}
         run: |
           set -euo pipefail
           WHEEL="$(find release-artifact/packages -maxdepth 1 -type f -name '*.whl' -print)"
@@ -165,6 +181,7 @@ jobs:
           )
 
       - name: Create and re-read the immutable artifact manifest
+        if: ${{ steps.candidate.outputs.status == 'active' }}
         run: |
           set -euo pipefail
           candidate_version="$(python -c \
@@ -185,6 +202,7 @@ jobs:
             --dist release-artifact/packages
 
       - name: Upload the only candidate artifact
+        if: ${{ steps.candidate.outputs.status == 'active' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: immutable-release-candidate

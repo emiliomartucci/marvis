@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from . import (
     admin_access,
+    agent_tokens,
     confidential,
     agent_onboarding,
     brain,
@@ -60,6 +61,7 @@ except ImportError:
 #: group is one import + one entry, never an edit to the server wiring.
 REGISTRARS = (
     admin_access.register,
+    agent_tokens.register,
     confidential.register,
     tasks.register,
     teams.register,

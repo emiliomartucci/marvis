@@ -4,13 +4,14 @@ The raw bearer value exists only in the return value of ``create_token``. The
 database stores its SHA-256 digest plus explicit principal, workspace, scope,
 expiry, rotation, acknowledgement, and revocation state.
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import secrets
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -30,9 +31,13 @@ from core.api.use_cases._errors import (
     ValidationError,
 )
 
-
 _TOKEN_BYTES = 32
 _DEFAULT_ROTATION_OVERLAP_MINUTES = 60
+GRAPH_INGEST_SCOPE = "graph:ingest"
+GRAPH_INGEST_TOKEN_ID_PREFIX = "grf_"
+GRAPH_INGEST_LOCAL_TOKEN_ID_PREFIX = "grf_local_"
+_GRAPH_INGEST_LABEL = "graph-ingest"
+_GRAPH_INGEST_LIFETIME_HOURS = 1
 _SELECT_FIELDS = (
     "id, agent_name, token_hash, scopes, is_active, created_at, last_used_at, "
     "workspace_id, principal_id, principal_type, label, issued_at, expires_at, "
@@ -98,8 +103,7 @@ async def _fetch_token(
     workspace_id: str,
 ) -> aiosqlite.Row | None:
     cursor = await db.execute(
-        f"SELECT {_SELECT_FIELDS} FROM agent_tokens "
-        "WHERE id = ? AND workspace_id = ?",
+        f"SELECT {_SELECT_FIELDS} FROM agent_tokens WHERE id = ? AND workspace_id = ?",
         (token_id, workspace_id),
     )
     return await cursor.fetchone()
@@ -123,6 +127,148 @@ async def _resolve_principal(
             message="The token principal is not available in this workspace.",
         )
     return rows[0]
+
+
+async def _resolve_principal_id(
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
+    principal_id: str,
+) -> aiosqlite.Row:
+    cursor = await db.execute(
+        "SELECT id, slug, type, system_role, auth_provider FROM users "
+        "WHERE id = ? AND deleted_at IS NULL AND workspace_id = ?",
+        (principal_id, workspace_id),
+    )
+    rows = await cursor.fetchall()
+    if len(rows) != 1:
+        raise NotFoundError(
+            code="token_principal_not_found",
+            message="The token principal is not available in this workspace.",
+        )
+    return rows[0]
+
+
+async def _resolve_graph_ingest_principal(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
+) -> aiosqlite.Row:
+    """Resolve a person or materialize one supported MCP service identity."""
+    is_service_caller = (
+        ctx.user_type == "agent" and not ctx.is_human_session and bool(ctx.username)
+    )
+    if not is_service_caller:
+        return await _resolve_principal_id(
+            db,
+            workspace_id=workspace_id,
+            principal_id=ctx.user_id,
+        )
+
+    try:
+        if not db.in_transaction:
+            await db.execute("BEGIN IMMEDIATE")
+        try:
+            principal = await _resolve_principal_id(
+                db,
+                workspace_id=workspace_id,
+                principal_id=ctx.user_id,
+            )
+        except NotFoundError:
+            principal = None
+
+        slug = (
+            "local"
+            if ctx.is_local_os_account
+            else "mcp-"
+            + hashlib.sha256(f"{workspace_id}\0{ctx.user_id}".encode()).hexdigest()[:24]
+        )
+        if principal is None:
+            await db.execute(
+                "INSERT INTO users "
+                "(id, slug, display_name, type, system_role, auth_provider, "
+                "workspace_id) VALUES (?, ?, ?, 'agent', ?, 'mcp_service', ?)",
+                (
+                    ctx.user_id,
+                    slug,
+                    ctx.username,
+                    ctx.system_role,
+                    workspace_id,
+                ),
+            )
+        elif ctx.is_local_os_account:
+            if principal["slug"] != "local" or principal["type"] not in {
+                "human",
+                "agent",
+            }:
+                raise ConflictError(
+                    code="token_principal_conflict",
+                    message="The local MCP principal conflicts with an existing identity.",
+                )
+        elif principal["auth_provider"] == "mcp_service":
+            if principal["slug"] != slug or principal["type"] != "agent":
+                raise ConflictError(
+                    code="token_principal_conflict",
+                    message="The MCP service principal conflicts with an existing identity.",
+                )
+            await db.execute(
+                "UPDATE users SET system_role = ?, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE id = ? AND workspace_id = ? AND auth_provider = 'mcp_service'",
+                (ctx.system_role, ctx.user_id, workspace_id),
+            )
+        elif (
+            principal["type"] != ctx.user_type
+            or principal["system_role"] != ctx.system_role
+        ):
+            raise ConflictError(
+                code="token_principal_conflict",
+                message="The MCP caller conflicts with an existing principal.",
+            )
+
+        principal = await _resolve_principal_id(
+            db,
+            workspace_id=workspace_id,
+            principal_id=ctx.user_id,
+        )
+        if ctx.is_local_os_account:
+            readback_valid = principal["slug"] == "local" and principal["type"] in {
+                "human",
+                "agent",
+            }
+        elif principal["auth_provider"] == "mcp_service":
+            readback_valid = (
+                principal["slug"] == slug
+                and principal["type"] == "agent"
+                and principal["system_role"] == ctx.system_role
+            )
+        else:
+            readback_valid = (
+                principal["type"] == ctx.user_type
+                and principal["system_role"] == ctx.system_role
+            )
+        if not readback_valid:
+            raise ServiceUnavailableError(
+                code="token_principal_readback_failed",
+                message="The MCP service principal could not be confirmed.",
+            )
+        return principal
+    except ServiceError:
+        await db.rollback()
+        raise
+    except aiosqlite.IntegrityError as exc:
+        await db.rollback()
+        raise ConflictError(
+            code="token_principal_conflict",
+            message="The MCP service principal changed concurrently; retry.",
+        ) from exc
+    except aiosqlite.Error as exc:
+        await db.rollback()
+        raise ServiceUnavailableError(
+            code="token_store_unavailable",
+            message="The token store is temporarily unavailable.",
+        ) from exc
 
 
 def _bounded_lifetime(body: AgentTokenCreateRequest) -> int:
@@ -239,66 +385,24 @@ async def _prepare_rotation(
     )
 
 
-async def create_token(
+async def _issue_token(
     ctx: CallerContext,
     db: aiosqlite.Connection,
     *,
     body: AgentTokenCreateRequest,
+    principal: aiosqlite.Row,
     personal: bool,
+    token_id_prefix: str | None = None,
 ) -> AgentTokenResponse:
-    """Issue one bounded token and return its plaintext exactly once."""
+    """Persist one token through the shared lifecycle and return plaintext once."""
     from core.api.services.audit import log_audit
 
-    if not personal:
-        require_role_ctx(ctx, "admin", "super_admin")
-        if ctx.user_type != "human" or not ctx.is_human_session:
-            raise AuthorizationError(
-                code="human_session_required",
-                message="Administrative token issuance requires a human session.",
-            )
-
     workspace_id = require_workspace_ctx(ctx)
-    if personal:
-        if not ctx.is_human_session:
-            requested_scopes = set(body.scopes)
-            caller_scopes = set(ctx.scopes)
-            if not requested_scopes.issubset(caller_scopes):
-                raise AuthorizationError(
-                    code="token_scope_escalation",
-                    message=(
-                        "A bearer-authenticated principal may only issue a "
-                        "personal token with an equal or narrower scope."
-                    ),
-                )
-        if not ctx.user_id:
-            raise AuthorizationError(
-                code="token_principal_unbound",
-                message="The authenticated principal has no stable identifier.",
-            )
-        principal = await _resolve_principal(
-            db, workspace_id=workspace_id, slug=ctx.username
-        )
-        if principal["id"] != ctx.user_id:
-            raise AuthorizationError(
-                code="token_principal_mismatch",
-                message="The authenticated principal no longer matches the workspace record.",
-            )
-        label = body.agent_name
-    else:
-        principal = await _resolve_principal(
-            db, workspace_id=workspace_id, slug=body.agent_name
-        )
-        if (principal["type"] or "human") != "agent":
-            raise ValidationError(
-                code="agent_principal_required",
-                message="Administrative agent tokens can only target an agent principal.",
-            )
-        label = body.agent_name
 
     now = _now()
     expiry = now + timedelta(hours=_bounded_lifetime(body))
-    token_id_prefix = "pat_" if personal else "agt_tok_"
-    token_id = f"{token_id_prefix}{uuid.uuid4().hex[:16]}"
+    resolved_prefix = token_id_prefix or ("pat_" if personal else "agt_tok_")
+    token_id = f"{resolved_prefix}{uuid.uuid4().hex[:16]}"
     raw_token = secrets.token_urlsafe(_TOKEN_BYTES)
     token_hash = hash_token(raw_token)
 
@@ -335,7 +439,7 @@ async def create_token(
                 workspace_id,
                 principal["id"],
                 principal["type"] or "human",
-                label,
+                body.agent_name,
                 now.isoformat(),
                 expiry.isoformat(),
                 family_id,
@@ -391,6 +495,103 @@ async def create_token(
         # audit failures from leaving an issuable credential in an open transaction.
         await db.rollback()
         raise
+
+
+async def create_token(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+    *,
+    body: AgentTokenCreateRequest,
+    personal: bool,
+) -> AgentTokenResponse:
+    """Issue one bounded token and return its plaintext exactly once."""
+    if not personal:
+        require_role_ctx(ctx, "admin", "super_admin")
+        if ctx.user_type != "human" or not ctx.is_human_session:
+            raise AuthorizationError(
+                code="human_session_required",
+                message="Administrative token issuance requires a human session.",
+            )
+
+    workspace_id = require_workspace_ctx(ctx)
+    if personal:
+        if not ctx.is_human_session:
+            requested_scopes = set(body.scopes)
+            caller_scopes = set(ctx.scopes)
+            if not requested_scopes.issubset(caller_scopes):
+                raise AuthorizationError(
+                    code="token_scope_escalation",
+                    message=(
+                        "A bearer-authenticated principal may only issue a "
+                        "personal token with an equal or narrower scope."
+                    ),
+                )
+        if not ctx.user_id:
+            raise AuthorizationError(
+                code="token_principal_unbound",
+                message="The authenticated principal has no stable identifier.",
+            )
+        principal = await _resolve_principal(
+            db, workspace_id=workspace_id, slug=ctx.username
+        )
+        if principal["id"] != ctx.user_id:
+            raise AuthorizationError(
+                code="token_principal_mismatch",
+                message="The authenticated principal no longer matches the workspace record.",
+            )
+    else:
+        principal = await _resolve_principal(
+            db, workspace_id=workspace_id, slug=body.agent_name
+        )
+        if (principal["type"] or "human") != "agent":
+            raise ValidationError(
+                code="agent_principal_required",
+                message="Administrative agent tokens can only target an agent principal.",
+            )
+
+    return await _issue_token(
+        ctx,
+        db,
+        body=body,
+        principal=principal,
+        personal=personal,
+    )
+
+
+async def mint_graph_ingest_token(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+) -> AgentTokenResponse:
+    """Mint a caller-bound, one-hour credential for graph ingest only."""
+    require_role_ctx(ctx, "operator")
+    workspace_id = require_workspace_ctx(ctx)
+    if not ctx.user_id:
+        raise AuthorizationError(
+            code="token_principal_unbound",
+            message="The authenticated principal has no stable identifier.",
+        )
+    principal = await _resolve_graph_ingest_principal(
+        ctx,
+        db,
+        workspace_id=workspace_id,
+    )
+    body = AgentTokenCreateRequest(
+        agent_name=_GRAPH_INGEST_LABEL,
+        scopes=[GRAPH_INGEST_SCOPE],
+        expires_in_hours=_GRAPH_INGEST_LIFETIME_HOURS,
+    )
+    return await _issue_token(
+        ctx,
+        db,
+        body=body,
+        principal=principal,
+        personal=True,
+        token_id_prefix=(
+            GRAPH_INGEST_LOCAL_TOKEN_ID_PREFIX
+            if ctx.is_local_os_account
+            else GRAPH_INGEST_TOKEN_ID_PREFIX
+        ),
+    )
 
 
 async def list_tokens(
@@ -561,7 +762,10 @@ async def acknowledge_rotation(
                     message="The token lifecycle changed concurrently; retry from current state.",
                 )
             revalidated_at = _now()
-            if expires_at <= revalidated_at or acknowledgement_deadline <= revalidated_at:
+            if (
+                expires_at <= revalidated_at
+                or acknowledgement_deadline <= revalidated_at
+            ):
                 raise NotFoundError(
                     code="rotation_not_found",
                     message="No acknowledgable rotation exists for this token.",
@@ -614,9 +818,13 @@ async def acknowledge_rotation(
 
 
 __all__ = [
+    "GRAPH_INGEST_LOCAL_TOKEN_ID_PREFIX",
+    "GRAPH_INGEST_SCOPE",
+    "GRAPH_INGEST_TOKEN_ID_PREFIX",
     "acknowledge_rotation",
     "create_token",
     "hash_token",
     "list_tokens",
+    "mint_graph_ingest_token",
     "revoke_token",
 ]

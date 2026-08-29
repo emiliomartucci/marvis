@@ -165,6 +165,7 @@
     {"name": "get_project_lifecycle", "evidence": ["core/api/mcp/tools/projects.py::get_project_lifecycle"]},
     {"name": "get_project_lifecycle_operation", "evidence": ["core/api/mcp/tools/projects.py::get_project_lifecycle_operation"]},
     {"name": "list_historical_pointers", "evidence": ["core/api/mcp/tools/projects.py::list_historical_pointers"]},
+    {"name": "mint_graph_ingest_token", "evidence": ["core/api/mcp/tools/agent_tokens.py::mint_graph_ingest_token"]},
     {"name": "register_project_lifecycle", "evidence": ["core/api/mcp/tools/projects.py::register_project_lifecycle"]},
     {"name": "supersede_governed_decision", "evidence": ["core/api/mcp/tools/projects.py::supersede_governed_decision"]},
     {"name": "update_project_selector_watermark", "evidence": ["core/api/mcp/tools/projects.py::update_project_selector_watermark"]}

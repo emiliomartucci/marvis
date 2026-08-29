@@ -2,8 +2,8 @@
   "consumer_base_ref": "6e2bf38dee96465cb4973411ebcfed24fe70befa",
   "generated_from": "core.api.mcp.server:mcp.list_tools",
   "schema": "marvis-mcp-tool-inventory/v1",
-  "source_ref": "962e0fa6bb15ca71e3b20e9c99636aa93c631271",
-  "tool_count": 129,
+  "source_ref": "64e96cb7e90292816296750906db68ec81c4a37e",
+  "tool_count": 130,
   "tools": [
     "accept_governed_decision",
     "ack_notification",
@@ -97,6 +97,7 @@
     "list_user_requests",
     "mark_confidential",
     "memory_feedback",
+    "mint_graph_ingest_token",
     "onboarding_answer",
     "onboarding_status",
     "patch_ingest_pending",
