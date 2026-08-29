@@ -3,7 +3,14 @@
   "package": "marvisx-cli",
   "repository": "emiliomartucci/marvis",
   "release_branch": "main",
-  "plan_b_product_base_sha": "82b1fff8cbd4c8641faff2de6353ada5f4973b82",
+  "plan_b_product_base_sha": "c1a4790100e228a8588e049fbd31233c6da73f88",
+  "shared_source": {
+    "repository": "emiliomartucci/marvisx",
+    "pull_request": 314,
+    "candidate_sha": "6c25bebde4d8feee6455994aeca37afc41da4a78",
+    "merge_sha": "962e0fa6bb15ca71e3b20e9c99636aa93c631271",
+    "engine_pin": "contracts/engine-pin.yaml"
+  },
   "candidate_version": "0.4.1",
   "candidate_tag": "v0.4.1",
   "historical_failed_version": "0.4.0",
@@ -32,25 +39,20 @@
     "owner": "emiliomartucci",
     "repository": "marvis",
     "workflow": "release.yml",
-    "environment": "pypi",
-    "readback": {
-      "status": "owner_readback_required",
-      "verified_at": null,
-      "verified_by": null,
-      "coordinates_sha256": null
-    }
+    "environment": "pypi"
   },
   "approval_watchdog": {
-    "status": "external_monitor_required",
-    "receipt_ref": null,
-    "verified_at": null,
-    "verified_by": null,
     "repository": "emiliomartucci/marvis",
     "workflow": "release.yml",
     "environment": "pypi",
     "candidate_tag": "v0.4.1",
     "approval_deadline_hours": 24,
     "late_approval_upload_guard": true
+  },
+  "external_receipts": {
+    "trusted_publisher_variable": "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT",
+    "approval_watchdog_variable": "MARVIS_APPROVAL_WATCHDOG_RECEIPT",
+    "schema": "marvis-external-release-receipt/v1"
   },
   "build": {
     "python": "3.13",

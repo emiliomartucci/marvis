@@ -17,10 +17,23 @@ The GitHub `pypi` environment readback showed:
 - `can_admins_bypass=false`;
 - no deployment-branch policy.
 
-Two external gates remain deliberately open in the source policy:
+Two external gates remain deliberately open outside the source policy:
 
 - owner readback of the exact PyPI Trusted Publisher coordinates;
 - a ready approval-watchdog receipt for the bounded 24-hour window.
+
+The candidate cannot assert either fact about itself. Fresh signed JSON
+receipts must be provided through the repository Actions variables
+`MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT` and
+`MARVIS_APPROVAL_WATCHDOG_RECEIPT`; the source policy contains only their
+schema and expected coordinates. The tag path also requires a successful,
+fresh `workflow_dispatch` preflight for the exact release SHA and binds that
+run into the artifact manifest.
+
+The projected shared source is MarvisX PR `#314`, candidate
+`6c25bebde4d8feee6455994aeca37afc41da4a78`, merge
+`962e0fa6bb15ca71e3b20e9c99636aa93c631271`, cross-checked against
+`contracts/engine-pin.yaml` and the live GitHub PR readback.
 
 No tag, release, upload, publication or workflow dispatch was created while
 capturing this snapshot.

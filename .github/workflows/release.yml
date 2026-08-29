@@ -1,7 +1,7 @@
 name: Immutable PyPI release
 
 # Pull requests exercise the exact build path without publishing. A version tag
-# reuses that artifact, creates a draft GitHub Release, waits for the protected
+# builds once and promotes that artifact, creates a draft GitHub Release, waits for the protected
 # `pypi` environment, then revalidates the 24-hour publication window before
 # requesting a short-lived PyPI OIDC token. Nothing is rebuilt after approval.
 
@@ -23,6 +23,7 @@ on:
     tags: ["v*"]
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -34,6 +35,9 @@ jobs:
     name: Build and verify one immutable candidate
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT: ${{ vars.MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT }}
+      MARVIS_APPROVAL_WATCHDOG_RECEIPT: ${{ vars.MARVIS_APPROVAL_WATCHDOG_RECEIPT }}
     steps:
       - name: Check out the reviewed source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -53,7 +57,7 @@ jobs:
           set -euo pipefail
           pip install --require-hashes -r requirements-release.lock
           python scripts/test_release_candidate.py
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
             python scripts/release_candidate.py static --tag-build --trigger-ref "$GITHUB_REF"
           else
             python scripts/release_candidate.py static
@@ -67,13 +71,19 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python scripts/release_candidate.py preflight
+        run: |
+          mkdir -p release-artifact
+          python scripts/release_candidate.py preflight \
+            > release-artifact/dispatch-preflight.json
 
       - name: Recheck the tagged namespace before the expensive build
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python scripts/release_candidate.py tag-preflight
+        run: |
+          mkdir -p release-artifact
+          python scripts/release_candidate.py tag-preflight \
+            > release-artifact/tag-preflight.json
 
       - name: Build the local GUI from a digest-pinned image
         run: |
@@ -81,7 +91,6 @@ jobs:
           desktop_source_sha="$(git rev-parse HEAD)"
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           export SOURCE_DATE_EPOCH
-          desktop_source_sha="$(git rev-parse HEAD)"
           docker run --rm \
             -v "$PWD:/repo" \
             -w /repo/apps/desktop-ui \
@@ -140,7 +149,6 @@ jobs:
 
           WORK="$(mktemp -d)"
           trap 'rm -rf "$WORK"' EXIT
-          export PIP_CACHE_DIR="$RUNNER_TEMP/marvis-release-pip-cache"
           export PIP_DISABLE_PIP_VERSION_CHECK=1
           python -m venv "$WORK/wheel-venv"
           "$WORK/wheel-venv/bin/pip" install --quiet --no-cache-dir "$WHEEL"
@@ -166,10 +174,19 @@ jobs:
       - name: Create and re-read the immutable artifact manifest
         run: |
           set -euo pipefail
-          python scripts/release_candidate.py manifest \
-            --dist release-artifact/packages \
-            --output release-artifact/release-manifest.json \
+          candidate_version="$(python -c \
+            'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          cp "docs/releases/${candidate_version}.md" \
+            release-artifact/release-notes.md
+          manifest_args=(
+            --dist release-artifact/packages
+            --output release-artifact/release-manifest.json
             --source-sha "$(git rev-parse HEAD)"
+          )
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
+            manifest_args+=(--dispatch-proof release-artifact/tag-preflight.json)
+          fi
+          python scripts/release_candidate.py manifest "${manifest_args[@]}"
           python scripts/release_candidate.py verify \
             --manifest release-artifact/release-manifest.json \
             --dist release-artifact/packages
@@ -184,7 +201,7 @@ jobs:
 
   release-record:
     name: Create a contained draft release
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -192,21 +209,11 @@ jobs:
       actions: read
       contents: write
     steps:
-      - name: Check out the tagged source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 0
       - name: Download the exact candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: immutable-release-candidate
           path: release-artifact
-      - name: Re-read the manifest before creating a draft
-        run: |
-          set -euo pipefail
-          python scripts/release_candidate.py verify \
-            --manifest release-artifact/release-manifest.json \
-            --dist release-artifact/packages
       - name: Create a draft and upload only manifested files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -221,30 +228,37 @@ jobs:
             --draft \
             --prerelease \
             --title "$TAG release candidate" \
-            --notes-file "docs/releases/${TAG#v}.md"
+            --notes-file release-artifact/release-notes.md
 
-  pypi:
-    name: Approve and publish the unchanged candidate
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+  prepublish:
+    name: Revalidate before the protected publisher
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     needs: [build, release-record]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: pypi
+    timeout-minutes: 10
     permissions:
       actions: read
       contents: read
-      id-token: write
+    env:
+      MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT: ${{ vars.MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT }}
+      MARVIS_APPROVAL_WATCHDOG_RECEIPT: ${{ vars.MARVIS_APPROVAL_WATCHDOG_RECEIPT }}
     steps:
-      - name: Check out the tagged source
+      - name: Check out the tagged source read-only
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
+      - name: Set up pinned Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13"
+      - name: Install the hash-closed release verifier
+        run: pip install --require-hashes -r requirements-release.lock
       - name: Download the exact candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: immutable-release-candidate
           path: release-artifact
-      - name: Revalidate external gates after approval
+      - name: Revalidate all external gates before approval
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -253,6 +267,106 @@ jobs:
           python scripts/release_candidate.py publish-window \
             --manifest release-artifact/release-manifest.json \
             --dist release-artifact/packages
+
+  pypi:
+    name: Approve and publish the unchanged candidate
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [build, release-record, prepublish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Download the exact candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: immutable-release-candidate
+          path: release-artifact
+      - name: Minimal post-approval readback without candidate execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > release-artifact/run-readback.json
+          gh api "repos/${GITHUB_REPOSITORY}/environments/pypi" \
+            > release-artifact/environment-readback.json
+          remote_tag_sha="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}" --jq .sha)"
+          test "$remote_tag_sha" = "$GITHUB_SHA"
+          release_state="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+            --jq '[.draft,.prerelease] | @tsv')"
+          test "$release_state" = $'true\ttrue'
+          python - \
+            release-artifact/release-manifest.json \
+            release-artifact/run-readback.json \
+            release-artifact/environment-readback.json \
+            release-artifact/packages <<'PY'
+          from datetime import datetime, timezone
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          manifest_path, run_path, environment_path, packages_path = map(Path, sys.argv[1:])
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          claimed = manifest.pop("content_digest")
+          canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+          assert claimed == hashlib.sha256(canonical).hexdigest()
+          assert manifest["release_source_sha"] == os.environ["GITHUB_SHA"]
+          assert manifest["tag"] == os.environ["GITHUB_REF_NAME"]
+          assert manifest["dispatch_preflight"]["head_sha"] == os.environ["GITHUB_SHA"]
+          receipts = manifest["release_controls"]["external_receipts"]
+          assert receipts and set(receipts) == {"trusted_publisher", "approval_watchdog"}
+          now = datetime.now(timezone.utc)
+          hours = int(manifest["release_controls"]["approval_deadline_hours"])
+          for receipt in receipts.values():
+              verified = datetime.fromisoformat(receipt["verified_at"].replace("Z", "+00:00"))
+              assert 0 <= (now - verified).total_seconds() <= hours * 3600
+
+          run = json.loads(run_path.read_text(encoding="utf-8"))
+          assert run["head_sha"] == os.environ["GITHUB_SHA"]
+          assert run["event"] == "push"
+          assert run["head_branch"] == os.environ["GITHUB_REF_NAME"]
+          assert run["path"] == ".github/workflows/release.yml"
+          created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+          assert 0 <= (now - created).total_seconds() <= hours * 3600
+
+          expected_environment = manifest["release_controls"]["github_environment"]
+          environment = json.loads(environment_path.read_text(encoding="utf-8"))
+          assert environment["can_admins_bypass"] is expected_environment["can_admins_bypass"]
+          assert environment.get("deployment_branch_policy") == expected_environment["deployment_branch_policy"]
+          reviewer_rules = [
+              rule for rule in environment["protection_rules"]
+              if rule.get("type") == "required_reviewers"
+          ]
+          assert len(reviewer_rules) == 1
+          rule = reviewer_rules[0]
+          assert rule["prevent_self_review"] is expected_environment["prevent_self_review"]
+          logins = {
+              item["reviewer"]["login"] for item in rule["reviewers"]
+          }
+          assert logins == {expected_environment["required_reviewer_login"]}
+
+          expected_files = {row["filename"]: row for row in manifest["artifacts"]}
+          observed_files = {path.name: path for path in packages_path.iterdir() if path.is_file()}
+          assert set(observed_files) == set(expected_files)
+          for name, path in observed_files.items():
+              raw = path.read_bytes()
+              assert len(raw) == expected_files[name]["size"]
+              assert hashlib.sha256(raw).hexdigest() == expected_files[name]["sha256"]
+          PY
+          if curl --silent --show-error --fail \
+            "https://pypi.org/pypi/marvisx-cli/${GITHUB_REF_NAME#v}/json" \
+            >/dev/null 2>&1; then
+            echo "::error::Candidate version appeared on PyPI before upload."
+            exit 1
+          fi
       - name: Publish to PyPI with a short-lived identity
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
@@ -262,13 +376,16 @@ jobs:
 
   accept:
     name: Verify registry bytes and reversible package upgrade
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     needs: pypi
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       actions: read
-      contents: write
+      contents: read
+    env:
+      MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT: ${{ vars.MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT }}
+      MARVIS_APPROVAL_WATCHDOG_RECEIPT: ${{ vars.MARVIS_APPROVAL_WATCHDOG_RECEIPT }}
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -370,8 +487,9 @@ jobs:
             )
 
             if [[ "$label" == "wheel" ]]; then
-              "$python_bin" scripts/verify_local_upgrade.py \
-                --download \
+              "$python_bin" "$GITHUB_WORKSPACE/scripts/release_candidate.py" \
+                --root "$GITHUB_WORKSPACE" \
+                installed-upgrade \
                 --version 0.3.8 \
                 --evidence-dir "$WORK/recovery-evidence"
             fi
@@ -388,17 +506,41 @@ jobs:
             --github-dist gh-release-readback \
             --output release-acceptance.json \
             --run-id "$GITHUB_RUN_ID"
-          gh release upload "$GITHUB_REF_NAME" release-acceptance.json
-          mkdir acceptance-readback
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern release-acceptance.json \
-            --dir acceptance-readback
-          cmp release-acceptance.json acceptance-readback/release-acceptance.json
-      - name: Finalize the verified GitHub Release
+      - name: Upload the read-only acceptance receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: immutable-release-acceptance
+          path: release-acceptance.json
+          if-no-files-found: error
+          retention-days: 30
+
+  finalize:
+    name: Publish acceptance evidence and finalize
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [build, accept]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download the acceptance receipt only
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: immutable-release-acceptance
+          path: acceptance
+      - name: Publish, read back and finalize the verified GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" acceptance/release-acceptance.json
+          mkdir acceptance-readback
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern release-acceptance.json \
+            --dir acceptance-readback
+          cmp acceptance/release-acceptance.json \
+            acceptance-readback/release-acceptance.json
           gh release edit "$GITHUB_REF_NAME" \
             --draft=false \
             --prerelease=false \
@@ -407,8 +549,8 @@ jobs:
 
   contain:
     name: Contain a failed tagged release
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && (needs.build.result != 'success' || needs.release-record.result != 'success' || needs.pypi.result != 'success' || needs.accept.result != 'success') }}
-    needs: [build, release-record, pypi, accept]
+    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && (needs.build.result != 'success' || needs.release-record.result != 'success' || needs.prepublish.result != 'success' || needs.pypi.result != 'success' || needs.accept.result != 'success' || needs.finalize.result != 'success') }}
+    needs: [build, release-record, prepublish, pypi, accept, finalize]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

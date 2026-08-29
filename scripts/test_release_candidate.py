@@ -4,12 +4,18 @@ import copy
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import os
 from pathlib import Path
+import re
+import subprocess
 import tarfile
 import tempfile
+import types
 import unittest
 from unittest import mock
 import zipfile
+
+import yaml
 
 import release_candidate as candidate
 
@@ -41,14 +47,24 @@ class ReleaseCandidateTests(unittest.TestCase):
         return wheel, sdist
 
     def verified_external_policy(self, now: datetime) -> dict:
-        policy = self.policy()
-        policy["trusted_publisher"]["readback"] = {
+        del now
+        return self.policy()
+
+    def external_receipts(
+        self, now: datetime, policy: dict | None = None
+    ) -> tuple[dict, dict]:
+        policy = policy or self.policy()
+        trusted = {
+            "schema": candidate.EXTERNAL_RECEIPT_SCHEMA,
+            "kind": "trusted_publisher_owner_readback",
             "status": "verified",
             "verified_at": now.isoformat(),
             "verified_by": "owner",
             "coordinates_sha256": candidate.publisher_coordinates_sha256(policy),
         }
-        policy["approval_watchdog"] = {
+        watchdog = {
+            "schema": candidate.EXTERNAL_RECEIPT_SCHEMA,
+            "kind": "approval_watchdog",
             "status": "ready",
             "receipt_ref": "ledger:receipt",
             "verified_at": now.isoformat(),
@@ -60,14 +76,143 @@ class ReleaseCandidateTests(unittest.TestCase):
             "approval_deadline_hours": policy["approval_deadline_hours"],
             "late_approval_upload_guard": True,
         }
-        return policy
+        return trusted, watchdog
 
     def test_real_release_candidate_static_policy(self) -> None:
         report = candidate.validate_static(ROOT)
         self.assertEqual(report["status"], "static_green_external_gates_open")
         self.assertEqual(report["version"], "0.4.1")
         self.assertEqual(report["release_branch"], "main")
+        self.assertEqual(
+            report["product_base_sha"],
+            "c1a4790100e228a8588e049fbd31233c6da73f88",
+        )
+        self.assertEqual(
+            report["shared_source"]["candidate_sha"],
+            "6c25bebde4d8feee6455994aeca37afc41da4a78",
+        )
+        self.assertEqual(
+            report["shared_source"]["merge_sha"],
+            "962e0fa6bb15ca71e3b20e9c99636aa93c631271",
+        )
         self.assertEqual(len(report["action_pins"]), 5)
+
+    def test_mutating_workflow_jobs_are_tag_only_and_privilege_minimal(self) -> None:
+        workflow = (ROOT / candidate.WORKFLOW_PATH).read_text(encoding="utf-8")
+        parsed = yaml.safe_load(workflow)
+        guards = candidate._release_job_guards(workflow)
+        expected = "${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
+        for job in ("release-record", "prepublish", "pypi", "accept", "finalize"):
+            self.assertEqual(guards[job], expected)
+            self.assertEqual(parsed["jobs"][job]["if"], expected)
+        contain_guard = parsed["jobs"]["contain"]["if"]
+        self.assertIn("github.event_name == 'push'", contain_guard)
+        self.assertIn("startsWith(github.ref, 'refs/tags/v')", contain_guard)
+        scenarios = {
+            ("pull_request", "refs/pull/1/merge"): set(),
+            ("workflow_dispatch", "refs/heads/main"): set(),
+            ("push", "refs/tags/v0.4.1"): {
+                "release-record",
+                "prepublish",
+                "pypi",
+                "accept",
+                "finalize",
+                "contain",
+            },
+        }
+        mutating = {
+            "release-record",
+            "prepublish",
+            "pypi",
+            "accept",
+            "finalize",
+            "contain",
+        }
+        for (event, ref), expected_jobs in scenarios.items():
+            enabled = mutating if event == "push" and ref.startswith("refs/tags/v") else set()
+            self.assertEqual(enabled, expected_jobs)
+        blocks = candidate._workflow_job_blocks(workflow)
+        for job in ("release-record", "pypi", "finalize"):
+            self.assertNotIn("actions/checkout@", blocks[job])
+            self.assertNotIn("scripts/", blocks[job])
+            self.assertNotIn("pip install", blocks[job])
+        self.assertIn("contents: read", blocks["accept"])
+        self.assertNotIn("contents: write", blocks["accept"])
+
+    def test_embedded_workflow_python_is_syntax_valid(self) -> None:
+        workflow = (ROOT / candidate.WORKFLOW_PATH).read_text(encoding="utf-8")
+        bodies = re.findall(r"<<'PY'\n(?P<body>.*?)\n\s*PY(?:\n|$)", workflow, re.DOTALL)
+        self.assertGreaterEqual(len(bodies), 2)
+        for index, body in enumerate(bodies, start=1):
+            lines = body.splitlines()
+            margin = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
+            source = "\n".join(line[margin:] for line in lines)
+            compile(source, f"release.yml:python-heredoc-{index}", "exec")
+
+    def test_shared_source_readback_requires_exact_pr_candidate_and_merge(self) -> None:
+        policy = self.policy()
+        expected = policy["shared_source"]
+        pull = {
+            "state": "closed",
+            "merged_at": "2026-08-28T10:00:00Z",
+            "head": {"sha": expected["candidate_sha"]},
+            "merge_commit_sha": expected["merge_sha"],
+        }
+        with mock.patch.object(candidate, "_request_json", return_value=pull):
+            report = candidate._shared_source_readback(
+                ROOT, policy, token="masked", api_url="https://api.example"
+            )
+        self.assertEqual(report["candidate_sha"], expected["candidate_sha"])
+        self.assertEqual(report["merge_sha"], expected["merge_sha"])
+
+        pull["head"]["sha"] = "a" * 40
+        with mock.patch.object(
+            candidate, "_request_json", return_value=pull
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "identity"):
+            candidate._shared_source_readback(
+                ROOT, policy, token="masked", api_url="https://api.example"
+            )
+
+    def test_tag_requires_fresh_successful_dispatch_at_exact_sha(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        source = "a" * 40
+        run = {
+            "id": 42,
+            "run_attempt": 1,
+            "head_sha": source,
+            "event": "workflow_dispatch",
+            "conclusion": "success",
+            "head_branch": "main",
+            "path": str(candidate.WORKFLOW_PATH),
+            "head_repository": {"full_name": policy["repository"]},
+            "updated_at": (now - timedelta(minutes=5)).isoformat(),
+            "html_url": "https://github.example/runs/42",
+        }
+        with mock.patch.object(
+            candidate, "_request_json", return_value={"workflow_runs": [run]}
+        ):
+            proof = candidate._workflow_dispatch_proof(
+                policy,
+                source,
+                token="masked",
+                api_url="https://api.example",
+                now=now,
+            )
+        self.assertEqual(proof["id"], 42)
+        self.assertEqual(proof["head_sha"], source)
+
+        run["head_sha"] = "b" * 40
+        with mock.patch.object(
+            candidate, "_request_json", return_value={"workflow_runs": [run]}
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "no fresh"):
+            candidate._workflow_dispatch_proof(
+                policy,
+                source,
+                token="masked",
+                api_url="https://api.example",
+                now=now,
+            )
 
     def test_unpinned_action_is_rejected(self) -> None:
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "full commit"):
@@ -177,27 +322,49 @@ class ReleaseCandidateTests(unittest.TestCase):
             )
 
     def test_external_receipts_fail_closed(self) -> None:
-        with self.assertRaisesRegex(candidate.ReleasePolicyError, "not verified"):
+        with mock.patch.dict(candidate.os.environ, {}, clear=True), self.assertRaisesRegex(
+            candidate.ReleasePolicyError, "receipt is absent"
+        ):
             candidate._strict_external_receipts(self.policy())
 
     def test_external_receipt_expires_after_24_hours(self) -> None:
         now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
-        policy = self.verified_external_policy(now - timedelta(hours=25))
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now - timedelta(hours=25), policy)
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "stale"):
-            candidate._strict_external_receipts(policy, now=now)
+            candidate._strict_external_receipts(
+                policy,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
 
     def test_fresh_matching_external_receipts_pass(self) -> None:
         now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
-        candidate._strict_external_receipts(
-            self.verified_external_policy(now - timedelta(minutes=5)), now=now
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now - timedelta(minutes=5), policy)
+        summaries = candidate._strict_external_receipts(
+            policy,
+            now=now,
+            trusted_publisher_receipt=trusted,
+            approval_watchdog_receipt=watchdog,
+        )
+        self.assertEqual(
+            set(summaries), {"trusted_publisher", "approval_watchdog"}
         )
 
     def test_watchdog_for_another_tag_is_rejected(self) -> None:
         now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
-        policy = self.verified_external_policy(now)
-        policy["approval_watchdog"]["candidate_tag"] = "v0.4.2"
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog["candidate_tag"] = "v0.4.2"
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "coordinates"):
-            candidate._strict_external_receipts(policy, now=now)
+            candidate._strict_external_receipts(
+                policy,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
 
     def test_manifest_byte_tamper_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="release-manifest-") as raw:
@@ -270,7 +437,18 @@ class ReleaseCandidateTests(unittest.TestCase):
             github_dist = root / "github"
             self.write_release_artifacts(registry_dist)
             self.write_release_artifacts(github_dist)
-            manifest = candidate.build_manifest(ROOT, registry_dist)
+            dispatch = {
+                "id": 77,
+                "run_attempt": 1,
+                "head_sha": str(candidate._git(ROOT, "rev-parse", "HEAD")),
+                "event": "workflow_dispatch",
+                "conclusion": "success",
+            }
+            manifest = candidate.build_manifest(
+                ROOT,
+                registry_dist,
+                dispatch_preflight=dispatch,
+            )
             manifest_path = root / "release-manifest.json"
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             (github_dist / manifest_path.name).write_text(
@@ -285,7 +463,15 @@ class ReleaseCandidateTests(unittest.TestCase):
             }
             with mock.patch.object(
                 candidate, "load_policy", return_value=policy
-            ), mock.patch.object(candidate, "_strict_external_receipts"), mock.patch.object(
+            ), mock.patch.object(
+                candidate,
+                "_strict_external_receipts",
+                return_value={"trusted_publisher": {}, "approval_watchdog": {}},
+            ), mock.patch.object(
+                candidate,
+                "_shared_source_readback",
+                return_value=manifest["shared_source"],
+            ), mock.patch.object(
                 candidate, "verify_manifest"
             ), mock.patch.object(
                 candidate,
@@ -303,6 +489,8 @@ class ReleaseCandidateTests(unittest.TestCase):
                 return_value={"id": 1, "draft": True, "prerelease": True},
             ), mock.patch.object(
                 candidate, "_workflow_run_readback", return_value=run
+            ), mock.patch.object(
+                candidate, "_workflow_dispatch_proof", return_value=dispatch
             ):
                 receipt = candidate.build_acceptance_receipt(
                     ROOT,
@@ -407,7 +595,7 @@ class ReleaseCandidateTests(unittest.TestCase):
             }
             response = mock.MagicMock()
             response.__enter__.return_value = response
-            response.read.return_value = raw_artifact
+            response.read.side_effect = [raw_artifact[:3], raw_artifact[3:], b""]
             response.geturl.return_value = url
             destination = root / "download"
             with mock.patch.object(
@@ -420,6 +608,64 @@ class ReleaseCandidateTests(unittest.TestCase):
                 )
             self.assertEqual(report["status"], "registry_downloaded")
             self.assertEqual((destination / "a.whl").read_bytes(), raw_artifact)
+
+    def test_registry_download_failure_removes_partial_and_final_files(self) -> None:
+        expected = b"payload"
+        sha256 = candidate._sha_bytes(expected)
+        url = "https://files.pythonhosted.org/packages/a/a.whl"
+        cases = {
+            "oversized": [expected + b"x"],
+            "short": [expected[:-1], b""],
+            "checksum": [b"PAYLOAD", b""],
+            "midstream": [expected[:3], OSError("connection reset")],
+        }
+        for label, chunks in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory(
+                prefix=f"registry-{label}-"
+            ) as raw:
+                root = Path(raw)
+                manifest_path = root / "manifest.json"
+                self.write_manifest(
+                    manifest_path,
+                    package="marvisx-cli",
+                    version="0.4.1",
+                    artifacts=[
+                        {
+                            "filename": "a.whl",
+                            "size": len(expected),
+                            "sha256": sha256,
+                        }
+                    ],
+                )
+                payload = {
+                    "info": {"name": "marvisx-cli", "version": "0.4.1"},
+                    "urls": [
+                        {
+                            "filename": "a.whl",
+                            "size": len(expected),
+                            "digests": {"sha256": sha256},
+                            "yanked": False,
+                            "url": url,
+                        }
+                    ],
+                }
+                response = mock.MagicMock()
+                response.__enter__.return_value = response
+                response.read.side_effect = chunks
+                response.geturl.return_value = url
+                destination = root / "download"
+                with mock.patch.object(
+                    candidate, "_request_json", return_value=payload
+                ), mock.patch.object(
+                    candidate.urllib.request, "urlopen", return_value=response
+                ), self.assertRaises((candidate.ReleasePolicyError, OSError)):
+                    candidate.registry_download(
+                        manifest_path,
+                        destination,
+                        attempts=1,
+                        delay_seconds=0,
+                    )
+                self.assertEqual(list(destination.iterdir()), [])
 
     def test_registry_download_rejects_off_host_url(self) -> None:
         raw_artifact = b"payload"
@@ -453,6 +699,92 @@ class ReleaseCandidateTests(unittest.TestCase):
                         manifest_path, root / "download", attempts=1, delay_seconds=0
                     )
 
+    def test_installed_upgrade_wrapper_excludes_checkout_product_imports(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="installed-candidate-") as raw:
+            installed = Path(raw) / "site-packages"
+            (installed / "migrations").mkdir(parents=True)
+            (installed / "core/api").mkdir(parents=True)
+            (installed / "core/api/__init__.py").write_text(
+                "ORIGIN = 'installed'\n", encoding="utf-8"
+            )
+
+            prior = types.SimpleNamespace(version="0.3.8")
+            verifier = types.SimpleNamespace()
+            verifier.UpgradeVerificationError = RuntimeError
+            verifier._load_contract = lambda _path: [prior]
+            verifier._download = lambda _prior, directory: directory / "prior.whl"
+
+            def verify_upgrade(root, _artifact, _prior, *, evidence_dir):
+                import core.api
+
+                self.assertEqual(core.api.ORIGIN, "installed")
+                self.assertEqual(root, installed.resolve())
+                self.assertIsNotNone(evidence_dir)
+                return {"rollback_status": "rolled_back"}
+
+            verifier.verify_upgrade = verify_upgrade
+            loader = types.SimpleNamespace(exec_module=lambda _module: None)
+            spec = types.SimpleNamespace(name="_test_upgrade_verifier", loader=loader)
+
+            class Distribution:
+                version = "0.4.1"
+
+                @staticmethod
+                def locate_file(_value):
+                    return installed
+
+            for name in [
+                module_name
+                for module_name in list(candidate.sys.modules)
+                if module_name == "core" or module_name.startswith("core.")
+            ]:
+                candidate.sys.modules.pop(name, None)
+            with mock.patch.object(
+                candidate.importlib.metadata,
+                "distribution",
+                return_value=Distribution(),
+            ), mock.patch.object(
+                candidate.importlib.util,
+                "spec_from_file_location",
+                return_value=spec,
+            ), mock.patch.object(
+                candidate.importlib.util,
+                "module_from_spec",
+                return_value=verifier,
+            ):
+                report = candidate.verify_installed_upgrade(
+                    ROOT,
+                    version="0.3.8",
+                    evidence_dir=Path(raw) / "evidence",
+                )
+            self.assertEqual(report["candidate_import_origin"], "installed_distribution")
+            self.assertEqual(report["candidate_distribution_version"], "0.4.1")
+
+    def test_release_entrypoint_does_not_import_build_only_packaging_eagerly(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="blocked-packaging-") as raw:
+            blocked = Path(raw) / "packaging"
+            blocked.mkdir()
+            (blocked / "__init__.py").write_text(
+                "raise AssertionError('packaging imported eagerly')\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(Path(raw))
+            result = subprocess.run(
+                [
+                    candidate.sys.executable,
+                    str(ROOT / "scripts/release_candidate.py"),
+                    "--help",
+                ],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("packaging imported eagerly", result.stderr)
+
     def test_pretag_rejects_remote_tag_on_another_commit(self) -> None:
         policy = self.policy()
         reviewed = "a" * 40
@@ -462,6 +794,10 @@ class ReleaseCandidateTests(unittest.TestCase):
             return_value={"release_source_sha": reviewed},
         ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
             candidate, "_strict_external_receipts"
+        ), mock.patch.object(
+            candidate,
+            "_shared_source_readback",
+            return_value=candidate._shared_source_coordinates(ROOT, policy),
         ), mock.patch.object(
             candidate, "_require_release_controls_committed"
         ), mock.patch.object(
@@ -481,6 +817,14 @@ class ReleaseCandidateTests(unittest.TestCase):
             return_value={"release_source_sha": reviewed},
         ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
             candidate, "_strict_external_receipts"
+        ), mock.patch.object(
+            candidate,
+            "_shared_source_readback",
+            return_value=candidate._shared_source_coordinates(ROOT, policy),
+        ), mock.patch.object(
+            candidate,
+            "_workflow_dispatch_proof",
+            return_value={"id": 1, "run_attempt": 1, "head_sha": reviewed},
         ), mock.patch.object(
             candidate, "_require_release_controls_committed"
         ), mock.patch.object(
@@ -510,18 +854,21 @@ class ReleaseCandidateTests(unittest.TestCase):
         ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
             candidate, "_strict_external_receipts"
         ), mock.patch.object(
+            candidate,
+            "_shared_source_readback",
+            return_value=candidate._shared_source_coordinates(ROOT, policy),
+        ), mock.patch.object(
             candidate, "_require_release_controls_committed"
         ), mock.patch.object(
             candidate, "_environment_check", return_value={"name": "pypi"}
         ), mock.patch.object(
-            candidate, "_require_remote_release_source", return_value="b" * 40
-        ), mock.patch.object(
-            candidate, "_registry_history_check", return_value={"info": {"version": "0.3.8"}}
+            candidate,
+            "_require_remote_release_source",
+            side_effect=candidate.ReleasePolicyError(
+                "release source is not the exact remote release-branch head"
+            ),
         ):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "exact remote"):
-                candidate._require_remote_release_source.side_effect = candidate.ReleasePolicyError(
-                    "release source is not the exact remote release-branch head"
-                )
                 candidate.preflight(ROOT, token="masked", api_url="https://api.example")
 
     def test_preflight_proves_exact_head_and_unused_namespace(self) -> None:
@@ -535,6 +882,10 @@ class ReleaseCandidateTests(unittest.TestCase):
             return_value={"release_source_sha": reviewed},
         ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
             candidate, "_strict_external_receipts"
+        ), mock.patch.object(
+            candidate,
+            "_shared_source_readback",
+            return_value=candidate._shared_source_coordinates(ROOT, policy),
         ), mock.patch.object(
             candidate, "_require_release_controls_committed"
         ), mock.patch.object(
@@ -618,6 +969,10 @@ class ReleaseCandidateTests(unittest.TestCase):
         ), mock.patch.object(candidate, "load_policy", return_value=policy), mock.patch.object(
             candidate, "_strict_external_receipts"
         ), mock.patch.object(
+            candidate,
+            "_shared_source_readback",
+            return_value=candidate._shared_source_coordinates(ROOT, policy),
+        ), mock.patch.object(
             candidate, "_require_release_controls_committed"
         ), mock.patch.object(
             candidate, "_environment_check", return_value={"name": "pypi"}
@@ -640,7 +995,12 @@ class ReleaseCandidateTests(unittest.TestCase):
         policy = self.verified_external_policy(now)
         with tempfile.TemporaryDirectory(prefix="approval-window-") as raw:
             manifest_path = Path(raw) / "manifest.json"
-            self.write_manifest(manifest_path, release_source_sha="a" * 40)
+            self.write_manifest(
+                manifest_path,
+                release_source_sha="a" * 40,
+                shared_source=candidate._shared_source_coordinates(ROOT, policy),
+                dispatch_preflight={"id": 7, "run_attempt": 1, "head_sha": "a" * 40},
+            )
             run = {
                 "created_at": (now - timedelta(hours=25)).isoformat(),
                 "head_sha": "a" * 40,
@@ -651,6 +1011,12 @@ class ReleaseCandidateTests(unittest.TestCase):
             }
             with mock.patch.object(
                 candidate, "load_policy", return_value=policy
+            ), mock.patch.object(
+                candidate, "_strict_external_receipts", return_value={}
+            ), mock.patch.object(
+                candidate,
+                "_shared_source_readback",
+                return_value=candidate._shared_source_coordinates(ROOT, policy),
             ), mock.patch.object(
                 candidate, "_request_json", return_value=run
             ):
@@ -670,7 +1036,12 @@ class ReleaseCandidateTests(unittest.TestCase):
         policy = self.verified_external_policy(now)
         with tempfile.TemporaryDirectory(prefix="approval-tag-") as raw:
             manifest_path = Path(raw) / "manifest.json"
-            self.write_manifest(manifest_path, release_source_sha="a" * 40)
+            self.write_manifest(
+                manifest_path,
+                release_source_sha="a" * 40,
+                shared_source=candidate._shared_source_coordinates(ROOT, policy),
+                dispatch_preflight={"id": 7, "run_attempt": 1, "head_sha": "a" * 40},
+            )
             run = {
                 "created_at": now.isoformat(),
                 "head_sha": "a" * 40,
@@ -681,6 +1052,12 @@ class ReleaseCandidateTests(unittest.TestCase):
             }
             with mock.patch.object(
                 candidate, "load_policy", return_value=policy
+            ), mock.patch.object(
+                candidate, "_strict_external_receipts", return_value={}
+            ), mock.patch.object(
+                candidate,
+                "_shared_source_readback",
+                return_value=candidate._shared_source_coordinates(ROOT, policy),
             ), mock.patch.object(
                 candidate, "_request_json", return_value=run
             ):
@@ -700,7 +1077,12 @@ class ReleaseCandidateTests(unittest.TestCase):
         policy = self.verified_external_policy(now)
         with tempfile.TemporaryDirectory(prefix="approval-pypi-") as raw:
             manifest_path = Path(raw) / "manifest.json"
-            self.write_manifest(manifest_path, release_source_sha="a" * 40)
+            self.write_manifest(
+                manifest_path,
+                release_source_sha="a" * 40,
+                shared_source=candidate._shared_source_coordinates(ROOT, policy),
+                dispatch_preflight={"id": 7, "run_attempt": 1, "head_sha": "a" * 40},
+            )
             run = {
                 "created_at": now.isoformat(),
                 "head_sha": "a" * 40,
@@ -711,6 +1093,16 @@ class ReleaseCandidateTests(unittest.TestCase):
             }
             with mock.patch.object(
                 candidate, "load_policy", return_value=policy
+            ), mock.patch.object(
+                candidate, "_strict_external_receipts", return_value={}
+            ), mock.patch.object(
+                candidate,
+                "_shared_source_readback",
+                return_value=candidate._shared_source_coordinates(ROOT, policy),
+            ), mock.patch.object(
+                candidate,
+                "_workflow_dispatch_proof",
+                return_value={"id": 7, "run_attempt": 1, "head_sha": "a" * 40},
             ), mock.patch.object(
                 candidate, "_request_json", return_value=run
             ), mock.patch.object(

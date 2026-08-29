@@ -11,6 +11,8 @@ import argparse
 from datetime import datetime, timezone
 from email.parser import Parser
 import hashlib
+import importlib.metadata
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -18,14 +20,16 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 
-from packaging.version import InvalidVersion, Version
+if TYPE_CHECKING:
+    from packaging.version import Version
 
 try:
     import tomllib
@@ -36,6 +40,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 POLICY_SCHEMA = "marvis-public-release-policy/v1"
 MANIFEST_SCHEMA = "marvis-public-release-manifest/v1"
 ACCEPTANCE_SCHEMA = "marvis-public-release-acceptance/v1"
+EXTERNAL_RECEIPT_SCHEMA = "marvis-external-release-receipt/v1"
 POLICY_PATH = Path("contracts/release/public-release-v1.json")
 WORKFLOW_PATH = Path(".github/workflows/release.yml")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -49,6 +54,9 @@ GENERATED_RELEASE_PREFIXES = (
     "pypi-readback/",
     "release-artifact/",
 )
+_FILE_CHUNK_BYTES = 1024 * 1024
+_TRUSTED_PUBLISHER_RECEIPT_ENV = "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT"
+_APPROVAL_WATCHDOG_RECEIPT_ENV = "MARVIS_APPROVAL_WATCHDOG_RECEIPT"
 
 
 class ReleasePolicyError(RuntimeError):
@@ -60,7 +68,11 @@ def _sha_bytes(raw: bytes) -> str:
 
 
 def _sha_file(path: Path) -> str:
-    return _sha_bytes(path.read_bytes())
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_FILE_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _canonical(value: Any) -> bytes:
@@ -163,6 +175,8 @@ def _validate_pyproject_version_only(root: Path, base: str) -> None:
 
 
 def _parsed_versions(values: list[str]) -> list[Version]:
+    from packaging.version import InvalidVersion, Version
+
     parsed: list[Version] = []
     for value in values:
         normalized = value.removeprefix("v")
@@ -176,6 +190,8 @@ def _parsed_versions(values: list[str]) -> list[Version]:
 def _require_candidate_above_history(
     policy: dict[str, Any], values: list[str], *, authority: str
 ) -> None:
+    from packaging.version import InvalidVersion, Version
+
     try:
         candidate = Version(str(policy["candidate_version"]))
     except (KeyError, InvalidVersion) as exc:
@@ -267,6 +283,117 @@ def publisher_coordinates_sha256(policy: dict[str, Any]) -> str:
     return _sha_bytes(_canonical(_publisher_coordinates(policy)))
 
 
+def _simple_yaml_value(path: Path, key: str) -> str:
+    pattern = re.compile(rf"^{re.escape(key)}:\s*([^#\s]+)\s*(?:#.*)?$")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ReleasePolicyError(f"shared-source engine pin is unreadable: {path}") from exc
+    matches = [match.group(1) for line in lines if (match := pattern.match(line))]
+    if len(matches) != 1:
+        raise ReleasePolicyError(f"shared-source engine pin has no unique {key}")
+    return matches[0]
+
+
+def _shared_source_coordinates(root: Path, policy: dict[str, Any]) -> dict[str, Any]:
+    source = policy.get("shared_source") or {}
+    repository = str(source.get("repository") or "")
+    candidate_sha = str(source.get("candidate_sha") or "")
+    merge_sha = str(source.get("merge_sha") or "")
+    pull_request = source.get("pull_request")
+    engine_pin_value = str(source.get("engine_pin") or "")
+    engine_pin = PurePosixPath(engine_pin_value)
+    if (
+        not repository
+        or not isinstance(pull_request, int)
+        or isinstance(pull_request, bool)
+        or pull_request < 1
+        or not SHA40.fullmatch(candidate_sha)
+        or not SHA40.fullmatch(merge_sha)
+        or engine_pin.is_absolute()
+        or ".." in engine_pin.parts
+        or engine_pin.name == ""
+    ):
+        raise ReleasePolicyError("shared-source coordinates are invalid")
+    engine_pin_path = root / Path(*engine_pin.parts)
+    if _simple_yaml_value(engine_pin_path, "engine_ref") != merge_sha:
+        raise ReleasePolicyError("shared-source merge differs from the engine pin")
+    return {
+        "repository": repository,
+        "pull_request": pull_request,
+        "candidate_sha": candidate_sha,
+        "merge_sha": merge_sha,
+        "engine_pin": engine_pin_value,
+        "engine_pin_sha256": _sha_file(engine_pin_path),
+    }
+
+
+def _shared_source_readback(
+    root: Path,
+    policy: dict[str, Any],
+    *,
+    token: str,
+    api_url: str,
+) -> dict[str, Any]:
+    expected = _shared_source_coordinates(root, policy)
+    pull = _request_json(
+        f"{api_url}/repos/{expected['repository']}/pulls/{expected['pull_request']}",
+        token=token,
+    )
+    if (
+        pull.get("state") != "closed"
+        or not pull.get("merged_at")
+        or (pull.get("head") or {}).get("sha") != expected["candidate_sha"]
+        or pull.get("merge_commit_sha") != expected["merge_sha"]
+    ):
+        raise ReleasePolicyError("shared-source PR identity differs from release policy")
+    return {
+        **expected,
+        "state": pull.get("state"),
+        "merged_at": pull.get("merged_at"),
+    }
+
+
+def _release_job_guards(workflow: str) -> dict[str, str]:
+    guards: dict[str, str] = {}
+    in_jobs = False
+    current: str | None = None
+    for raw in workflow.splitlines():
+        if raw == "jobs:":
+            in_jobs = True
+            continue
+        if not in_jobs:
+            continue
+        job = re.match(r"^  ([a-z0-9-]+):\s*$", raw)
+        if job:
+            current = job.group(1)
+            continue
+        guard = re.match(r"^    if:\s*(.+?)\s*$", raw)
+        if current and guard:
+            guards[current] = guard.group(1)
+    return guards
+
+
+def _workflow_job_blocks(workflow: str) -> dict[str, str]:
+    lines = workflow.splitlines()
+    starts: list[tuple[str, int]] = []
+    in_jobs = False
+    for index, raw in enumerate(lines):
+        if raw == "jobs:":
+            in_jobs = True
+            continue
+        if not in_jobs:
+            continue
+        job = re.match(r"^  ([a-z0-9-]+):\s*$", raw)
+        if job:
+            starts.append((job.group(1), index))
+    result: dict[str, str] = {}
+    for offset, (name, start) in enumerate(starts):
+        end = starts[offset + 1][1] if offset + 1 < len(starts) else len(lines)
+        result[name] = "\n".join(lines[start:end])
+    return result
+
+
 def _parse_time(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -277,11 +404,52 @@ def _parse_time(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _external_receipt(raw: str | None, *, kind: str) -> dict[str, Any]:
+    if not raw:
+        raise ReleasePolicyError(f"external {kind} receipt is absent")
+    try:
+        receipt = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ReleasePolicyError(f"external {kind} receipt is invalid") from exc
+    if not isinstance(receipt, dict) or receipt.get("schema") != EXTERNAL_RECEIPT_SCHEMA:
+        raise ReleasePolicyError(f"external {kind} receipt schema is invalid")
+    if receipt.get("kind") != kind:
+        raise ReleasePolicyError(f"external {kind} receipt kind is invalid")
+    return receipt
+
+
+def _external_receipts(
+    *,
+    trusted_publisher_raw: str | None = None,
+    approval_watchdog_raw: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return (
+        _external_receipt(
+            trusted_publisher_raw
+            if trusted_publisher_raw is not None
+            else os.environ.get(_TRUSTED_PUBLISHER_RECEIPT_ENV),
+            kind="trusted_publisher_owner_readback",
+        ),
+        _external_receipt(
+            approval_watchdog_raw
+            if approval_watchdog_raw is not None
+            else os.environ.get(_APPROVAL_WATCHDOG_RECEIPT_ENV),
+            kind="approval_watchdog",
+        ),
+    )
+
+
 def _strict_external_receipts(
-    policy: dict[str, Any], *, now: datetime | None = None
-) -> None:
+    policy: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    trusted_publisher_receipt: dict[str, Any] | None = None,
+    approval_watchdog_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    readback = ((policy.get("trusted_publisher") or {}).get("readback") or {})
+    if trusted_publisher_receipt is None or approval_watchdog_receipt is None:
+        trusted_publisher_receipt, approval_watchdog_receipt = _external_receipts()
+    readback = trusted_publisher_receipt
     if readback.get("status") != "verified":
         raise ReleasePolicyError("PyPI trusted-publisher owner readback is not verified")
     if readback.get("coordinates_sha256") != publisher_coordinates_sha256(policy):
@@ -293,18 +461,12 @@ def _strict_external_receipts(
     if not readback.get("verified_by"):
         raise ReleasePolicyError("trusted-publisher readback has no verifier")
 
-    watchdog = policy.get("approval_watchdog") or {}
+    watchdog = approval_watchdog_receipt
     if watchdog.get("status") != "ready" or not watchdog.get("receipt_ref"):
         raise ReleasePolicyError("external approval watchdog has no ready receipt")
     if watchdog.get("late_approval_upload_guard") is not True:
         raise ReleasePolicyError("late-approval upload guard is disabled")
-    expected_watchdog = {
-        "repository": policy.get("repository"),
-        "workflow": _publisher_coordinates(policy)["workflow"],
-        "environment": (policy.get("github_environment") or {}).get("name"),
-        "candidate_tag": policy.get("candidate_tag"),
-        "approval_deadline_hours": policy.get("approval_deadline_hours"),
-    }
+    expected_watchdog = policy.get("approval_watchdog") or {}
     observed_watchdog = {key: watchdog.get(key) for key in expected_watchdog}
     if observed_watchdog != expected_watchdog:
         raise ReleasePolicyError("approval watchdog receipt coordinates do not match policy")
@@ -314,6 +476,21 @@ def _strict_external_receipts(
         raise ReleasePolicyError("approval watchdog receipt is stale")
     if not watchdog.get("verified_by"):
         raise ReleasePolicyError("approval watchdog receipt has no verifier")
+    summaries = {
+        "trusted_publisher": {
+            "sha256": _sha_bytes(_canonical(readback)),
+            "verified_at": readback["verified_at"],
+            "verified_by": readback["verified_by"],
+            "coordinates_sha256": readback["coordinates_sha256"],
+        },
+        "approval_watchdog": {
+            "sha256": _sha_bytes(_canonical(watchdog)),
+            "verified_at": watchdog["verified_at"],
+            "verified_by": watchdog["verified_by"],
+            "receipt_ref": watchdog["receipt_ref"],
+        },
+    }
+    return summaries
 
 
 def _tag_target(root: Path, tag: str) -> str | None:
@@ -350,6 +527,16 @@ def validate_static(
     base = str(policy.get("plan_b_product_base_sha") or "")
     if not SHA40.fullmatch(base):
         raise ReleasePolicyError("Plan B product base is not a full commit")
+    shared_source = _shared_source_coordinates(root, policy)
+    receipt_policy = policy.get("external_receipts") or {}
+    if (
+        receipt_policy.get("schema") != EXTERNAL_RECEIPT_SCHEMA
+        or receipt_policy.get("trusted_publisher_variable")
+        != _TRUSTED_PUBLISHER_RECEIPT_ENV
+        or receipt_policy.get("approval_watchdog_variable")
+        != _APPROVAL_WATCHDOG_RECEIPT_ENV
+    ):
+        raise ReleasePolicyError("external receipt provider contract is invalid")
     resolved_head = str(_git(root, "rev-parse", head))
     ancestor = subprocess.run(
         ["git", "-C", str(root), "merge-base", "--is-ancestor", base, resolved_head],
@@ -411,6 +598,9 @@ def validate_static(
         "release_candidate.py tag-preflight",
         "release_candidate.py pretag",
         "release_candidate.py publish-window",
+        "installed-upgrade",
+        "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT",
+        "MARVIS_APPROVAL_WATCHDOG_RECEIPT",
         "environment: pypi",
         "pypa/gh-action-pypi-publish@" + expected_pins.get("pypa/gh-action-pypi-publish", ""),
     )
@@ -420,15 +610,20 @@ def validate_static(
     active_lines = _active_workflow_lines(workflow)
     required_lines = {
         "python scripts/test_release_candidate.py",
-        "run: python scripts/release_candidate.py tag-preflight",
+        'if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then',
+        "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
+        "python scripts/release_candidate.py tag-preflight \\",
         'desktop_source_sha="$(git rev-parse HEAD)"',
+        'SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"',
         '-e MARVIS_CONSOLE_BUILD_ID="$desktop_source_sha" \\',
+        '-e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \\',
         "bash -lc 'npm ci && npm run test:build-id && npm run audit:production && npm run build'",
+        'export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"',
         "python scripts/release_candidate.py registry-download \\",
         "python scripts/release_candidate.py acceptance \\",
-        'gh release upload "$GITHUB_REF_NAME" release-acceptance.json',
-        "cmp release-acceptance.json acceptance-readback/release-acceptance.json",
-        '"$python_bin" scripts/verify_local_upgrade.py \\',
+        'gh release upload "$GITHUB_REF_NAME" acceptance/release-acceptance.json',
+        '"$python_bin" "$GITHUB_WORKSPACE/scripts/release_candidate.py" \\',
+        "installed-upgrade \\",
         '"$marvis" doctor --offline',
         '"$marvis" hooks install',
         '"$marvis" mcp register',
@@ -436,7 +631,9 @@ def validate_static(
         'assert status["db_ok"] is True',
         'assert mcp["connected"] is True',
         'assert mcp["tool_count"] > 0',
-        "if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && (needs.build.result != 'success' || needs.release-record.result != 'success' || needs.pypi.result != 'success' || needs.accept.result != 'success') }}",
+        "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT: ${{ vars.MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT }}",
+        "MARVIS_APPROVAL_WATCHDOG_RECEIPT: ${{ vars.MARVIS_APPROVAL_WATCHDOG_RECEIPT }}",
+        "if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && (needs.build.result != 'success' || needs.release-record.result != 'success' || needs.prepublish.result != 'success' || needs.pypi.result != 'success' || needs.accept.result != 'success' || needs.finalize.result != 'success') }}",
         'echo "::error::Refusing to mutate an already-final GitHub Release."',
         'echo "::error::The failed candidate exists on PyPI; owner verification and yank are required."',
     }
@@ -449,9 +646,24 @@ def validate_static(
         raise ReleasePolicyError("release workflow installs mutable build tooling")
     if '--force-reinstall "marvisx-cli==0.3.8"' in workflow:
         raise ReleasePolicyError("release workflow presents package reinstall as data rollback")
-    publish_guard = "startsWith(github.ref, 'refs/tags/v')"
-    if workflow.count(publish_guard) < 3:
-        raise ReleasePolicyError("tag-only release/publish/finalize guards are incomplete")
+    tag_guard = "${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
+    guards = _release_job_guards(workflow)
+    for job in ("release-record", "prepublish", "pypi", "accept", "finalize"):
+        if guards.get(job) != tag_guard:
+            raise ReleasePolicyError(f"{job} is not confined to a tag-push event")
+    contain_guard = guards.get("contain") or ""
+    if not contain_guard.startswith("${{ always() && github.event_name == 'push'"):
+        raise ReleasePolicyError("contain is not confined to a tag-push event")
+    blocks = _workflow_job_blocks(workflow)
+    for privileged_job in ("release-record", "pypi", "finalize"):
+        block = blocks.get(privileged_job) or ""
+        if "actions/checkout@" in block or "scripts/" in block or "pip install" in block:
+            raise ReleasePolicyError(
+                f"{privileged_job} executes checkout or candidate code with write authority"
+            )
+    accept_block = blocks.get("accept") or ""
+    if "contents: write" in accept_block or "contents: read" not in accept_block:
+        raise ReleasePolicyError("acceptance does not use a read-only repository token")
     window_pos = workflow.find("release_candidate.py publish-window")
     publisher_pos = workflow.find("pypa/gh-action-pypi-publish@")
     if window_pos < 0 or publisher_pos < 0 or window_pos > publisher_pos:
@@ -467,13 +679,14 @@ def validate_static(
         raise ReleasePolicyError("release build lock is not hash closed")
 
     external_blockers: list[str] = []
-    if ((policy.get("trusted_publisher") or {}).get("readback") or {}).get("status") != "verified":
+    if not os.environ.get(_TRUSTED_PUBLISHER_RECEIPT_ENV):
         external_blockers.append("trusted_publisher_owner_readback")
-    if (policy.get("approval_watchdog") or {}).get("status") != "ready":
+    if not os.environ.get(_APPROVAL_WATCHDOG_RECEIPT_ENV):
         external_blockers.append("external_approval_watchdog")
     return {
         "schema": "marvis-public-release-static-preflight/v1",
         "product_base_sha": base,
+        "shared_source": shared_source,
         "release_source_sha": resolved_head,
         "release_branch": release_branch,
         "version": version,
@@ -586,6 +799,65 @@ def _require_remote_release_source(
     return remote_sha
 
 
+def _workflow_dispatch_proof(
+    policy: dict[str, Any],
+    release_source_sha: str,
+    *,
+    token: str,
+    api_url: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    repository = str(policy["repository"])
+    workflow = urllib.parse.quote(_publisher_coordinates(policy)["workflow"], safe="")
+    branch = urllib.parse.quote(str(policy["release_branch"]), safe="")
+    payload = _request_json(
+        f"{api_url}/repos/{repository}/actions/workflows/{workflow}/runs"
+        f"?event=workflow_dispatch&branch={branch}&status=completed&per_page=100",
+        token=token,
+    )
+    rows = payload.get("workflow_runs")
+    if not isinstance(rows, list):
+        raise ReleasePolicyError("workflow-dispatch proof inventory is unavailable")
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    candidates = []
+    for run in rows:
+        if not isinstance(run, dict):
+            continue
+        if (
+            run.get("head_sha") != release_source_sha
+            or run.get("event") != "workflow_dispatch"
+            or run.get("conclusion") != "success"
+            or run.get("head_branch") != policy["release_branch"]
+            or run.get("path") != str(WORKFLOW_PATH)
+            or (run.get("head_repository") or {}).get("full_name") != repository
+        ):
+            continue
+        completed_at = _parse_time(str(run.get("updated_at") or ""))
+        age = (current - completed_at).total_seconds()
+        if 0 <= age <= int(policy["approval_deadline_hours"]) * 3600:
+            candidates.append((completed_at, run))
+    if not candidates:
+        raise ReleasePolicyError(
+            "no fresh successful workflow_dispatch preflight exists for the release SHA"
+        )
+    completed_at, run = max(candidates, key=lambda item: item[0])
+    run_id = run.get("id")
+    attempt = run.get("run_attempt")
+    if not isinstance(run_id, int) or not isinstance(attempt, int):
+        raise ReleasePolicyError("workflow-dispatch proof identity is invalid")
+    return {
+        "id": run_id,
+        "run_attempt": attempt,
+        "head_sha": run["head_sha"],
+        "head_branch": run["head_branch"],
+        "event": run["event"],
+        "conclusion": run["conclusion"],
+        "path": run["path"],
+        "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
+        "html_url": run.get("html_url"),
+    }
+
+
 def _environment_check(policy: dict[str, Any], *, token: str, api_url: str) -> dict[str, Any]:
     repository = str(policy["repository"])
     expected = policy["github_environment"]
@@ -669,7 +941,10 @@ def preflight(
     report = validate_static(root)
     policy = load_policy(root)
     _require_release_controls_committed(root, report["release_source_sha"])
-    _strict_external_receipts(policy)
+    external_receipts = _strict_external_receipts(policy)
+    shared_source = _shared_source_readback(
+        root, policy, token=token, api_url=api_url
+    )
     environment = _environment_check(policy, token=token, api_url=api_url)
     remote_sha = _require_remote_release_source(
         policy,
@@ -698,6 +973,8 @@ def preflight(
     report.update(
         {
             "environment": environment,
+            "external_receipts": external_receipts,
+            "shared_source": shared_source,
             "remote_release_branch_sha": remote_sha,
             "registry_latest": (registry.get("info") or {}).get("version"),
             "namespace": {
@@ -719,7 +996,10 @@ def tag_preflight(
     report = validate_static(root, tag_build=True)
     policy = load_policy(root)
     _require_release_controls_committed(root, report["release_source_sha"])
-    _strict_external_receipts(policy)
+    external_receipts = _strict_external_receipts(policy)
+    shared_source = _shared_source_readback(
+        root, policy, token=token, api_url=api_url
+    )
     environment = _environment_check(policy, token=token, api_url=api_url)
     remote_tag_sha = _remote_tag_sha(policy, token=token, api_url=api_url)
     if remote_tag_sha != report["release_source_sha"]:
@@ -730,6 +1010,12 @@ def tag_preflight(
         token=token,
         api_url=api_url,
         allow_branch_advance=True,
+    )
+    dispatch_preflight = _workflow_dispatch_proof(
+        policy,
+        report["release_source_sha"],
+        token=token,
+        api_url=api_url,
     )
     repository = str(policy["repository"])
     tag = urllib.parse.quote(str(policy["candidate_tag"]), safe="")
@@ -746,6 +1032,9 @@ def tag_preflight(
     report.update(
         {
             "environment": environment,
+            "external_receipts": external_receipts,
+            "shared_source": shared_source,
+            "dispatch_preflight": dispatch_preflight,
             "remote_tag_sha": remote_tag_sha,
             "remote_release_branch_sha": remote_branch_sha,
             "registry_latest": (registry.get("info") or {}).get("version"),
@@ -760,7 +1049,10 @@ def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -
     report = validate_static(root, tag_build=True)
     policy = load_policy(root)
     _require_release_controls_committed(root, report["release_source_sha"])
-    _strict_external_receipts(policy)
+    external_receipts = _strict_external_receipts(policy)
+    shared_source = _shared_source_readback(
+        root, policy, token=token, api_url=api_url
+    )
     environment = _environment_check(policy, token=token, api_url=api_url)
     remote_tag_sha = _remote_tag_sha(policy, token=token, api_url=api_url)
     if remote_tag_sha != report["release_source_sha"]:
@@ -772,6 +1064,12 @@ def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -
         api_url=api_url,
         allow_branch_advance=True,
     )
+    dispatch_preflight = _workflow_dispatch_proof(
+        policy,
+        report["release_source_sha"],
+        token=token,
+        api_url=api_url,
+    )
     release = _draft_release(policy, token=token, api_url=api_url)
     _require_remote_absence(
         _candidate_pypi_url(policy),
@@ -781,6 +1079,9 @@ def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -
     report.update(
         {
             "environment": environment,
+            "external_receipts": external_receipts,
+            "shared_source": shared_source,
+            "dispatch_preflight": dispatch_preflight,
             "github_release": release,
             "remote_release_branch_sha": remote_branch_sha,
             "registry_latest": (registry.get("info") or {}).get("version"),
@@ -820,7 +1121,33 @@ def _distribution_metadata(path: Path) -> tuple[str, str]:
     return str(metadata.get("Name") or ""), str(metadata.get("Version") or "")
 
 
-def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[str, Any]:
+def _dispatch_preflight_from_report(
+    path: Path,
+    *,
+    release_source_sha: str,
+) -> dict[str, Any]:
+    report = _load_json(path)
+    dispatch = report.get("dispatch_preflight")
+    if (
+        report.get("status") != "tag_preflight_green"
+        or report.get("release_source_sha") != release_source_sha
+        or not isinstance(dispatch, dict)
+        or dispatch.get("head_sha") != release_source_sha
+        or dispatch.get("event") != "workflow_dispatch"
+        or dispatch.get("conclusion") != "success"
+    ):
+        raise ReleasePolicyError("tag preflight report is not bound to the release SHA")
+    return {**dispatch, "report_sha256": _sha_file(path)}
+
+
+def build_manifest(
+    root: Path,
+    dist: Path,
+    *,
+    source_sha: str = "HEAD",
+    dispatch_proof: Path | None = None,
+    dispatch_preflight: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     resolved_source = str(_git(root, "rev-parse", source_sha))
     checked_out_source = str(_git(root, "rev-parse", "HEAD"))
     if not SHA40.fullmatch(resolved_source) or resolved_source != checked_out_source:
@@ -848,6 +1175,24 @@ def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[
             raise ReleasePolicyError(f"artifact metadata mismatch: {path.name}")
         rows.append({"filename": path.name, "size": path.stat().st_size, "sha256": _sha_file(path)})
     resolved_head = static["release_source_sha"]
+    if dispatch_proof is not None and dispatch_preflight is not None:
+        raise ReleasePolicyError("dispatch preflight was provided twice")
+    if dispatch_proof is not None:
+        dispatch_preflight = _dispatch_preflight_from_report(
+            dispatch_proof,
+            release_source_sha=resolved_head,
+        )
+    if tag_exists and dispatch_preflight is None:
+        raise ReleasePolicyError("tag manifest has no prior dispatch-preflight proof")
+    receipt_env_present = bool(
+        os.environ.get(_TRUSTED_PUBLISHER_RECEIPT_ENV)
+        or os.environ.get(_APPROVAL_WATCHDOG_RECEIPT_ENV)
+    )
+    external_receipts = (
+        _strict_external_receipts(policy)
+        if tag_exists or receipt_env_present
+        else None
+    )
     delta = _git(
         root,
         "diff",
@@ -862,6 +1207,7 @@ def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[
         "version": policy["candidate_version"],
         "tag": policy["candidate_tag"],
         "product_base_sha": policy["plan_b_product_base_sha"],
+        "shared_source": static["shared_source"],
         "release_source_sha": resolved_head,
         "allowed_release_delta_sha256": _sha_bytes(delta),
         "changed_paths": static["changed_paths"],
@@ -869,15 +1215,22 @@ def build_manifest(root: Path, dist: Path, *, source_sha: str = "HEAD") -> dict[
         "policy": {"path": str(POLICY_PATH), "sha256": static["policy_sha256"]},
         "action_pins": static["action_pins"],
         "build": policy["build"],
+        "dispatch_preflight": dispatch_preflight,
+        "release_notes": {
+            "path": f"docs/releases/{policy['candidate_version']}.md",
+            "sha256": _sha_file(
+                root / f"docs/releases/{policy['candidate_version']}.md"
+            ),
+        },
         "release_controls": {
             "release_branch": policy["release_branch"],
             "approval_deadline_hours": policy["approval_deadline_hours"],
             "github_environment": policy["github_environment"],
             "trusted_publisher": {
                 "coordinates": _publisher_coordinates(policy),
-                "readback": policy["trusted_publisher"]["readback"],
             },
             "approval_watchdog": policy["approval_watchdog"],
+            "external_receipts": external_receipts,
         },
         "artifacts": rows,
         "candidate_state_at_build": {
@@ -909,7 +1262,12 @@ def verify_manifest(root: Path, manifest_path: Path, dist: Path) -> dict[str, An
     checked_out_source = str(_git(root, "rev-parse", "HEAD"))
     if manifest.get("release_source_sha") != checked_out_source:
         raise ReleasePolicyError("release manifest is not bound to the checked-out commit")
-    rebuilt = build_manifest(root, dist, source_sha=checked_out_source)
+    rebuilt = build_manifest(
+        root,
+        dist,
+        source_sha=checked_out_source,
+        dispatch_preflight=manifest.get("dispatch_preflight"),
+    )
     if manifest != rebuilt:
         differing = sorted(
             key
@@ -956,7 +1314,6 @@ def _registry_readback(
     }
     if attempts < 1 or delay_seconds < 0:
         raise ReleasePolicyError("registry retry policy is invalid")
-    observed: dict[str, dict[str, Any]] = {}
     encoded_package = urllib.parse.quote(package, safe="")
     encoded_version = urllib.parse.quote(version, safe="")
     url = f"https://pypi.org/pypi/{encoded_package}/{encoded_version}/json"
@@ -1049,14 +1406,23 @@ def registry_download(
             )
             target = destination / filename
             part = destination / f".{filename}.part"
+            size = 0
+            digest = hashlib.sha256()
             with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
                 final = urllib.parse.urlparse(response.geturl())
                 if final.scheme != "https" or final.hostname != "files.pythonhosted.org":
                     raise ReleasePolicyError(f"PyPI artifact redirected off-host: {filename}")
-                raw = response.read(int(identity["size"]) + 1)
-            if len(raw) != identity["size"] or _sha_bytes(raw) != identity["sha256"]:
+                with part.open("xb") as handle:
+                    while chunk := response.read(_FILE_CHUNK_BYTES):
+                        size += len(chunk)
+                        if size > identity["size"]:
+                            raise ReleasePolicyError(
+                                f"downloaded PyPI bytes differ from manifest: {filename}"
+                            )
+                        digest.update(chunk)
+                        handle.write(chunk)
+            if size != identity["size"] or digest.hexdigest() != identity["sha256"]:
                 raise ReleasePolicyError(f"downloaded PyPI bytes differ from manifest: {filename}")
-            part.write_bytes(raw)
             part.replace(target)
             created.append(target)
     except KeyError as exc:
@@ -1068,6 +1434,114 @@ def registry_download(
             path.unlink(missing_ok=True)
         raise
     return {**report, "status": "registry_downloaded", "destination": str(destination)}
+
+
+def verify_installed_upgrade(
+    contract_root: Path,
+    *,
+    version: str,
+    evidence_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Run the existing recovery proof against installed candidate modules only."""
+
+    contract_root = contract_root.resolve()
+    try:
+        distribution = importlib.metadata.distribution("marvisx-cli")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise ReleasePolicyError("installed marvisx-cli candidate is absent") from exc
+    installed_root = Path(distribution.locate_file("")).resolve()
+    if installed_root == contract_root or installed_root.is_relative_to(contract_root):
+        raise ReleasePolicyError("candidate distribution resolves inside the checkout")
+    migrations = installed_root / "migrations"
+    if not migrations.is_dir():
+        raise ReleasePolicyError("installed candidate migrations are absent")
+
+    verifier_path = contract_root / "scripts/verify_local_upgrade.py"
+    spec = importlib.util.spec_from_file_location(
+        "_marvis_release_upgrade_verifier",
+        verifier_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ReleasePolicyError("upgrade verifier cannot be loaded")
+    checkout_modules = [
+        name for name in sys.modules if name == "core" or name.startswith("core.")
+    ]
+    if checkout_modules:
+        raise ReleasePolicyError("candidate modules were imported before isolation")
+    original_path = list(sys.path)
+    verifier = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = verifier
+    try:
+        spec.loader.exec_module(verifier)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        sys.path[:] = original_path
+        raise
+
+    try:
+        filtered = []
+        for entry in sys.path:
+            resolved = Path(entry or os.getcwd()).resolve()
+            if resolved == contract_root or resolved.is_relative_to(contract_root):
+                continue
+            filtered.append(entry)
+        sys.path[:] = [str(installed_root), *filtered]
+
+        contract = verifier._load_contract(
+            contract_root / "contracts/compatibility/prior-distributions-v1.json"
+        )
+        prior = next((item for item in contract if item.version == version), None)
+        if prior is None:
+            raise ReleasePolicyError("requested prior version is not supported")
+        try:
+            with tempfile.TemporaryDirectory(prefix="marvis-prior-download-") as raw:
+                artifact = verifier._download(prior, Path(raw))
+                report = verifier.verify_upgrade(
+                    installed_root,
+                    artifact,
+                    prior,
+                    evidence_dir=evidence_dir,
+                )
+        except verifier.UpgradeVerificationError as exc:
+            raise ReleasePolicyError(str(exc)) from exc
+        product_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if module is not None and (name == "core" or name.startswith("core."))
+        }
+        if not product_modules:
+            raise ReleasePolicyError("upgrade proof imported no candidate product modules")
+        for name, module in product_modules.items():
+            origins: list[Path] = []
+            module_file = getattr(module, "__file__", None)
+            if module_file:
+                origins.append(Path(module_file).resolve())
+            spec = getattr(module, "__spec__", None)
+            locations = getattr(spec, "submodule_search_locations", None)
+            if locations:
+                origins.extend(Path(item).resolve() for item in locations)
+            if not origins or any(
+                origin != installed_root and not origin.is_relative_to(installed_root)
+                for origin in origins
+            ):
+                raise ReleasePolicyError(
+                    f"upgrade proof imported {name} outside the installed wheel"
+                )
+    finally:
+        sys.path[:] = original_path
+        sys.modules.pop(spec.name, None)
+        for name in [
+            module_name
+            for module_name in sys.modules
+            if module_name == "core" or module_name.startswith("core.")
+        ]:
+            sys.modules.pop(name, None)
+
+    return {
+        **report,
+        "candidate_import_origin": "installed_distribution",
+        "candidate_distribution_version": distribution.version,
+    }
 
 
 def _workflow_run_readback(
@@ -1117,7 +1591,12 @@ def build_acceptance_receipt(
     verify_manifest(root, github_dist / manifest_path.name, github_dist)
     registry = registry_verify(manifest_path, attempts=1, delay_seconds=0)
     policy = load_policy(root)
-    _strict_external_receipts(policy, now=now)
+    external_receipts = _strict_external_receipts(policy, now=now)
+    shared_source = _shared_source_readback(
+        root, policy, token=token, api_url=api_url
+    )
+    if manifest.get("shared_source") != _shared_source_coordinates(root, policy):
+        raise ReleasePolicyError("release manifest shared-source identity changed")
     remote_tag_sha = _remote_tag_sha(policy, token=token, api_url=api_url)
     if remote_tag_sha != source_sha:
         raise ReleasePolicyError("candidate tag moved before acceptance receipt")
@@ -1136,6 +1615,20 @@ def build_acceptance_receipt(
         run_id=run_id,
         api_url=api_url,
     )
+    dispatch_preflight = _workflow_dispatch_proof(
+        policy,
+        source_sha,
+        token=token,
+        api_url=api_url,
+        now=now,
+    )
+    manifest_dispatch = manifest.get("dispatch_preflight") or {}
+    if (
+        manifest_dispatch.get("id") != dispatch_preflight["id"]
+        or manifest_dispatch.get("run_attempt") != dispatch_preflight["run_attempt"]
+        or manifest_dispatch.get("head_sha") != source_sha
+    ):
+        raise ReleasePolicyError("manifest dispatch-preflight proof changed")
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     receipt = {
         "schema": ACCEPTANCE_SCHEMA,
@@ -1145,6 +1638,7 @@ def build_acceptance_receipt(
         "version": manifest["version"],
         "tag": manifest["tag"],
         "product_base_sha": manifest["product_base_sha"],
+        "shared_source": shared_source,
         "release_source_sha": source_sha,
         "remote_release_branch_sha": remote_branch_sha,
         "remote_tag_sha": remote_tag_sha,
@@ -1160,6 +1654,8 @@ def build_acceptance_receipt(
             "sha256": _sha_file(manifest_path),
             "content_digest": manifest["content_digest"],
         },
+        "dispatch_preflight": dispatch_preflight,
+        "external_receipts": external_receipts,
         "registry_readback": {
             **registry,
             "artifacts": manifest["artifacts"],
@@ -1190,8 +1686,13 @@ def publish_window(
     api_url: str = "https://api.github.com",
 ) -> dict[str, Any]:
     policy = load_policy(root)
-    _strict_external_receipts(policy, now=now)
+    external_receipts = _strict_external_receipts(policy, now=now)
     manifest = _validated_manifest(manifest_path)
+    shared_source = _shared_source_readback(
+        root, policy, token=token, api_url=api_url
+    )
+    if manifest.get("shared_source") != _shared_source_coordinates(root, policy):
+        raise ReleasePolicyError("release manifest shared-source identity changed")
     run = _workflow_run_readback(
         policy,
         str(manifest.get("release_source_sha") or ""),
@@ -1204,6 +1705,13 @@ def publish_window(
     age = (current - created).total_seconds()
     if age < 0 or age > int(policy["approval_deadline_hours"]) * 3600:
         raise ReleasePolicyError("release approval window expired")
+    dispatch_preflight = _workflow_dispatch_proof(
+        policy,
+        str(manifest.get("release_source_sha") or ""),
+        token=token,
+        api_url=api_url,
+        now=now,
+    )
     if _remote_tag_sha(policy, token=token, api_url=api_url) != manifest.get(
         "release_source_sha"
     ):
@@ -1228,6 +1736,9 @@ def publish_window(
         "run_id": str(run_id),
         "age_seconds": int(age),
         "environment": environment,
+        "external_receipts": external_receipts,
+        "shared_source": shared_source,
+        "dispatch_preflight": dispatch_preflight,
         "remote_release_branch_sha": remote_branch_sha,
         "registry_latest": (registry.get("info") or {}).get("version"),
     }
@@ -1254,6 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest_parser.add_argument("--dist", type=Path, required=True)
     manifest_parser.add_argument("--output", type=Path, required=True)
     manifest_parser.add_argument("--source-sha", default=os.environ.get("GITHUB_SHA", "HEAD"))
+    manifest_parser.add_argument("--dispatch-proof", type=Path)
     verify_parser = sub.add_parser("verify")
     verify_parser.add_argument("--manifest", type=Path, required=True)
     verify_parser.add_argument("--dist", type=Path, required=True)
@@ -1276,6 +1788,9 @@ def main(argv: list[str] | None = None) -> int:
     window_parser.add_argument("--dist", type=Path, required=True)
     window_parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
     window_parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID"))
+    installed_upgrade_parser = sub.add_parser("installed-upgrade")
+    installed_upgrade_parser.add_argument("--version", default="0.3.8")
+    installed_upgrade_parser.add_argument("--evidence-dir", type=Path)
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
@@ -1300,7 +1815,16 @@ def main(argv: list[str] | None = None) -> int:
                 raise ReleasePolicyError("GITHUB_TOKEN is required for live preflight checks")
             result = preflight(root, token=args.token)
         elif args.command == "manifest":
-            result = build_manifest(root, args.dist.resolve(), source_sha=args.source_sha)
+            result = build_manifest(
+                root,
+                args.dist.resolve(),
+                source_sha=args.source_sha,
+                dispatch_proof=(
+                    args.dispatch_proof.resolve()
+                    if args.dispatch_proof is not None
+                    else None
+                ),
+            )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(
                 json.dumps(result, indent=2, sort_keys=True) + "\n",
@@ -1330,7 +1854,7 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(result, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-        else:
+        elif args.command == "publish-window":
             if not args.token or not args.run_id:
                 raise ReleasePolicyError("GITHUB_TOKEN and GITHUB_RUN_ID are required")
             result = publish_window(
@@ -1339,6 +1863,16 @@ def main(argv: list[str] | None = None) -> int:
                 args.dist.resolve(),
                 token=args.token,
                 run_id=args.run_id,
+            )
+        else:
+            result = verify_installed_upgrade(
+                root,
+                version=args.version,
+                evidence_dir=(
+                    args.evidence_dir.resolve()
+                    if args.evidence_dir is not None
+                    else None
+                ),
             )
     except (
         ReleasePolicyError,
