@@ -102,23 +102,6 @@ def _workflow(root: Path, contract: dict[str, Any]) -> None:
     if setup_python != [contract["primary_python"]]:
         raise CollectionContractError("primary CI Python row drift")
 
-    if spec.get("requires_full_history"):
-        checkout_steps = [
-            step
-            for step in steps
-            if isinstance(step, dict)
-            and str(step.get("uses", "")).startswith("actions/checkout@")
-        ]
-        fetch_depths = [
-            step.get("with", {}).get("fetch-depth")
-            for step in checkout_steps
-            if isinstance(step.get("with"), dict)
-        ]
-        if len(checkout_steps) != 1 or fetch_depths not in ([0], ["0"]):
-            raise CollectionContractError(
-                "required Python CI job needs full Git history"
-            )
-
     for additional in spec.get("additional_jobs", []):
         job_name = str(additional["job"])
         job = jobs.get(job_name)

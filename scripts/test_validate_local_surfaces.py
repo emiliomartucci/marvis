@@ -9,8 +9,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import yaml
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from validate_local_surfaces import (  # noqa: E402
     FRAMEWORK_HTML_ROUTES,
@@ -265,24 +263,6 @@ class TestPerimeterIsClosed(unittest.TestCase):
                 any("/universe/" in error and "missing" in error for error in errors),
                 errors,
             )
-
-    def test_release_workflow_validates_the_emitted_bundle_before_packaging(
-        self,
-    ) -> None:
-        workflow = yaml.safe_load(
-            (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-        )
-        steps = workflow["jobs"]["build"]["steps"]
-        names = [step.get("name") for step in steps]
-        build_index = names.index("Build the local GUI from a digest-pinned image")
-        gate_index = names.index("Fail if a foreign route reached the local artifact")
-        package_index = names.index("Build one wheel and one source archive")
-        self.assertLess(build_index, gate_index)
-        self.assertLess(gate_index, package_index)
-        self.assertEqual(
-            steps[gate_index]["run"],
-            "python scripts/validate_local_surfaces.py --bundle core/api/console_dist",
-        )
 
 
 if __name__ == "__main__":

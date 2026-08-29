@@ -6,6 +6,8 @@ import shutil
 import tempfile
 import unittest
 
+import yaml
+
 from run_ci_contract import _DESELECTED_RE
 from verify_ci_collection import (
     CollectionContractError,
@@ -51,21 +53,17 @@ class CICollectionContractTests(unittest.TestCase):
             _workflow(ROOT, contract)
 
     def test_release_ancestry_job_cannot_return_to_a_shallow_checkout(self) -> None:
-        contract = json.loads(
-            (ROOT / "contracts/ci/collection-v1.json").read_text(encoding="utf-8")
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         )
-        with tempfile.TemporaryDirectory(prefix="marvis-ci-history-") as raw:
-            root = Path(raw)
-            shutil.copytree(ROOT / ".github", root / ".github")
-            workflow = root / ".github/workflows/ci.yml"
-            workflow.write_text(
-                workflow.read_text(encoding="utf-8").replace(
-                    "fetch-depth: 0", "fetch-depth: 1", 1
-                ),
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(CollectionContractError, "full Git history"):
-                _workflow(root, contract)
+        steps = workflow["jobs"]["python-contract"]["steps"]
+        checkout = [
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        ]
+        self.assertEqual(len(checkout), 1)
+        self.assertEqual(checkout[0].get("with", {}).get("fetch-depth"), 0)
 
     def test_desktop_release_build_cannot_leave_ci(self) -> None:
         contract = json.loads(

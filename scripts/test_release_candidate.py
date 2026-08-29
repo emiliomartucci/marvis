@@ -149,6 +149,22 @@ class ReleaseCandidateTests(unittest.TestCase):
             source = "\n".join(line[margin:] for line in lines)
             compile(source, f"release.yml:python-heredoc-{index}", "exec")
 
+    def test_release_build_validates_emitted_routes_before_packaging(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / candidate.WORKFLOW_PATH).read_text(encoding="utf-8")
+        )
+        steps = workflow["jobs"]["build"]["steps"]
+        names = [step.get("name") for step in steps]
+        build_index = names.index("Build the local GUI from a digest-pinned image")
+        gate_index = names.index("Fail if a foreign route reached the local artifact")
+        package_index = names.index("Build one wheel and one source archive")
+        self.assertLess(build_index, gate_index)
+        self.assertLess(gate_index, package_index)
+        self.assertEqual(
+            steps[gate_index]["run"],
+            "python scripts/validate_local_surfaces.py --bundle core/api/console_dist",
+        )
+
     def test_shared_source_readback_requires_exact_pr_candidate_and_merge(self) -> None:
         policy = self.policy()
         expected = policy["shared_source"]
