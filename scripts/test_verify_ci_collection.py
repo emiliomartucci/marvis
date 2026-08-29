@@ -50,6 +50,23 @@ class CICollectionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(CollectionContractError, "Python row drift"):
             _workflow(ROOT, contract)
 
+    def test_release_ancestry_job_cannot_return_to_a_shallow_checkout(self) -> None:
+        contract = json.loads(
+            (ROOT / "contracts/ci/collection-v1.json").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory(prefix="marvis-ci-history-") as raw:
+            root = Path(raw)
+            shutil.copytree(ROOT / ".github", root / ".github")
+            workflow = root / ".github/workflows/ci.yml"
+            workflow.write_text(
+                workflow.read_text(encoding="utf-8").replace(
+                    "fetch-depth: 0", "fetch-depth: 1", 1
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CollectionContractError, "full Git history"):
+                _workflow(root, contract)
+
     def test_desktop_release_build_cannot_leave_ci(self) -> None:
         contract = json.loads(
             (ROOT / "contracts/ci/collection-v1.json").read_text(encoding="utf-8")

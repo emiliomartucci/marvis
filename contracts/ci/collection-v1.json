@@ -64,6 +64,7 @@
   "workflow": {
     "file": ".github/workflows/ci.yml",
     "required_job": "python-contract",
+    "requires_full_history": true,
     "required_run_fragments": [
       "pip install -e \".[dev]\"",
       "python scripts/verify_ci_collection.py",

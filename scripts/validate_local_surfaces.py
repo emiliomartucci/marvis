@@ -21,6 +21,7 @@ ship. Pages were never the perimeter: the emitted JavaScript is.
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -39,6 +40,9 @@ SHELL_ROUTES = {"/", "/login/", "/login/sso-callback/", "/welcome/"}
 ROUTE_FILES = {"page.tsx", "layout.tsx", "template.tsx", "error.tsx", "not-found.tsx", "loading.tsx"}
 # Reachable from the toolchain rather than from a route.
 TOOLCHAIN_MODULES = {SRC / "test/setup.ts"}
+# Next emits both 404.html and 404/index.html for the framework fallback. It is
+# not a navigable product surface, but it is expected in every static export.
+FRAMEWORK_HTML_ROUTES = {"/404/"}
 
 IMPORT_RE = re.compile(r"""(?:from\s+|import\s*\(\s*)["']([^"']+)["']""")
 # Anything that puts the user on a route: a plain href, a braced one, a template
@@ -273,19 +277,74 @@ def foreign_routes(root: Path) -> list[str]:
     return sorted(exported_routes(root) - declared_routes(root))
 
 
-def main() -> int:
-    root = (Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()).resolve()
-    errors = validate(root)
+def bundled_routes(bundle: Path) -> set[str]:
+    """Translate every emitted HTML file into its public route."""
+    bundle = bundle.resolve()
+    if not bundle.is_dir():
+        return set()
+    routes: set[str] = set()
+    for page in bundle.rglob("*.html"):
+        relative = page.relative_to(bundle)
+        if relative == Path("index.html"):
+            routes.add("/")
+        elif relative.name == "index.html":
+            routes.add("/" + relative.parent.as_posix().strip("/") + "/")
+        else:
+            routes.add("/" + relative.with_suffix("").as_posix().strip("/") + "/")
+    return routes
+
+
+def validate_built_routes(root: Path, bundle: Path) -> list[str]:
+    """Compare the actual packaged HTML routes with the ratified perimeter."""
+    root = root.resolve()
+    bundle = bundle.resolve()
+    emitted = bundled_routes(bundle)
+    if not bundle.is_dir():
+        return [f"static bundle is missing: {bundle}"]
+    if not emitted:
+        return [f"static bundle contains no HTML routes: {bundle}"]
+
+    required = declared_routes(root)
+    allowed = required | FRAMEWORK_HTML_ROUTES
+    errors = [
+        f"{route}: declared local route missing from the built artifact"
+        for route in sorted(required - emitted)
+    ]
+    errors.extend(
+        f"{route}: built artifact route is outside the local perimeter"
+        for route in sorted(emitted - allowed)
+    )
+    return errors
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", nargs="?", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--bundle",
+        type=Path,
+        help="validate emitted HTML routes in this static bundle",
+    )
+    args = parser.parse_args(argv)
+    root = args.root.resolve()
+    errors = (
+        validate_built_routes(root, args.bundle)
+        if args.bundle is not None
+        else validate(root)
+    )
     if errors:
         print("local surface perimeter INVALID:", file=sys.stderr)
         for error in errors:
             print(f"  - {error}", file=sys.stderr)
         return 1
 
-    print(
-        "local surface perimeter valid: the shipped source carries the declared "
-        "routes, navigates nowhere else, and holds no module the product cannot reach"
-    )
+    if args.bundle is not None:
+        print("local artifact perimeter valid: emitted HTML matches declared routes")
+    else:
+        print(
+            "local surface perimeter valid: the shipped source carries the declared "
+            "routes, navigates nowhere else, and holds no module the product cannot reach"
+        )
     return 0
 
 

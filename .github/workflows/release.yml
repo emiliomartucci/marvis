@@ -108,14 +108,7 @@ jobs:
           cp -a apps/desktop-ui/out/. core/api/console_dist/
 
       - name: Fail if a foreign route reached the local artifact
-        run: |
-          set -euo pipefail
-          for route in terminal settings monitoring brain graph inbox triage finder; do
-            if find core/api/console_dist -path "*/$route/*" -name "*.html" | grep -q .; then
-              echo "::error::/$route/ is not owned by the local product"
-              exit 1
-            fi
-          done
+        run: python scripts/validate_local_surfaces.py --bundle core/api/console_dist
 
       - name: Build one wheel and one source archive
         run: |
