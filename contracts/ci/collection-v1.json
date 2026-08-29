@@ -4,7 +4,7 @@
   "pytest_suites": [
     {
       "path": "core/api/tests",
-      "minimum_collected": 443,
+      "minimum_collected": 444,
       "allowed_skips": 0,
       "allowed_deselections": 0,
       "required_nodes": [
@@ -29,7 +29,7 @@
     },
     {
       "path": "core/cli/tests",
-      "minimum_collected": 29,
+      "minimum_collected": 32,
       "allowed_skips": 0,
       "allowed_deselections": 0,
       "required_nodes": [
@@ -44,7 +44,7 @@
     {
       "path": "scripts",
       "pattern": "test_*.py",
-      "minimum_collected": 187,
+      "minimum_collected": 209,
       "allowed_skips": 0,
       "required_node_suffixes": [
         "CompatibilityContractTests.test_current_contract_passes",
@@ -53,7 +53,8 @@
         "LocalUpgradeTests.test_synthetic_prior_upgrade_and_rollback",
         "LocalUpgradeTests.test_cli_upgrade_uses_settings_projects_root_without_environment",
         "LocalUpgradeTests.test_runtime_settings_preserve_explicit_projects_root",
-        "ReleaseCandidateTests.test_real_release_candidate_is_invalidated_by_the_source_advance"
+        "ReleaseCandidateTests.test_real_release_candidate_is_invalidated_by_the_source_advance",
+        "ReleaseCandidateTests.test_invalidated_pull_request_skips_every_expensive_release_step"
       ]
     }
   ],
@@ -64,9 +65,10 @@
   "workflow": {
     "file": ".github/workflows/ci.yml",
     "required_job": "python-contract",
-    "required_run_fragments": [
+    "required_run_lines": [
       "pip install -e \".[dev]\"",
       "python scripts/verify_ci_collection.py",
+      "python scripts/release_candidate.py state",
       "python scripts/run_ci_contract.py",
       "python scripts/verify_local_upgrade.py --download --version 0.3.8",
       "python scripts/verify_public_claims.py"

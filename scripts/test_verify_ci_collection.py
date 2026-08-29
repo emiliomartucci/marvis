@@ -23,10 +23,10 @@ ROOT = Path(__file__).resolve().parents[1]
 class CICollectionContractTests(unittest.TestCase):
     def test_current_collection_and_workflows_pass(self) -> None:
         result = verify(ROOT)
-        # 416 API + 29 CLI tests from a clean checkout.  Keep this independent
+        # 444 API + 32 CLI tests from a clean checkout. Keep this independent
         # from generated Console assets and other local build by-products.
-        self.assertGreaterEqual(result["pytest_collected"], 445)
-        self.assertGreaterEqual(result["unittest_collected"], 128)
+        self.assertGreaterEqual(result["pytest_collected"], 476)
+        self.assertGreaterEqual(result["unittest_collected"], 209)
 
     def test_lowered_collection_floor_is_not_a_bypass(self) -> None:
         with tempfile.TemporaryDirectory(prefix="marvis-ci-contract-") as raw:
@@ -51,6 +51,24 @@ class CICollectionContractTests(unittest.TestCase):
         contract["primary_python"] = "3.11"
         with self.assertRaisesRegex(CollectionContractError, "Python row drift"):
             _workflow(ROOT, contract)
+
+    def test_echoed_primary_release_state_is_not_a_gate(self) -> None:
+        contract = json.loads(
+            (ROOT / "contracts/ci/collection-v1.json").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory(prefix="marvis-primary-ci-") as raw:
+            root = Path(raw)
+            shutil.copytree(ROOT / ".github", root / ".github")
+            workflow = root / ".github/workflows/ci.yml"
+            workflow.write_text(
+                workflow.read_text(encoding="utf-8").replace(
+                    "run: python scripts/release_candidate.py state",
+                    "run: echo python scripts/release_candidate.py state",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CollectionContractError, "CI run line missing"):
+                _workflow(root, contract)
 
     def test_release_ancestry_job_cannot_return_to_a_shallow_checkout(self) -> None:
         workflow = yaml.safe_load(

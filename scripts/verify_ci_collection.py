@@ -86,12 +86,16 @@ def _workflow(root: Path, contract: dict[str, Any]) -> None:
     if not isinstance(jobs, dict) or spec["required_job"] not in jobs:
         raise CollectionContractError("required Python CI job missing")
     steps = jobs[spec["required_job"]].get("steps", [])
-    commands = "\n".join(
-        str(step.get("run", "")) for step in steps if isinstance(step, dict)
-    )
-    for fragment in spec["required_run_fragments"]:
-        if fragment not in commands:
-            raise CollectionContractError(f"CI run fragment missing: {fragment}")
+    command_lines = {
+        line.strip()
+        for step in steps
+        if isinstance(step, dict)
+        for line in str(step.get("run", "")).splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    for line in spec["required_run_lines"]:
+        if line not in command_lines:
+            raise CollectionContractError(f"CI run line missing: {line}")
     setup_python = [
         step.get("with", {}).get("python-version")
         for step in steps
