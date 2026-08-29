@@ -49,8 +49,10 @@ USES = re.compile(r"(?m)^\s*(?:-\s*)?uses:\s*([^#\s]+)")
 GENERATED_RELEASE_PREFIXES = (
     "acceptance-readback/",
     "apps/desktop-ui/out/",
+    "build/",
     "core/api/console_dist/",
     "gh-release-readback/",
+    "marvisx_cli.egg-info/",
     "pypi-readback/",
     "release-artifact/",
 )
@@ -235,11 +237,12 @@ def _require_release_controls_committed(root: Path, resolved_head: str) -> None:
         ).splitlines()
         if line
     }
-    unexpected = sorted(
+    unexpected_untracked = {
         path
-        for path in tracked_dirty | untracked
+        for path in untracked
         if not path.startswith(GENERATED_RELEASE_PREFIXES)
-    )
+    }
+    unexpected = sorted(tracked_dirty | unexpected_untracked)
     if unexpected:
         raise ReleasePolicyError(
             f"release source tree differs from the checked-out commit: {unexpected}"

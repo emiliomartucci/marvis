@@ -301,6 +301,31 @@ class ReleaseCandidateTests(unittest.TestCase):
                 "a" * 40,
             )
 
+    def test_release_source_tree_allows_only_untracked_generated_outputs(self) -> None:
+        with mock.patch.object(
+            candidate,
+            "_git",
+            side_effect=[
+                "",
+                "\n".join(
+                    [
+                        "build/lib/core/api/main.py",
+                        "marvisx_cli.egg-info/PKG-INFO",
+                        "release-artifact/packages/a.whl",
+                    ]
+                ),
+            ],
+        ):
+            candidate._require_release_controls_committed(ROOT, "a" * 40)
+
+    def test_release_source_tree_rejects_tracked_generated_path_changes(self) -> None:
+        with mock.patch.object(
+            candidate,
+            "_git",
+            side_effect=["core/api/console_dist/.gitkeep", "build/lib/generated.py"],
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "source tree"):
+            candidate._require_release_controls_committed(ROOT, "a" * 40)
+
     def test_tag_build_rejects_another_trigger_tag(self) -> None:
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "another-tag"):
             candidate._validate_tag_trigger("v0.4.1", "refs/tags/another-tag")
