@@ -35,5 +35,15 @@ The projected shared source is MarvisX PR `#314`, candidate
 `962e0fa6bb15ca71e3b20e9c99636aa93c631271`, cross-checked against
 `contracts/engine-pin.yaml` and the live GitHub PR readback.
 
+The immutable Plan B product base remains
+`c1a4790100e228a8588e049fbd31233c6da73f88`. Before the release-only delta,
+Marvis PR `#54` adds the separately reviewed CI evidence foundation: candidate
+`2da56bfaff8ea6e0c8744761e40268750d2eeae3`, merged as
+`5a37295a084c990c63e824e2019108ee984684aa`. The policy verifies that this
+merge joins exactly the Plan B base and PR candidate, changes exactly four
+declared CI/perimeter files, and remains an ancestor of the release source.
+The release allowlist is applied only after this verified foundation; it is not
+widened to admit those prerequisite files.
+
 No tag, release, upload, publication or workflow dispatch was created while
 capturing this snapshot.

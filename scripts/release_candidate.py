@@ -354,6 +354,92 @@ def _shared_source_readback(
     }
 
 
+def _release_foundation_coordinates(
+    root: Path, policy: dict[str, Any]
+) -> dict[str, Any]:
+    foundation = policy.get("release_foundation") or {}
+    repository = str(foundation.get("repository") or "")
+    candidate_sha = str(foundation.get("candidate_sha") or "")
+    merge_sha = str(foundation.get("merge_sha") or "")
+    pull_request = foundation.get("pull_request")
+    expected_paths = foundation.get("expected_changed_paths")
+    product_base = str(policy.get("plan_b_product_base_sha") or "")
+    if (
+        repository != str(policy.get("repository") or "")
+        or not isinstance(pull_request, int)
+        or isinstance(pull_request, bool)
+        or pull_request < 1
+        or not SHA40.fullmatch(candidate_sha)
+        or not SHA40.fullmatch(merge_sha)
+        or not SHA40.fullmatch(product_base)
+        or not isinstance(expected_paths, list)
+        or not expected_paths
+        or any(not isinstance(path, str) or not path for path in expected_paths)
+        or expected_paths != sorted(set(expected_paths))
+    ):
+        raise ReleasePolicyError("release-foundation coordinates are invalid")
+    for path in expected_paths:
+        parsed = PurePosixPath(path)
+        if parsed.is_absolute() or ".." in parsed.parts:
+            raise ReleasePolicyError("release-foundation path is invalid")
+    for label, sha in (
+        ("Plan B product base", product_base),
+        ("release-foundation candidate", candidate_sha),
+        ("release-foundation merge", merge_sha),
+    ):
+        try:
+            resolved = str(_git(root, "rev-parse", "--verify", f"{sha}^{{commit}}"))
+        except subprocess.CalledProcessError as exc:
+            raise ReleasePolicyError(f"{label} commit is unavailable") from exc
+        if resolved != sha:
+            raise ReleasePolicyError(f"{label} commit identity is ambiguous")
+    parents = str(_git(root, "rev-list", "--parents", "-n", "1", merge_sha)).split()
+    if parents != [merge_sha, product_base, candidate_sha]:
+        raise ReleasePolicyError(
+            "release-foundation merge does not join the exact Plan B base and candidate"
+        )
+    observed_paths = _changed_paths(root, product_base, merge_sha)
+    if observed_paths != expected_paths:
+        raise ReleasePolicyError(
+            "release-foundation changed paths differ from release policy"
+        )
+    return {
+        "repository": repository,
+        "pull_request": pull_request,
+        "candidate_sha": candidate_sha,
+        "merge_sha": merge_sha,
+        "changed_paths": observed_paths,
+    }
+
+
+def _release_foundation_readback(
+    root: Path,
+    policy: dict[str, Any],
+    *,
+    token: str,
+    api_url: str,
+) -> dict[str, Any]:
+    expected = _release_foundation_coordinates(root, policy)
+    pull = _request_json(
+        f"{api_url}/repos/{expected['repository']}/pulls/{expected['pull_request']}",
+        token=token,
+    )
+    if (
+        pull.get("state") != "closed"
+        or not pull.get("merged_at")
+        or (pull.get("head") or {}).get("sha") != expected["candidate_sha"]
+        or pull.get("merge_commit_sha") != expected["merge_sha"]
+    ):
+        raise ReleasePolicyError(
+            "release-foundation PR identity differs from release policy"
+        )
+    return {
+        **expected,
+        "state": pull.get("state"),
+        "merged_at": pull.get("merged_at"),
+    }
+
+
 def _release_job_guards(workflow: str) -> dict[str, str]:
     guards: dict[str, str] = {}
     in_jobs = False
@@ -527,6 +613,7 @@ def validate_static(
     base = str(policy.get("plan_b_product_base_sha") or "")
     if not SHA40.fullmatch(base):
         raise ReleasePolicyError("Plan B product base is not a full commit")
+    release_foundation = _release_foundation_coordinates(root, policy)
     shared_source = _shared_source_coordinates(root, policy)
     receipt_policy = policy.get("external_receipts") or {}
     if (
@@ -544,13 +631,29 @@ def validate_static(
     )
     if ancestor.returncode != 0:
         raise ReleasePolicyError("release source does not descend from exact Plan B merge")
-    _validate_pyproject_version_only(root, base)
+    foundation_ancestor = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "merge-base",
+            "--is-ancestor",
+            release_foundation["merge_sha"],
+            resolved_head,
+        ],
+        capture_output=True,
+    )
+    if foundation_ancestor.returncode != 0:
+        raise ReleasePolicyError(
+            "release source does not descend from exact release foundation"
+        )
+    _validate_pyproject_version_only(root, release_foundation["merge_sha"])
     _require_local_version_order(root, policy)
 
     allowlist = policy.get("allowed_release_delta")
     if not isinstance(allowlist, list) or not allowlist:
         raise ReleasePolicyError("release delta allowlist is empty")
-    changed = _changed_paths(root, base, resolved_head)
+    changed = _changed_paths(root, release_foundation["merge_sha"], resolved_head)
     disallowed = [path for path in changed if not _path_allowed(path, allowlist)]
     if disallowed:
         raise ReleasePolicyError(f"product behavior entered release-only delta: {disallowed}")
@@ -686,6 +789,7 @@ def validate_static(
     return {
         "schema": "marvis-public-release-static-preflight/v1",
         "product_base_sha": base,
+        "release_foundation": release_foundation,
         "shared_source": shared_source,
         "release_source_sha": resolved_head,
         "release_branch": release_branch,
@@ -945,6 +1049,9 @@ def preflight(
     shared_source = _shared_source_readback(
         root, policy, token=token, api_url=api_url
     )
+    release_foundation = _release_foundation_readback(
+        root, policy, token=token, api_url=api_url
+    )
     environment = _environment_check(policy, token=token, api_url=api_url)
     remote_sha = _require_remote_release_source(
         policy,
@@ -974,6 +1081,7 @@ def preflight(
         {
             "environment": environment,
             "external_receipts": external_receipts,
+            "release_foundation": release_foundation,
             "shared_source": shared_source,
             "remote_release_branch_sha": remote_sha,
             "registry_latest": (registry.get("info") or {}).get("version"),
@@ -998,6 +1106,9 @@ def tag_preflight(
     _require_release_controls_committed(root, report["release_source_sha"])
     external_receipts = _strict_external_receipts(policy)
     shared_source = _shared_source_readback(
+        root, policy, token=token, api_url=api_url
+    )
+    release_foundation = _release_foundation_readback(
         root, policy, token=token, api_url=api_url
     )
     environment = _environment_check(policy, token=token, api_url=api_url)
@@ -1033,6 +1144,7 @@ def tag_preflight(
         {
             "environment": environment,
             "external_receipts": external_receipts,
+            "release_foundation": release_foundation,
             "shared_source": shared_source,
             "dispatch_preflight": dispatch_preflight,
             "remote_tag_sha": remote_tag_sha,
@@ -1051,6 +1163,9 @@ def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -
     _require_release_controls_committed(root, report["release_source_sha"])
     external_receipts = _strict_external_receipts(policy)
     shared_source = _shared_source_readback(
+        root, policy, token=token, api_url=api_url
+    )
+    release_foundation = _release_foundation_readback(
         root, policy, token=token, api_url=api_url
     )
     environment = _environment_check(policy, token=token, api_url=api_url)
@@ -1080,6 +1195,7 @@ def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -
         {
             "environment": environment,
             "external_receipts": external_receipts,
+            "release_foundation": release_foundation,
             "shared_source": shared_source,
             "dispatch_preflight": dispatch_preflight,
             "github_release": release,
@@ -1198,7 +1314,7 @@ def build_manifest(
         "diff",
         "--binary",
         "--full-index",
-        f"{policy['plan_b_product_base_sha']}..{resolved_head}",
+        f"{static['release_foundation']['merge_sha']}..{resolved_head}",
         text=False,
     )
     manifest = {
@@ -1207,6 +1323,7 @@ def build_manifest(
         "version": policy["candidate_version"],
         "tag": policy["candidate_tag"],
         "product_base_sha": policy["plan_b_product_base_sha"],
+        "release_foundation": static["release_foundation"],
         "shared_source": static["shared_source"],
         "release_source_sha": resolved_head,
         "allowed_release_delta_sha256": _sha_bytes(delta),
@@ -1595,8 +1712,15 @@ def build_acceptance_receipt(
     shared_source = _shared_source_readback(
         root, policy, token=token, api_url=api_url
     )
+    release_foundation = _release_foundation_readback(
+        root, policy, token=token, api_url=api_url
+    )
     if manifest.get("shared_source") != _shared_source_coordinates(root, policy):
         raise ReleasePolicyError("release manifest shared-source identity changed")
+    if manifest.get("release_foundation") != _release_foundation_coordinates(
+        root, policy
+    ):
+        raise ReleasePolicyError("release manifest foundation identity changed")
     remote_tag_sha = _remote_tag_sha(policy, token=token, api_url=api_url)
     if remote_tag_sha != source_sha:
         raise ReleasePolicyError("candidate tag moved before acceptance receipt")
@@ -1638,6 +1762,7 @@ def build_acceptance_receipt(
         "version": manifest["version"],
         "tag": manifest["tag"],
         "product_base_sha": manifest["product_base_sha"],
+        "release_foundation": release_foundation,
         "shared_source": shared_source,
         "release_source_sha": source_sha,
         "remote_release_branch_sha": remote_branch_sha,
@@ -1691,8 +1816,15 @@ def publish_window(
     shared_source = _shared_source_readback(
         root, policy, token=token, api_url=api_url
     )
+    release_foundation = _release_foundation_readback(
+        root, policy, token=token, api_url=api_url
+    )
     if manifest.get("shared_source") != _shared_source_coordinates(root, policy):
         raise ReleasePolicyError("release manifest shared-source identity changed")
+    if manifest.get("release_foundation") != _release_foundation_coordinates(
+        root, policy
+    ):
+        raise ReleasePolicyError("release manifest foundation identity changed")
     run = _workflow_run_readback(
         policy,
         str(manifest.get("release_source_sha") or ""),
@@ -1737,6 +1869,7 @@ def publish_window(
         "age_seconds": int(age),
         "environment": environment,
         "external_receipts": external_receipts,
+        "release_foundation": release_foundation,
         "shared_source": shared_source,
         "dispatch_preflight": dispatch_preflight,
         "remote_release_branch_sha": remote_branch_sha,

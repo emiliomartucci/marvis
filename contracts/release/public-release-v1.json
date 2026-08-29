@@ -4,6 +4,18 @@
   "repository": "emiliomartucci/marvis",
   "release_branch": "main",
   "plan_b_product_base_sha": "c1a4790100e228a8588e049fbd31233c6da73f88",
+  "release_foundation": {
+    "repository": "emiliomartucci/marvis",
+    "pull_request": 54,
+    "candidate_sha": "2da56bfaff8ea6e0c8744761e40268750d2eeae3",
+    "merge_sha": "5a37295a084c990c63e824e2019108ee984684aa",
+    "expected_changed_paths": [
+      ".github/workflows/ci.yml",
+      "scripts/test_validate_local_surfaces.py",
+      "scripts/test_verify_ci_collection.py",
+      "scripts/validate_local_surfaces.py"
+    ]
+  },
   "shared_source": {
     "repository": "emiliomartucci/marvisx",
     "pull_request": 314,

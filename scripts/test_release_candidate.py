@@ -88,6 +88,18 @@ class ReleaseCandidateTests(unittest.TestCase):
             "c1a4790100e228a8588e049fbd31233c6da73f88",
         )
         self.assertEqual(
+            report["release_foundation"]["candidate_sha"],
+            "2da56bfaff8ea6e0c8744761e40268750d2eeae3",
+        )
+        self.assertEqual(
+            report["release_foundation"]["merge_sha"],
+            "5a37295a084c990c63e824e2019108ee984684aa",
+        )
+        self.assertEqual(
+            report["release_foundation"]["changed_paths"],
+            self.policy()["release_foundation"]["expected_changed_paths"],
+        )
+        self.assertEqual(
             report["shared_source"]["candidate_sha"],
             "6c25bebde4d8feee6455994aeca37afc41da4a78",
         )
@@ -189,6 +201,43 @@ class ReleaseCandidateTests(unittest.TestCase):
                 ROOT, policy, token="masked", api_url="https://api.example"
             )
 
+    def test_release_foundation_is_exact_and_remotely_read_back(self) -> None:
+        policy = self.policy()
+        expected = policy["release_foundation"]
+        pull = {
+            "state": "closed",
+            "merged_at": "2026-08-29T13:06:26Z",
+            "head": {"sha": expected["candidate_sha"]},
+            "merge_commit_sha": expected["merge_sha"],
+        }
+        with mock.patch.object(candidate, "_request_json", return_value=pull):
+            report = candidate._release_foundation_readback(
+                ROOT, policy, token="masked", api_url="https://api.example"
+            )
+        self.assertEqual(report["pull_request"], 54)
+        self.assertEqual(
+            report["changed_paths"], expected["expected_changed_paths"]
+        )
+
+        pull["merge_commit_sha"] = "a" * 40
+        with mock.patch.object(
+            candidate, "_request_json", return_value=pull
+        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "identity"):
+            candidate._release_foundation_readback(
+                ROOT, policy, token="masked", api_url="https://api.example"
+            )
+
+    def test_release_foundation_rejects_unexpected_changed_path(self) -> None:
+        policy = self.policy()
+        policy["release_foundation"]["expected_changed_paths"] = sorted(
+            [
+                *policy["release_foundation"]["expected_changed_paths"],
+                "scripts/unreviewed.py",
+            ]
+        )
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "changed paths"):
+            candidate._release_foundation_coordinates(ROOT, policy)
+
     def test_tag_requires_fresh_successful_dispatch_at_exact_sha(self) -> None:
         now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
         policy = self.policy()
@@ -257,11 +306,18 @@ class ReleaseCandidateTests(unittest.TestCase):
             candidate._validate_tag_trigger("v0.4.1", "refs/tags/another-tag")
 
     def test_release_delta_rejects_product_code(self) -> None:
+        foundation = candidate._release_foundation_coordinates(ROOT, self.policy())
         with mock.patch.object(
-            candidate, "_changed_paths", return_value=["core/api/main.py"]
-        ):
+            candidate, "_release_foundation_coordinates", return_value=foundation
+        ), mock.patch.object(candidate, "_changed_paths", return_value=["core/api/main.py"]):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "product behavior"):
                 candidate.validate_static(ROOT)
+
+    def test_release_source_must_descend_from_exact_foundation(self) -> None:
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "exact release foundation"):
+            candidate.validate_static(
+                ROOT, head=self.policy()["plan_b_product_base_sha"]
+            )
 
     def test_pyproject_release_delta_rejects_dependency_change(self) -> None:
         base = copy.deepcopy(candidate.tomllib.loads((ROOT / "pyproject.toml").read_text()))
@@ -273,7 +329,7 @@ class ReleaseCandidateTests(unittest.TestCase):
             side_effect=[base, changed],
         ), self.assertRaisesRegex(candidate.ReleasePolicyError, "beyond project.version"):
             candidate._validate_pyproject_version_only(
-                ROOT, self.policy()["plan_b_product_base_sha"]
+                ROOT, self.policy()["release_foundation"]["merge_sha"]
             )
 
     def test_candidate_version_must_exceed_all_history(self) -> None:
@@ -393,6 +449,26 @@ class ReleaseCandidateTests(unittest.TestCase):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "bytes differ"):
                 candidate.verify_manifest(ROOT, manifest_path, dist)
 
+    def test_manifest_hashes_only_the_post_foundation_release_delta(self) -> None:
+        policy = self.policy()
+        with tempfile.TemporaryDirectory(prefix="release-foundation-manifest-") as raw:
+            dist = Path(raw) / "dist"
+            self.write_release_artifacts(dist)
+            manifest = candidate.build_manifest(ROOT, dist)
+        expected_delta = candidate._git(
+            ROOT,
+            "diff",
+            "--binary",
+            "--full-index",
+            f"{policy['release_foundation']['merge_sha']}..HEAD",
+            text=False,
+        )
+        self.assertEqual(
+            manifest["allowed_release_delta_sha256"],
+            candidate._sha_bytes(expected_delta),
+        )
+        self.assertNotIn(".github/workflows/ci.yml", manifest["changed_paths"])
+
     def test_manifest_recomputed_identity_tamper_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="release-identity-") as raw:
             dist = Path(raw) / "dist"
@@ -488,6 +564,10 @@ class ReleaseCandidateTests(unittest.TestCase):
                 "_shared_source_readback",
                 return_value=manifest["shared_source"],
             ), mock.patch.object(
+                candidate,
+                "_release_foundation_readback",
+                return_value=manifest["release_foundation"],
+            ), mock.patch.object(
                 candidate, "verify_manifest"
             ), mock.patch.object(
                 candidate,
@@ -523,6 +603,10 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.assertEqual(
                 receipt["terminal_state"],
                 "accepted_ready_for_github_release_finalization",
+            )
+            self.assertEqual(
+                receipt["release_foundation"]["merge_sha"],
+                policy["release_foundation"]["merge_sha"],
             )
 
     def test_registry_readback_retries_then_matches_exact_bytes(self) -> None:
@@ -815,6 +899,10 @@ class ReleaseCandidateTests(unittest.TestCase):
             "_shared_source_readback",
             return_value=candidate._shared_source_coordinates(ROOT, policy),
         ), mock.patch.object(
+            candidate,
+            "_release_foundation_readback",
+            return_value=candidate._release_foundation_coordinates(ROOT, policy),
+        ), mock.patch.object(
             candidate, "_require_release_controls_committed"
         ), mock.patch.object(
             candidate, "_environment_check", return_value={"name": "pypi"}
@@ -837,6 +925,10 @@ class ReleaseCandidateTests(unittest.TestCase):
             candidate,
             "_shared_source_readback",
             return_value=candidate._shared_source_coordinates(ROOT, policy),
+        ), mock.patch.object(
+            candidate,
+            "_release_foundation_readback",
+            return_value=candidate._release_foundation_coordinates(ROOT, policy),
         ), mock.patch.object(
             candidate,
             "_workflow_dispatch_proof",
@@ -874,6 +966,10 @@ class ReleaseCandidateTests(unittest.TestCase):
             "_shared_source_readback",
             return_value=candidate._shared_source_coordinates(ROOT, policy),
         ), mock.patch.object(
+            candidate,
+            "_release_foundation_readback",
+            return_value=candidate._release_foundation_coordinates(ROOT, policy),
+        ), mock.patch.object(
             candidate, "_require_release_controls_committed"
         ), mock.patch.object(
             candidate, "_environment_check", return_value={"name": "pypi"}
@@ -902,6 +998,10 @@ class ReleaseCandidateTests(unittest.TestCase):
             candidate,
             "_shared_source_readback",
             return_value=candidate._shared_source_coordinates(ROOT, policy),
+        ), mock.patch.object(
+            candidate,
+            "_release_foundation_readback",
+            return_value=candidate._release_foundation_coordinates(ROOT, policy),
         ), mock.patch.object(
             candidate, "_require_release_controls_committed"
         ), mock.patch.object(
@@ -989,6 +1089,10 @@ class ReleaseCandidateTests(unittest.TestCase):
             "_shared_source_readback",
             return_value=candidate._shared_source_coordinates(ROOT, policy),
         ), mock.patch.object(
+            candidate,
+            "_release_foundation_readback",
+            return_value=candidate._release_foundation_coordinates(ROOT, policy),
+        ), mock.patch.object(
             candidate, "_require_release_controls_committed"
         ), mock.patch.object(
             candidate, "_environment_check", return_value={"name": "pypi"}
@@ -1014,6 +1118,9 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.write_manifest(
                 manifest_path,
                 release_source_sha="a" * 40,
+                release_foundation=candidate._release_foundation_coordinates(
+                    ROOT, policy
+                ),
                 shared_source=candidate._shared_source_coordinates(ROOT, policy),
                 dispatch_preflight={"id": 7, "run_attempt": 1, "head_sha": "a" * 40},
             )
@@ -1033,6 +1140,10 @@ class ReleaseCandidateTests(unittest.TestCase):
                 candidate,
                 "_shared_source_readback",
                 return_value=candidate._shared_source_coordinates(ROOT, policy),
+            ), mock.patch.object(
+                candidate,
+                "_release_foundation_readback",
+                return_value=candidate._release_foundation_coordinates(ROOT, policy),
             ), mock.patch.object(
                 candidate, "_request_json", return_value=run
             ):
@@ -1055,6 +1166,9 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.write_manifest(
                 manifest_path,
                 release_source_sha="a" * 40,
+                release_foundation=candidate._release_foundation_coordinates(
+                    ROOT, policy
+                ),
                 shared_source=candidate._shared_source_coordinates(ROOT, policy),
                 dispatch_preflight={"id": 7, "run_attempt": 1, "head_sha": "a" * 40},
             )
@@ -1074,6 +1188,10 @@ class ReleaseCandidateTests(unittest.TestCase):
                 candidate,
                 "_shared_source_readback",
                 return_value=candidate._shared_source_coordinates(ROOT, policy),
+            ), mock.patch.object(
+                candidate,
+                "_release_foundation_readback",
+                return_value=candidate._release_foundation_coordinates(ROOT, policy),
             ), mock.patch.object(
                 candidate, "_request_json", return_value=run
             ):
@@ -1096,6 +1214,9 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.write_manifest(
                 manifest_path,
                 release_source_sha="a" * 40,
+                release_foundation=candidate._release_foundation_coordinates(
+                    ROOT, policy
+                ),
                 shared_source=candidate._shared_source_coordinates(ROOT, policy),
                 dispatch_preflight={"id": 7, "run_attempt": 1, "head_sha": "a" * 40},
             )
@@ -1115,6 +1236,10 @@ class ReleaseCandidateTests(unittest.TestCase):
                 candidate,
                 "_shared_source_readback",
                 return_value=candidate._shared_source_coordinates(ROOT, policy),
+            ), mock.patch.object(
+                candidate,
+                "_release_foundation_readback",
+                return_value=candidate._release_foundation_coordinates(ROOT, policy),
             ), mock.patch.object(
                 candidate,
                 "_workflow_dispatch_proof",

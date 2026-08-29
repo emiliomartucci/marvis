@@ -10,9 +10,10 @@ No changes yet.
 
 ## [0.4.1] - candidate
 
-Security and provenance refresh based on the exact merged Plan B product base.
-The release keeps the local CLI, MCP, hooks and packaged GUI contracts while
-updating the shared engine and its regression coverage.
+Security and provenance refresh based on the exact merged Plan B product base
+and the separately pinned CI evidence foundation from PR #54. The release
+keeps the local CLI, MCP, hooks and packaged GUI contracts while updating the
+shared engine and its regression coverage.
 
 ### Security
 
