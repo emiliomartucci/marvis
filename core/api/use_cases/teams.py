@@ -10,6 +10,7 @@ import aiosqlite
 
 from core.api.services import access_grants
 from core.api.services.audit import log_audit
+from core.api.services.project_lifecycle import record_project_write
 from core.api.use_cases._context import (
     CallerContext,
     require_role_ctx,
@@ -481,6 +482,7 @@ async def add_team_member(
         )
     except aiosqlite.IntegrityError as exc:
         if "UNIQUE" not in str(exc):
+            await db.rollback()
             raise
         await db.execute(
             "UPDATE team_members SET role=?,is_admin=? "
@@ -628,6 +630,14 @@ async def assign_team_project(
         _require_active_lead(ctx)
     assigned_at = _now()
     action = "team.project_assign"
+    await record_project_write(
+        db,
+        workspace_id=workspace_id,
+        project_slug=project,
+        writer_kind="project_team",
+        actor=ctx.user_id or ctx.username,
+        resource_ref=team_id,
+    )
     try:
         await db.execute(
             "INSERT INTO project_teams"
@@ -704,6 +714,14 @@ async def unassign_team_project(
                 code="project_not_assigned",
                 message="Project not assigned to this team",
             )
+    await record_project_write(
+        db,
+        workspace_id=workspace_id,
+        project_slug=project,
+        writer_kind="project_team",
+        actor=ctx.user_id or ctx.username,
+        resource_ref=team_id,
+    )
     await db.execute(
         "DELETE FROM project_teams WHERE project=? AND team_id=?",
         (project, team_id),

@@ -24,6 +24,8 @@ from core.api.services.ingest.xlsx_privacy import (
     neutral_xlsx_filenames,
     neutral_xlsx_title,
 )
+from core.api.services.project_lifecycle import isolated_project_file_write
+from core.api.use_cases._context import CallerContext
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,16 @@ _IMAGE_SUFFIXES_WITH_POST_PARSE_DIGEST = {".jpeg", ".jpg", ".png", ".webp"}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _XLSX_TARGET_FOLDER = "docs/assets"
 ProjectType = Literal["work", "code", "system"]
+
+
+def _ingest_caller(workspace_id: str) -> CallerContext:
+    return CallerContext(
+        username="pir-ingest",
+        system_role="operator",
+        user_type="agent",
+        workspace_id=workspace_id,
+        user_id="pir-ingest",
+    )
 
 
 def _project_root(slug: str) -> Path:
@@ -851,26 +863,34 @@ async def _finish_inserted_row(row, workspace_id: str) -> None:
     if target_path.suffix.lower() == ".xlsx":
         queued_sha = str(row["sha256"] or "").lower()
         project_root = _project_root(project_slug)
-        neutral_target = _unique_target_path(
-            project_root,
-            _XLSX_TARGET_FOLDER,
-            neutral_xlsx_filename(queued_sha),
-            queued_sha,
-            target_sha256=queued_sha,
-        )
-        safe_classification = _privacy_safe_xlsx_classification(
-            queued_sha,
-            target_filename=neutral_target.name,
-        )
-        _materialize_target_file(
-            source_path=target_path,
-            target_path=neutral_target,
-            row=row,
-            classification=safe_classification,
-        )
-        target_path = neutral_target
-        classification = safe_classification
-        async with acquire_write_db() as db:
+        async with isolated_project_file_write(
+            _ingest_caller(workspace_id),
+            project_slug=project_slug,
+            writer_kind="ingest_recovery",
+            resource_ref=str(row["id"]),
+            operation_id=f"ingest:{row['id']}",
+            projects_root=_projects_root(),
+        ):
+            neutral_target = _unique_target_path(
+                project_root,
+                _XLSX_TARGET_FOLDER,
+                neutral_xlsx_filename(queued_sha),
+                queued_sha,
+                target_sha256=queued_sha,
+            )
+            safe_classification = _privacy_safe_xlsx_classification(
+                queued_sha,
+                target_filename=neutral_target.name,
+            )
+            _materialize_target_file(
+                source_path=target_path,
+                target_path=neutral_target,
+                row=row,
+                classification=safe_classification,
+            )
+            target_path = neutral_target
+            classification = safe_classification
+        async with acquire_write_db(label="ingest.recovery-metadata") as db:
             await db.execute(
                 """
                 UPDATE ingest_pending
@@ -1023,87 +1043,89 @@ async def execute_saga(ingest_id: str, workspace_id: str) -> None:
         if not source_path.is_relative_to(project_root):
             raise ValueError("source path escapes project root")
 
-        classification = json.loads(row["classification_json"] or "{}")
-        target_folder = row["target_folder"] or classification.get("target_folder")
-        target_filename = row["target_filename"] or classification.get("target_filename")
-        if not target_folder or not target_filename:
-            raise ValueError("missing target_folder/target_filename")
-        is_xlsx_source = source_path.suffix.lower() == ".xlsx"
-        if is_xlsx_source:
-            queued_sha = str(row["sha256"] or "").lower()
-            target_folder = _XLSX_TARGET_FOLDER
-            if str(target_filename) not in neutral_xlsx_filenames(queued_sha):
-                target_filename = neutral_xlsx_filename(queued_sha)
-            classification = _privacy_safe_xlsx_classification(
-                queued_sha,
-                target_filename=str(target_filename),
-            )
-        if not source_path.exists():
-            target_path = (
-                _recover_materialized_xlsx_target(
+        async with isolated_project_file_write(
+            _ingest_caller(workspace_id),
+            project_slug=project_slug,
+            writer_kind="ingest_materialize",
+            resource_ref=ingest_id,
+            operation_id=f"ingest:{ingest_id}",
+            projects_root=_projects_root(),
+        ):
+            classification = json.loads(row["classification_json"] or "{}")
+            target_folder = row["target_folder"] or classification.get("target_folder")
+            target_filename = row["target_filename"] or classification.get("target_filename")
+            if not target_folder or not target_filename:
+                raise ValueError("missing target_folder/target_filename")
+            is_xlsx_source = source_path.suffix.lower() == ".xlsx"
+            if is_xlsx_source:
+                queued_sha = str(row["sha256"] or "").lower()
+                target_folder = _XLSX_TARGET_FOLDER
+                if str(target_filename) not in neutral_xlsx_filenames(queued_sha):
+                    target_filename = neutral_xlsx_filename(queued_sha)
+                classification = _privacy_safe_xlsx_classification(
+                    queued_sha,
+                    target_filename=str(target_filename),
+                )
+            if not source_path.exists():
+                target_path = (
+                    _recover_materialized_xlsx_target(
+                        project_root,
+                        str(target_folder),
+                        queued_sha,
+                    )
+                    if is_xlsx_source
+                    else None
+                )
+                if target_path is None:
+                    raise FileNotFoundError(str(source_path))
+                _move_sidecar_if_present(source_path, target_path, queued_sha)
+            else:
+                materialization_sha = _materialization_sha256(row, source_path)
+                expected_target_sha = _expected_target_sha256(
+                    source_path=source_path,
+                    target_path=Path(str(target_filename)),
+                    row=row,
+                    classification=classification,
+                )
+
+                target_path = _unique_target_path(
                     project_root,
                     str(target_folder),
-                    queued_sha,
+                    str(target_filename),
+                    materialization_sha,
+                    target_sha256=expected_target_sha,
                 )
-                if is_xlsx_source
-                else None
-            )
-            if target_path is None:
-                raise FileNotFoundError(str(source_path))
-            _move_sidecar_if_present(source_path, target_path, queued_sha)
-        else:
-            materialization_sha = _materialization_sha256(row, source_path)
-            expected_target_sha = _expected_target_sha256(
-                source_path=source_path,
-                target_path=Path(str(target_filename)),
-                row=row,
-                classification=classification,
-            )
-
-            target_path = _unique_target_path(
-                project_root,
-                str(target_folder),
-                str(target_filename),
-                materialization_sha,
-                target_sha256=expected_target_sha,
-            )
-            _materialize_target_file(
-                source_path=source_path,
-                target_path=target_path,
-                row=row,
-                classification=classification,
-            )
-        if is_xlsx_source:
-            classification = _privacy_safe_xlsx_classification(
-                queued_sha,
-                target_filename=target_path.name,
-            )
-
-        commit_created = False
-        if project_type in ("code", "system"):
-            try:
-                commit_created = _commit_ingested_file(
-                    slug=project_slug,
-                    repo_path=repo_path,
+                _materialize_target_file(
+                    source_path=source_path,
                     target_path=target_path,
+                    row=row,
+                    classification=classification,
+                )
+            if is_xlsx_source:
+                classification = _privacy_safe_xlsx_classification(
+                    queued_sha,
                     target_filename=target_path.name,
                 )
-            except Exception as exc:
-                logger.warning("ingest git commit blocked: %s", exc)
-                await _set_saga_error(
-                    ingest_id,
-                    workspace_id,
-                    project_slug,
-                    f"workspace guard: {exc}",
-                )
-                return
 
-        async with acquire_write_db() as db:
-            persisted_file_path = (
-                str(target_path)
-                if is_xlsx_source
-                else str(row["file_path"])
-            )
+            commit_created = False
+            if project_type in ("code", "system"):
+                try:
+                    commit_created = _commit_ingested_file(
+                        slug=project_slug,
+                        repo_path=repo_path,
+                        target_path=target_path,
+                        target_filename=target_path.name,
+                    )
+                except Exception as exc:
+                    logger.warning("ingest git commit blocked: %s", exc)
+                    raise RuntimeError(f"workspace guard: {exc}") from exc
+
+        persisted_file_path = (
+            str(target_path)
+            if is_xlsx_source
+            else str(row["file_path"])
+        )
+        async with acquire_write_db(label="ingest.materialize-metadata") as db:
             await db.execute(
                 """
                 UPDATE ingest_pending

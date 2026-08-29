@@ -23,6 +23,114 @@
       "evidence": ["core/api/routers/auth.py"]
     },
     {
+      "path": "/api/v1/projects/_cloud-f/activate",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::activate_cloud_f_control"]
+    },
+    {
+      "path": "/api/v1/projects/_cloud-f/changes/acquire",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::acquire_cloud_f_change"]
+    },
+    {
+      "path": "/api/v1/projects/_cloud-f/changes/complete",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::complete_cloud_f_change"]
+    },
+    {
+      "path": "/api/v1/projects/_cloud-f/changes/{operation_id}",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::get_cloud_f_change_operation"]
+    },
+    {
+      "path": "/api/v1/projects/_cloud-f/control",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::get_cloud_f_control"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/archive",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::archive_project"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/archive-approvals",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::approve_project_archive"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/decision-operations/{operation_id}",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::get_decision_lifecycle_operation"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/decisions",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::create_governed_decision"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/decisions/{decision_id}",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::get_governed_decision"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/decisions/{decision_id}/accept",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::accept_governed_decision"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/decisions/{decision_id}/supersede",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::supersede_governed_decision"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/historical-pointers",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::get_historical_artifact_pointers"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/historical-pointers",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::create_historical_artifact_pointer"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/lifecycle",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::get_project_lifecycle"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/lifecycle/operations/{operation_id}",
+      "method": "get",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::get_project_lifecycle_operation"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/lifecycle/register",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::register_project_lifecycle"]
+    },
+    {
+      "path": "/api/v1/projects/{slug}/lifecycle/selector-watermark",
+      "method": "post",
+      "surfaces": ["http"],
+      "evidence": ["core/api/routers/projects.py::update_project_selector_watermark"]
+    },
+    {
       "path": "/api/v1/graph/ingest",
       "method": "post",
       "surfaces": ["cli", "http", "package_install"],
@@ -40,6 +148,26 @@
       "surfaces": ["http"],
       "evidence": ["core/api/routers/auth.py"]
     }
+  ],
+  "n_only_mcp_tools": [
+    {"name": "accept_governed_decision", "evidence": ["core/api/mcp/tools/projects.py::accept_governed_decision"]},
+    {"name": "acquire_cloud_f_change", "evidence": ["core/api/mcp/tools/projects.py::acquire_cloud_f_change"]},
+    {"name": "activate_cloud_f_control", "evidence": ["core/api/mcp/tools/projects.py::activate_cloud_f_control"]},
+    {"name": "archive_project", "evidence": ["core/api/mcp/tools/projects.py::archive_project"]},
+    {"name": "complete_cloud_f_change", "evidence": ["core/api/mcp/tools/projects.py::complete_cloud_f_change"]},
+    {"name": "create_governed_decision", "evidence": ["core/api/mcp/tools/projects.py::create_governed_decision"]},
+    {"name": "create_historical_pointer", "evidence": ["core/api/mcp/tools/projects.py::create_historical_pointer"]},
+    {"name": "create_project_archive_approval", "evidence": ["core/api/mcp/tools/projects.py::create_project_archive_approval"]},
+    {"name": "get_cloud_f_change_operation", "evidence": ["core/api/mcp/tools/projects.py::get_cloud_f_change_operation"]},
+    {"name": "get_cloud_f_control", "evidence": ["core/api/mcp/tools/projects.py::get_cloud_f_control"]},
+    {"name": "get_decision_operation", "evidence": ["core/api/mcp/tools/projects.py::get_decision_operation"]},
+    {"name": "get_governed_decision", "evidence": ["core/api/mcp/tools/projects.py::get_governed_decision"]},
+    {"name": "get_project_lifecycle", "evidence": ["core/api/mcp/tools/projects.py::get_project_lifecycle"]},
+    {"name": "get_project_lifecycle_operation", "evidence": ["core/api/mcp/tools/projects.py::get_project_lifecycle_operation"]},
+    {"name": "list_historical_pointers", "evidence": ["core/api/mcp/tools/projects.py::list_historical_pointers"]},
+    {"name": "register_project_lifecycle", "evidence": ["core/api/mcp/tools/projects.py::register_project_lifecycle"]},
+    {"name": "supersede_governed_decision", "evidence": ["core/api/mcp/tools/projects.py::supersede_governed_decision"]},
+    {"name": "update_project_selector_watermark", "evidence": ["core/api/mcp/tools/projects.py::update_project_selector_watermark"]}
   ],
   "n_consumer_n_minus_1_schema_breaks": [
     {
@@ -83,10 +211,10 @@
     {
       "surface": "local_mcp",
       "n_consumer_n_contract": "pass",
-      "n_consumer_n_minus_1_contract": "pass",
+      "n_consumer_n_minus_1_contract": "migration_required",
       "n_minus_1_consumer_n_contract": "pass",
       "old_binary_forward_schema": "deny",
-      "evidence": ["core/api/tests/test_require_scope_empty_deny.py", "core/api/mcp/stdio.py", "core/api/db.py:assert_schema_compatible"]
+      "evidence": ["contracts/compatibility/fixtures/n-mcp-tools.json", "contracts/compatibility/fixtures/n-minus-1-mcp-tools.json", "core/api/tests/test_require_scope_empty_deny.py", "core/api/mcp/stdio.py", "core/api/db.py:assert_schema_compatible"]
     },
     {
       "surface": "http",

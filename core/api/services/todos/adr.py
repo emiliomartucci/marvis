@@ -24,12 +24,15 @@ huge bodies.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import tempfile
 import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+import aiosqlite
 import yaml
 
 from core.scripts._frontmatter import parse_frontmatter
@@ -117,8 +120,33 @@ def _mark_superseded(path: Path, new_filename: str) -> bool:
         return False
     data["superseded_by"] = new_filename
     new_text = "---\n" + _dump_frontmatter(data) + "\n---\n" + (body or "")
-    path.write_text(new_text, encoding="utf-8")
+    _atomic_write_text(path, new_text)
     return True
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    descriptor, temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _body(
@@ -203,7 +231,7 @@ def write_adr(
         rationale=rationale,
     )
     document = "---\n" + _dump_frontmatter(frontmatter) + "\n---\n\n" + body
-    target.write_text(document, encoding="utf-8")
+    _atomic_write_text(target, document)
 
     for predecessor in predecessors:
         try:
@@ -219,4 +247,40 @@ def write_adr(
     return target
 
 
-__all__ = ["write_adr", "slugify"]
+async def write_adr_guarded(
+    *,
+    ctx,
+    db: aiosqlite.Connection,
+    project_slug: str | None,
+    payload: dict[str, Any] | None,
+    decisore: str,
+    now: datetime,
+) -> Path | None:
+    """Journal and serialize an ADR write against project archival."""
+    if not project_slug:
+        return None
+    from core.api.services import project_lifecycle
+    from core.api.use_cases._context import require_workspace_ctx
+    from core.api.use_cases.projects import data_project_dir
+
+    root = data_project_dir()
+    async with project_lifecycle.async_project_mutation_guard(projects_root=root):
+        await project_lifecycle.record_project_write(
+            db,
+            workspace_id=require_workspace_ctx(ctx),
+            project_slug=project_slug,
+            writer_kind="decision",
+            actor=ctx.user_id or ctx.username,
+            resource_ref="docs/decisions",
+            projects_root=root,
+        )
+        await db.commit()
+        return write_adr(
+            project_slug=project_slug,
+            payload=payload,
+            decisore=decisore,
+            now=now,
+        )
+
+
+__all__ = ["write_adr", "write_adr_guarded", "slugify"]

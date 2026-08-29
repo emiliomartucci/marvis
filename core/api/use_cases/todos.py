@@ -969,7 +969,7 @@ async def update_todo(
     await db.commit()
 
     if adr_context is not None and adr_correlation_id is not None:
-        from core.api.services.todos.adr import write_adr
+        from core.api.services.todos.adr import write_adr_guarded
 
         final_details = {
             "todo_id": todo_id,
@@ -979,7 +979,9 @@ async def update_todo(
             "adr_name": None,
         }
         try:
-            adr_path = write_adr(
+            adr_path = await write_adr_guarded(
+                ctx=ctx,
+                db=db,
                 project_slug=adr_context["project"],
                 payload=adr_context["payload"],
                 decisore=ctx.username,

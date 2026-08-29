@@ -342,7 +342,47 @@ async def _purge_index_rows(
     return purged
 
 
-async def mark_confidential(db: aiosqlite.Connection, actor: CallerContext, *, path: str) -> dict:
+async def mark_confidential(
+    db: aiosqlite.Connection,
+    actor: CallerContext,
+    *,
+    path: str,
+) -> dict:
+    """Serialize a confidentiality flip with project archive."""
+    key = canonical_file_key(path)
+    if key is None:
+        raise ConfidentialFileError(
+            code="invalid_path",
+            message="path is not inside a project",
+        )
+    from core.api.services import project_lifecycle
+
+    projects_root = Path(
+        os.environ.get("MARVIS_PROJECTS_ROOT", "/data/projects").strip()
+        or "/data/projects"
+    ).expanduser().resolve()
+    async with project_lifecycle.async_project_mutation_guard(
+        projects_root=projects_root
+    ):
+        await project_lifecycle.record_project_write(
+            db,
+            workspace_id=require_workspace_ctx(actor),
+            project_slug=key[0],
+            writer_kind="confidential_mark",
+            actor=actor.user_id or actor.username,
+            resource_ref=key[1],
+            projects_root=projects_root,
+        )
+        await db.commit()
+        return await _mark_confidential_locked(db, actor, path=path)
+
+
+async def _mark_confidential_locked(
+    db: aiosqlite.Connection,
+    actor: CallerContext,
+    *,
+    path: str,
+) -> dict:
     """Owner-only mark. A file without an owner can be claimed by the person
     marking it (pre-F4 files); agents/bearer never mark. Fail-closed order:
     frontmatter first (instant hide), then ONE writer tx for meta + purge."""
@@ -458,7 +498,47 @@ async def mark_confidential(db: aiosqlite.Connection, actor: CallerContext, *, p
     return {"path": path, "confidential": True, "owner": refreshed["owner_user_id"] if refreshed else actor.user_id, "purged": purged}
 
 
-async def unmark_confidential(db: aiosqlite.Connection, actor: CallerContext, *, path: str) -> dict:
+async def unmark_confidential(
+    db: aiosqlite.Connection,
+    actor: CallerContext,
+    *,
+    path: str,
+) -> dict:
+    """Serialize a declassification flip with project archive."""
+    key = canonical_file_key(path)
+    if key is None:
+        raise ConfidentialFileError(
+            code="invalid_path",
+            message="path is not inside a project",
+        )
+    from core.api.services import project_lifecycle
+
+    projects_root = Path(
+        os.environ.get("MARVIS_PROJECTS_ROOT", "/data/projects").strip()
+        or "/data/projects"
+    ).expanduser().resolve()
+    async with project_lifecycle.async_project_mutation_guard(
+        projects_root=projects_root
+    ):
+        await project_lifecycle.record_project_write(
+            db,
+            workspace_id=require_workspace_ctx(actor),
+            project_slug=key[0],
+            writer_kind="confidential_unmark",
+            actor=actor.user_id or actor.username,
+            resource_ref=key[1],
+            projects_root=projects_root,
+        )
+        await db.commit()
+        return await _unmark_confidential_locked(db, actor, path=path)
+
+
+async def _unmark_confidential_locked(
+    db: aiosqlite.Connection,
+    actor: CallerContext,
+    *,
+    path: str,
+) -> dict:
     """Owner-only declassify: flips DB flag + frontmatter; the file re-enters
     the index on the next reindex of its path."""
     workspace_id = require_workspace_ctx(actor)

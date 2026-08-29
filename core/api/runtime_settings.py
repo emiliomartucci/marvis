@@ -79,7 +79,14 @@ def apply_marvis_settings(*, force: bool = False) -> bool:
         from core.api import config as config_mod
         from core.api.routers.projects import _set_project_dirs
 
-        projects_root_path = Path(projects_root).expanduser().resolve()
+        # Explicit process configuration wins over the persisted settings
+        # file.  Normalize the winning value once, then keep every consumer
+        # aligned with it.
+        effective_projects_root = (
+            os.environ.get("MARVIS_PROJECTS_ROOT") or projects_root
+        )
+        projects_root_path = Path(effective_projects_root).expanduser().resolve()
+        os.environ["MARVIS_PROJECTS_ROOT"] = str(projects_root_path)
         _set_project_dirs([projects_root_path])
 
         # Hosted tenants keep project metadata under ``projects/`` and Git repos

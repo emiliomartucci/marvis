@@ -35,6 +35,8 @@ from core.api.db import acquire_db, write_db
 from core.api.models import UserInfo
 from core.api.rbac import require_role
 from core.api.services.brain import direction as direction_svc
+from core.api.services import project_lifecycle
+from core.api.use_cases._context import CallerContext
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +148,7 @@ async def _apply_write_back(
     change_type: str,
     source_finding_id: str | None,
     rationale: str | None,
+    ctx: CallerContext,
 ) -> tuple[direction_svc.DirectionRecord, str]:
     """Run the atomic write-back transaction.
 
@@ -157,41 +160,49 @@ async def _apply_write_back(
     old_summary = current.summary if current else None
     old_oos = current.out_of_scope if current else None
 
-    # Step 1: filesystem (with .bak backup)
-    try:
-        record = direction_svc.write_direction_frontmatter(
-            slug,
-            summary,
-            out_of_scope,
-            applied_by=applied_by,
-            source_finding=source_finding_id,
-        )
-    except (ValueError, FileNotFoundError, OSError) as exc:
-        logger.exception("direction.write_direction_frontmatter failed for %s", slug)
-        raise HTTPException(status_code=500, detail=f"filesystem write failed: {exc}")
-
-    # Steps 2 + 3: DB cache + changelog (same transaction)
+    # Filesystem + DB cache/changelog share the project mutation lock. The
+    # lifecycle event commits before context.md changes, so archive cannot race.
+    projects_root = direction_svc._context_md_path(slug).parent.parent
     async with write_db() as db:
-        try:
-            await direction_svc.sync_db_cache(record, db=db)
-            changelog_id = await direction_svc.append_changelog(
-                direction_svc.ChangelogEntry(
-                    project_slug=slug,
-                    change_type=change_type,
-                    applied_at=record.last_updated_at,
+        async with project_lifecycle.guarded_project_file_write(
+            ctx,
+            db,
+            project_slug=slug,
+            writer_kind="brain_direction",
+            resource_ref="context.md",
+            projects_root=projects_root,
+        ):
+            try:
+                record = direction_svc.write_direction_frontmatter(
+                    slug,
+                    summary,
+                    out_of_scope,
                     applied_by=applied_by,
-                    new_summary=summary,
-                    new_out_of_scope=out_of_scope,
-                    old_summary=old_summary,
-                    old_out_of_scope=old_oos,
-                    source_finding_id=source_finding_id,
-                    rationale=rationale,
-                ),
-                db=db,
-            )
-        except Exception as exc:
-            logger.exception("direction db sync failed for %s", slug)
-            raise HTTPException(status_code=500, detail=f"db sync failed: {exc}")
+                    source_finding=source_finding_id,
+                )
+            except (ValueError, FileNotFoundError, OSError) as exc:
+                logger.exception("direction.write_direction_frontmatter failed for %s", slug)
+                raise HTTPException(status_code=500, detail=f"filesystem write failed: {exc}")
+            try:
+                await direction_svc.sync_db_cache(record, db=db)
+                changelog_id = await direction_svc.append_changelog(
+                    direction_svc.ChangelogEntry(
+                        project_slug=slug,
+                        change_type=change_type,
+                        applied_at=record.last_updated_at,
+                        applied_by=applied_by,
+                        new_summary=summary,
+                        new_out_of_scope=out_of_scope,
+                        old_summary=old_summary,
+                        old_out_of_scope=old_oos,
+                        source_finding_id=source_finding_id,
+                        rationale=rationale,
+                    ),
+                    db=db,
+                )
+            except Exception as exc:
+                logger.exception("direction db sync failed for %s", slug)
+                raise HTTPException(status_code=500, detail=f"db sync failed: {exc}")
     return record, changelog_id
 
 
@@ -323,6 +334,7 @@ async def approve_direction_finding(
         ),
         source_finding_id=finding_id,
         rationale=payload.get("rationale"),
+        ctx=CallerContext.from_user_info(user, is_human_session=True),
     )
 
     # Mark finding as applied (+ state transition row)
@@ -448,6 +460,7 @@ async def edit_direction_finding(
         ),
         source_finding_id=finding_id,
         rationale=body.rationale or "edited via Console Triage",
+        ctx=CallerContext.from_user_info(user, is_human_session=True),
     )
 
     async with write_db() as db:
@@ -511,6 +524,7 @@ async def manual_direction_write(
         change_type="manual_edit",
         source_finding_id=None,
         rationale=body.rationale or "manual direct write",
+        ctx=CallerContext.from_user_info(user, is_human_session=True),
     )
     return DirectionResponse(
         project_slug=record.project_slug,

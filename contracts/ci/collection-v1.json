@@ -4,7 +4,7 @@
   "pytest_suites": [
     {
       "path": "core/api/tests",
-      "minimum_collected": 416,
+      "minimum_collected": 443,
       "allowed_skips": 0,
       "allowed_deselections": 0,
       "required_nodes": [
@@ -14,7 +14,17 @@
         "core/api/tests/test_pr_workflow_e2e.py::test_pr_merge_completes_task",
         "core/api/tests/test_pr_workflow_e2e.py::test_pr_closed_sets_review_feedback",
         "core/api/tests/test_pr_workflow_e2e.py::test_webhook_invalid_signature_rejected",
-        "core/api/tests/test_pr_workflow_e2e.py::test_webhook_idempotent_delivery"
+        "core/api/tests/test_pr_workflow_e2e.py::test_webhook_idempotent_delivery",
+        "core/api/tests/test_project_lifecycle_projection.py::test_migration_187_installs_and_seals_lifecycle_contract",
+        "core/api/tests/test_project_lifecycle_projection.py::test_archive_is_idempotent_and_fences_late_writers",
+        "core/api/tests/test_project_lifecycle_projection.py::test_expired_cloud_f_lease_requires_exact_idempotent_renewal",
+        "core/api/tests/test_project_lifecycle_projection.py::test_http_and_mcp_expose_same_governed_decision_lifecycle",
+        "core/api/tests/test_project_lifecycle_projection.py::test_mcp_lifecycle_registration_rejects_viewer_before_discovery",
+        "core/api/tests/test_project_lifecycle_projection.py::test_real_project_lock_releases_on_different_worker_thread",
+        "core/api/tests/test_project_lifecycle_projection.py::test_cancelled_async_lock_releases_after_delayed_acquisition",
+        "core/api/tests/test_project_lifecycle_projection.py::test_workspace_rejects_project_lifecycle_metadata",
+        "core/api/tests/test_project_lifecycle_projection.py::test_workspace_archived_project_write_is_fenced",
+        "core/api/tests/test_project_lifecycle_projection.py::test_workspace_write_adapters_use_lifecycle_fence"
       ]
     },
     {
@@ -34,12 +44,15 @@
     {
       "path": "scripts",
       "pattern": "test_*.py",
-      "minimum_collected": 144,
+      "minimum_collected": 151,
       "allowed_skips": 0,
       "required_node_suffixes": [
         "CompatibilityContractTests.test_current_contract_passes",
+        "CompatibilityContractTests.test_n_client_against_n_minus_one_mcp_requires_migration",
         "HookPolicyTests.test_five_representation_policy_passes",
-        "LocalUpgradeTests.test_synthetic_prior_upgrade_and_rollback"
+        "LocalUpgradeTests.test_synthetic_prior_upgrade_and_rollback",
+        "LocalUpgradeTests.test_cli_upgrade_uses_settings_projects_root_without_environment",
+        "LocalUpgradeTests.test_runtime_settings_preserve_explicit_projects_root"
       ]
     }
   ],

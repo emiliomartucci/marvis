@@ -1707,6 +1707,89 @@
         "title": "ClosureMemoryOpApplied",
         "type": "object"
       },
+      "CloudFActivationRequest": {
+        "properties": {
+          "expected_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Epoch",
+            "type": "integer"
+          },
+          "subtype": {
+            "enum": [
+              "bootstrap_activation",
+              "existing_live_adoption"
+            ],
+            "title": "Subtype",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subtype",
+          "expected_epoch"
+        ],
+        "title": "CloudFActivationRequest",
+        "type": "object"
+      },
+      "CloudFChangeAcquireRequest": {
+        "properties": {
+          "expected_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Epoch",
+            "type": "integer"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "title": "Lease Expires At",
+            "type": "string"
+          },
+          "operation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "operation_kind": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Operation Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "operation_kind",
+          "expected_epoch",
+          "lease_expires_at"
+        ],
+        "title": "CloudFChangeAcquireRequest",
+        "type": "object"
+      },
+      "CloudFChangeCompleteRequest": {
+        "properties": {
+          "advance_epoch": {
+            "default": true,
+            "title": "Advance Epoch",
+            "type": "boolean"
+          },
+          "expected_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Epoch",
+            "type": "integer"
+          },
+          "operation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "expected_epoch"
+        ],
+        "title": "CloudFChangeCompleteRequest",
+        "type": "object"
+      },
       "CodexFunctionItem": {
         "additionalProperties": false,
         "properties": {
@@ -5142,6 +5225,189 @@
         "title": "FlushEntry",
         "type": "object"
       },
+      "GovernedDecisionAcceptRequest": {
+        "properties": {
+          "expected_cloud_f_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Cloud F Epoch",
+            "type": "integer"
+          },
+          "expected_content_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Content Digest",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "title": "Lease Expires At",
+            "type": "string"
+          },
+          "operation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_content_digest",
+          "operation_id",
+          "idempotency_key",
+          "expected_cloud_f_epoch",
+          "lease_expires_at"
+        ],
+        "title": "GovernedDecisionAcceptRequest",
+        "type": "object"
+      },
+      "GovernedDecisionCreateRequest": {
+        "properties": {
+          "body": {
+            "maxLength": 500000,
+            "title": "Body",
+            "type": "string"
+          },
+          "decision_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Id"
+          },
+          "expected_cloud_f_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Cloud F Epoch",
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "title": "Lease Expires At",
+            "type": "string"
+          },
+          "operation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "relative_path": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Relative Path",
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "relative_path",
+          "title",
+          "body",
+          "operation_id",
+          "idempotency_key",
+          "expected_cloud_f_epoch",
+          "lease_expires_at"
+        ],
+        "title": "GovernedDecisionCreateRequest",
+        "type": "object"
+      },
+      "GovernedDecisionSupersedeRequest": {
+        "properties": {
+          "expected_cloud_f_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Cloud F Epoch",
+            "type": "integer"
+          },
+          "expected_source_body_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Source Body Digest",
+            "type": "string"
+          },
+          "expected_source_content_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Source Content Digest",
+            "type": "string"
+          },
+          "expected_target_content_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Target Content Digest",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "title": "Lease Expires At",
+            "type": "string"
+          },
+          "operation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "source_relative_path": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Source Relative Path",
+            "type": "string"
+          },
+          "target_decision_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+            "title": "Target Decision Id",
+            "type": "string"
+          },
+          "target_project_slug": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+            "title": "Target Project Slug",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_relative_path",
+          "expected_source_content_digest",
+          "expected_source_body_digest",
+          "target_project_slug",
+          "target_decision_id",
+          "expected_target_content_digest",
+          "operation_id",
+          "idempotency_key",
+          "expected_cloud_f_epoch",
+          "lease_expires_at"
+        ],
+        "title": "GovernedDecisionSupersedeRequest",
+        "type": "object"
+      },
       "GraphCapabilities": {
         "description": "KG schema metadata per agent discovery (Phase 7.x, plan Pilastro 5).\n\nReturned by `GET /api/v1/graph/capabilities`. Lets agents discover valid\n`edge_types` / `node_kinds` / `node_prefixes` at runtime instead of hardcoding\n(prevents the resolves_to sync bug seen in sessione 157).\n\nNote: mcp_version omitted intentionally (deepen section 9: no fingerprinting).\nOnly schema_version exposed, which is needed for drift detection.",
         "properties": {
@@ -5606,6 +5872,106 @@
           }
         },
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "HistoricalArtifactPointerRequest": {
+        "properties": {
+          "expected_cloud_f_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Cloud F Epoch",
+            "type": "integer"
+          },
+          "expected_source_body_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Source Body Digest",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "title": "Lease Expires At",
+            "type": "string"
+          },
+          "operation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "relation": {
+            "enum": [
+              "forward",
+              "applies_to"
+            ],
+            "title": "Relation",
+            "type": "string"
+          },
+          "source_kind": {
+            "enum": [
+              "decision",
+              "handoff",
+              "learning"
+            ],
+            "title": "Source Kind",
+            "type": "string"
+          },
+          "source_ref": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Source Ref",
+            "type": "string"
+          },
+          "target_decision_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Decision Id"
+          },
+          "target_project_slug": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+            "title": "Target Project Slug",
+            "type": "string"
+          },
+          "target_relative_path": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Relative Path"
+          }
+        },
+        "required": [
+          "source_kind",
+          "source_ref",
+          "expected_source_body_digest",
+          "relation",
+          "target_project_slug",
+          "operation_id",
+          "idempotency_key",
+          "expected_cloud_f_epoch",
+          "lease_expires_at"
+        ],
+        "title": "HistoricalArtifactPointerRequest",
         "type": "object"
       },
       "HotspotItem": {
@@ -10218,6 +10584,178 @@
         "title": "Project",
         "type": "object"
       },
+      "ProjectArchiveApprovalRequest": {
+        "properties": {
+          "approval_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Id"
+          },
+          "evidence_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Evidence Digest",
+            "type": "string"
+          },
+          "expected_active_operations_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Active Operations Digest",
+            "type": "string"
+          },
+          "expected_cloud_f_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Cloud F Epoch",
+            "type": "integer"
+          },
+          "expected_project_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Project Digest",
+            "type": "string"
+          },
+          "expected_project_id": {
+            "maxLength": 80,
+            "minLength": 5,
+            "title": "Expected Project Id",
+            "type": "string"
+          },
+          "expected_selector_watermark": {
+            "maxLength": 256,
+            "title": "Expected Selector Watermark",
+            "type": "string"
+          },
+          "expected_writer_watermark": {
+            "minimum": 0.0,
+            "title": "Expected Writer Watermark",
+            "type": "integer"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "master_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Master Digest",
+            "type": "string"
+          },
+          "plan_f_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Plan F Digest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_project_id",
+          "expected_project_digest",
+          "plan_f_digest",
+          "master_digest",
+          "evidence_digest",
+          "expected_writer_watermark",
+          "expected_selector_watermark",
+          "expected_cloud_f_epoch",
+          "expected_active_operations_digest",
+          "expires_at"
+        ],
+        "title": "ProjectArchiveApprovalRequest",
+        "type": "object"
+      },
+      "ProjectArchiveRequest": {
+        "properties": {
+          "approval_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "evidence_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Evidence Digest",
+            "type": "string"
+          },
+          "expected_active_operations_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Active Operations Digest",
+            "type": "string"
+          },
+          "expected_cloud_f_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Cloud F Epoch",
+            "type": "integer"
+          },
+          "expected_project_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Project Digest",
+            "type": "string"
+          },
+          "expected_selector_watermark": {
+            "maxLength": 256,
+            "title": "Expected Selector Watermark",
+            "type": "string"
+          },
+          "expected_writer_watermark": {
+            "minimum": 0.0,
+            "title": "Expected Writer Watermark",
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "title": "Lease Expires At",
+            "type": "string"
+          },
+          "master_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Master Digest",
+            "type": "string"
+          },
+          "operation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "plan_f_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Plan F Digest",
+            "type": "string"
+          },
+          "project_id": {
+            "maxLength": 80,
+            "minLength": 5,
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "approval_id",
+          "expected_project_digest",
+          "plan_f_digest",
+          "master_digest",
+          "evidence_digest",
+          "expected_writer_watermark",
+          "expected_selector_watermark",
+          "expected_cloud_f_epoch",
+          "expected_active_operations_digest",
+          "operation_id",
+          "idempotency_key",
+          "lease_expires_at"
+        ],
+        "title": "ProjectArchiveRequest",
+        "type": "object"
+      },
       "ProjectBillingSummary": {
         "properties": {
           "agent_bill_rate": {
@@ -10961,6 +11499,45 @@
           "name"
         ],
         "title": "ProjectInfo",
+        "type": "object"
+      },
+      "ProjectLifecycleRegistrationRequest": {
+        "description": "Explicitly register an existing filesystem project with a stable ID.",
+        "properties": {},
+        "title": "ProjectLifecycleRegistrationRequest",
+        "type": "object"
+      },
+      "ProjectSelectorWatermarkRequest": {
+        "properties": {
+          "expected_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Epoch",
+            "type": "integer"
+          },
+          "expected_selector_watermark": {
+            "maxLength": 256,
+            "title": "Expected Selector Watermark",
+            "type": "string"
+          },
+          "operation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "selector_watermark": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Selector Watermark",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "expected_epoch",
+          "expected_selector_watermark",
+          "selector_watermark"
+        ],
+        "title": "ProjectSelectorWatermarkRequest",
         "type": "object"
       },
       "ProjectStatusBreakdown": {
@@ -29233,6 +29810,207 @@
         ]
       }
     },
+    "/api/v1/projects/_cloud-f/activate": {
+      "post": {
+        "description": "One-time readiness primitive; invocation belongs to Plan F U11.",
+        "operationId": "activate_cloud_f_control_api_v1_projects__cloud_f_activate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloudFActivationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Activate Cloud F Control Api V1 Projects  Cloud F Activate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Activate Cloud F Control",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/_cloud-f/changes/acquire": {
+      "post": {
+        "description": "Acquire the exclusive lease for one U11-integrated protected change.",
+        "operationId": "acquire_cloud_f_change_api_v1_projects__cloud_f_changes_acquire_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloudFChangeAcquireRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Acquire Cloud F Change Api V1 Projects  Cloud F Changes Acquire Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acquire Cloud F Change",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/_cloud-f/changes/complete": {
+      "post": {
+        "description": "Release an exact lease and advance the protected-change epoch.",
+        "operationId": "complete_cloud_f_change_api_v1_projects__cloud_f_changes_complete_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloudFChangeCompleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Complete Cloud F Change Api V1 Projects  Cloud F Changes Complete Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete Cloud F Change",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/_cloud-f/changes/{operation_id}": {
+      "get": {
+        "description": "Read durable protected-change coordinates before any retry.",
+        "operationId": "get_cloud_f_change_operation_api_v1_projects__cloud_f_changes__operation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Cloud F Change Operation Api V1 Projects  Cloud F Changes  Operation Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Cloud F Change Operation",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/_cloud-f/control": {
+      "get": {
+        "description": "Read the common Cloud/F epoch, lease, and active-operation set.",
+        "operationId": "get_cloud_f_control_api_v1_projects__cloud_f_control_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Cloud F Control Api V1 Projects  Cloud F Control Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Cloud F Control",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/api/v1/projects/{slug}": {
       "get": {
         "description": "Get project detail with context.md, config, handoffs, plans, solutions.",
@@ -29345,6 +30123,118 @@
         ]
       }
     },
+    "/api/v1/projects/{slug}/archive": {
+      "post": {
+        "description": "Run the approval-bound, idempotent project archive saga.",
+        "operationId": "archive_project_api_v1_projects__slug__archive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectArchiveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Archive Project Api V1 Projects  Slug  Archive Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Archive Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/archive-approvals": {
+      "post": {
+        "description": "Record explicit, expiring approval bound to exact archive coordinates.",
+        "operationId": "approve_project_archive_api_v1_projects__slug__archive_approvals_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectArchiveApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Approve Project Archive Api V1 Projects  Slug  Archive Approvals Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Approve Project Archive",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/api/v1/projects/{slug}/brief": {
       "get": {
         "description": "Pre-assembled context bundle for agent cold-start.\n\nCollapses 5+ sequential MCP calls into a single round-trip. Phase 6.5 B\nadds a ``kg_context`` section (hotspots, recent active nodes, cross-project\nmentions, applicable learnings) gated by ``deep`` for effort budget.\n\nTarget latency: <500ms standard, <1000ms with ``deep=true``.",
@@ -29398,6 +30288,302 @@
           }
         },
         "summary": "Get Session Brief",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decision-operations/{operation_id}": {
+      "get": {
+        "description": "Read a decision saga before retrying a timed-out mutation.",
+        "operationId": "get_decision_lifecycle_operation_api_v1_projects__slug__decision_operations__operation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Decision Lifecycle Operation Api V1 Projects  Slug  Decision Operations  Operation Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Decision Lifecycle Operation",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decisions": {
+      "post": {
+        "description": "Create a draft through the journaled decision lifecycle.",
+        "operationId": "create_governed_decision_api_v1_projects__slug__decisions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GovernedDecisionCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Governed Decision Api V1 Projects  Slug  Decisions Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Governed Decision",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decisions/{decision_id}": {
+      "get": {
+        "description": "Direct known-ID read, including superseded decisions after archive.",
+        "operationId": "get_governed_decision_api_v1_projects__slug__decisions__decision_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "decision_id",
+            "required": true,
+            "schema": {
+              "title": "Decision Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Governed Decision Api V1 Projects  Slug  Decisions  Decision Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Governed Decision",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decisions/{decision_id}/accept": {
+      "post": {
+        "description": "Accept a draft without changing its substantive body.",
+        "operationId": "accept_governed_decision_api_v1_projects__slug__decisions__decision_id__accept_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "decision_id",
+            "required": true,
+            "schema": {
+              "title": "Decision Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GovernedDecisionAcceptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Accept Governed Decision Api V1 Projects  Slug  Decisions  Decision Id  Accept Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Accept Governed Decision",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decisions/{decision_id}/supersede": {
+      "post": {
+        "description": "Supersede an accepted or legacy decision with an accepted target.",
+        "operationId": "supersede_governed_decision_api_v1_projects__slug__decisions__decision_id__supersede_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "decision_id",
+            "required": true,
+            "schema": {
+              "title": "Decision Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GovernedDecisionSupersedeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Supersede Governed Decision Api V1 Projects  Slug  Decisions  Decision Id  Supersede Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Supersede Governed Decision",
         "tags": [
           "projects"
         ]
@@ -29790,6 +30976,360 @@
           }
         },
         "summary": "Get Handoffs",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/historical-pointers": {
+      "get": {
+        "description": "Read additive historical pointers without selecting archived work.",
+        "operationId": "get_historical_artifact_pointers_api_v1_projects__slug__historical_pointers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "decision",
+                    "handoff",
+                    "learning"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_ref",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Ref"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response Get Historical Artifact Pointers Api V1 Projects  Slug  Historical Pointers Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Historical Artifact Pointers",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "description": "Add non-destructive handoff, learning, or decision lineage.",
+        "operationId": "create_historical_artifact_pointer_api_v1_projects__slug__historical_pointers_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HistoricalArtifactPointerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Historical Artifact Pointer Api V1 Projects  Slug  Historical Pointers Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Historical Artifact Pointer",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/lifecycle": {
+      "get": {
+        "description": "Direct lifecycle read; archived projects remain readable by known slug.",
+        "operationId": "get_project_lifecycle_api_v1_projects__slug__lifecycle_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Project Lifecycle Api V1 Projects  Slug  Lifecycle Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Lifecycle",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/lifecycle/operations/{operation_id}": {
+      "get": {
+        "description": "Read operation state before any retry after timeout.",
+        "operationId": "get_project_lifecycle_operation_api_v1_projects__slug__lifecycle_operations__operation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Project Lifecycle Operation Api V1 Projects  Slug  Lifecycle Operations  Operation Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Lifecycle Operation",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/lifecycle/register": {
+      "post": {
+        "description": "Assign a stable lifecycle identity to an existing project.",
+        "operationId": "register_project_lifecycle_api_v1_projects__slug__lifecycle_register_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectLifecycleRegistrationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Register Project Lifecycle Api V1 Projects  Slug  Lifecycle Register Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Project Lifecycle",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/lifecycle/selector-watermark": {
+      "post": {
+        "description": "Bind an audited selector digest under the caller's exact Cloud/F lease.",
+        "operationId": "update_project_selector_watermark_api_v1_projects__slug__lifecycle_selector_watermark_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9&+_.\\-]{0,62}$",
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectSelectorWatermarkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Project Selector Watermark Api V1 Projects  Slug  Lifecycle Selector Watermark Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Project Selector Watermark",
         "tags": [
           "projects"
         ]

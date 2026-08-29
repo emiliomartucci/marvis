@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
+import shutil
+import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 from verify_local_upgrade import (
@@ -52,6 +56,183 @@ class LocalUpgradeTests(unittest.TestCase):
     def test_invariant_surface_tamper_fails_closed(self) -> None:
         with self.assertRaisesRegex(UpgradeVerificationError, "surface mutated"):
             _assert_invariants({"settings": "a"}, {"settings": "b"})
+
+    def test_cli_upgrade_uses_settings_projects_root_without_environment(self) -> None:
+        from typer.testing import CliRunner
+
+        from core.api import db as db_mod
+        from core.api import config as config_mod
+        from core.api import runtime_settings
+        from core.api.config import settings
+        from core.api.routers import projects as projects_router
+        from core.api.services import schema_upgrade
+        from core.cli.marvis_init import app
+
+        with tempfile.TemporaryDirectory(prefix="marvis-schema-cli-") as raw:
+            root = Path(raw)
+            projects_root = root / "configured-projects"
+            project_dir = projects_root / "sample"
+            project_dir.mkdir(parents=True)
+            (project_dir / "project.yaml").write_text(
+                "name: Sample\nslug: sample\ntype: work\nlifecycle: active\n",
+                encoding="utf-8",
+            )
+            database = root / "configured.db"
+            settings_path = root / "settings.yaml"
+            settings_path.write_text(
+                "storage:\n"
+                f"  db_path: {database}\n"
+                f"  projects_root: {projects_root}\n",
+                encoding="utf-8",
+            )
+            prior_migrations = root / "prior-migrations"
+            prior_migrations.mkdir()
+            for migration in db_mod.discover_up_migrations(ROOT / "migrations"):
+                if db_mod._migration_version(migration) < 187:
+                    shutil.copy2(migration, prior_migrations / migration.name)
+
+            original_migrations = db_mod.MIGRATIONS_DIR
+            original_db_path = settings.db_path
+            original_backup_dir = settings.db_backup_dir
+            original_settings_path = os.environ.get("MARVIS_SETTINGS_PATH")
+            original_projects_root = os.environ.get("MARVIS_PROJECTS_ROOT")
+            original_password = os.environ.get("PIR_PASSWORD")
+            original_applied = runtime_settings._applied
+            original_project_dirs = list(projects_router.PROJECT_DIRS)
+            original_repo_parents = list(config_mod.ALLOWED_REPO_PARENTS)
+            try:
+                settings.db_path = str(database)
+                settings.db_backup_dir = str(root / "backups")
+                os.environ["MARVIS_PROJECTS_ROOT"] = str(projects_root)
+                os.environ.setdefault("PIR_PASSWORD", "test-migration-seed-password")
+                db_mod.MIGRATIONS_DIR = prior_migrations
+                prior = db_mod.run_migrations()
+                self.assertEqual(prior.final_version, 186)
+                with sqlite3.connect(database) as connection:
+                    connection.execute(
+                        "INSERT INTO tasks"
+                        "(id,title,status,project,priority,created_by,source,workspace_id) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            "cli-upgrade-fixture",
+                            "CLI upgrade fixture",
+                            "pending",
+                            "sample",
+                            "medium",
+                            "local",
+                            "fixture",
+                            "ws_default",
+                        ),
+                    )
+                    connection.commit()
+
+                db_mod.MIGRATIONS_DIR = original_migrations
+                os.environ["MARVIS_SETTINGS_PATH"] = str(settings_path)
+                os.environ.pop("MARVIS_PROJECTS_ROOT", None)
+                runtime_settings._applied = False
+                receipt = root / "receipt.json"
+                with patch.object(
+                    schema_upgrade,
+                    "prove_local_writers_stopped",
+                    return_value="test_process_scan",
+                ):
+                    result = CliRunner().invoke(
+                        app,
+                        [
+                            "schema",
+                            "upgrade",
+                            "--release-id",
+                            "marvis-oss@test-settings-root",
+                            "--receipt",
+                            str(receipt),
+                            "--json",
+                        ],
+                    )
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(
+                    os.environ.get("MARVIS_PROJECTS_ROOT"),
+                    str(projects_root.resolve()),
+                )
+                with sqlite3.connect(database) as connection:
+                    version = connection.execute(
+                        "SELECT MAX(version) FROM schema_versions"
+                    ).fetchone()[0]
+                    lifecycle = connection.execute(
+                        "SELECT lifecycle FROM project_lifecycle_state "
+                        "WHERE workspace_id=? AND project_slug=?",
+                        ("ws_default", "sample"),
+                    ).fetchone()
+                self.assertEqual(version, 187)
+                self.assertEqual(lifecycle, ("active",))
+            finally:
+                db_mod.MIGRATIONS_DIR = original_migrations
+                settings.db_path = original_db_path
+                settings.db_backup_dir = original_backup_dir
+                runtime_settings._applied = original_applied
+                projects_router._set_project_dirs(original_project_dirs)
+                config_mod.ALLOWED_REPO_PARENTS[:] = original_repo_parents
+                if original_settings_path is None:
+                    os.environ.pop("MARVIS_SETTINGS_PATH", None)
+                else:
+                    os.environ["MARVIS_SETTINGS_PATH"] = original_settings_path
+                if original_projects_root is None:
+                    os.environ.pop("MARVIS_PROJECTS_ROOT", None)
+                else:
+                    os.environ["MARVIS_PROJECTS_ROOT"] = original_projects_root
+                if original_password is None:
+                    os.environ.pop("PIR_PASSWORD", None)
+                else:
+                    os.environ["PIR_PASSWORD"] = original_password
+
+    def test_runtime_settings_preserve_explicit_projects_root(self) -> None:
+        from core.api import config as config_mod
+        from core.api import runtime_settings
+        from core.api.routers import projects as projects_router
+
+        with tempfile.TemporaryDirectory(prefix="marvis-settings-precedence-") as raw:
+            root = Path(raw)
+            settings_root = root / "settings-projects"
+            explicit_root = root / "explicit-projects"
+            settings_root.mkdir()
+            explicit_root.mkdir()
+            settings_path = root / "settings.yaml"
+            settings_path.write_text(
+                "storage:\n"
+                f"  projects_root: {settings_root}\n",
+                encoding="utf-8",
+            )
+
+            original_settings_path = os.environ.get("MARVIS_SETTINGS_PATH")
+            original_projects_root = os.environ.get("MARVIS_PROJECTS_ROOT")
+            original_applied = runtime_settings._applied
+            original_project_dirs = list(projects_router.PROJECT_DIRS)
+            original_repo_parents = list(config_mod.ALLOWED_REPO_PARENTS)
+            try:
+                os.environ["MARVIS_SETTINGS_PATH"] = str(settings_path)
+                os.environ["MARVIS_PROJECTS_ROOT"] = str(explicit_root)
+                runtime_settings._applied = False
+                config_mod.ALLOWED_REPO_PARENTS[:] = []
+
+                self.assertTrue(runtime_settings.apply_marvis_settings(force=True))
+                resolved = explicit_root.resolve()
+                self.assertEqual(os.environ["MARVIS_PROJECTS_ROOT"], str(resolved))
+                self.assertEqual(projects_router.PROJECT_DIRS, [resolved])
+                self.assertIn(resolved, config_mod.ALLOWED_REPO_PARENTS)
+                self.assertNotIn(
+                    settings_root.resolve(), config_mod.ALLOWED_REPO_PARENTS
+                )
+            finally:
+                runtime_settings._applied = original_applied
+                projects_router._set_project_dirs(original_project_dirs)
+                config_mod.ALLOWED_REPO_PARENTS[:] = original_repo_parents
+                if original_settings_path is None:
+                    os.environ.pop("MARVIS_SETTINGS_PATH", None)
+                else:
+                    os.environ["MARVIS_SETTINGS_PATH"] = original_settings_path
+                if original_projects_root is None:
+                    os.environ.pop("MARVIS_PROJECTS_ROOT", None)
+                else:
+                    os.environ["MARVIS_PROJECTS_ROOT"] = original_projects_root
 
 
 if __name__ == "__main__":

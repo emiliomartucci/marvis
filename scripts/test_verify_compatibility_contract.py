@@ -11,8 +11,8 @@ from verify_compatibility_contract import CompatibilityError, provider_breaks, v
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_REF = "d413f09bf0e43c1929d1c774c77c7eed1d56bf18"
-PAYLOAD_SHA256 = "07069a51ce4ddb70731d6d2838eb50018538d059548ab5691fb344e5a2788f49"
+SOURCE_REF = "962e0fa6bb15ca71e3b20e9c99636aa93c631271"
+PAYLOAD_SHA256 = "6f1b5667df2b0a0ec91a2508914761e12c209f622557d7d8b912008849351717"
 
 
 class CompatibilityContractTests(unittest.TestCase):
@@ -25,11 +25,13 @@ class CompatibilityContractTests(unittest.TestCase):
             "contracts/engine-pin.yaml",
             "core/api/db.py",
             "core/api/mcp/stdio.py",
+            "core/api/mcp/tools/projects.py",
             "core/api/models/auth.py",
             "core/api/models/tasks.py",
             "core/api/routers/agent_tokens.py",
             "core/api/routers/auth.py",
             "core/api/routers/graph_ingest.py",
+            "core/api/routers/projects.py",
             "core/api/routers/tasks.py",
             "core/api/services/schema_upgrade.py",
             "core/api/tests/test_require_scope_empty_deny.py",
@@ -229,6 +231,30 @@ class CompatibilityContractTests(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(CompatibilityError, "projection payload digest"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_n_client_against_n_minus_one_mcp_requires_migration(self) -> None:
+        root = self._copy()
+        path = root / "contracts/compatibility/consumer-matrix-v1.json"
+        matrix = json.loads(path.read_text())
+        local_mcp = next(
+            row for row in matrix["rows"] if row["surface"] == "local_mcp"
+        )
+        local_mcp["n_consumer_n_minus_1_contract"] = "pass"
+        path.write_text(json.dumps(matrix, sort_keys=True, indent=2) + "\n")
+
+        with self.assertRaisesRegex(CompatibilityError, "N-only MCP tool"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_current_mcp_inventory_cannot_be_self_certified(self) -> None:
+        root = self._copy()
+        path = root / "contracts/compatibility/fixtures/n-mcp-tools.json"
+        inventory = json.loads(path.read_text())
+        inventory["tools"].pop()
+        inventory["tool_count"] = len(inventory["tools"])
+        self._rewrite_fixture(root, "n-mcp-tools.json", inventory)
+
+        with self.assertRaisesRegex(CompatibilityError, "does not reconstruct"):
             verify(root, expected_source_ref=SOURCE_REF)
 
 

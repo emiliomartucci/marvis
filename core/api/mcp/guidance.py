@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 ROUTING_GUIDE: tuple[dict[str, str], ...] = (
     {
         "intent": "first-time agent setup",
@@ -363,6 +362,14 @@ TOOL_TIERS: dict[str, dict[str, Any]] = {
             "brain_findings_get",
             "brain_memory_operations",
             "brain_memory_operations_get",
+            # governed project / Cloud-F control reads
+            "get_project_lifecycle",
+            "get_cloud_f_control",
+            "get_cloud_f_change_operation",
+            "get_project_lifecycle_operation",
+            "get_governed_decision",
+            "list_historical_pointers",
+            "get_decision_operation",
         ),
     },
     "tier2": {
@@ -416,6 +423,12 @@ TOOL_TIERS: dict[str, dict[str, Any]] = {
             "brain_write_finding",
             "brain_write_journal",
             "brain_staleness",
+            # governed project / Cloud-F control writes
+            "register_project_lifecycle",
+            "acquire_cloud_f_change",
+            "complete_cloud_f_change",
+            "update_project_selector_watermark",
+            "create_governed_decision",
         ),
     },
     "tier3": {
@@ -461,6 +474,13 @@ TOOL_TIERS: dict[str, dict[str, Any]] = {
             "brain_memory_operations_patch",
             "brain_memory_operations_apply",
             "brain_cycles_recompute",
+            # governed lifecycle authority
+            "activate_cloud_f_control",
+            "create_project_archive_approval",
+            "archive_project",
+            "accept_governed_decision",
+            "supersede_governed_decision",
+            "create_historical_pointer",
         ),
     },
 }

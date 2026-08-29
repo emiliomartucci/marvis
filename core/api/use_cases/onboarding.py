@@ -20,6 +20,7 @@ from core.api.models.onboarding import (
 )
 from core.api.models.tasks import TaskCreateRequest
 from core.api.models.todos import TodoCreateRequest
+from core.api.services.project_lifecycle import guarded_project_file_write
 from core.api.use_cases import projects as projects_uc
 from core.api.use_cases import tasks as tasks_uc
 from core.api.use_cases import todos as todos_uc
@@ -474,7 +475,7 @@ async def _ensure_demo_project(ctx: CallerContext, db: aiosqlite.Connection, *, 
     from core.api.routers import projects as projects_mod
 
     if projects_mod._find_project_entry(_DEMO_PROJECT) is not None:
-        _write_demo_marker()
+        await _write_demo_marker(ctx, db)
         return False
     content = _DEMO_CONTENT[lang]
     try:
@@ -493,25 +494,38 @@ async def _ensure_demo_project(ctx: CallerContext, db: aiosqlite.Connection, *, 
     except ConflictError:
         await db.rollback()
         projects_mod._build_project_index()
-        _write_demo_marker()
+        await _write_demo_marker(ctx, db)
         return False
     projects_mod._build_project_index()
-    _write_demo_marker(Path(created.metadata_path))
+    await _write_demo_marker(ctx, db, Path(created.metadata_path))
     return True
 
 
-def _write_demo_marker(metadata_path: Path | None = None) -> None:
+async def _write_demo_marker(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+    metadata_path: Path | None = None,
+) -> None:
     from core.api.routers.projects import _find_project_entry
 
     entry = _find_project_entry(_DEMO_PROJECT) if metadata_path is None else None
     path = metadata_path or (entry.metadata_path if entry else None)
     if path is None:
         return
-    marker = path / ".marvis-demo.json"
-    marker.write_text(
-        json.dumps({"demo": True, "project": _DEMO_PROJECT}, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    async with guarded_project_file_write(
+        ctx,
+        db,
+        project_slug=_DEMO_PROJECT,
+        writer_kind="demo_marker",
+        resource_ref=".marvis-demo.json",
+        projects_root=path.parent,
+    ):
+        marker = path / ".marvis-demo.json"
+        marker.write_text(
+            json.dumps({"demo": True, "project": _DEMO_PROJECT}, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
 
 
 async def seed_demo(
@@ -601,9 +615,9 @@ async def teardown_demo(ctx: CallerContext, db: aiosqlite.Connection) -> DemoTea
         )
     ).fetchone()
     await db.commit()
-    project_deleted = (
-        False if remaining_demo and bool(remaining_demo[0]) else _delete_demo_project_dir()
-    )
+    project_deleted = False
+    if not (remaining_demo and bool(remaining_demo[0])):
+        project_deleted = await _delete_demo_project_dir(ctx, db)
     return DemoTeardownResponse(
         project=_DEMO_PROJECT,
         tasks_deleted=task_cursor.rowcount if task_cursor.rowcount != -1 else 0,
@@ -612,21 +626,37 @@ async def teardown_demo(ctx: CallerContext, db: aiosqlite.Connection) -> DemoTea
     )
 
 
-def _delete_demo_project_dir() -> bool:
+async def _delete_demo_project_dir(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+) -> bool:
     from core.api.routers import projects as projects_mod
 
     entry = projects_mod._find_project_entry(_DEMO_PROJECT)
     if not entry:
         return False
-    marker = entry.metadata_path / ".marvis-demo.json"
-    if not marker.exists():
-        return False
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if payload.get("demo") is not True or payload.get("project") != _DEMO_PROJECT:
-        return False
-    shutil.rmtree(entry.metadata_path)
-    projects_mod._build_project_index()
-    return True
+    async with guarded_project_file_write(
+        ctx,
+        db,
+        project_slug=_DEMO_PROJECT,
+        writer_kind="demo_teardown",
+        resource_ref="project-directory",
+        projects_root=entry.metadata_path.parent,
+    ):
+        # Re-resolve under the lifecycle lock: another process may have changed
+        # the index between the optimistic check and this destructive step.
+        entry = projects_mod._find_project_entry(_DEMO_PROJECT)
+        if not entry:
+            return False
+        marker = entry.metadata_path / ".marvis-demo.json"
+        if not marker.exists():
+            return False
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if payload.get("demo") is not True or payload.get("project") != _DEMO_PROJECT:
+            return False
+        shutil.rmtree(entry.metadata_path)
+        projects_mod._build_project_index()
+        return True

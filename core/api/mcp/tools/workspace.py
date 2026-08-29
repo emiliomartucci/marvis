@@ -3,14 +3,22 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import asynccontextmanager
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any
 
 from pydantic import Field
 
-from core.api.mcp._adapter import LOCAL_CTX, current_mcp_context, raise_mcp_error
+from core.api.mcp._adapter import (
+    LOCAL_CTX,
+    acquire_write_db,
+    current_mcp_context,
+    raise_mcp_error,
+)
+from core.api.services import access_grants, project_lifecycle
 from core.api.services import workspace_tools as svc
 from core.api.use_cases._context import require_workspace_ctx
-from core.api.use_cases._errors import ServiceError
+from core.api.use_cases._errors import AuthorizationError, ConflictError, ServiceError
 
 
 def _truthy_env(name: str) -> bool:
@@ -36,6 +44,84 @@ def _policy(*, write: bool = False, shell: bool = False) -> svc.WorkspacePolicy:
         can_shell=shell and _truthy_env("MARVIS_WORKSPACE_SHELL_ENABLED"),
         require_audit_for_writes=(write or shell) and _truthy_env("MARVIS_WORKSPACE_AUDIT_REQUIRED"),
     )
+
+
+def _reject_project_lifecycle_path(path: str) -> None:
+    """Keep generic workspace writes away from canonical project.yaml."""
+    pure = PurePosixPath((path or "").strip().strip("/"))
+    normalized = tuple(part.casefold() for part in pure.parts)
+    parts = normalized[1:] if normalized[:1] == ("projects",) else normalized
+    if len(parts) == 2 and parts[1] == "project.yaml":
+        raise AuthorizationError(
+            code="project_lifecycle_path_denied",
+            message=(
+                "project.yaml is a lifecycle control surface; use the "
+                "governed project lifecycle API"
+            ),
+        )
+
+
+def _reject_project_lifecycle_shell() -> None:
+    """Fail closed: an arbitrary shell cannot be fenced to one project."""
+    raise AuthorizationError(
+        code="project_lifecycle_shell_denied",
+        message=(
+            "run_bash is disabled in lifecycle-controlled workspaces; use "
+            "the governed workspace tools"
+        ),
+    )
+
+
+def _canonical_project_directory(project_slug: str, root: Path) -> Path | None:
+    project_dir = project_lifecycle.project_directory(
+        project_slug,
+        projects_root=root,
+    )
+    project_yaml = project_dir / "project.yaml"
+    if (
+        not project_dir.is_dir()
+        or not project_yaml.is_file()
+        or project_yaml.is_symlink()
+    ):
+        return None
+    return project_dir
+
+
+@asynccontextmanager
+async def _project_file_mutation(path: str, *, writer_kind: str):
+    """Fence one local MCP project write against archive transitions."""
+    _reject_project_lifecycle_path(path)
+    project_slug, _relative = access_grants._path_parts(path)
+    if project_slug is None:
+        yield None
+        return
+    ctx = current_mcp_context()
+    root = svc.projects_root_from_env()
+    if _canonical_project_directory(project_slug, root) is None:
+        async with project_lifecycle.async_project_mutation_guard(
+            projects_root=root
+        ):
+            if _canonical_project_directory(project_slug, root) is None:
+                yield None
+                return
+    async with acquire_write_db(label=f"mcp.workspace.{writer_kind}") as db:
+        async with project_lifecycle.async_project_mutation_guard(projects_root=root):
+            if _canonical_project_directory(project_slug, root) is None:
+                raise ConflictError(
+                    code="project_lifecycle_identity_changed",
+                    message="Project identity changed while the write was starting",
+                )
+            await project_lifecycle.record_project_write(
+                db,
+                workspace_id=require_workspace_ctx(ctx),
+                project_slug=project_slug,
+                writer_kind=writer_kind,
+                actor=ctx.user_id or ctx.username,
+                resource_ref=path,
+                projects_root=root,
+            )
+            await db.commit()
+            yield db
 
 
 def _audit_db_path() -> str:
@@ -166,16 +252,19 @@ def register(mcp) -> None:
         PROVA: sha256 nuovo e audit_status; verifica poi con read_file/grep.
         RESTITUISCE: sha256 nuovo, previous_sha256, created, audit_status e freshness block. Hash stale produce errore conflict con current_sha256."""
         try:
-            return svc.write_file(
-                path,
-                content,
-                actor=_actor(),
-                policy=_policy(write=True),
-                audit_sink=_workspace_audit_sink,
-                if_match_sha256=if_match_sha256,
-                overwrite=overwrite,
-                create_parent=create_parent,
-            )
+            async with _project_file_mutation(
+                path, writer_kind="workspace_file"
+            ):
+                return svc.write_file(
+                    path,
+                    content,
+                    actor=_actor(),
+                    policy=_policy(write=True),
+                    audit_sink=_workspace_audit_sink,
+                    if_match_sha256=if_match_sha256,
+                    overwrite=overwrite,
+                    create_parent=create_parent,
+                )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -194,17 +283,20 @@ def register(mcp) -> None:
         QUANDO NON USARLO: NOT se old_text e' ambiguo senza replace_all=true; NOT per binari, secret path, symlink o file fuori projects-root.
         RESTITUISCE: sha256 nuovo, previous_sha256, replacements, audit_status e freshness. Match multipli non dichiarati producono ambiguous_edit."""
         try:
-            return svc.edit(
-                path,
-                old_text,
-                new_text,
-                actor=_actor(),
-                policy=_policy(write=True),
-                audit_sink=_workspace_audit_sink,
-                if_match_sha256=if_match_sha256,
-                replace_all=replace_all,
-                expected_replacements=expected_replacements,
-            )
+            async with _project_file_mutation(
+                path, writer_kind="workspace_edit"
+            ):
+                return svc.edit(
+                    path,
+                    old_text,
+                    new_text,
+                    actor=_actor(),
+                    policy=_policy(write=True),
+                    audit_sink=_workspace_audit_sink,
+                    if_match_sha256=if_match_sha256,
+                    replace_all=replace_all,
+                    expected_replacements=expected_replacements,
+                )
         except ServiceError as e:
             raise_mcp_error(e)
 
@@ -215,12 +307,13 @@ def register(mcp) -> None:
         timeout_ms: Annotated[int, Field(ge=100, le=svc.MAX_BASH_TIMEOUT_MS)] = svc.MAX_BASH_TIMEOUT_MS,
         max_output_bytes: Annotated[int, Field(ge=1, le=svc.MAX_BASH_OUTPUT_BYTES)] = svc.MAX_BASH_OUTPUT_BYTES,
     ) -> dict[str, Any]:
-        """Run one guarded shell command inside the tenant projects-root workspace.
+        """Reject arbitrary shell execution in a lifecycle-controlled workspace.
 
-        QUANDO USARLO: hosted repo work che richiede comandi semplici come git status, test mirati o build brevi, dopo aver abilitato MARVIS_WORKSPACE_SHELL_ENABLED sul tenant.
-        QUANDO NON USARLO: NOT per shell interattive, pipeline, rete/ssh/curl, sudo, path assoluti, ../, secret path o comandi lunghi. Non e' un filesystem jail kernel-level.
-        RESTITUISCE: ok, returncode, stdout/stderr capped, timeout, cwd e safety metadata; returncode non-zero torna come ok=false, non come errore tool."""
+        QUANDO USARLO: non disponibile su questa superficie; usa i tool workspace governati.
+        QUANDO NON USARLO: sempre, perche' un comando arbitrario puo' aggirare journal e archiviazione.
+        RESTITUISCE: errore project_lifecycle_shell_denied prima di invocare il service."""
         try:
+            _reject_project_lifecycle_shell()
             return svc.run_bash(
                 command,
                 cwd=cwd,

@@ -60,14 +60,14 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal
 
-# A resolver ``project_slug -> resolved project root Path``. The adapter binds
-# this to the patchable router-level ``PROJECTS_ROOT`` so the containment base
-# path used by filesystem-domain operations stays test-monkeypatchable.
-ProjectRootResolver = Callable[[str], Path]
-
 import aiosqlite
 from pydantic import BaseModel
 
+from core.api.services.project_lifecycle import (
+    async_project_mutation_guard,
+    guarded_project_file_write,
+    record_project_write,
+)
 from core.api.use_cases._context import (
     CallerContext,
     require_role_ctx,
@@ -79,6 +79,11 @@ from core.api.use_cases._errors import (
     ServiceError,
     ValidationError,
 )
+
+# A resolver ``project_slug -> resolved project root Path``. The adapter binds
+# this to the patchable router-level ``PROJECTS_ROOT`` so the containment base
+# path used by filesystem-domain operations stays test-monkeypatchable.
+ProjectRootResolver = Callable[[str], Path]
 
 
 # ---------------------------------------------------------------------------
@@ -935,36 +940,44 @@ async def delete(
     row = await _visible_row(ctx, db, ingest_id, visible_projects)
     project_slug = row["project_slug"]
     project_root = project_root_for(project_slug)
+    async with guarded_project_file_write(
+        ctx,
+        db,
+        project_slug=project_slug,
+        writer_kind="ingest_delete",
+        resource_ref=ingest_id,
+        operation_id=f"ingest-delete:{ingest_id}",
+        projects_root=project_root.parent,
+    ):
+        deleted_paths: list[str] = []
 
-    deleted_paths: list[str] = []
+        def _safe_unlink(candidate: Path) -> None:
+            try:
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError):
+                return
+            if not resolved.is_relative_to(project_root):
+                return
+            if resolved.exists() and resolved.is_file():
+                resolved.unlink(missing_ok=True)
+                deleted_paths.append(str(resolved))
 
-    def _safe_unlink(candidate: Path) -> None:
-        try:
-            resolved = candidate.resolve()
-        except (OSError, RuntimeError):
-            return
-        if not resolved.is_relative_to(project_root):
-            return
-        if resolved.exists() and resolved.is_file():
-            resolved.unlink(missing_ok=True)
-            deleted_paths.append(str(resolved))
+        if row["file_path"]:
+            _safe_unlink(Path(row["file_path"]))
 
-    if row["file_path"]:
-        _safe_unlink(Path(row["file_path"]))
+        target_folder = row["target_folder"]
+        target_filename = row["target_filename"]
+        if target_folder and target_filename:
+            target = project_root / target_folder / target_filename
+            _safe_unlink(target)
 
-    target_folder = row["target_folder"]
-    target_filename = row["target_filename"]
-    if target_folder and target_filename:
-        target = project_root / target_folder / target_filename
-        _safe_unlink(target)
-
-    cursor = await db.execute(
-        "DELETE FROM ingest_pending WHERE workspace_id = ? AND id = ?",
-        (workspace_id, ingest_id),
-    )
-    if cursor.rowcount != 1:
-        raise NotFoundError(code="ingest_not_found", message="Ingest item not found")
-    await db.commit()
+        cursor = await db.execute(
+            "DELETE FROM ingest_pending WHERE workspace_id = ? AND id = ?",
+            (workspace_id, ingest_id),
+        )
+        if cursor.rowcount != 1:
+            raise NotFoundError(code="ingest_not_found", message="Ingest item not found")
+        await db.commit()
     return project_slug
 
 
@@ -1069,6 +1082,129 @@ async def reparse_batch(
 # ---------------------------------------------------------------------------
 # Use case — patch (project_slug change + atomic file move; domain I/O)
 # ---------------------------------------------------------------------------
+
+
+async def _move_pending_file_under_lifecycle_guard(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+    *,
+    row: aiosqlite.Row,
+    ingest_id: str,
+    workspace_id: str,
+    new_slug: str,
+    old_path: Path,
+    new_path: Path,
+    new_input_root: Path,
+    projects_root: Path,
+    changed_by: str,
+    source_ip: str | None,
+    user_agent: str | None,
+) -> IngestPendingItem:
+    old_slug = str(row["project_slug"])
+    async with async_project_mutation_guard(projects_root=projects_root):
+        await record_project_write(
+            db,
+            workspace_id=workspace_id,
+            project_slug=old_slug,
+            writer_kind="ingest_move_source",
+            actor=ctx.user_id or ctx.username,
+            resource_ref=ingest_id,
+            operation_id=f"ingest-move:{ingest_id}",
+            projects_root=projects_root,
+        )
+        if new_slug != old_slug:
+            await record_project_write(
+                db,
+                workspace_id=workspace_id,
+                project_slug=new_slug,
+                writer_kind="ingest_move_target",
+                actor=ctx.user_id or ctx.username,
+                resource_ref=ingest_id,
+                operation_id=f"ingest-move:{ingest_id}",
+                projects_root=projects_root,
+            )
+        await db.commit()
+
+        # M-D11 TOCTOU-safe: copy to staging on the same filesystem as the
+        # destination, then atomic rename. Rollback the staging file on any DB
+        # error before we touch the source.
+        staging_dir = new_input_root.parent / ".staging"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staging = staging_dir / f"{uuid.uuid4().hex}-{old_path.name}"
+        await asyncio.to_thread(shutil.copy2, str(old_path), str(staging))
+
+        try:
+            await db.execute(
+                """
+                UPDATE ingest_pending
+                   SET project_slug = ?,
+                       file_path = ?,
+                       updated_at = strftime('%Y-%m-%d %H:%M:%f','now')
+                 WHERE id = ?
+                   AND workspace_id = ?
+                """,
+                (new_slug, str(new_path), ingest_id, workspace_id),
+            )
+            await db.execute(
+                """
+                INSERT INTO ingest_change_history
+                    (workspace_id, ingest_pending_id, field_name, old_value, new_value,
+                     changed_by, source_ip, user_agent)
+                VALUES (?, ?, 'project_slug', ?, ?, ?, ?, ?)
+                """,
+                (
+                    workspace_id,
+                    ingest_id,
+                    old_slug,
+                    new_slug,
+                    changed_by,
+                    source_ip,
+                    user_agent,
+                ),
+            )
+            await db.commit()
+        except sqlite3.IntegrityError as exc:
+            staging.unlink(missing_ok=True)
+            if "ingest_pending.workspace_id, ingest_pending.sha256" in str(exc):
+                raise DetailedServiceError(
+                    code="target_sha_collision",
+                    message=(
+                        "A file with the same content already exists in the "
+                        f"target project '{new_slug}'"
+                    ),
+                    http_status=409,
+                    detail={
+                        "error": "target_sha_collision",
+                        "message": (
+                            "A file with the same content already exists in the "
+                            f"target project '{new_slug}'"
+                        ),
+                        "project_slug": new_slug,
+                        "sha256": row["sha256"],
+                    },
+                ) from exc
+            raise
+        except Exception:
+            staging.unlink(missing_ok=True)
+            raise
+
+        try:
+            await asyncio.to_thread(staging.rename, new_path)
+        except Exception as exc:
+            staging.unlink(missing_ok=True)
+            raise DetailedServiceError(
+                code="rename_failed",
+                message="DB updated but file move failed; manual recovery needed",
+                http_status=500,
+                detail={
+                    "error": "rename_failed",
+                    "message": "DB updated but file move failed; manual recovery needed",
+                },
+            ) from exc
+        await asyncio.to_thread(old_path.unlink, True)
+
+        refreshed = await _load_row(db, ingest_id, workspace_id)
+        return _row_to_item(refreshed)
 
 
 async def patch_pending(
@@ -1184,87 +1320,18 @@ async def patch_pending(
             },
         )
 
-    # M-D11 TOCTOU-safe: copy to staging on the same filesystem as the
-    # destination, then atomic rename. Rollback the staging file on any DB
-    # error before we touch the source.
-    staging_dir = new_input_root.parent / ".staging"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    staging = staging_dir / f"{uuid.uuid4().hex}-{old_path.name}"
-
-    await asyncio.to_thread(shutil.copy2, str(old_path), str(staging))
-
-    try:
-        await db.execute(
-            """
-            UPDATE ingest_pending
-               SET project_slug = ?,
-                   file_path = ?,
-                   updated_at = strftime('%Y-%m-%d %H:%M:%f','now')
-             WHERE id = ?
-               AND workspace_id = ?
-            """,
-            (new_slug, str(new_path), ingest_id, workspace_id),
-        )
-
-        await db.execute(
-            """
-            INSERT INTO ingest_change_history
-                (workspace_id, ingest_pending_id, field_name, old_value, new_value,
-                 changed_by, source_ip, user_agent)
-            VALUES (?, ?, 'project_slug', ?, ?, ?, ?, ?)
-            """,
-            (
-                workspace_id,
-                ingest_id,
-                row["project_slug"],
-                new_slug,
-                changed_by,
-                source_ip,
-                user_agent,
-            ),
-        )
-
-        await db.commit()
-    except sqlite3.IntegrityError as exc:
-        staging.unlink(missing_ok=True)
-        if "ingest_pending.workspace_id, ingest_pending.sha256" in str(exc):
-            raise DetailedServiceError(
-                code="target_sha_collision",
-                message=(
-                    "A file with the same content already exists in the "
-                    f"target project '{new_slug}'"
-                ),
-                http_status=409,
-                detail={
-                    "error": "target_sha_collision",
-                    "message": (
-                        "A file with the same content already exists in the "
-                        f"target project '{new_slug}'"
-                    ),
-                    "project_slug": new_slug,
-                    "sha256": row["sha256"],
-                },
-            ) from exc
-        raise
-    except Exception:
-        staging.unlink(missing_ok=True)
-        raise
-
-    # Promote staging -> final destination, then unlink the source.
-    try:
-        await asyncio.to_thread(staging.rename, new_path)
-    except Exception as exc:
-        staging.unlink(missing_ok=True)
-        raise DetailedServiceError(
-            code="rename_failed",
-            message="DB updated but file move failed; manual recovery needed",
-            http_status=500,
-            detail={
-                "error": "rename_failed",
-                "message": "DB updated but file move failed; manual recovery needed",
-            },
-        ) from exc
-    await asyncio.to_thread(old_path.unlink, True)
-
-    refreshed = await _load_row(db, ingest_id, workspace_id)
-    return _row_to_item(refreshed)
+    return await _move_pending_file_under_lifecycle_guard(
+        ctx,
+        db,
+        row=row,
+        ingest_id=ingest_id,
+        workspace_id=workspace_id,
+        new_slug=new_slug,
+        old_path=old_path,
+        new_path=new_path,
+        new_input_root=new_input_root,
+        projects_root=projects_root,
+        changed_by=changed_by,
+        source_ip=source_ip,
+        user_agent=user_agent,
+    )

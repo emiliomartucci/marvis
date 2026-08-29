@@ -8,12 +8,14 @@ import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.api.db import get_db, get_write_db
-from core.api.models import RaciEntry, RaciAddRequest, RaciReplaceRequest, UserSummary
+from core.api.models import RaciAddRequest, RaciEntry, RaciReplaceRequest, UserSummary
 from core.api.rbac import require_role
+from core.api.routers._adapter import to_http
 from core.api.security import get_current_user_or_agent
-from core.api.services import access_grants
+from core.api.services import access_grants, project_lifecycle
 from core.api.services.events import emit_event
 from core.api.use_cases._context import CallerContext, require_workspace_ctx
+from core.api.use_cases._errors import ServiceError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/projects", tags=["raci"])
@@ -58,7 +60,7 @@ async def _get_raci_with_users(
 
 async def _require_workspace_project(
     db: aiosqlite.Connection, user, project: str
-) -> str | None:
+) -> str:
     """Return workspace for an unambiguous visible slug; local stdio bypasses."""
     ctx = CallerContext.from_user_info(
         user, is_human_session=getattr(user, "user_type", "human") == "human"
@@ -86,6 +88,31 @@ async def _require_workspace_project(
     if owners != {workspace_id}:
         raise HTTPException(status_code=404, detail="Not found")
     return workspace_id
+
+
+async def _record_raci_write(
+    db: aiosqlite.Connection,
+    user,
+    *,
+    workspace_id: str,
+    project: str,
+    resource_ref: str,
+) -> None:
+    """Journal the RACI mutation so archived projects remain immutable."""
+    ctx = CallerContext.from_user_info(
+        user, is_human_session=getattr(user, "user_type", "human") == "human"
+    )
+    try:
+        await project_lifecycle.record_project_write(
+            db,
+            workspace_id=workspace_id,
+            project_slug=project,
+            writer_kind="project_raci",
+            actor=ctx.user_id or ctx.username,
+            resource_ref=resource_ref,
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
 
 
 @router.get("/{slug}/raci", response_model=list[RaciEntry])
@@ -135,6 +162,13 @@ async def add_raci_entry(
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+    await _record_raci_write(
+        db,
+        user,
+        workspace_id=workspace_id,
+        project=slug,
+        resource_ref=f"{body.user_id}:{body.role}",
+    )
     try:
         await db.execute(
             "INSERT INTO project_raci (project, user_id, role) VALUES (?, ?, ?)",
@@ -148,6 +182,7 @@ async def add_raci_entry(
         )
         await db.commit()
     except Exception as exc:
+        await db.rollback()
         if "UNIQUE" in str(exc):
             raise HTTPException(
                 status_code=409,
@@ -201,6 +236,14 @@ async def replace_raci(
         "SELECT user_id, role FROM project_raci WHERE project = ?", (slug,)
     ) as cursor:
         existing = await cursor.fetchall()
+
+    await _record_raci_write(
+        db,
+        user,
+        workspace_id=workspace_id,
+        project=slug,
+        resource_ref="replace",
+    )
 
     # Cancella entries correnti
     await db.execute("DELETE FROM project_raci WHERE project = ?", (slug,))
@@ -271,11 +314,19 @@ async def remove_raci_entry(
             raise HTTPException(status_code=404, detail="RACI entry not found")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+    await _record_raci_write(
+        db,
+        user,
+        workspace_id=workspace_id,
+        project=slug,
+        resource_ref=f"{user_id}:{role}",
+    )
     result = await db.execute(
         "DELETE FROM project_raci WHERE project = ? AND user_id = ? AND role = ?",
         (slug, user_id, role),
     )
     if result.rowcount == 0:
+        await db.rollback()
         raise HTTPException(status_code=404, detail="RACI entry not found")
 
     await db.execute(

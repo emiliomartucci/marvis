@@ -39,8 +39,8 @@ def test_windows_lock_backend_acquires_without_fcntl(monkeypatch, tmp_path) -> N
     calls: list[object] = []
 
     class StubFileLock:
-        def __init__(self, path, *, mode, timeout):
-            calls.append((path, mode, timeout))
+        def __init__(self, path, *, mode, timeout, thread_local):
+            calls.append((path, mode, timeout, thread_local))
 
         def acquire(self):
             calls.append("acquire")
@@ -60,7 +60,7 @@ def test_windows_lock_backend_acquires_without_fcntl(monkeypatch, tmp_path) -> N
         calls.append("body")
 
     assert calls == [
-        (str(lock_path), 0o600, -1),
+        (str(lock_path), 0o600, -1, True),
         "acquire",
         "body",
         "release",
