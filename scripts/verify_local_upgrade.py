@@ -203,7 +203,9 @@ def _seed_surfaces(root: Path) -> None:
     (root / "projects/sample").mkdir(parents=True)
     (root / "project/.claude/hooks").mkdir(parents=True)
     (root / "vault/settings.yaml").write_text(
-        "storage:\n  db_path: synthetic-console.db\n  projects_root: synthetic-projects\n",
+        "storage:\n"
+        f"  db_path: {root / 'console.db'}\n"
+        f"  projects_root: {root / 'projects'}\n",
         encoding="utf-8",
     )
     (root / "vault/byok.vault").write_bytes(b"synthetic-encrypted-vault-fixture\n")
@@ -230,7 +232,10 @@ def verify_upgrade(
         raise UpgradeVerificationError("prior distribution identity mismatch")
 
     from core.api import db as db_mod
+    from core.api import config as config_mod
     from core.api.config import settings
+    from core.api import runtime_settings
+    from core.api.routers import projects as projects_router
     from core.api.services import schema_upgrade
 
     with tempfile.TemporaryDirectory(prefix="marvis-upgrade-") as raw:
@@ -245,10 +250,23 @@ def verify_upgrade(
         original_db_path = settings.db_path
         original_backup_dir = settings.db_backup_dir
         original_quiesced = os.environ.get(db_mod.QUIESCED_MIGRATION_ENV)
+        original_projects_root = os.environ.get("MARVIS_PROJECTS_ROOT")
+        original_settings_path = os.environ.get("MARVIS_SETTINGS_PATH")
+        original_settings_applied = runtime_settings._applied
+        original_project_dirs = list(projects_router.PROJECT_DIRS)
+        original_repo_parents = list(config_mod.ALLOWED_REPO_PARENTS)
         database = root / "console.db"
         receipt_path = root / "upgrade-receipt.json"
         try:
-            settings.db_path = str(database)
+            os.environ["MARVIS_SETTINGS_PATH"] = str(root / "vault/settings.yaml")
+            os.environ.pop("MARVIS_PROJECTS_ROOT", None)
+            runtime_settings.apply_marvis_settings(force=True)
+            if Path(settings.db_path) != database:
+                raise UpgradeVerificationError("settings database path was not applied")
+            if os.environ.get("MARVIS_PROJECTS_ROOT") != str(
+                (root / "projects").resolve()
+            ):
+                raise UpgradeVerificationError("settings projects root was not applied")
             settings.db_backup_dir = str(root / "backups")
             os.environ[db_mod.QUIESCED_MIGRATION_ENV] = "1"
             db_mod.MIGRATIONS_DIR = prior_migrations
@@ -363,6 +381,17 @@ def verify_upgrade(
                 os.environ.pop(db_mod.QUIESCED_MIGRATION_ENV, None)
             else:
                 os.environ[db_mod.QUIESCED_MIGRATION_ENV] = original_quiesced
+            if original_projects_root is None:
+                os.environ.pop("MARVIS_PROJECTS_ROOT", None)
+            else:
+                os.environ["MARVIS_PROJECTS_ROOT"] = original_projects_root
+            if original_settings_path is None:
+                os.environ.pop("MARVIS_SETTINGS_PATH", None)
+            else:
+                os.environ["MARVIS_SETTINGS_PATH"] = original_settings_path
+            runtime_settings._applied = original_settings_applied
+            projects_router._set_project_dirs(original_project_dirs)
+            config_mod.ALLOWED_REPO_PARENTS[:] = original_repo_parents
 
 
 def main(argv: list[str] | None = None) -> int:

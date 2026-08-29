@@ -554,6 +554,47 @@
         "memory_operation_id"
       ]
     },
+    "CloudFActivationRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "expected_epoch": "6c65d0bad2ef97923974be987f529334829edee6f8d85d92d059a940b4808188",
+        "subtype": "fd977e313134c289669da0b2f369253cd7f210a59fb408c769bbe7ca815312bc"
+      },
+      "required": [
+        "expected_epoch",
+        "subtype"
+      ]
+    },
+    "CloudFChangeAcquireRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "expected_epoch": "6c65d0bad2ef97923974be987f529334829edee6f8d85d92d059a940b4808188",
+        "lease_expires_at": "bae02730aa008eaf4ab6c27e8ab96da7dfbbd63d6365f14f29e17711ff6dfd3c",
+        "operation_id": "ea1aef085729180dc6261ff4bec1c237568d9c0425188c36869745f4c58ab721",
+        "operation_kind": "585e8fee9b50f2f7c230eb9e58841b86b7b6c1f4dc8ee1af632e15a1950d77b3"
+      },
+      "required": [
+        "expected_epoch",
+        "lease_expires_at",
+        "operation_id",
+        "operation_kind"
+      ]
+    },
+    "CloudFChangeCompleteRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "advance_epoch": "10a24577da4115e2887e7065886ab1a9eb4c2993af77fa4321ce40be32a2faaa",
+        "expected_epoch": "6c65d0bad2ef97923974be987f529334829edee6f8d85d92d059a940b4808188",
+        "operation_id": "ea1aef085729180dc6261ff4bec1c237568d9c0425188c36869745f4c58ab721"
+      },
+      "required": [
+        "expected_epoch",
+        "operation_id"
+      ]
+    },
     "CodexFunctionItem": {
       "envelope_sha256": "5a1f0b88c3da70853b5513efaf9fc5d3374ebee53b30b4b1dfb1e8cbc5c3ed64",
       "kind": "object",
@@ -1650,6 +1691,75 @@
         "at"
       ]
     },
+    "GovernedDecisionAcceptRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "expected_cloud_f_epoch": "494c46ab504b8aa3cc0970898687692c8aeddf7a3cbf584508a3c259e5812074",
+        "expected_content_digest": "47903693b57e693e6a0ba0d5cf0b0eb3b481835d707f7e3ec47359b2432a7da2",
+        "idempotency_key": "2bebe6f9ba1a454133eb91f37ef635003f9500827c329c370b1eef9cd1386b46",
+        "lease_expires_at": "bae02730aa008eaf4ab6c27e8ab96da7dfbbd63d6365f14f29e17711ff6dfd3c",
+        "operation_id": "ea1aef085729180dc6261ff4bec1c237568d9c0425188c36869745f4c58ab721"
+      },
+      "required": [
+        "expected_cloud_f_epoch",
+        "expected_content_digest",
+        "idempotency_key",
+        "lease_expires_at",
+        "operation_id"
+      ]
+    },
+    "GovernedDecisionCreateRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "body": "caa8288ef35728f426c7331fbf9e7a49920120eba74f5b09a35bbf47d2d2b40a",
+        "decision_id": "00f060f2857b03cd8841e0538df17c0492fa16d47e602abe443cd21cfe0701c2",
+        "expected_cloud_f_epoch": "494c46ab504b8aa3cc0970898687692c8aeddf7a3cbf584508a3c259e5812074",
+        "idempotency_key": "2bebe6f9ba1a454133eb91f37ef635003f9500827c329c370b1eef9cd1386b46",
+        "lease_expires_at": "bae02730aa008eaf4ab6c27e8ab96da7dfbbd63d6365f14f29e17711ff6dfd3c",
+        "operation_id": "ea1aef085729180dc6261ff4bec1c237568d9c0425188c36869745f4c58ab721",
+        "relative_path": "808213d6d5f3d18a8649cf78ca42fcff6feacc303f84a024942e54ce0cca4086",
+        "title": "953a53311fc87140fd23cb5ac97dc4c8a0466ac48e740211ed7d895e96584df8"
+      },
+      "required": [
+        "body",
+        "expected_cloud_f_epoch",
+        "idempotency_key",
+        "lease_expires_at",
+        "operation_id",
+        "relative_path",
+        "title"
+      ]
+    },
+    "GovernedDecisionSupersedeRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "expected_cloud_f_epoch": "494c46ab504b8aa3cc0970898687692c8aeddf7a3cbf584508a3c259e5812074",
+        "expected_source_body_digest": "63c86677ae855fcc99620db160fec34f6f6ecd51d730188c2c9a3e1ead516f69",
+        "expected_source_content_digest": "2794bd53fdbc9235568afc4dd223de6a2da0a1bdaedb3316079b7b677a0ddcff",
+        "expected_target_content_digest": "b840e249fa2c27147b0a1eff1e18c460496d069c01382f59603b5274f0872099",
+        "idempotency_key": "2bebe6f9ba1a454133eb91f37ef635003f9500827c329c370b1eef9cd1386b46",
+        "lease_expires_at": "bae02730aa008eaf4ab6c27e8ab96da7dfbbd63d6365f14f29e17711ff6dfd3c",
+        "operation_id": "ea1aef085729180dc6261ff4bec1c237568d9c0425188c36869745f4c58ab721",
+        "source_relative_path": "255986da4e4dc89986ae8507d4af6bb67f6bc8f5e40f12684a73398a506b7051",
+        "target_decision_id": "2e0847b13c9887bfc56907d951badaacfe3efba4ce482dd5c064f1c4cc40c7b3",
+        "target_project_slug": "5c75c9167db38b4a872c3f53695636360639cbc1de6302b54b6d65b3b85818d2"
+      },
+      "required": [
+        "expected_cloud_f_epoch",
+        "expected_source_body_digest",
+        "expected_source_content_digest",
+        "expected_target_content_digest",
+        "idempotency_key",
+        "lease_expires_at",
+        "operation_id",
+        "source_relative_path",
+        "target_decision_id",
+        "target_project_slug"
+      ]
+    },
     "GraphCapabilities": {
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
       "kind": "object",
@@ -1801,6 +1911,34 @@
         "version": "62d12f22e59367215553d10019bfd89561682a793c93930b9d20135003ced80c"
       },
       "required": []
+    },
+    "HistoricalArtifactPointerRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "expected_cloud_f_epoch": "494c46ab504b8aa3cc0970898687692c8aeddf7a3cbf584508a3c259e5812074",
+        "expected_source_body_digest": "63c86677ae855fcc99620db160fec34f6f6ecd51d730188c2c9a3e1ead516f69",
+        "idempotency_key": "2bebe6f9ba1a454133eb91f37ef635003f9500827c329c370b1eef9cd1386b46",
+        "lease_expires_at": "bae02730aa008eaf4ab6c27e8ab96da7dfbbd63d6365f14f29e17711ff6dfd3c",
+        "operation_id": "ea1aef085729180dc6261ff4bec1c237568d9c0425188c36869745f4c58ab721",
+        "relation": "b0cf947726f5d0e0350e5bfad09d893e279cdef5db0e879aa8ef60392e87fe5a",
+        "source_kind": "5175b64e69c3c8b54b3cf4e63b1ec1e3e7a6a3bd640e1aa1e681e8b9a3745bf9",
+        "source_ref": "2573610fdb651330017d861bb6c82206ef318a862358eb10e87ca82b4e4fce33",
+        "target_decision_id": "c5fa0fb79178b9779c2cc9c7aeacfaa0fb4f1031e57a8f7b5f8f8cec5e2bad0a",
+        "target_project_slug": "5c75c9167db38b4a872c3f53695636360639cbc1de6302b54b6d65b3b85818d2",
+        "target_relative_path": "6b9eb1ea04fb1992401fadd06c46eaeeeab7379cf6582ca060022f54f8b1788e"
+      },
+      "required": [
+        "expected_cloud_f_epoch",
+        "expected_source_body_digest",
+        "idempotency_key",
+        "lease_expires_at",
+        "operation_id",
+        "relation",
+        "source_kind",
+        "source_ref",
+        "target_project_slug"
+      ]
     },
     "HotspotItem": {
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
@@ -3133,6 +3271,69 @@
         "slug"
       ]
     },
+    "ProjectArchiveApprovalRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "approval_id": "668c347b414dc50d9077c74a67fd7fc9295f16913813c8b84667eceb29c5ca7f",
+        "evidence_digest": "51b5044df70d08ed9fbefb6eb90fa01a64b0353204659e5da86fb286c5afb1ab",
+        "expected_active_operations_digest": "7d33b18f8eea60ec03f09cdf58f4f0a4ad13fda9e6923685a61badccb40dafb7",
+        "expected_cloud_f_epoch": "494c46ab504b8aa3cc0970898687692c8aeddf7a3cbf584508a3c259e5812074",
+        "expected_project_digest": "f2217941fd78149b957c60d0940334610bdad9405105a68462fe5af4dce2e309",
+        "expected_project_id": "a91af67679baa0decf0e5541b3cd66d2054df8dceb8af8fb6ed57baa448de50e",
+        "expected_selector_watermark": "2a38e60a3ff123725b6eb6d5966590347ce16a4b8dca2960843c65f2de1b9bcb",
+        "expected_writer_watermark": "889396b08ea4d01db1d028840ba7080e1b5f9a6b8167c07b49403e51229833c2",
+        "expires_at": "4b3f70833ab9ead12c32a571f15036b66b1b604483ed3b47c32a2a1234209170",
+        "master_digest": "65e12c04ebad68fba4c95039af4504fd7b44dee29a63096c5eb19231886a4920",
+        "plan_f_digest": "0cc0d0a0fd2f3799ba0e57b144fcd91114f28212cb39595c59cd6c71900ce05f"
+      },
+      "required": [
+        "evidence_digest",
+        "expected_active_operations_digest",
+        "expected_cloud_f_epoch",
+        "expected_project_digest",
+        "expected_project_id",
+        "expected_selector_watermark",
+        "expected_writer_watermark",
+        "expires_at",
+        "master_digest",
+        "plan_f_digest"
+      ]
+    },
+    "ProjectArchiveRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "approval_id": "b7a236e6b0cbbc77091fe95a247bf71f8b647a910dd98007bdd2fda62af1b127",
+        "evidence_digest": "51b5044df70d08ed9fbefb6eb90fa01a64b0353204659e5da86fb286c5afb1ab",
+        "expected_active_operations_digest": "7d33b18f8eea60ec03f09cdf58f4f0a4ad13fda9e6923685a61badccb40dafb7",
+        "expected_cloud_f_epoch": "494c46ab504b8aa3cc0970898687692c8aeddf7a3cbf584508a3c259e5812074",
+        "expected_project_digest": "f2217941fd78149b957c60d0940334610bdad9405105a68462fe5af4dce2e309",
+        "expected_selector_watermark": "2a38e60a3ff123725b6eb6d5966590347ce16a4b8dca2960843c65f2de1b9bcb",
+        "expected_writer_watermark": "889396b08ea4d01db1d028840ba7080e1b5f9a6b8167c07b49403e51229833c2",
+        "idempotency_key": "2bebe6f9ba1a454133eb91f37ef635003f9500827c329c370b1eef9cd1386b46",
+        "lease_expires_at": "bae02730aa008eaf4ab6c27e8ab96da7dfbbd63d6365f14f29e17711ff6dfd3c",
+        "master_digest": "65e12c04ebad68fba4c95039af4504fd7b44dee29a63096c5eb19231886a4920",
+        "operation_id": "ea1aef085729180dc6261ff4bec1c237568d9c0425188c36869745f4c58ab721",
+        "plan_f_digest": "0cc0d0a0fd2f3799ba0e57b144fcd91114f28212cb39595c59cd6c71900ce05f",
+        "project_id": "de0b840374525ec2dc895ac4d0ee0ac4025758312ddd2170a790d5adb5185f36"
+      },
+      "required": [
+        "approval_id",
+        "evidence_digest",
+        "expected_active_operations_digest",
+        "expected_cloud_f_epoch",
+        "expected_project_digest",
+        "expected_selector_watermark",
+        "expected_writer_watermark",
+        "idempotency_key",
+        "lease_expires_at",
+        "master_digest",
+        "operation_id",
+        "plan_f_digest",
+        "project_id"
+      ]
+    },
     "ProjectBillingSummary": {
       "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
       "kind": "object",
@@ -3287,6 +3488,28 @@
       "required": [
         "name",
         "slug"
+      ]
+    },
+    "ProjectLifecycleRegistrationRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {},
+      "required": []
+    },
+    "ProjectSelectorWatermarkRequest": {
+      "envelope_sha256": "9091a8164f97eaca182b3d06d0e5a59e923c880ebc0148056c453c651f5b46cb",
+      "kind": "object",
+      "property_sha256": {
+        "expected_epoch": "6c65d0bad2ef97923974be987f529334829edee6f8d85d92d059a940b4808188",
+        "expected_selector_watermark": "2a38e60a3ff123725b6eb6d5966590347ce16a4b8dca2960843c65f2de1b9bcb",
+        "operation_id": "ea1aef085729180dc6261ff4bec1c237568d9c0425188c36869745f4c58ab721",
+        "selector_watermark": "5e9720d868002fe629ad5e3b81ae2dcb18d04e5d88657777ebee5068cb96febb"
+      },
+      "required": [
+        "expected_epoch",
+        "expected_selector_watermark",
+        "operation_id",
+        "selector_watermark"
       ]
     },
     "ProjectStatusBreakdown": {
@@ -5171,7 +5394,7 @@
       ]
     }
   },
-  "component_schema_count": 314,
+  "component_schema_count": 325,
   "component_schema_sha256": {
     "ActionResponse": "08d79fd23d016503365f82de841d07bca3a06b3d2140791a43447799d11611fc",
     "AgentSessionUpdate": "10c9fc525061d333e73a90b36f5ecb635a92aeecdefb4a1acb51c860beef7f0d",
@@ -5210,6 +5433,9 @@
     "ClosureDriftSignalClears": "9785b4012b7bc8b476322a2cd882378c9c4b8db4d713371de05ff91bd81de179",
     "ClosureManualAttest": "c7e2521f80dc4607e33f1a4bbf48828e5888cfc47174ef76bba22970e1d994e1",
     "ClosureMemoryOpApplied": "12592cb712c9f4fd7eda689c8d3b419834be22727731351d12fa9a495632d000",
+    "CloudFActivationRequest": "fd59c8f439ac1ca9134b94dab585720f51b1831edc06460e65fa40a863926d9b",
+    "CloudFChangeAcquireRequest": "622240c33da6ea38180af530622523ae5de7f76a1b9694e165d56d80e843869a",
+    "CloudFChangeCompleteRequest": "2fb4d7b103a22f74f68e18ee527b9c195a15637b7a799ac72083d006ff0fa0fa",
     "CodexFunctionItem": "c9c3e234aba0824fcb11829fe1eefd7f74c75cfda1c8807a24ac4846a1ff063a",
     "CodexFunctionsResponse": "d4c0e7602b2de32118303f6ae324547e7a68d710d05b36f52b4ad8c175743bde",
     "CodexModuleEdgeItem": "07e1e48e68bd576ea580156a771f664a590c7873c79e0c8e5a8a81d054404345",
@@ -5271,6 +5497,9 @@
     "FindingRedacted": "4a1a636f6a5153e05881a5cf2ea49d64a44b59b84e3e2c5bd9d4a394555f5680",
     "FindingsListResponse": "2c53e6559d9bcaf2132250355ec664405bfdd884e3a8138a918fc317b00e41bf",
     "FlushEntry": "db3a26f82af5aa1ea3a3945f5765a6ba821cec88f145914da4cc37c7aed1fa13",
+    "GovernedDecisionAcceptRequest": "0cf44f8a93391a31fb3079a014e93a45032fb969be1217bc92f3241e462afcf2",
+    "GovernedDecisionCreateRequest": "930e7692c5459517eaefb0fb2e6ffb5aca9e8c4f9424d58b863789dfc708a57c",
+    "GovernedDecisionSupersedeRequest": "af1fdba53cc108e1a844234d93fddec6da136c0b44d00a6017aaee528cb70520",
     "GraphCapabilities": "69ec0ce62d35abdcaa3b1b128ef573e6de329c5426e5e8bdc417e8d8e80d72ea",
     "GraphCosmoOut": "d9d08e4b1c12e99bcd799b82f7a13406cc102d548b7cb030f8731254be684908",
     "GraphIngestEdge": "7783c321415ce7fd1cec597ff6145c461c02eca00d542faccce1e4412412da71",
@@ -5281,6 +5510,7 @@
     "HandoffEntry": "f294d1399dbedc88207fadf64ca9a17b06d04c5bf87c6c3bd26489909c9faedf",
     "HandoffSearchResult": "a8e99a48ca7362d59ad9ac41b31d1f46e920f2230209c9eb4bc219c2ef7eaef7",
     "HealthResponse": "535fbcd23c631480cfed4a61fa69856ec9e15831a1fddbc60fe1c5e40a5d95db",
+    "HistoricalArtifactPointerRequest": "c3ee2fc325819e65803dbb6f916e057c36c6151c2200aa39c57d8cf0ae5b3239",
     "HotspotItem": "5a1fcad604ef8d4901dd9d08c154e63fbe6d9c1faac2e20abb01360f41ddf7ef",
     "HumanCostEntryCreate": "422aa50a39bb67058eea9f0ae37af7a52ea84790dbfded7209916e73f262dad3",
     "InboxGmailSyncCandidate": "03a679319b60e4e2b00dae4e24295d43c18fc95f8859cc047783798bc1867b17",
@@ -5357,6 +5587,8 @@
     "PrMetadata": "cee09e4ef6cc3c7f969474ab8e53d228570cd392a7f7d696b55508a611d50420",
     "ProgramInfo": "0f4b6131e50911813ba9bc88f61dd1ecd2466668d5aee2134b452ef3f5dc6032",
     "Project": "e4e4fd8bb9ed2321d2f70bb4dee1fbf5ed5a3e61773481e4facec03844869d3d",
+    "ProjectArchiveApprovalRequest": "9053d2b2b5d2e3d36306c0217bac6c351c27d9f4ee3ac2d72c670be6f9dc4774",
+    "ProjectArchiveRequest": "0a51c44f6c2e00175e2517b6dc0fbd8a3481b28b34d8b5d430d4479de8a1870c",
     "ProjectBillingSummary": "54a742c3f04ab2c077a83c91e5c3c00f3e9f79cad9093c7657c26c3c971dfbbc",
     "ProjectCostSummary": "f3b3a246b67c522f71f14537fd7aad6ee77f9d43e9049302dd58e28ee4737982",
     "ProjectCreateRequest": "6973776acc422dc297c26e1af06b48c01efd04907ad4457c64bd2fc1e2da5942",
@@ -5365,6 +5597,8 @@
     "ProjectDirsResponse": "e0a20d0f82832e257c9598a2d40fe4b05113797da5d85072da56ec707a50543c",
     "ProjectDirsUpdate": "c4276e1bdb385942fc39dc60c99a60f249e834b39a0ca4429b399741aa5039f5",
     "ProjectInfo": "a8b7af69dd98d82ad51133501d1307baa9ee790847bcb2185370fc2b59bd8426",
+    "ProjectLifecycleRegistrationRequest": "7aa4b41c7bc25411f1e23c13bc4ecf4c56aaeeb76fa603f0c69eb4fbecdcb679",
+    "ProjectSelectorWatermarkRequest": "161da818b404c3a1d7dc9161dfc2db6ef798b9066c86777e2db16aeb222942b6",
     "ProjectStatusBreakdown": "c558b9cb077dd33af9b721377935c0bd5738b3ed167d7e30802c54da687c1073",
     "ProjectSummary": "778fab747b53fec05a2fa28b2e7f5a1dc886e367d3e30613ec0617d2b1a59083",
     "ProjectUpdateRequest": "f3995483eca9bb41de5ba7faadd3eb38da6e169494cef98095a732630453d95d",
@@ -5490,7 +5724,7 @@
   },
   "contract_version": 3,
   "openapi": "3.1.0",
-  "operation_count": 326,
+  "operation_count": 344,
   "operations": {
     "/agent/pr/abandon/{task_id}": {
       "post": {
@@ -11294,6 +11528,129 @@
         ]
       }
     },
+    "/api/v1/projects/_cloud-f/activate": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "activate_cloud_f_control_api_v1_projects__cloud_f_activate_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "CloudFActivationRequest"
+        ],
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "CloudFActivationRequest",
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/_cloud-f/changes/acquire": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "acquire_cloud_f_change_api_v1_projects__cloud_f_changes_acquire_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "CloudFChangeAcquireRequest"
+        ],
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "CloudFChangeAcquireRequest",
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/_cloud-f/changes/complete": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "complete_cloud_f_change_api_v1_projects__cloud_f_changes_complete_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "CloudFChangeCompleteRequest"
+        ],
+        "required_parameters": [],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "CloudFChangeCompleteRequest",
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/_cloud-f/changes/{operation_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_cloud_f_change_operation_api_v1_projects__cloud_f_changes__operation_id__get",
+        "request_body_required": false,
+        "request_schema_refs": [],
+        "required_parameters": [
+          "path:operation_id"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/_cloud-f/control": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_cloud_f_control_api_v1_projects__cloud_f_control_get",
+        "request_body_required": false,
+        "request_schema_refs": [],
+        "required_parameters": [],
+        "response_codes": [
+          "200"
+        ],
+        "response_schema_refs": {
+          "200": []
+        },
+        "schema_refs": []
+      }
+    },
     "/api/v1/projects/{slug}": {
       "get": {
         "deprecated": false,
@@ -11361,6 +11718,64 @@
         ]
       }
     },
+    "/api/v1/projects/{slug}/archive": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "archive_project_api_v1_projects__slug__archive_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "ProjectArchiveRequest"
+        ],
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ProjectArchiveRequest",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/archive-approvals": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "approve_project_archive_api_v1_projects__slug__archive_approvals_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "ProjectArchiveApprovalRequest"
+        ],
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "201",
+          "422"
+        ],
+        "response_schema_refs": {
+          "201": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ProjectArchiveApprovalRequest",
+          "ValidationError"
+        ]
+      }
+    },
     "/api/v1/projects/{slug}/brief": {
       "get": {
         "deprecated": false,
@@ -11382,6 +11797,149 @@
           ]
         },
         "schema_refs": [
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decision-operations/{operation_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_decision_lifecycle_operation_api_v1_projects__slug__decision_operations__operation_id__get",
+        "request_body_required": false,
+        "request_schema_refs": [],
+        "required_parameters": [
+          "path:operation_id",
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decisions": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_governed_decision_api_v1_projects__slug__decisions_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "GovernedDecisionCreateRequest"
+        ],
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "201",
+          "422"
+        ],
+        "response_schema_refs": {
+          "201": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "GovernedDecisionCreateRequest",
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decisions/{decision_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_governed_decision_api_v1_projects__slug__decisions__decision_id__get",
+        "request_body_required": false,
+        "request_schema_refs": [],
+        "required_parameters": [
+          "path:decision_id",
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decisions/{decision_id}/accept": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "accept_governed_decision_api_v1_projects__slug__decisions__decision_id__accept_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "GovernedDecisionAcceptRequest"
+        ],
+        "required_parameters": [
+          "path:decision_id",
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "GovernedDecisionAcceptRequest",
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/decisions/{decision_id}/supersede": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "supersede_governed_decision_api_v1_projects__slug__decisions__decision_id__supersede_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "GovernedDecisionSupersedeRequest"
+        ],
+        "required_parameters": [
+          "path:decision_id",
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "GovernedDecisionSupersedeRequest",
           "HTTPValidationError",
           "ValidationError"
         ]
@@ -11573,6 +12131,170 @@
         "schema_refs": [
           "HTTPValidationError",
           "HandoffEntry",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/historical-pointers": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_historical_artifact_pointers_api_v1_projects__slug__historical_pointers_get",
+        "request_body_required": false,
+        "request_schema_refs": [],
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      },
+      "post": {
+        "deprecated": false,
+        "operation_id": "create_historical_artifact_pointer_api_v1_projects__slug__historical_pointers_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "HistoricalArtifactPointerRequest"
+        ],
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "201",
+          "422"
+        ],
+        "response_schema_refs": {
+          "201": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "HistoricalArtifactPointerRequest",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/lifecycle": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_project_lifecycle_api_v1_projects__slug__lifecycle_get",
+        "request_body_required": false,
+        "request_schema_refs": [],
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/lifecycle/operations/{operation_id}": {
+      "get": {
+        "deprecated": false,
+        "operation_id": "get_project_lifecycle_operation_api_v1_projects__slug__lifecycle_operations__operation_id__get",
+        "request_body_required": false,
+        "request_schema_refs": [],
+        "required_parameters": [
+          "path:operation_id",
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/lifecycle/register": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "register_project_lifecycle_api_v1_projects__slug__lifecycle_register_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "ProjectLifecycleRegistrationRequest"
+        ],
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ProjectLifecycleRegistrationRequest",
+          "ValidationError"
+        ]
+      }
+    },
+    "/api/v1/projects/{slug}/lifecycle/selector-watermark": {
+      "post": {
+        "deprecated": false,
+        "operation_id": "update_project_selector_watermark_api_v1_projects__slug__lifecycle_selector_watermark_post",
+        "request_body_required": true,
+        "request_schema_refs": [
+          "ProjectSelectorWatermarkRequest"
+        ],
+        "required_parameters": [
+          "path:slug"
+        ],
+        "response_codes": [
+          "200",
+          "422"
+        ],
+        "response_schema_refs": {
+          "200": [],
+          "422": [
+            "HTTPValidationError",
+            "ValidationError"
+          ]
+        },
+        "schema_refs": [
+          "HTTPValidationError",
+          "ProjectSelectorWatermarkRequest",
           "ValidationError"
         ]
       }
@@ -14383,8 +15105,8 @@
       }
     }
   },
-  "path_count": 276,
+  "path_count": 293,
   "schema": "marvis-compatibility-fixture/v1",
-  "source_openapi_sha256": "403c02d7a595291b62d443bde528ed055655011cca3f47e7ff2eb14f898b60cc",
-  "source_ref": "d413f09bf0e43c1929d1c774c77c7eed1d56bf18"
+  "source_openapi_sha256": "74b4f1e9b91f19059a96b72e71391b831fadcdcb9fd7e4262a63cb4b1aa7604f",
+  "source_ref": "b92bcb1ec7a579a5bd37e4f6e557e2daeb84c7be"
 }

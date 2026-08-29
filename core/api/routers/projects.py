@@ -44,12 +44,23 @@ from fastapi import Path as PathParam
 from core.api.config import settings
 from core.api.db import get_db, get_write_db
 from core.api.models import (
+    CloudFActivationRequest,
+    CloudFChangeAcquireRequest,
+    CloudFChangeCompleteRequest,
     DocEntry,
+    GovernedDecisionAcceptRequest,
+    GovernedDecisionCreateRequest,
+    GovernedDecisionSupersedeRequest,
     HandoffEntry,
+    HistoricalArtifactPointerRequest,
     ProgramInfo,
+    ProjectArchiveApprovalRequest,
+    ProjectArchiveRequest,
     ProjectCreateRequest,
     ProjectCreateResponse,
     ProjectDetail,
+    ProjectLifecycleRegistrationRequest,
+    ProjectSelectorWatermarkRequest,
     ProjectUpdateRequest,
     StatusUpdateFeedCreateRequest,
     StatusUpdateFeedItem,
@@ -61,6 +72,8 @@ from core.api.routers._adapter import to_http
 from core.api.routers._browser_mutation_denial import agent_only_route
 from core.api.security import get_agent_user, get_current_user_or_agent
 from core.api.services import project_status_updates as status_feed_service  # noqa: F401  (re-export / used by use_case)
+from core.api.services import governed_decisions as decision_service
+from core.api.services import project_lifecycle as lifecycle_service
 from core.api.visibility import check_project_access, get_visible_projects  # noqa: F401  (check_project_access kept as re-export seam)
 from core.api.services.kg.audit import check_deep_rate_limit, log_kg_deep_access
 from core.api.services.kg.lens import build_kg_context_for_project, require_kg_visibility
@@ -121,6 +134,15 @@ def _schedule_embed_project(
 
 
 router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
+
+
+def _lifecycle_ctx(user: UserInfo, *, human_session: bool = False) -> CallerContext:
+    return CallerContext.from_user_info(
+        user,
+        is_human_session=(
+            human_session and user.auth_mechanism in {"session", "local"}
+        ),
+    )
 
 def _default_project_dirs() -> list[Path]:
     """Initial project roots for non-FastAPI runtimes.
@@ -484,7 +506,7 @@ def _parse_handoffs(project_path: Path) -> list[HandoffEntry]:
             continue
         candidates.append((f, content, _handoff_date_from_content(content, f.name)))
 
-    for f, content, date in sorted(
+    for f, content, handoff_date in sorted(
         candidates,
         key=lambda item: _handoff_sort_key(item[0], item[2]),
         reverse=True,
@@ -501,7 +523,7 @@ def _parse_handoffs(project_path: Path) -> list[HandoffEntry]:
                 try:
                     fm = yaml.safe_load(content[3:end])
                     if isinstance(fm, dict):
-                        date = str(fm["date"]) if "date" in fm else ""
+                        handoff_date = str(fm["date"]) if "date" in fm else ""
                         raw_session = fm.get("session")
                         if raw_session not in (None, ""):
                             session = str(raw_session)
@@ -528,7 +550,7 @@ def _parse_handoffs(project_path: Path) -> list[HandoffEntry]:
 
         entries.append(HandoffEntry(
             filename=f"memory/{f.name}",
-            date=date,
+            date=handoff_date,
             summary=summary.strip()[:200],
             session=session,
             branch=branch,
@@ -814,6 +836,460 @@ async def list_programs(
         return await uc.list_programs(ctx, db, visible_projects=visible_projects)
     except ServiceError as e:
         raise to_http(e)
+
+
+@router.get("/_cloud-f/control")
+async def get_cloud_f_control(
+    user: UserInfo = Depends(get_current_user_or_agent),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> dict:
+    """Read the common Cloud/F epoch, lease, and active-operation set."""
+    ctx = _lifecycle_ctx(user)
+    try:
+        snapshot = await lifecycle_service.read_cloud_f_control(
+            db,
+            workspace_id=ctx.workspace_id,
+        )
+        return lifecycle_service.snapshot_dict(snapshot)
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/_cloud-f/activate")
+async def activate_cloud_f_control(
+    body: CloudFActivationRequest,
+    user: UserInfo = Depends(
+        require_role("admin", "super_admin", human_only=True)
+    ),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """One-time readiness primitive; invocation belongs to Plan F U11."""
+    try:
+        snapshot = await lifecycle_service.activate_cloud_f_control(
+            _lifecycle_ctx(user, human_session=True),
+            db,
+            subtype=body.subtype,
+            expected_epoch=body.expected_epoch,
+        )
+        return lifecycle_service.snapshot_dict(snapshot)
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/_cloud-f/changes/acquire")
+async def acquire_cloud_f_change(
+    body: CloudFChangeAcquireRequest,
+    user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Acquire the exclusive lease for one U11-integrated protected change."""
+    try:
+        snapshot = await lifecycle_service.acquire_cloud_f_change(
+            _lifecycle_ctx(user),
+            db,
+            operation_id=body.operation_id,
+            operation_kind=body.operation_kind,
+            expected_epoch=body.expected_epoch,
+            lease_expires_at=body.lease_expires_at,
+        )
+        return lifecycle_service.snapshot_dict(snapshot)
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/_cloud-f/changes/complete")
+async def complete_cloud_f_change(
+    body: CloudFChangeCompleteRequest,
+    user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Release an exact lease and advance the protected-change epoch."""
+    try:
+        snapshot = await lifecycle_service.complete_cloud_f_change(
+            _lifecycle_ctx(user),
+            db,
+            operation_id=body.operation_id,
+            expected_epoch=body.expected_epoch,
+            advance_epoch=body.advance_epoch,
+        )
+        return lifecycle_service.snapshot_dict(snapshot)
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.get("/_cloud-f/changes/{operation_id}")
+async def get_cloud_f_change_operation(
+    operation_id: str,
+    user: UserInfo = Depends(get_current_user_or_agent),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> dict:
+    """Read durable protected-change coordinates before any retry."""
+    ctx = _lifecycle_ctx(user)
+    try:
+        return await lifecycle_service.read_cloud_f_change_operation(
+            db,
+            workspace_id=ctx.workspace_id,
+            operation_id=operation_id,
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/{slug}/lifecycle/selector-watermark")
+async def update_project_selector_watermark(
+    body: ProjectSelectorWatermarkRequest,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Bind an audited selector digest under the caller's exact Cloud/F lease."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx,
+            db,
+            slug,
+            visible_projects,
+        )
+        snapshot = await lifecycle_service.update_project_selector_watermark(
+            ctx,
+            db,
+            project_slug=slug,
+            **body.model_dump(),
+        )
+        return lifecycle_service.snapshot_dict(snapshot)
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/{slug}/lifecycle/register")
+async def register_project_lifecycle(
+    body: ProjectLifecycleRegistrationRequest,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Assign a stable lifecycle identity to an existing project."""
+    del body
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx,
+            db,
+            slug,
+            visible_projects,
+        )
+        async with lifecycle_service.async_project_mutation_guard():
+            snapshot = await lifecycle_service.ensure_project_lifecycle(
+                db,
+                workspace_id=ctx.workspace_id,
+                project_slug=slug,
+            )
+            await db.commit()
+        return lifecycle_service.snapshot_dict(snapshot)
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.get("/{slug}/lifecycle")
+async def get_project_lifecycle(
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(get_current_user_or_agent),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> dict:
+    """Direct lifecycle read; archived projects remain readable by known slug."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx,
+            db,
+            slug,
+            visible_projects,
+        )
+        snapshot = await lifecycle_service.read_project_lifecycle(
+            db,
+            workspace_id=ctx.workspace_id,
+            project_slug=slug,
+        )
+        return lifecycle_service.snapshot_dict(snapshot)
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/{slug}/archive-approvals", status_code=201)
+async def approve_project_archive(
+    body: ProjectArchiveApprovalRequest,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(
+        require_role("admin", "super_admin", human_only=True)
+    ),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Record explicit, expiring approval bound to exact archive coordinates."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user, human_session=True)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx,
+            db,
+            slug,
+            visible_projects,
+        )
+        return await lifecycle_service.create_archive_approval(
+            ctx,
+            db,
+            project_slug=slug,
+            **body.model_dump(),
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/{slug}/archive")
+async def archive_project(
+    body: ProjectArchiveRequest,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(require_role("admin", "super_admin")),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Run the approval-bound, idempotent project archive saga."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx,
+            db,
+            slug,
+            visible_projects,
+        )
+        return await lifecycle_service.archive_project(
+            ctx,
+            db,
+            project_slug=slug,
+            **body.model_dump(),
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.get("/{slug}/lifecycle/operations/{operation_id}")
+async def get_project_lifecycle_operation(
+    operation_id: str,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(get_current_user_or_agent),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> dict:
+    """Read operation state before any retry after timeout."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx,
+            db,
+            slug,
+            visible_projects,
+        )
+        result = await lifecycle_service.read_lifecycle_operation(
+            db,
+            workspace_id=ctx.workspace_id,
+            operation_id=operation_id,
+        )
+        if result["project_slug"] != slug:
+            raise ServiceError(
+                code="lifecycle_operation_scope_mismatch",
+                message="Lifecycle operation does not belong to this project",
+            )
+        return result
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/{slug}/decisions", status_code=201)
+async def create_governed_decision(
+    body: GovernedDecisionCreateRequest,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(require_role("operator", "admin", "super_admin")),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Create a draft through the journaled decision lifecycle."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx, db, slug, visible_projects
+        )
+        return await decision_service.create_decision(
+            ctx,
+            db,
+            project_slug=slug,
+            **body.model_dump(),
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.get("/{slug}/decisions/{decision_id}")
+async def get_governed_decision(
+    decision_id: str,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(get_current_user_or_agent),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> dict:
+    """Direct known-ID read, including superseded decisions after archive."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx, db, slug, visible_projects
+        )
+        return await decision_service.read_decision(
+            db,
+            workspace_id=ctx.workspace_id,
+            project_slug=slug,
+            decision_id=decision_id,
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/{slug}/decisions/{decision_id}/accept")
+async def accept_governed_decision(
+    body: GovernedDecisionAcceptRequest,
+    decision_id: str,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(require_role("admin", "super_admin")),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Accept a draft without changing its substantive body."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user, human_session=True)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx, db, slug, visible_projects
+        )
+        return await decision_service.accept_decision(
+            ctx,
+            db,
+            project_slug=slug,
+            decision_id=decision_id,
+            **body.model_dump(),
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/{slug}/decisions/{decision_id}/supersede")
+async def supersede_governed_decision(
+    body: GovernedDecisionSupersedeRequest,
+    decision_id: str,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(require_role("admin", "super_admin")),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Supersede an accepted or legacy decision with an accepted target."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user, human_session=True)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx, db, slug, visible_projects
+        )
+        await uc._require_project_filesystem_access(
+            ctx, db, body.target_project_slug, visible_projects
+        )
+        return await decision_service.supersede_decision(
+            ctx,
+            db,
+            source_project_slug=slug,
+            source_decision_id=decision_id,
+            **body.model_dump(),
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.post("/{slug}/historical-pointers", status_code=201)
+async def create_historical_artifact_pointer(
+    body: HistoricalArtifactPointerRequest,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(require_role("admin", "super_admin")),
+    db: aiosqlite.Connection = Depends(get_write_db),
+) -> dict:
+    """Add non-destructive handoff, learning, or decision lineage."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user, human_session=True)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx, db, slug, visible_projects
+        )
+        await uc._require_project_filesystem_access(
+            ctx, db, body.target_project_slug, visible_projects
+        )
+        return await decision_service.create_historical_pointer(
+            ctx,
+            db,
+            source_project_slug=slug,
+            **body.model_dump(),
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.get("/{slug}/historical-pointers")
+async def get_historical_artifact_pointers(
+    source_kind: Literal["decision", "handoff", "learning"] | None = None,
+    source_ref: str | None = Query(default=None, max_length=512),
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(get_current_user_or_agent),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> list[dict]:
+    """Read additive historical pointers without selecting archived work."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx, db, slug, visible_projects
+        )
+        return await decision_service.list_historical_pointers(
+            db,
+            workspace_id=ctx.workspace_id,
+            source_project_slug=slug,
+            source_kind=source_kind,
+            source_ref=source_ref,
+        )
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
+@router.get("/{slug}/decision-operations/{operation_id}")
+async def get_decision_lifecycle_operation(
+    operation_id: str,
+    slug: str = PathParam(..., pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$"),
+    user: UserInfo = Depends(get_current_user_or_agent),
+    db: aiosqlite.Connection = Depends(get_db),
+) -> dict:
+    """Read a decision saga before retrying a timed-out mutation."""
+    visible_projects = await get_visible_projects(db, user)
+    ctx = _lifecycle_ctx(user)
+    try:
+        await uc._require_project_filesystem_access(
+            ctx, db, slug, visible_projects
+        )
+        result = await decision_service.read_decision_operation(
+            db,
+            workspace_id=ctx.workspace_id,
+            operation_id=operation_id,
+        )
+        if result["primary_project_slug"] != slug:
+            raise ServiceError(
+                code="decision_operation_scope_mismatch",
+                message="Decision operation does not belong to this project",
+            )
+        return result
+    except ServiceError as exc:
+        raise to_http(exc) from exc
 
 
 def _create_project_on_disk(

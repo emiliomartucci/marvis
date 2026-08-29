@@ -26,6 +26,7 @@ unrestricted — DECISION 1).
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import logging
 from typing import Annotated, Any
 
@@ -41,9 +42,12 @@ from core.api.mcp._adapter import (
     dump,
     raise_mcp_error,
     require_any_grant,
+    require_unambiguous_visible_project,
 )
+from core.api.services import project_lifecycle as lifecycle_service
+from core.api.services import governed_decisions as decision_service
 from core.api.use_cases import projects as projects_uc
-from core.api.use_cases._context import CallerContext
+from core.api.use_cases._context import CallerContext, require_role_ctx
 from core.api.use_cases._errors import ServiceError
 
 logger = logging.getLogger(__name__)
@@ -195,7 +199,10 @@ def register(mcp) -> None:
                 # Node `list_projects` returns the program-grouped project list =
                 # `list_programs` here. visible_projects=None -> local sees all.
                 result = await projects_uc.list_programs(
-                    ctx, db, visible_projects=visible_projects
+                    ctx,
+                    db,
+                    visible_projects=visible_projects,
+                    include_archived=lifecycle == "archived",
                 )
                 rows = _lean_project_rows(
                     dump(result), lifecycle=lifecycle, program=program
@@ -290,6 +297,571 @@ def register(mcp) -> None:
                     description=result.get("description"),
                     workspace_id=ctx.workspace_id,
                 )
+                return result
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def register_project_lifecycle(
+        slug: Annotated[str, Field(min_length=1, max_length=63)],
+    ) -> dict[str, Any]:
+        """Register an existing project with an immutable lifecycle identity.
+
+        QUANDO USARLO: preparazione amministrativa prima di approval/archive.
+        QUANDO NON USARLO: NOT come archive e NOT per cambiare project.yaml.
+        RESTITUISCE: project_id, lifecycle, digest e writer watermark."""
+        try:
+            async with acquire_write_db(label="mcp.register_project_lifecycle") as db:
+                ctx = current_mcp_context()
+                require_role_ctx(ctx, "operator", "admin", "super_admin")
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, slug, visible_projects
+                )
+                async with lifecycle_service.async_project_mutation_guard():
+                    snapshot = await lifecycle_service.ensure_project_lifecycle(
+                        db,
+                        workspace_id=ctx.workspace_id,
+                        project_slug=slug,
+                    )
+                    await db.commit()
+                return lifecycle_service.snapshot_dict(snapshot)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def get_project_lifecycle(
+        slug: Annotated[str, Field(min_length=1, max_length=63)],
+    ) -> dict[str, Any]:
+        """Read project lifecycle by known slug, including archived history.
+
+        QUANDO USARLO: readback before retry or after archive.
+        QUANDO NON USARLO: NOT to discover selectable projects -> list_projects.
+        RESTITUISCE: immutable ID, lifecycle, digests and transition state."""
+        try:
+            async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, slug, visible_projects
+                )
+                snapshot = await lifecycle_service.read_project_lifecycle(
+                    db,
+                    workspace_id=ctx.workspace_id,
+                    project_slug=slug,
+                )
+                return lifecycle_service.snapshot_dict(snapshot)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def get_cloud_f_control() -> dict[str, Any]:
+        """Read the common Cloud/F epoch, lease and active-operation set.
+
+        QUANDO USARLO: bind a protected change or archive approval to live state.
+        QUANDO NON USARLO: NOT as proof that U11 entry points are deployed.
+        RESTITUISCE: readiness, epoch, lease and active-operations digest."""
+        try:
+            async with acquire_db() as db:
+                ctx = current_mcp_context()
+                snapshot = await lifecycle_service.read_cloud_f_control(
+                    db,
+                    workspace_id=ctx.workspace_id,
+                )
+                return lifecycle_service.snapshot_dict(snapshot)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def activate_cloud_f_control(
+        subtype: Annotated[
+            str,
+            Field(pattern=r"^(bootstrap_activation|existing_live_adoption)$"),
+        ],
+        expected_epoch: Annotated[int, Field(ge=0)],
+    ) -> dict[str, Any]:
+        """Activate/adopt the common lease exactly once (U11 readiness only).
+
+        QUANDO USARLO: only through the master cloud-bootstrap operation.
+        QUANDO NON USARLO: NOT during source preparation or Plan F mutation.
+        RESTITUISCE: activated control readback; approval authority required."""
+        try:
+            async with acquire_write_db(label="mcp.activate_cloud_f_control") as db:
+                snapshot = await lifecycle_service.activate_cloud_f_control(
+                    current_mcp_context(),
+                    db,
+                    subtype=subtype,
+                    expected_epoch=expected_epoch,
+                )
+                return lifecycle_service.snapshot_dict(snapshot)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def acquire_cloud_f_change(
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        operation_kind: Annotated[str, Field(min_length=1, max_length=100)],
+        expected_epoch: Annotated[int, Field(ge=0)],
+        lease_expires_at: datetime,
+    ) -> dict[str, Any]:
+        """Acquire the exclusive common lease for one protected U11 operation."""
+        try:
+            async with acquire_write_db(label="mcp.acquire_cloud_f_change") as db:
+                snapshot = await lifecycle_service.acquire_cloud_f_change(
+                    current_mcp_context(),
+                    db,
+                    operation_id=operation_id,
+                    operation_kind=operation_kind,
+                    expected_epoch=expected_epoch,
+                    lease_expires_at=lease_expires_at,
+                )
+                return lifecycle_service.snapshot_dict(snapshot)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def complete_cloud_f_change(
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        expected_epoch: Annotated[int, Field(ge=0)],
+        advance_epoch: bool = True,
+    ) -> dict[str, Any]:
+        """Release the exact Cloud/F lease and normally advance its epoch."""
+        try:
+            async with acquire_write_db(label="mcp.complete_cloud_f_change") as db:
+                snapshot = await lifecycle_service.complete_cloud_f_change(
+                    current_mcp_context(),
+                    db,
+                    operation_id=operation_id,
+                    expected_epoch=expected_epoch,
+                    advance_epoch=advance_epoch,
+                )
+                return lifecycle_service.snapshot_dict(snapshot)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def get_cloud_f_change_operation(
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+    ) -> dict[str, Any]:
+        """Read a durable protected-change operation before retrying it."""
+        try:
+            async with acquire_db() as db:
+                ctx = current_mcp_context()
+                return await lifecycle_service.read_cloud_f_change_operation(
+                    db,
+                    workspace_id=ctx.workspace_id,
+                    operation_id=operation_id,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def update_project_selector_watermark(
+        project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        expected_epoch: Annotated[int, Field(ge=0)],
+        expected_selector_watermark: Annotated[str, Field(max_length=256)],
+        selector_watermark: Annotated[
+            str, Field(pattern=r"^[0-9a-f]{64}$")
+        ],
+    ) -> dict[str, Any]:
+        """Bind a selector snapshot while the caller owns the common lease."""
+        try:
+            async with acquire_write_db(
+                label="mcp.update_project_selector_watermark"
+            ) as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, project_slug, visible_projects
+                )
+                snapshot = (
+                    await lifecycle_service.update_project_selector_watermark(
+                        ctx,
+                        db,
+                        project_slug=project_slug,
+                        operation_id=operation_id,
+                        expected_epoch=expected_epoch,
+                        expected_selector_watermark=expected_selector_watermark,
+                        selector_watermark=selector_watermark,
+                    )
+                )
+                return lifecycle_service.snapshot_dict(snapshot)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def create_project_archive_approval(
+        project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        expected_project_id: Annotated[str, Field(min_length=5, max_length=80)],
+        expected_project_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        plan_f_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        master_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        evidence_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        expected_writer_watermark: Annotated[int, Field(ge=0)],
+        expected_selector_watermark: Annotated[str, Field(max_length=256)],
+        expected_cloud_f_epoch: Annotated[int, Field(ge=0)],
+        expected_active_operations_digest: Annotated[
+            str, Field(pattern=r"^[0-9a-f]{64}$")
+        ],
+        expires_at: datetime,
+        approval_id: Annotated[str | None, Field(max_length=128)] = None,
+    ) -> dict[str, Any]:
+        """Record explicit approval bound to every archive compare-and-set value.
+
+        Agent MCP calls require a live persisted delegation; a caller-provided
+        approval string never creates authority."""
+        try:
+            async with acquire_write_db(label="mcp.create_archive_approval") as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, project_slug, visible_projects
+                )
+                return await lifecycle_service.create_archive_approval(
+                    ctx,
+                    db,
+                    project_slug=project_slug,
+                    expected_project_id=expected_project_id,
+                    expected_project_digest=expected_project_digest,
+                    plan_f_digest=plan_f_digest,
+                    master_digest=master_digest,
+                    evidence_digest=evidence_digest,
+                    expected_writer_watermark=expected_writer_watermark,
+                    expected_selector_watermark=expected_selector_watermark,
+                    expected_cloud_f_epoch=expected_cloud_f_epoch,
+                    expected_active_operations_digest=(
+                        expected_active_operations_digest
+                    ),
+                    expires_at=expires_at,
+                    approval_id=approval_id,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def archive_project(
+        project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        project_id: Annotated[str, Field(min_length=5, max_length=80)],
+        approval_id: Annotated[str, Field(min_length=1, max_length=128)],
+        expected_project_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        plan_f_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        master_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        evidence_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        expected_writer_watermark: Annotated[int, Field(ge=0)],
+        expected_selector_watermark: Annotated[str, Field(max_length=256)],
+        expected_cloud_f_epoch: Annotated[int, Field(ge=0)],
+        expected_active_operations_digest: Annotated[
+            str, Field(pattern=r"^[0-9a-f]{64}$")
+        ],
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        idempotency_key: Annotated[str, Field(min_length=1, max_length=200)],
+        lease_expires_at: datetime,
+    ) -> dict[str, Any]:
+        """Archive one logical project through the approval-bound saga.
+
+        QUANDO USARLO: only after U11 readiness and explicit bound approval.
+        QUANDO NON USARLO: NOT to delete/move tenant data or runtime assets.
+        RESTITUISCE: immutable project/readback coordinates; safe to replay."""
+        try:
+            async with acquire_write_db(label="mcp.archive_project") as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, project_slug, visible_projects
+                )
+                return await lifecycle_service.archive_project(
+                    ctx,
+                    db,
+                    project_slug=project_slug,
+                    project_id=project_id,
+                    approval_id=approval_id,
+                    expected_project_digest=expected_project_digest,
+                    plan_f_digest=plan_f_digest,
+                    master_digest=master_digest,
+                    evidence_digest=evidence_digest,
+                    expected_writer_watermark=expected_writer_watermark,
+                    expected_selector_watermark=expected_selector_watermark,
+                    expected_cloud_f_epoch=expected_cloud_f_epoch,
+                    expected_active_operations_digest=(
+                        expected_active_operations_digest
+                    ),
+                    operation_id=operation_id,
+                    idempotency_key=idempotency_key,
+                    lease_expires_at=lease_expires_at,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def get_project_lifecycle_operation(
+        project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+    ) -> dict[str, Any]:
+        """Read an archive operation before retrying after a timeout."""
+        try:
+            async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, project_slug, visible_projects
+                )
+                result = await lifecycle_service.read_lifecycle_operation(
+                    db,
+                    workspace_id=ctx.workspace_id,
+                    operation_id=operation_id,
+                )
+                if result["project_slug"] != project_slug:
+                    raise ServiceError(
+                        code="lifecycle_operation_scope_mismatch",
+                        message="Lifecycle operation does not belong to this project",
+                    )
+                return result
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def create_governed_decision(
+        project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        relative_path: Annotated[str, Field(min_length=1, max_length=512)],
+        title: Annotated[str, Field(min_length=1, max_length=200)],
+        body: Annotated[str, Field(max_length=500_000)],
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        idempotency_key: Annotated[str, Field(min_length=1, max_length=200)],
+        expected_cloud_f_epoch: Annotated[int, Field(ge=0)],
+        lease_expires_at: datetime,
+        decision_id: Annotated[str | None, Field(max_length=128)] = None,
+    ) -> dict[str, Any]:
+        """Create a draft decision through the protected, resumable saga.
+
+        Requires a ready Cloud/F authority and advances its epoch exactly once.
+        On timeout, read the operation before replaying the same IDs."""
+        try:
+            async with acquire_write_db(label="mcp.create_governed_decision") as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, project_slug, visible_projects
+                )
+                return await decision_service.create_decision(
+                    ctx,
+                    db,
+                    project_slug=project_slug,
+                    relative_path=relative_path,
+                    title=title,
+                    body=body,
+                    operation_id=operation_id,
+                    idempotency_key=idempotency_key,
+                    expected_cloud_f_epoch=expected_cloud_f_epoch,
+                    lease_expires_at=lease_expires_at,
+                    decision_id=decision_id,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def get_governed_decision(
+        project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        decision_id: Annotated[str, Field(min_length=1, max_length=128)],
+    ) -> dict[str, Any]:
+        """Read a known decision directly, including superseded archived history."""
+        try:
+            async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, project_slug, visible_projects
+                )
+                return await decision_service.read_decision(
+                    db,
+                    workspace_id=ctx.workspace_id,
+                    project_slug=project_slug,
+                    decision_id=decision_id,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def accept_governed_decision(
+        project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        decision_id: Annotated[str, Field(min_length=1, max_length=128)],
+        expected_content_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        idempotency_key: Annotated[str, Field(min_length=1, max_length=200)],
+        expected_cloud_f_epoch: Annotated[int, Field(ge=0)],
+        lease_expires_at: datetime,
+    ) -> dict[str, Any]:
+        """Accept a draft while preserving its substantive body."""
+        try:
+            async with acquire_write_db(label="mcp.accept_governed_decision") as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, project_slug, visible_projects
+                )
+                return await decision_service.accept_decision(
+                    ctx,
+                    db,
+                    project_slug=project_slug,
+                    decision_id=decision_id,
+                    expected_content_digest=expected_content_digest,
+                    operation_id=operation_id,
+                    idempotency_key=idempotency_key,
+                    expected_cloud_f_epoch=expected_cloud_f_epoch,
+                    lease_expires_at=lease_expires_at,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def supersede_governed_decision(
+        source_project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        source_decision_id: Annotated[str, Field(min_length=1, max_length=128)],
+        source_relative_path: Annotated[str, Field(min_length=1, max_length=512)],
+        expected_source_content_digest: Annotated[
+            str, Field(pattern=r"^[0-9a-f]{64}$")
+        ],
+        expected_source_body_digest: Annotated[
+            str, Field(pattern=r"^[0-9a-f]{64}$")
+        ],
+        target_project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        target_decision_id: Annotated[str, Field(min_length=1, max_length=128)],
+        expected_target_content_digest: Annotated[
+            str, Field(pattern=r"^[0-9a-f]{64}$")
+        ],
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        idempotency_key: Annotated[str, Field(min_length=1, max_length=200)],
+        expected_cloud_f_epoch: Annotated[int, Field(ge=0)],
+        lease_expires_at: datetime,
+    ) -> dict[str, Any]:
+        """Supersede an accepted/legacy decision with an accepted target."""
+        try:
+            async with acquire_write_db(label="mcp.supersede_governed_decision") as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, source_project_slug, visible_projects
+                )
+                await require_unambiguous_visible_project(
+                    db, ctx, target_project_slug, visible_projects
+                )
+                return await decision_service.supersede_decision(
+                    ctx,
+                    db,
+                    source_project_slug=source_project_slug,
+                    source_decision_id=source_decision_id,
+                    source_relative_path=source_relative_path,
+                    expected_source_content_digest=expected_source_content_digest,
+                    expected_source_body_digest=expected_source_body_digest,
+                    target_project_slug=target_project_slug,
+                    target_decision_id=target_decision_id,
+                    expected_target_content_digest=expected_target_content_digest,
+                    operation_id=operation_id,
+                    idempotency_key=idempotency_key,
+                    expected_cloud_f_epoch=expected_cloud_f_epoch,
+                    lease_expires_at=lease_expires_at,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def create_historical_pointer(
+        source_project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        source_kind: Annotated[
+            str, Field(pattern=r"^(decision|handoff|learning)$")
+        ],
+        source_ref: Annotated[str, Field(min_length=1, max_length=512)],
+        expected_source_body_digest: Annotated[
+            str, Field(pattern=r"^[0-9a-f]{64}$")
+        ],
+        relation: Annotated[str, Field(pattern=r"^(forward|applies_to)$")],
+        target_project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+        idempotency_key: Annotated[str, Field(min_length=1, max_length=200)],
+        expected_cloud_f_epoch: Annotated[int, Field(ge=0)],
+        lease_expires_at: datetime,
+        target_decision_id: Annotated[str | None, Field(max_length=128)] = None,
+        target_relative_path: Annotated[str | None, Field(max_length=512)] = None,
+    ) -> dict[str, Any]:
+        """Add handoff/learning/decision lineage without rewriting the source."""
+        try:
+            async with acquire_write_db(label="mcp.create_historical_pointer") as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, source_project_slug, visible_projects
+                )
+                await require_unambiguous_visible_project(
+                    db, ctx, target_project_slug, visible_projects
+                )
+                return await decision_service.create_historical_pointer(
+                    ctx,
+                    db,
+                    source_project_slug=source_project_slug,
+                    source_kind=source_kind,
+                    source_ref=source_ref,
+                    expected_source_body_digest=expected_source_body_digest,
+                    relation=relation,
+                    target_project_slug=target_project_slug,
+                    target_decision_id=target_decision_id,
+                    target_relative_path=target_relative_path,
+                    operation_id=operation_id,
+                    idempotency_key=idempotency_key,
+                    expected_cloud_f_epoch=expected_cloud_f_epoch,
+                    lease_expires_at=lease_expires_at,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def list_historical_pointers(
+        source_project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        source_kind: Annotated[
+            str | None, Field(pattern=r"^(decision|handoff|learning)$")
+        ] = None,
+        source_ref: Annotated[str | None, Field(max_length=512)] = None,
+    ) -> list[dict[str, Any]]:
+        """Read additive lineage records for one known project."""
+        try:
+            async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, source_project_slug, visible_projects
+                )
+                return await decision_service.list_historical_pointers(
+                    db,
+                    workspace_id=ctx.workspace_id,
+                    source_project_slug=source_project_slug,
+                    source_kind=source_kind,
+                    source_ref=source_ref,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def get_decision_operation(
+        project_slug: Annotated[str, Field(min_length=1, max_length=63)],
+        operation_id: Annotated[str, Field(min_length=1, max_length=128)],
+    ) -> dict[str, Any]:
+        """Read the persisted decision saga before any timeout retry."""
+        try:
+            async with acquire_db() as db:
+                ctx = current_mcp_context()
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, project_slug, visible_projects
+                )
+                result = await decision_service.read_decision_operation(
+                    db,
+                    workspace_id=ctx.workspace_id,
+                    operation_id=operation_id,
+                )
+                if result["primary_project_slug"] != project_slug:
+                    raise ServiceError(
+                        code="decision_operation_scope_mismatch",
+                        message="Decision operation does not belong to this project",
+                    )
                 return result
         except ServiceError as e:
             raise_mcp_error(e)

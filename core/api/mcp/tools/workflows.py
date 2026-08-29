@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -38,6 +40,7 @@ from pydantic import Field
 from core.api.mcp._adapter import (
     LOCAL_CTX,
     acquire_db,
+    acquire_write_db,
     current_mcp_context,
     current_visible_projects,
     require_unambiguous_visible_project,
@@ -45,6 +48,7 @@ from core.api.mcp._adapter import (
 )
 from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import NotFoundError, ServiceError
+from core.api.services import project_lifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +331,31 @@ def _resolve_project_path(project: str) -> Path | None:
     return _find_project_path(project)
 
 
+def _atomic_write_text(path: Path, body: str) -> None:
+    descriptor, temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 async def _save_doc_artifact(
     project: str,
     title: str,
@@ -364,17 +393,26 @@ async def _save_doc_artifact(
             message=f"Project '{project}' not found",
         )
 
-    docs_dir = project_path / "docs" / subdir
-    docs_dir.mkdir(parents=True, exist_ok=True)
-
     today = _dt.date.today().isoformat()
     slug = _kebab_title(title)
     if suffix and not slug.endswith(suffix):
         stem = f"{slug}{suffix}"
     else:
         stem = slug
-    doc_path = docs_dir / f"{today}-{stem}.md"
-    doc_path.write_text(body, encoding="utf-8")
+    relative_path = f"docs/{subdir}/{today}-{stem}.md"
+    docs_dir = project_path / "docs" / subdir
+    doc_path = project_path / relative_path
+    async with acquire_write_db(label=f"mcp.save_{subdir}") as db:
+        async with project_lifecycle.guarded_project_file_write(
+            ctx,
+            db,
+            project_slug=project,
+            writer_kind=f"workflow_{subdir}",
+            resource_ref=relative_path,
+            projects_root=project_path.parent,
+        ):
+            docs_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(doc_path, body)
 
     indexed = False
     try:

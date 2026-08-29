@@ -4,7 +4,7 @@
 schema: marvis-consumer-contract/v1
 scope: "public-shared"
 openapi: "3.1.0"
-paths: 276
+paths: 293
 generator: contracts/openapi/generate_consumer.py
 source_contract: contracts/openapi/marvisx.json
 action_manifest: contracts/actions/manifest.public-shared.yaml

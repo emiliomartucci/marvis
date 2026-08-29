@@ -43,7 +43,9 @@ DECISION 3 (function-local service imports) — same as ``search.py``.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import tempfile
 from datetime import date as _date
 from pathlib import Path
 
@@ -51,7 +53,11 @@ import aiosqlite
 import yaml
 
 from core.api.models import HandoffSearchResult
-from core.api.use_cases._context import CallerContext, require_role_ctx
+from core.api.use_cases._context import (
+    CallerContext,
+    require_role_ctx,
+    require_workspace_ctx,
+)
 from core.api.use_cases._errors import (
     ConflictError,
     NotFoundError,
@@ -285,8 +291,8 @@ async def create_handoff(
     writes a canonical ``memory/handoff-*.md`` file and returns a payload directly
     usable by ``get_handoff``.
     """
-    del db  # Handoffs live on disk; the DB connection keeps the surface uniform.
     from core.api.routers import projects as _projects_mod
+    from core.api.services import project_lifecycle
 
     require_role_ctx(ctx, "operator", "admin", "super_admin")
 
@@ -336,21 +342,9 @@ async def create_handoff(
     except Exception as exc:
         raise ServiceError(code="invalid_project_path", message="Invalid project path") from exc
 
-    if memory_dir.exists() and not memory_dir.is_dir():
-        raise ServiceError(
-            code="invalid_memory_dir",
-            message="Project memory path is not a directory",
-        )
-    memory_dir.mkdir(parents=True, exist_ok=True)
-
     file_path = (memory_dir / filename).resolve()
     if not str(file_path).startswith(str(memory_dir) + "/"):
         raise ServiceError(code="invalid_filename", message="Invalid filename")
-    if file_path.exists():
-        raise ConflictError(
-            code="handoff_exists",
-            message=f"Handoff file '{filename}' already exists",
-        )
 
     frontmatter: dict[str, object] = {
         "date": handoff_date,
@@ -373,10 +367,53 @@ async def create_handoff(
         sections.append(f"## Summary\n{summary.strip()}")
     sections.append(body_clean)
     rendered_body = "\n\n".join(sections)
-    file_path.write_text(
-        _render_handoff_content(frontmatter, rendered_body),
-        encoding="utf-8",
-    )
+    rendered = _render_handoff_content(frontmatter, rendered_body)
+    async with project_lifecycle.async_project_mutation_guard(
+        projects_root=project_root.parent
+    ):
+        if memory_dir.exists() and not memory_dir.is_dir():
+            raise ServiceError(
+                code="invalid_memory_dir",
+                message="Project memory path is not a directory",
+            )
+        if file_path.exists():
+            raise ConflictError(
+                code="handoff_exists",
+                message=f"Handoff file '{filename}' already exists",
+            )
+        await project_lifecycle.record_project_write(
+            db,
+            workspace_id=require_workspace_ctx(ctx),
+            project_slug=project_slug,
+            writer_kind="handoff",
+            actor=ctx.user_id or ctx.username,
+            resource_ref=f"memory/{filename}",
+            projects_root=project_root.parent,
+        )
+        await db.commit()
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            dir=memory_dir,
+            prefix=".handoff-",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(rendered)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, file_path)
+            directory_fd = os.open(memory_dir, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
 
     return {
         "project": project_slug,

@@ -46,6 +46,7 @@ passes the resolved Path (or a resolver bound to it) into the use_case.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import os
 import re
 import shutil
@@ -111,6 +112,7 @@ from core.api.services.ingest.watcher import (
     ProjectWorkspaceOwnershipError,
     require_unique_project_workspace,
 )
+from core.api.services.project_lifecycle import isolated_project_file_write
 from core.api.use_cases import ingest_triage as uc
 from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import ServiceError
@@ -194,6 +196,37 @@ def _to_http(err: ServiceError) -> HTTPException:
 
 def _ctx(user: UserInfo, *, is_human_session: bool = False) -> CallerContext:
     return CallerContext.from_user_info(user, is_human_session=is_human_session)
+
+
+def _ingest_service_ctx(*, workspace_id: str, actor: str) -> CallerContext:
+    return CallerContext(
+        username="ingest-runtime",
+        system_role="operator",
+        user_type="agent",
+        workspace_id=workspace_id,
+        user_id=actor,
+    )
+
+
+@asynccontextmanager
+async def _guard_project_ingest_write(
+    ctx: CallerContext,
+    *,
+    project_slug: str,
+    writer_kind: str,
+    resource_ref: str,
+):
+    try:
+        async with isolated_project_file_write(
+            ctx,
+            project_slug=project_slug,
+            writer_kind=writer_kind,
+            resource_ref=resource_ref,
+            projects_root=PROJECTS_ROOT,
+        ):
+            yield
+    except ServiceError as exc:
+        raise to_http(exc) from exc
 
 
 async def _require_ingest_project_owner(
@@ -429,55 +462,61 @@ async def upload_ingest_folder(
     saved_paths: list[Path] = []
     skipped: list[IngestUploadSkipped] = []
     pending_skip_logs: list[tuple[str, SkipReason, str | None]] = []
-    for upload in files:
-        relative_path = _safe_upload_relative_path(upload.filename)
-        if relative_path is None:
-            attempted = upload.filename or "unnamed"
-            skipped.append(IngestUploadSkipped(path=attempted, reason="invalid-path"))
-            pending_skip_logs.append((attempted, "invalid_path", None))
-            continue
+    async with _guard_project_ingest_write(
+        _ctx(user),
+        project_slug=project_slug,
+        writer_kind="ingest_upload_folder",
+        resource_ref=f"input:{len(files)}",
+    ):
+        for upload in files:
+            relative_path = _safe_upload_relative_path(upload.filename)
+            if relative_path is None:
+                attempted = upload.filename or "unnamed"
+                skipped.append(IngestUploadSkipped(path=attempted, reason="invalid-path"))
+                pending_skip_logs.append((attempted, "invalid_path", None))
+                continue
 
-        upload_mime = _normalized_upload_mime(upload.content_type)
-        if not _is_parseable_upload_mime(upload_mime):
-            display_mime = upload_mime or "unknown"
-            skipped.append(
-                IngestUploadSkipped(
-                    path=str(relative_path),
-                    reason=f"mime_not_supported:{display_mime}",
+            upload_mime = _normalized_upload_mime(upload.content_type)
+            if not _is_parseable_upload_mime(upload_mime):
+                display_mime = upload_mime or "unknown"
+                skipped.append(
+                    IngestUploadSkipped(
+                        path=str(relative_path),
+                        reason=f"mime_not_supported:{display_mime}",
+                    )
                 )
-            )
-            pending_skip_logs.append(
-                (
-                    str(relative_path),
-                    "mime_not_allowed",
-                    f"unsupported MIME: {display_mime}",
+                pending_skip_logs.append(
+                    (
+                        str(relative_path),
+                        "mime_not_allowed",
+                        f"unsupported MIME: {display_mime}",
+                    )
                 )
-            )
-            continue
+                continue
 
-        saved_path, skip_reason = await _save_upload_file(
-            upload,
-            input_root,
-            relative_path,
-        )
-        if saved_path is None:
-            skipped.append(
-                IngestUploadSkipped(
-                    path=str(relative_path),
-                    reason=skip_reason or "skipped",
+            saved_path, skip_reason = await _save_upload_file(
+                upload,
+                input_root,
+                relative_path,
+            )
+            if saved_path is None:
+                skipped.append(
+                    IngestUploadSkipped(
+                        path=str(relative_path),
+                        reason=skip_reason or "skipped",
+                    )
                 )
-            )
-            # UX-6: classify the skip into the audit enum. The save helper
-            # rejects MIME-disallowed extensions, oversize files, and a few
-            # corner cases — collapse them all to mime_not_allowed since the
-            # user-visible distinction is "we won't ingest this", not the
-            # internal reason. invalid_path is reserved for path traversal
-            # which is handled in the branch above.
-            pending_skip_logs.append(
-                (str(relative_path), "mime_not_allowed", skip_reason)
-            )
-            continue
-        saved_paths.append(saved_path)
+                # UX-6: classify the skip into the audit enum. The save helper
+                # rejects MIME-disallowed extensions, oversize files, and a few
+                # corner cases — collapse them all to mime_not_allowed since the
+                # user-visible distinction is "we won't ingest this", not the
+                # internal reason. invalid_path is reserved for path traversal
+                # which is handled in the branch above.
+                pending_skip_logs.append(
+                    (str(relative_path), "mime_not_allowed", skip_reason)
+                )
+                continue
+            saved_paths.append(saved_path)
 
     if pending_skip_logs:
         async with write_db(label="ingest.upload_folder.skip_log") as skip_db:
@@ -577,9 +616,18 @@ async def handle_signed_webhook_request(request: Request) -> IngestIngressRespon
     target = _available_target(input_root, relative_path)
     if target is None:
         raise HTTPException(status_code=422, detail="content.filename is invalid.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    async with aiofiles.open(target, "wb") as f:
-        await f.write(data)
+    async with _guard_project_ingest_write(
+        _ingest_service_ctx(
+            workspace_id=workspace_id,
+            actor=f"webhook:{webhook_source}",
+        ),
+        project_slug=payload.project,
+        writer_kind="ingest_webhook",
+        resource_ref=str(relative_path),
+    ):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        async with aiofiles.open(target, "wb") as f:
+            await f.write(data)
 
     source = payload.source or webhook_source
     provenance = IngestProvenance(
@@ -763,39 +811,48 @@ async def ingest_unified(
         # --- 7. Materialize content into <project>/input/ (path guards) ---
         saved_paths: list[Path] = []
         skipped = 0
-        if payload is not None:
-            data, filename = decode_json_content(payload.content)
-            relative_path = _safe_upload_relative_path(filename)
-            if relative_path is None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="content.filename is unsafe (path traversal / absolute path).",
-                )
-            target = _available_target(input_root, relative_path)
-            if target is None:
-                raise HTTPException(status_code=422, detail="content.filename is invalid.")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            async with aiofiles.open(target, "wb") as f:
-                await f.write(data)
-            saved_paths.append(target)
-        else:
-            if len(uploads) > MAX_INGRESS_FILE_COUNT:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Too many files (max {MAX_INGRESS_FILE_COUNT} per request).",
-                )
-            for upload in uploads:
-                relative_path = _safe_upload_relative_path(upload.filename)
+        async with _guard_project_ingest_write(
+            _ingest_service_ctx(
+                workspace_id=ctx.workspace_id,
+                actor=f"ingest-key:{ctx.key_id}",
+            ),
+            project_slug=project,
+            writer_kind="ingest_api",
+            resource_ref=f"request:{idempotency_key or 'unkeyed'}",
+        ):
+            if payload is not None:
+                data, filename = decode_json_content(payload.content)
+                relative_path = _safe_upload_relative_path(filename)
                 if relative_path is None:
-                    skipped += 1
-                    continue
-                saved_path, _reason = await _save_upload_file(
-                    upload, input_root, relative_path
-                )
-                if saved_path is None:
-                    skipped += 1
-                    continue
-                saved_paths.append(saved_path)
+                    raise HTTPException(
+                        status_code=422,
+                        detail="content.filename is unsafe (path traversal / absolute path).",
+                    )
+                target = _available_target(input_root, relative_path)
+                if target is None:
+                    raise HTTPException(status_code=422, detail="content.filename is invalid.")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                async with aiofiles.open(target, "wb") as f:
+                    await f.write(data)
+                saved_paths.append(target)
+            else:
+                if len(uploads) > MAX_INGRESS_FILE_COUNT:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Too many files (max {MAX_INGRESS_FILE_COUNT} per request).",
+                    )
+                for upload in uploads:
+                    relative_path = _safe_upload_relative_path(upload.filename)
+                    if relative_path is None:
+                        skipped += 1
+                        continue
+                    saved_path, _reason = await _save_upload_file(
+                        upload, input_root, relative_path
+                    )
+                    if saved_path is None:
+                        skipped += 1
+                        continue
+                    saved_paths.append(saved_path)
 
         # --- 8. Dispatch into the existing pipeline. The key policy snapshot
         # rides on the row; per-source enforcement (open -> triage, trusted ->
@@ -876,19 +933,25 @@ async def upload_ingest_zip(
             IngestUploadSkipped(path=item.path, reason=item.reason)
             for item in extract_result.skipped
         ]
-        for item in extract_result.files:
-            target = _available_target(input_root, item.relative_path)
-            if target is None:
-                skipped.append(
-                    IngestUploadSkipped(
-                        path=str(item.relative_path),
-                        reason="invalid-path",
+        async with _guard_project_ingest_write(
+            _ctx(user),
+            project_slug=project_slug,
+            writer_kind="ingest_upload_zip",
+            resource_ref=archive_name,
+        ):
+            for item in extract_result.files:
+                target = _available_target(input_root, item.relative_path)
+                if target is None:
+                    skipped.append(
+                        IngestUploadSkipped(
+                            path=str(item.relative_path),
+                            reason="invalid-path",
+                        )
                     )
-                )
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(shutil.move, str(item.path), str(target))
-            saved_paths.append(target)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(shutil.move, str(item.path), str(target))
+                saved_paths.append(target)
 
         dispatch = await dispatch_files_batched(
             saved_paths,

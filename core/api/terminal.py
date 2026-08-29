@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import fcntl
 import json
 import logging
@@ -29,12 +30,12 @@ from fastapi.responses import JSONResponse
 from core.api.config import settings
 from core.api.db import acquire_db
 from core.api.models import UserInfo
+from core.api.routers._adapter import to_http
 from core.api.routers._browser_mutation_denial import agent_only_route
 from core.api.security import (
     TerminalTicketPrincipal,
     consume_ws_ticket_principal,
     get_agent_user,
-    get_current_user,
 )
 from core.api.services.runas import runas_user
 from core.api.services.terminal_metrics import TerminalMetricsCollector
@@ -46,6 +47,9 @@ from core.api.services.tmux import (
     validate_session_name,
 )
 from core.api.services.ingest.watcher import enqueue_file
+from core.api.services.project_lifecycle import isolated_project_file_write
+from core.api.use_cases._context import CallerContext
+from core.api.use_cases._errors import ServiceError
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +349,42 @@ def _terminal_attachment_paths(
     return absolute_dir, relative_dir
 
 
+@asynccontextmanager
+async def _terminal_project_write_guard(
+    user: UserInfo,
+    *,
+    workspace_id: str,
+    project_slug: str | None,
+    session: str | None,
+):
+    if project_slug is None:
+        yield
+        return
+    ctx = CallerContext.from_user_info(user, is_human_session=False)
+    if ctx.workspace_id != workspace_id:
+        ctx = CallerContext(
+            username=ctx.username,
+            system_role=ctx.system_role,
+            user_type=ctx.user_type,
+            workspace_id=workspace_id,
+            scopes=ctx.scopes,
+            is_human_session=False,
+            user_id=ctx.user_id,
+            local_runtime=ctx.local_runtime,
+        )
+    try:
+        async with isolated_project_file_write(
+            ctx,
+            project_slug=project_slug,
+            writer_kind="terminal_upload",
+            resource_ref=f"terminal:{session or 'manual'}",
+            projects_root=PROJECTS_ROOT,
+        ):
+            yield
+    except ServiceError as exc:
+        raise to_http(exc) from exc
+
+
 @agent_only_route(router, "/terminal/upload", methods=["POST"])
 async def upload_file(
     file: UploadFile,
@@ -492,48 +532,54 @@ async def upload_file(
                 content={"detail": "Invalid project upload path"},
             )
 
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    async with _terminal_project_write_guard(
+        _user,
+        workspace_id=workspace_id,
+        project_slug=project_slug,
+        session=session,
+    ):
+        upload_dir.mkdir(parents=True, exist_ok=True)
 
-    # Timestamp prefix for dedup
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    filename = f"{ts}_{raw_name}"
-    filepath = (upload_dir / filename).resolve()
+        # Timestamp prefix for dedup
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        filename = f"{ts}_{raw_name}"
+        filepath = (upload_dir / filename).resolve()
 
-    # Path traversal guard
-    if not filepath.is_relative_to(upload_dir.resolve()):
-        return JSONResponse(
-            status_code=400,
-            content={"detail": "Invalid filename (path traversal)"},
-        )
-
-    # Stream to disk in chunks (avoid loading entire file into memory)
-    total_size = 0
-    async with aiofiles.open(filepath, "wb") as f:
-        while True:
-            chunk = await file.read(UPLOAD_CHUNK_SIZE)
-            if not chunk:
-                break
-            total_size += len(chunk)
-            if total_size > MAX_UPLOAD_SIZE:
-                await f.close()
-                filepath.unlink(missing_ok=True)
-                return JSONResponse(
-                    status_code=400,
-                    content={"detail": "File too large (max 100MB)"},
-                )
-            await f.write(chunk)
-
-    if project_slug:
-        ingest_dir.mkdir(parents=True, exist_ok=True)
-        ingest_path = (ingest_dir / filename).resolve()
-        if not ingest_path.is_relative_to(ingest_dir.resolve()):
-            filepath.unlink(missing_ok=True)
+        # Path traversal guard
+        if not filepath.is_relative_to(upload_dir.resolve()):
             return JSONResponse(
                 status_code=400,
                 content={"detail": "Invalid filename (path traversal)"},
             )
-        shutil.copy2(filepath, ingest_path)
-        project_relative_path = (project_relative_dir / filename).as_posix()
+
+        # Stream to disk in chunks (avoid loading entire file into memory)
+        total_size = 0
+        async with aiofiles.open(filepath, "wb") as f:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_UPLOAD_SIZE:
+                    await f.close()
+                    filepath.unlink(missing_ok=True)
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": "File too large (max 100MB)"},
+                    )
+                await f.write(chunk)
+
+        if project_slug:
+            ingest_dir.mkdir(parents=True, exist_ok=True)
+            ingest_path = (ingest_dir / filename).resolve()
+            if not ingest_path.is_relative_to(ingest_dir.resolve()):
+                filepath.unlink(missing_ok=True)
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Invalid filename (path traversal)"},
+                )
+            shutil.copy2(filepath, ingest_path)
+            project_relative_path = (project_relative_dir / filename).as_posix()
 
     logger.info(
         "File uploaded: %s (%d bytes, project=%s, ingest_path=%s)",

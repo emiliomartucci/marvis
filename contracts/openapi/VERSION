@@ -10,10 +10,10 @@
 contract_version: 3
 lineage: unified-main
 openapi: "3.1.0"
-engine_ref: e9c9db62ef27aada51438d76d53a05d4de8a99d9
+engine_ref: d11f13d774f7165e0c05b0a0338509f32a44f9c0
 predecessor_contract_version: 2
 predecessor_engine_ref: e0a6994ae2102e3a6a631a11fb9934940e180a60
-paths: 285
+paths: 302
 generator: contracts/openapi/generate.py
 # Profile (ratified by owner 2026-07-27): the governed contract covers all public,
 # discoverable routes registered in the app, optional routers included. Historical
@@ -50,8 +50,11 @@ coupled_to: requirements-tenant.txt
 # (typed response model; no generator overlay). The baseline gate additionally
 # runs contracts/openapi/runtime_probe.py in a fresh process and requires
 # app.openapi() to equal the committed baseline byte-for-byte.
-# engine_ref moved to the source commit carrying this spec (e9c9db62) by
-# metadata-only follow-up. Exact-SHA consumers can therefore reproduce the
+# 2026-08-28 (additive, no version bump): project lifecycle registration,
+# Cloud/F change control, approval-bound archive, governed decisions, and
+# historical pointers become discoverable. Existing routes remain compatible.
+# engine_ref moved to the rebased source commit carrying this spec (d11f13d7)
+# by metadata-only follow-up. Exact-SHA consumers can therefore reproduce the
 # committed contract before reading this metadata commit.
 # The baseline test compares git show <engine_ref>:contracts/openapi/marvisx.json
 # byte-for-byte with the committed file — keep this repoint rule on every

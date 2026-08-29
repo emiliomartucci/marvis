@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import hashlib
 import inspect
 import json
 import logging
@@ -76,7 +77,7 @@ PRE_UPDATE_BACKUP_KEEP = 2
 # operator assertion that all writers are stopped; fresh databases have no
 # predecessor process and may bootstrap normally.
 QUIESCED_REQUIRED_MIGRATIONS = frozenset(
-    {176, 177, 179, 180, 181, 182, 183, 185, 186}
+    {176, 177, 179, 180, 181, 182, 183, 185, 186, 187}
 )
 QUIESCED_MIGRATION_ENV = "MARVIS_SCHEMA_WRITERS_QUIESCED"
 
@@ -200,6 +201,21 @@ SCHEMA_ASSERTIONS: tuple[tuple[int, str, str], ...] = (
     (185, "session_costs", "workspace_id"),
     (185, "session_conversations", "workspace_id"),
     (186, "session_operation_leases", "generation"),
+    (187, "project_lifecycle_state", "project_id"),
+    (187, "project_lifecycle_state", "writer_watermark"),
+    (187, "project_lifecycle_bootstrap", "snapshot_digest"),
+    (187, "cloud_f_control", "change_epoch"),
+    (187, "cloud_f_active_operations", "lease_generation"),
+    (187, "cloud_f_change_operations", "result_epoch"),
+    (187, "project_archive_approvals", "expected_project_digest"),
+    (187, "project_lifecycle_operations", "request_digest"),
+    (187, "project_lifecycle_operations", "actor"),
+    (187, "governed_decisions", "body_digest"),
+    (187, "governed_decisions", "created_by"),
+    (187, "decision_lifecycle_operations", "primary_project_slug"),
+    (187, "decision_lifecycle_operations", "cloud_f_epoch"),
+    (187, "decision_lifecycle_operations", "request_json"),
+    (187, "historical_artifact_pointers", "source_kind"),
 )
 
 # Exact index contracts for workspace-owned schemas that cannot be represented
@@ -799,6 +815,77 @@ SCHEMA_OBJECT_ASSERTIONS: tuple[
             "raise(abort, 'pull request cost workspace mismatch')",
         ),
     ),
+    (
+        187,
+        "table",
+        "project_lifecycle_bootstrap",
+        (
+            "state text not null check (state in ('pending','complete'))",
+            "state = 'pending' and snapshot_digest is null",
+            "state = 'complete' and snapshot_digest is not null",
+        ),
+    ),
+    (
+        187,
+        "trigger",
+        "project_write_events_writability_gate",
+        (
+            "before insert on project_write_events",
+            "state.lifecycle = 'archived'",
+            "state.transition_operation_id is not null",
+            "raise(abort, 'project_not_writable')",
+        ),
+    ),
+    (
+        187,
+        "trigger",
+        "project_writes_pull_requests_insert",
+        (
+            "after insert on pull_requests",
+            "from tasks where id=new.task_id",
+            "new.project,'pull_request',new.id",
+        ),
+    ),
+    (
+        187,
+        "trigger",
+        "project_writes_pull_requests_update",
+        (
+            "after update on pull_requests",
+            "from tasks where id=new.task_id",
+            "new.project,'pull_request',new.id",
+        ),
+    ),
+    (
+        187,
+        "trigger",
+        "project_writes_pull_requests_delete",
+        (
+            "after delete on pull_requests",
+            "from tasks where id=old.task_id",
+            "old.project,'pull_request',old.id",
+        ),
+    ),
+    (
+        187,
+        "trigger",
+        "project_writes_pull_requests_update_old_scope",
+        (
+            "before update of project, workspace_id, task_id on pull_requests",
+            "from tasks where id=old.task_id",
+            "from tasks where id=new.task_id",
+            "old.project,'pull_request_move_source',old.id",
+        ),
+    ),
+    (
+        187,
+        "trigger",
+        "project_writes_comment_reactions_immutable",
+        (
+            "before update on comment_reactions",
+            "raise(abort, 'comment_reactions_immutable')",
+        ),
+    ),
 )
 
 
@@ -871,6 +958,59 @@ def _sql_object_matches_assertion(
     )
 
 
+def _migration_trigger_contract(path: Path) -> dict[str, str]:
+    """Return exact normalized CREATE TRIGGER statements from one migration."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return {}
+    statements: dict[str, str] = {}
+    buffer = ""
+    for line in lines:
+        buffer += line
+        if not sqlite3.complete_statement(buffer):
+            continue
+        match = re.search(
+            r"\bCREATE\s+TRIGGER\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            buffer,
+            re.IGNORECASE,
+        )
+        if match is not None:
+            name = match.group(1)
+            if name in statements:
+                return {}
+            statements[name] = " ".join(
+                buffer[match.start() :].rstrip().rstrip(";").lower().split()
+            )
+        buffer = ""
+    if buffer.strip():
+        return {}
+    return statements
+
+
+def _migration_187_trigger_contract_valid(conn: sqlite3.Connection) -> bool:
+    """Prove every lifecycle trigger is present with its canonical SQL body."""
+    expected = _migration_trigger_contract(
+        MIGRATIONS_DIR / "187_project_lifecycle_control.sql"
+    )
+    expected = {
+        name: definition
+        for name, definition in expected.items()
+        if name.startswith(("project_write_events_", "project_writes_"))
+    }
+    if not expected:
+        return False
+    rows = conn.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+        "AND (name LIKE 'project_write_events_%' OR name LIKE 'project_writes_%')"
+    ).fetchall()
+    actual = {
+        str(row[0]): " ".join(str(row[1] or "").rstrip().rstrip(";").lower().split())
+        for row in rows
+    }
+    return actual == expected
+
+
 def assert_schema_compatible(
     conn: sqlite3.Connection,
     code_max: int,
@@ -939,6 +1079,16 @@ def assert_schema_compatible(
                     f"(migration {version:03d}) is missing or malformed — the version "
                     "table and the real schema diverged; restore from a known-good backup."
                 )
+        if (
+            187 <= current
+            and (known_versions is None or 187 in known_versions)
+            and not _migration_187_trigger_contract_valid(conn)
+        ):
+            raise RuntimeError(
+                f"schema_versions claims v{current} but the migration 187 project "
+                "write-trigger set is missing or malformed — the version table and "
+                "the real schema diverged; restore from a known-good backup."
+            )
     return current
 
 
@@ -1643,6 +1793,30 @@ async def _acquire_writer(
             raise RuntimeError("DB not initialized — call init_pool() first")
         try:
             yield _writer
+        except aiosqlite.IntegrityError as exc:
+            await _writer.rollback()
+            # Migration 187 intentionally aborts the *outer* project mutation
+            # from its append-only write journal.  Translate that one stable
+            # SQLite reason at the shared writer boundary so HTTP's global
+            # ServiceError handler and MCP's surrounding adapter both expose a
+            # typed 409/tool error instead of a transport-specific 500.
+            if "project_not_writable" in str(exc):
+                from core.api.use_cases._errors import ConflictError
+
+                raise ConflictError(
+                    code="project_not_writable",
+                    message=(
+                        "Project is archived or a lifecycle transition is active"
+                    ),
+                ) from exc
+            if "project_workspace_ambiguous" in str(exc):
+                from core.api.use_cases._errors import ConflictError
+
+                raise ConflictError(
+                    code="project_workspace_ambiguous",
+                    message="Project workspace ownership is ambiguous",
+                ) from exc
+            raise
         except Exception:
             await _writer.rollback()
             raise
@@ -1950,6 +2124,8 @@ def run_migrations() -> MigrationResult:
                     _migration_178_agent_token_lifecycle(conn)
                 if version == 179:
                     _migration_179_workspace_isolation(conn)
+                if version == 187:
+                    _migration_187_project_lifecycle_bootstrap(conn)
 
                 logger.info("Migration %s applied", migration_file.name)
 
@@ -2833,6 +3009,8 @@ def _repair_versioned_schema_invariants(
         _migration_178_agent_token_lifecycle(conn)
     if 179 in needed and _table_exists(conn, "access_grants"):
         _migration_179_workspace_isolation(conn)
+    if 187 in needed and _table_exists(conn, "project_lifecycle_bootstrap"):
+        _migration_187_project_lifecycle_bootstrap(conn)
 
 
 def _claimed_schema_version(conn: sqlite3.Connection) -> int:
@@ -2857,7 +3035,7 @@ def _sqlite_object_exists(
 def _claimed_security_repairs_needed(
     conn: sqlite3.Connection, known_versions: set[int]
 ) -> set[int]:
-    """Return claimed v175-v179 hooks that need a write to restore invariants.
+    """Return claimed security hooks that need a write to restore invariants.
 
     This preflight is intentionally read-only: a normal startup with all
     concrete artifacts present does not acquire the controlled-migration
@@ -3028,7 +3206,355 @@ def _claimed_security_repairs_needed(
         ):
             needed.add(179)
 
+    if 187 in known_versions and claimed >= 187:
+        bootstrap_schema_present = all(
+            _table_exists(conn, table)
+            for table in (
+                "project_lifecycle_bootstrap",
+                "project_lifecycle_state",
+            )
+        )
+        if bootstrap_schema_present and not _migration_187_bootstrap_evidence_valid(
+            conn
+        ):
+            needed.add(187)
+
     return needed
+
+
+def _migration_187_bootstrap_evidence_valid(conn: sqlite3.Connection) -> bool:
+    """Validate the immutable v187 bootstrap marker and DB-owned coordinates."""
+    if not _migration_187_trigger_contract_valid(conn):
+        return False
+    if not all(
+        _table_exists(conn, table)
+        for table in (
+            "project_lifecycle_bootstrap",
+            "project_lifecycle_state",
+        )
+    ):
+        return False
+    required_marker_columns = (
+        "state",
+        "project_count",
+        "archived_count",
+        "snapshot_digest",
+        "completed_at",
+    )
+    if not all(
+        _column_exists(conn, "project_lifecycle_bootstrap", column)
+        for column in required_marker_columns
+    ):
+        return False
+    marker_rows = conn.execute(
+        "SELECT state,project_count,archived_count,snapshot_digest,completed_at "
+        "FROM project_lifecycle_bootstrap WHERE id=1"
+    ).fetchall()
+    if len(marker_rows) != 1:
+        return False
+    state, project_count, archived_count, snapshot_digest, completed_at = marker_rows[0]
+    digest = str(snapshot_digest or "")
+    if (
+        state != "complete"
+        or not isinstance(project_count, int)
+        or not isinstance(archived_count, int)
+        or project_count < archived_count
+        or archived_count < 0
+        or len(digest) != 64
+        or digest != digest.lower()
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or not str(completed_at or "").strip()
+    ):
+        return False
+    counts = conn.execute(
+        "SELECT COUNT(DISTINCT project_slug),"
+        "COUNT(DISTINCT CASE WHEN lifecycle='archived' THEN project_slug END) "
+        "FROM project_lifecycle_state"
+    ).fetchone()
+    if (
+        counts is None
+        or project_count > int(counts[0] or 0)
+        or archived_count > int(counts[1] or 0)
+    ):
+        return False
+    if _table_exists(conn, "workspace_projects"):
+        missing_owner = conn.execute(
+            "SELECT 1 FROM workspace_projects owner WHERE NOT EXISTS ("
+            "SELECT 1 FROM project_lifecycle_state state "
+            "WHERE state.workspace_id=owner.workspace_id "
+            "AND state.project_slug=owner.project_slug) LIMIT 1"
+        ).fetchone()
+        if missing_owner is not None:
+            return False
+    if _table_exists(conn, "tasks") and all(
+        _column_exists(conn, "tasks", column)
+        for column in ("project", "workspace_id")
+    ):
+        missing_task = conn.execute(
+            "SELECT 1 FROM tasks task WHERE task.project IS NOT NULL "
+            "AND length(trim(task.project))>0 AND NOT EXISTS (SELECT 1 "
+            "FROM project_lifecycle_state state WHERE state.workspace_id="
+            "COALESCE(NULLIF(trim(task.workspace_id),''),'ws_default') "
+            "AND state.project_slug=task.project) LIMIT 1"
+        ).fetchone()
+        if missing_task is not None:
+            return False
+    if (
+        _table_exists(conn, "pull_requests")
+        and _table_exists(conn, "tasks")
+        and _table_exists(conn, "workspace_projects")
+        and all(
+            _column_exists(conn, "pull_requests", column)
+            for column in ("project", "task_id", "workspace_id")
+        )
+    ):
+        missing_pull_request = conn.execute(
+            "SELECT 1 FROM pull_requests pr WHERE NOT EXISTS (SELECT 1 "
+            "FROM project_lifecycle_state state WHERE state.workspace_id=COALESCE("
+            "(SELECT NULLIF(trim(task.workspace_id),'') FROM tasks task "
+            "WHERE task.id=pr.task_id),NULLIF(trim(pr.workspace_id),''),"
+            "(SELECT MIN(owner.workspace_id) FROM workspace_projects owner "
+            "WHERE owner.project_slug=pr.project HAVING "
+            "COUNT(DISTINCT owner.workspace_id)=1),'ws_default') "
+            "AND state.project_slug=pr.project) LIMIT 1"
+        ).fetchone()
+        if missing_pull_request is not None:
+            return False
+    return True
+
+
+def _migration_187_project_lifecycle_bootstrap(
+    conn: sqlite3.Connection,
+    *,
+    projects_root: Path | None = None,
+) -> None:
+    """Seed exact filesystem lifecycle before v187 writers can serve traffic.
+
+    SQL cannot read ``project.yaml``.  This quiesced, idempotent post-hook pins
+    every existing project to its current lifecycle and content digest so a
+    legacy archived project is never auto-created as writable by the first DB
+    writer.  A durable completion marker makes a failed hook repairable without
+    silently re-reading changed files on every startup.
+    """
+    if not _table_exists(conn, "project_lifecycle_bootstrap") or not _table_exists(
+        conn, "project_lifecycle_state"
+    ):
+        raise RuntimeError("Migration 187 lifecycle bootstrap schema is incomplete")
+
+    marker = conn.execute(
+        "SELECT state FROM project_lifecycle_bootstrap WHERE id=1"
+    ).fetchone()
+    if marker is None:
+        raise RuntimeError("Migration 187 lifecycle bootstrap marker is missing")
+    if str(marker[0]) == "complete":
+        if not _migration_187_bootstrap_evidence_valid(conn):
+            raise RuntimeError(
+                "Migration 187 completed lifecycle bootstrap evidence is invalid"
+            )
+        return
+
+    if projects_root is None:
+        configured = os.environ.get("MARVIS_PROJECTS_ROOT", "").strip()
+        if configured:
+            root = Path(configured).expanduser()
+        else:
+            from core.platform import projects_root_default
+
+            root = projects_root_default()
+    else:
+        root = Path(projects_root).expanduser()
+
+    if root.is_symlink():
+        raise RuntimeError("Migration 187 projects root cannot be a symlink")
+    root = root.resolve()
+
+    bindings: dict[str, set[str]] = {}
+    binding_sources = (
+        ("workspace_projects", "project_slug", "workspace_id"),
+        ("access_grants", "project_slug", "workspace_id"),
+        ("tasks", "project", "workspace_id"),
+        ("learnings", "project", "workspace_id"),
+        ("pull_requests", "project", "workspace_id"),
+        ("todos", "project", "workspace_id"),
+        ("file_meta", "project_slug", "workspace_id"),
+        ("documents", "project", "workspace_id"),
+        ("ingest_pending", "project_slug", "workspace_id"),
+        ("project_gui_metadata", "project_slug", "workspace_id"),
+        ("project_status_updates", "project", None),
+    )
+    for table, slug_column, workspace_column in binding_sources:
+        if not _table_exists(conn, table) or not _column_exists(
+            conn, table, slug_column
+        ):
+            continue
+        if workspace_column is not None and not _column_exists(
+            conn, table, workspace_column
+        ):
+            workspace_column = None
+        workspace_expression = (
+            f'"{workspace_column}"' if workspace_column is not None else "NULL"
+        )
+        rows = conn.execute(
+            f'SELECT DISTINCT "{slug_column}",{workspace_expression} '
+            f'FROM "{table}" WHERE "{slug_column}" IS NOT NULL '
+            f'AND length(trim("{slug_column}")) > 0'
+        ).fetchall()
+        for raw_slug, raw_workspace in rows:
+            slug = str(raw_slug).strip()
+            workspace_id = str(raw_workspace or "").strip() or "ws_default"
+            bindings.setdefault(slug, set()).add(workspace_id)
+
+    if (
+        _table_exists(conn, "pull_requests")
+        and _table_exists(conn, "tasks")
+        and _table_exists(conn, "workspace_projects")
+        and all(
+            _column_exists(conn, "pull_requests", column)
+            for column in ("project", "task_id", "workspace_id")
+        )
+    ):
+        for raw_slug, raw_workspace in conn.execute(
+            "SELECT pr.project,COALESCE("
+            "(SELECT NULLIF(trim(task.workspace_id),'') FROM tasks task "
+            "WHERE task.id=pr.task_id),NULLIF(trim(pr.workspace_id),''),"
+            "(SELECT MIN(owner.workspace_id) FROM workspace_projects owner "
+            "WHERE owner.project_slug=pr.project HAVING "
+            "COUNT(DISTINCT owner.workspace_id)=1),'ws_default') "
+            "FROM pull_requests pr WHERE pr.project IS NOT NULL "
+            "AND length(trim(pr.project))>0"
+        ).fetchall():
+            slug = str(raw_slug).strip()
+            workspace_id = str(raw_workspace or "").strip() or "ws_default"
+            bindings.setdefault(slug, set()).add(workspace_id)
+
+    if _table_exists(conn, "comments") and all(
+        _column_exists(conn, "comments", column)
+        for column in ("target_type", "target_id")
+    ):
+        for row in conn.execute(
+            "SELECT DISTINCT target_id FROM comments "
+            "WHERE target_type='project' AND target_id IS NOT NULL "
+            "AND length(trim(target_id)) > 0"
+        ).fetchall():
+            bindings.setdefault(str(row[0]).strip(), set()).add("ws_default")
+
+    known_slugs = set(bindings)
+
+    if not root.exists():
+        if known_slugs:
+            raise RuntimeError(
+                "Migration 187 projects root is missing for existing project state"
+            )
+        project_files: list[Path] = []
+    else:
+        if not root.is_dir():
+            raise RuntimeError("Migration 187 projects root is not a directory")
+        project_files = []
+        for child in sorted(root.iterdir(), key=lambda item: item.name):
+            if child.is_symlink():
+                raise RuntimeError(
+                    f"Migration 187 project directory is a symlink: {child.name}"
+                )
+            metadata_path = child / "project.yaml"
+            if child.is_dir() and metadata_path.exists():
+                if metadata_path.is_symlink() or not metadata_path.is_file():
+                    raise RuntimeError(
+                        f"Migration 187 project metadata is not a regular file: {child.name}"
+                    )
+                project_files.append(metadata_path)
+
+    filesystem_slugs = {path.parent.name for path in project_files}
+    missing_slugs = sorted(known_slugs - filesystem_slugs)
+    if missing_slugs:
+        raise RuntimeError(
+            "Migration 187 project metadata missing for: " + ", ".join(missing_slugs)
+        )
+
+    import yaml
+
+    allowed_lifecycles = {"idea", "planning", "active", "maintenance", "archived"}
+    snapshot: list[dict[str, str]] = []
+    archived_slugs: set[str] = set()
+    for metadata_path in project_files:
+        slug = metadata_path.parent.name
+        if not re.fullmatch(r"[a-z0-9][a-z0-9&+_.\-]{0,62}", slug):
+            raise RuntimeError(f"Migration 187 invalid project slug: {slug}")
+        raw = metadata_path.read_bytes()
+        try:
+            metadata = yaml.safe_load(raw.decode("utf-8")) or {}
+        except (UnicodeDecodeError, yaml.YAMLError) as exc:
+            raise RuntimeError(
+                f"Migration 187 invalid project metadata: {slug}"
+            ) from exc
+        if not isinstance(metadata, dict):
+            raise RuntimeError(f"Migration 187 invalid project metadata: {slug}")
+        lifecycle = str(metadata.get("lifecycle") or "active")
+        if lifecycle not in allowed_lifecycles:
+            raise RuntimeError(
+                f"Migration 187 unsupported project lifecycle: {slug}:{lifecycle}"
+            )
+        if lifecycle == "archived":
+            archived_slugs.add(slug)
+        project_digest = hashlib.sha256(raw).hexdigest()
+
+        workspace_ids = sorted(bindings.get(slug) or {"ws_default"})
+
+        for workspace_id in workspace_ids:
+            existing = conn.execute(
+                "SELECT lifecycle,project_digest FROM project_lifecycle_state "
+                "WHERE workspace_id=? AND project_slug=?",
+                (workspace_id, slug),
+            ).fetchone()
+            if existing is not None and (
+                str(existing[0]) != lifecycle or str(existing[1] or "") != project_digest
+            ):
+                raise RuntimeError(
+                    "Migration 187 lifecycle bootstrap conflicts with persisted state "
+                    f"for {workspace_id}:{slug}"
+                )
+            archived_at = (
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                if lifecycle == "archived"
+                else None
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO project_lifecycle_state "
+                "(workspace_id,project_slug,project_id,lifecycle,project_digest,"
+                "archived_at,archived_by) VALUES (?,?,?,?,?,?,?)",
+                (
+                    workspace_id,
+                    slug,
+                    "prj_" + uuid_mod.uuid4().hex,
+                    lifecycle,
+                    project_digest,
+                    archived_at,
+                    "migration:187" if archived_at else None,
+                ),
+            )
+            snapshot.append(
+                {
+                    "workspace_id": workspace_id,
+                    "project_slug": slug,
+                    "lifecycle": lifecycle,
+                    "project_digest": project_digest,
+                }
+            )
+
+    snapshot_digest = hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    conn.execute(
+        "UPDATE project_lifecycle_bootstrap SET state='complete',project_count=?,"
+        "archived_count=?,snapshot_digest=?,completed_at=? WHERE id=1 AND state='pending'",
+        (len(project_files), len(archived_slugs), snapshot_digest, completed_at),
+    )
+    conn.commit()
+    logger.info(
+        "Migration 187: pinned %d project lifecycle records (%d archived)",
+        len(snapshot),
+        len(archived_slugs),
+    )
 
 
 def _migration_175_audit_chain(conn: sqlite3.Connection) -> None:

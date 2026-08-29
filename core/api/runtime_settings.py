@@ -79,7 +79,15 @@ def apply_marvis_settings(*, force: bool = False) -> bool:
         from core.api import config as config_mod
         from core.api.routers.projects import _set_project_dirs
 
-        projects_root_path = Path(projects_root).expanduser().resolve()
+        effective_projects_root = (
+            os.environ.get("MARVIS_PROJECTS_ROOT") or projects_root
+        )
+        projects_root_path = Path(effective_projects_root).expanduser().resolve()
+        # Migration hooks and filesystem services consume the effective root
+        # through this process-local contract.  Keep it aligned with the
+        # router roots so ``marvis schema upgrade`` cannot silently migrate a
+        # different/default project tree from the one in settings.yaml.
+        os.environ["MARVIS_PROJECTS_ROOT"] = str(projects_root_path)
         _set_project_dirs([projects_root_path])
 
         # Hosted tenants keep project metadata under ``projects/`` and Git repos

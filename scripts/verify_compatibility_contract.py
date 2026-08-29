@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ast
 from copy import deepcopy
 import hashlib
@@ -17,6 +18,7 @@ from build_compatibility_fixtures import compact_spec
 FIXTURE_SCHEMA = "marvis-compatibility-fixture/v1"
 MANIFEST_SCHEMA = "marvis-compatibility-fixture-manifest/v1"
 MATRIX_SCHEMA = "marvis-consumer-compatibility-matrix/v1"
+MCP_INVENTORY_SCHEMA = "marvis-mcp-tool-inventory/v1"
 TRUST_SCHEMA = "marvis-local-server-trust-matrix/v1"
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 SHA_40 = re.compile(r"^[0-9a-f]{40}$")
@@ -125,6 +127,35 @@ def _validate_fixture(name: str, fixture: dict[str, Any]) -> None:
             raise CompatibilityError(
                 f"{name}: operation references missing schemas: {sorted(missing)}"
             )
+
+
+def _validate_mcp_inventory(name: str, inventory: dict[str, Any]) -> set[str]:
+    if inventory.get("schema") != MCP_INVENTORY_SCHEMA:
+        raise CompatibilityError(f"{name}: unsupported MCP inventory schema")
+    if not SHA_40.fullmatch(str(inventory.get("source_ref", ""))):
+        raise CompatibilityError(f"{name}: source_ref must be an exact commit SHA")
+    tools = inventory.get("tools")
+    if (
+        not isinstance(tools, list)
+        or not tools
+        or not all(isinstance(tool, str) and tool for tool in tools)
+        or tools != sorted(set(tools))
+        or inventory.get("tool_count") != len(tools)
+    ):
+        raise CompatibilityError(f"{name}: MCP tool inventory drift")
+    return set(tools)
+
+
+def _runtime_mcp_tools() -> set[str]:
+    try:
+        from core.api.mcp.server import mcp
+
+        async def collect() -> set[str]:
+            return {tool.name for tool in await mcp.list_tools()}
+
+        return asyncio.run(collect())
+    except Exception as exc:  # noqa: BLE001 - compatibility gate fails closed
+        raise CompatibilityError("current MCP tool inventory cannot be reconstructed") from exc
 
 
 def _operation_breaks(
@@ -312,6 +343,8 @@ def _validate_matrix(
     n_consumer: dict[str, Any],
     previous: dict[str, Any],
     consumer_previous_breaks: set[str],
+    current_mcp_tools: set[str],
+    previous_mcp_tools: set[str],
 ) -> None:
     if matrix.get("schema") != MATRIX_SCHEMA or matrix.get("contract_window") != "N/N-1":
         raise CompatibilityError("consumer matrix header invalid")
@@ -360,6 +393,36 @@ def _validate_matrix(
     if declared != new_only:
         missing = sorted(new_only - declared)
         raise CompatibilityError(f"unclassified N-only operations: {missing}")
+
+    mcp_declarations = matrix.get("n_only_mcp_tools")
+    if not isinstance(mcp_declarations, list):
+        raise CompatibilityError("n_only_mcp_tools inventory missing")
+    added_mcp_tools = current_mcp_tools - previous_mcp_tools
+    removed_mcp_tools = previous_mcp_tools - current_mcp_tools
+    declared_mcp_tools: set[str] = set()
+    for item in mcp_declarations:
+        if not isinstance(item, dict):
+            raise CompatibilityError("invalid n_only_mcp_tools row")
+        name = item.get("name")
+        if not isinstance(name, str) or name in declared_mcp_tools or name not in added_mcp_tools:
+            raise CompatibilityError(f"invalid or duplicate N-only MCP tool: {name}")
+        declared_mcp_tools.add(name)
+        evidence = item.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            raise CompatibilityError(f"N-only MCP tool lacks evidence: {name}")
+        for reference in evidence:
+            _validate_evidence(root, str(reference))
+    if declared_mcp_tools != added_mcp_tools:
+        missing = sorted(added_mcp_tools - declared_mcp_tools)
+        stale = sorted(declared_mcp_tools - added_mcp_tools)
+        raise CompatibilityError(
+            f"N-only MCP tool inventory drift: missing={missing}, stale={stale}"
+        )
+    local_mcp = by_surface["local_mcp"]
+    if added_mcp_tools and local_mcp.get("n_consumer_n_minus_1_contract") != "migration_required":
+        raise CompatibilityError("local_mcp: N-only MCP tool lacks traced migration")
+    if removed_mcp_tools and local_mcp.get("n_minus_1_consumer_n_contract") != "migration_required":
+        raise CompatibilityError("local_mcp: removed MCP tool lacks traced migration")
 
     schema_declarations = matrix.get("n_consumer_n_minus_1_schema_breaks")
     if not isinstance(schema_declarations, list):
@@ -431,8 +494,10 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         raise CompatibilityError("fixture manifest invalid")
     expected_files = {
         "n-contract.json",
+        "n-mcp-tools.json",
         "n-consumer-contract.json",
         "n-minus-1-contract.json",
+        "n-minus-1-mcp-tools.json",
         "n-minus-1-openapi.json",
         "deliberate-break.json",
     }
@@ -445,6 +510,8 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
     current = _load(fixtures / "n-contract.json")
     consumer = _load(fixtures / "n-consumer-contract.json")
     previous = _load(fixtures / "n-minus-1-contract.json")
+    current_mcp_inventory = _load(fixtures / "n-mcp-tools.json")
+    previous_mcp_inventory = _load(fixtures / "n-minus-1-mcp-tools.json")
     broken = _load(fixtures / "deliberate-break.json")
     for name, fixture in (
         ("N", current),
@@ -465,6 +532,9 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
     previous_openapi_sha256 = _simple_yaml_value(
         pin, "n_minus_1_openapi_sha256"
     )
+    previous_mcp_tools_sha256 = _simple_yaml_value(
+        pin, "n_minus_1_mcp_tools_sha256"
+    )
     deliberate_break_sha256 = _simple_yaml_value(
         pin, "deliberate_break_fixture_sha256"
     )
@@ -476,6 +546,8 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         raise CompatibilityError("N-1 source ref is invalid")
     if not HEX_64.fullmatch(previous_openapi_sha256):
         raise CompatibilityError("N-1 OpenAPI digest is invalid")
+    if not HEX_64.fullmatch(previous_mcp_tools_sha256):
+        raise CompatibilityError("N-1 MCP inventory digest is invalid")
     if not HEX_64.fullmatch(deliberate_break_sha256):
         raise CompatibilityError("deliberate-break fixture digest is invalid")
     if current["source_ref"] != pinned_ref or consumer["source_ref"] != pinned_ref:
@@ -484,6 +556,16 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         raise CompatibilityError("N fixture version does not match engine pin")
     if previous["source_ref"] != previous_ref or broken["source_ref"] != previous_ref:
         raise CompatibilityError("N-1 fixture source does not match the external pin")
+    current_mcp_tools = _validate_mcp_inventory("N MCP", current_mcp_inventory)
+    previous_mcp_tools = _validate_mcp_inventory("N-1 MCP", previous_mcp_inventory)
+    if current_mcp_inventory["source_ref"] != pinned_ref:
+        raise CompatibilityError("N MCP inventory source does not match engine pin")
+    if previous_mcp_inventory["source_ref"] != previous_ref:
+        raise CompatibilityError("N-1 MCP inventory source does not match engine pin")
+    if _sha(fixtures / "n-minus-1-mcp-tools.json") != previous_mcp_tools_sha256:
+        raise CompatibilityError("N-1 MCP inventory does not match the external pin")
+    if _runtime_mcp_tools() != current_mcp_tools:
+        raise CompatibilityError("N MCP inventory does not reconstruct from runtime")
     previous_openapi_path = fixtures / "n-minus-1-openapi.json"
     if (
         previous["source_openapi_sha256"] != previous_openapi_sha256
@@ -599,6 +681,8 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         n_consumer=consumer,
         previous=previous,
         consumer_previous_breaks=consumer_previous_breaks,
+        current_mcp_tools=current_mcp_tools,
+        previous_mcp_tools=previous_mcp_tools,
     )
     _validate_trust(root, _load(root / "contracts/compatibility/trust-matrix-v1.json"))
 
@@ -611,6 +695,9 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         "n_minus_1_operations": previous["operation_count"],
         "consumer_operations": consumer["operation_count"],
         "n_only_operations": len(set(_operations(consumer)) - set(_operations(previous))),
+        "n_mcp_tools": len(current_mcp_tools),
+        "n_minus_1_mcp_tools": len(previous_mcp_tools),
+        "n_only_mcp_tools": len(current_mcp_tools - previous_mcp_tools),
         "deliberate_breaks_detected": len(break_failures),
         "declared_n_minus_1_schema_breaks": len(consumer_previous_breaks),
     }

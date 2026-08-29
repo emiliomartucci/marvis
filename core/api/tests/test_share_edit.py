@@ -103,6 +103,10 @@ class _FakeAsyncCursor:
     def __init__(self, cursor: sqlite3.Cursor):
         self._cursor = cursor
 
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
     async def fetchone(self):
         return self._cursor.fetchone()
 
@@ -351,6 +355,10 @@ async def test_put_data_project_share_local_operator_writes(
     finder_root = tmp_path
     project_dir = finder_root / "projects" / "demo"
     project_dir.mkdir(parents=True)
+    (project_dir / "project.yaml").write_text(
+        "name: Demo\nslug: demo\ntype: work\n",
+        encoding="utf-8",
+    )
     target = project_dir / "report.md"
     target.write_text("# Original\n", encoding="utf-8")
 

@@ -66,10 +66,10 @@ router's import surface, parsed by FastAPI before the use_case is called.
 """
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
 import logging
 import os
 import time
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 import aiosqlite
@@ -95,8 +95,8 @@ from core.api.use_cases._errors import (
     NotFoundError,
     ServiceError,
     ServiceUnavailableError,
+    ValidationError,
 )
-from core.platform.locking import LockUnavailableError, exclusive_file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -169,48 +169,47 @@ def _customer_project_count(data_dir: Path) -> int:
         ) from exc
 
 
+def _validated_project_entitlement(data_dir: Path):
+    entitlement = load_signed_project_entitlement()
+    if entitlement is not None and entitlement.project_limit is not None:
+        current = _customer_project_count(data_dir)
+        if current >= entitlement.project_limit:
+            try:
+                from core.api.services.hosted_entitlements import HostedLimitError
+            except ImportError as exc:
+                raise ServiceUnavailableError(
+                    code="project_entitlement_runtime_missing",
+                    message="Hosted project entitlement support is unavailable",
+                ) from exc
+            tier = (
+                entitlement.tier.value
+                if entitlement.tier is not None
+                else entitlement.entitlement_class
+            )
+            raise HostedLimitError.project(
+                tier=tier,
+                current=current,
+                limit=entitlement.project_limit,
+            )
+    return entitlement
+
+
 @contextmanager
 def project_creation_guard(data_dir: Path):
-    try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ServiceError(
-            code="data_dir_missing",
-            message=f"Data directory does not exist and cannot be created: {data_dir}",
-        ) from exc
-    lock_path = data_dir / ".project-create.lock"
-    with ExitStack() as stack:
-        try:
-            stack.enter_context(
-                exclusive_file_lock(lock_path, mode=0o600, nofollow=True)
-            )
-        except LockUnavailableError as exc:
-            raise ServiceUnavailableError(
-                code="project_limit_lock_unavailable",
-                message="Project limit lock is unavailable",
-            ) from exc
-        entitlement = load_signed_project_entitlement()
-        if entitlement is not None and entitlement.project_limit is not None:
-            current = _customer_project_count(data_dir)
-            if current >= entitlement.project_limit:
-                try:
-                    from core.api.services.hosted_entitlements import HostedLimitError
-                except ImportError as exc:
-                    raise ServiceUnavailableError(
-                        code="project_entitlement_runtime_missing",
-                        message="Hosted project entitlement support is unavailable",
-                    ) from exc
-                tier = (
-                    entitlement.tier.value
-                    if entitlement.tier is not None
-                    else entitlement.entitlement_class
-                )
-                raise HostedLimitError.project(
-                    tier=tier,
-                    current=current,
-                    limit=entitlement.project_limit,
-                )
-        yield entitlement
+    """Synchronous guard retained for the CLI project creator."""
+    from core.api.services.project_lifecycle import project_mutation_guard
+
+    with project_mutation_guard(projects_root=data_dir):
+        yield _validated_project_entitlement(data_dir)
+
+
+@asynccontextmanager
+async def _async_project_creation_guard(data_dir: Path):
+    """Async guard for API/MCP creation without blocking the event loop."""
+    from core.api.services.project_lifecycle import async_project_mutation_guard
+
+    async with async_project_mutation_guard(projects_root=data_dir):
+        yield _validated_project_entitlement(data_dir)
 
 
 def data_project_dir() -> Path:
@@ -333,6 +332,7 @@ async def list_programs(
     db: aiosqlite.Connection,
     *,
     visible_projects: set[str] | None = None,
+    include_archived: bool = False,
 ) -> list[ProgramInfo]:
     """List all programs with their projects and per-project task counts.
 
@@ -342,6 +342,7 @@ async def list_programs(
     the filesystem helpers (project index, programs loader, metadata reader) and
     the git command constant function-locally to stay fastapi-free at import.
     """
+    import core.api.routers.projects as _projects_mod
     from core.api.routers.projects import (  # function-local: keeps this module fastapi-free
         _INDEX_TTL,
         _build_project_index,
@@ -350,7 +351,6 @@ async def list_programs(
         _get_programs,
         _get_project_metadata,
     )
-    import core.api.routers.projects as _projects_mod
 
     programs = _get_programs()
     if not _projects_mod._project_index or (
@@ -412,6 +412,8 @@ async def list_programs(
             meta: dict = {}
             if on_server and entry:
                 meta = _get_project_metadata(entry.metadata_path)
+            if not include_archived and meta.get("lifecycle") == "archived":
+                continue
 
             counts = task_counts.get(slug, {})
             sc = StatusCounts(**{k: v for k, v in counts.items() if k in StatusCounts.model_fields})
@@ -453,6 +455,8 @@ async def list_programs(
         if visible_slugs is not None and slug not in visible_slugs:
             continue
         meta = _get_project_metadata(entry.metadata_path)
+        if not include_archived and meta.get("lifecycle") == "archived":
+            continue
         counts = task_counts.get(slug, {})
         sc = StatusCounts(**{k: v for k, v in counts.items() if k in StatusCounts.model_fields})
         su = status_updates.get(slug)
@@ -508,6 +512,11 @@ async def create_project(
     working.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    if lifecycle == "archived":
+        raise ValidationError(
+            code="project_lifecycle_requires_archive_approval",
+            message="Archived lifecycle requires the governed archive workflow",
+        )
 
     from core.api.routers.projects import _create_project_on_disk, _find_project_entry
     from core.api.services.access_grants import (
@@ -522,7 +531,7 @@ async def create_project(
     workspace_id = require_workspace_ctx(ctx)
     local_single_user = ctx.user_id == "local" and ctx.username == "local"
     try:
-        with project_creation_guard(data_dir):
+        async with _async_project_creation_guard(data_dir):
             if _find_project_entry(slug) is not None:
                 raise ConflictError(
                     code="project_exists",
@@ -588,6 +597,34 @@ async def create_project(
                 lifecycle=lifecycle,
                 language=language,
                 type=type,
+            )
+            # U10: establish the immutable lifecycle identity while the same
+            # cross-process mutation lock still excludes an archive.  A remote
+            # create may already have seeded the row through workspace_projects;
+            # update only its initial metadata coordinates here.
+            from core.api.services.project_lifecycle import (
+                ensure_project_lifecycle,
+                project_digest,
+            )
+
+            lifecycle_state = await ensure_project_lifecycle(
+                db,
+                workspace_id=workspace_id,
+                project_slug=slug,
+                projects_root=data_dir,
+            )
+            await db.execute(
+                "UPDATE project_lifecycle_state SET lifecycle=?,project_digest=?,"
+                "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE workspace_id=? AND project_slug=? AND project_id=? "
+                "AND lifecycle!='archived' AND transition_operation_id IS NULL",
+                (
+                    lifecycle,
+                    project_digest(project_dir),
+                    workspace_id,
+                    slug,
+                    lifecycle_state.project_id,
+                ),
             )
     except Exception:
         await db.rollback()
@@ -837,6 +874,7 @@ async def get_session_brief(
     await _require_project_filesystem_access(ctx, db, slug, visible_projects)
 
     import json
+
     from core.api.config import settings
     from core.api.routers.projects import (
         _find_project_entry,

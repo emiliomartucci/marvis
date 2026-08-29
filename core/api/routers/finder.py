@@ -9,6 +9,7 @@ import mimetypes
 import os
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -38,6 +39,7 @@ from core.api.security import (
     is_loopback_request,
 )
 from core.api.services import access_grants
+from core.api.services import project_lifecycle
 from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import AuthorizationError
 from core.api.services.share_links import (
@@ -64,6 +66,10 @@ _LOCAL_HOST_DETAIL = (
 _LEGACY_SHARE_DETAIL = (
     "Legacy host-global share routes are local-only. Use the governed share_file "
     "MCP tool for remote project-owned sharing."
+)
+_PROJECT_LIFECYCLE_DETAIL = (
+    "Project roots and project.yaml are lifecycle control surfaces. "
+    "Use the governed project lifecycle API."
 )
 
 
@@ -101,6 +107,83 @@ def _authenticated_actor(user: UserInfo) -> CallerContext:
     except AuthorizationError as exc:
         raise HTTPException(status_code=403, detail=exc.message) from exc
     return actor
+
+
+def _finder_project_scopes(path: str) -> set[tuple[str, str]]:
+    """Return both logical and resolved project scopes for one Finder path.
+
+    Finder deliberately supports allow-listed symlinks.  A link below one
+    project may therefore resolve into another project's tree.  Journaling
+    only the user-facing path would let an active project mutate archived
+    bytes through that link, so every mutation fences both identities.
+    """
+    scopes: set[tuple[str, str]] = set()
+    pure = PurePosixPath((path or "").strip("/"))
+    if len(pure.parts) >= 2 and pure.parts[0] == "projects":
+        scopes.add((pure.parts[1], pure.as_posix()))
+
+    projects_root = (Path(settings.finder_root).resolve() / "projects").resolve()
+    resolved = _validate_path(path)
+    try:
+        resolved_relative = resolved.relative_to(projects_root)
+    except ValueError:
+        return scopes
+    if resolved_relative.parts:
+        resolved_ref = PurePosixPath(
+            "projects",
+            *resolved_relative.parts,
+        ).as_posix()
+        scopes.add((resolved_relative.parts[0], resolved_ref))
+    return scopes
+
+
+def _reject_project_lifecycle_path(*paths: str) -> None:
+    """Keep generic Finder mutations away from project identity/lifecycle."""
+    for path in paths:
+        pure = PurePosixPath((path or "").strip("/"))
+        if len(pure.parts) < 2 or pure.parts[0] != "projects":
+            continue
+        is_project_root = len(pure.parts) == 2
+        is_project_metadata = (
+            len(pure.parts) == 3 and pure.parts[2] == "project.yaml"
+        )
+        if is_project_root or is_project_metadata:
+            raise HTTPException(status_code=403, detail=_PROJECT_LIFECYCLE_DETAIL)
+
+
+@asynccontextmanager
+async def _finder_project_mutation(
+    db: aiosqlite.Connection,
+    user: UserInfo,
+    *,
+    paths: list[str],
+    writer_kind: str,
+):
+    """Fence every project touched by one local Finder filesystem mutation."""
+    grouped: dict[str, list[str]] = {}
+    for path in paths:
+        for project_slug, resource_ref in _finder_project_scopes(path):
+            grouped.setdefault(project_slug, []).append(resource_ref)
+    if not grouped:
+        yield
+        return
+    actor = _authenticated_actor(user)
+    projects_root = (Path(settings.finder_root).resolve() / "projects").resolve()
+    async with project_lifecycle.async_project_mutation_guard(
+        projects_root=projects_root
+    ):
+        for project_slug, refs in sorted(grouped.items()):
+            await project_lifecycle.record_project_write(
+                db,
+                workspace_id=require_workspace_ctx(actor),
+                project_slug=project_slug,
+                writer_kind=writer_kind,
+                actor=actor.user_id or actor.username,
+                resource_ref=" -> ".join(refs),
+                projects_root=projects_root,
+            )
+        await db.commit()
+        yield
 
 
 def _validate_path(raw_path: str) -> Path:
@@ -457,6 +540,7 @@ async def save_file(
     await _check_finder_write(path, current_user, db)
     actor = _authenticated_actor(current_user)
     target = _validate_path(path)
+    _reject_project_lifecycle_path(path)
     if not target.exists():
         raise HTTPException(404, "File not found")
     if not os.access(target, os.W_OK):
@@ -486,11 +570,18 @@ async def save_file(
                 pass
             raise
 
-    await asyncio.to_thread(_write)
+    async with _finder_project_mutation(
+        db,
+        current_user,
+        paths=[path],
+        writer_kind="finder_file",
+    ):
+        await asyncio.to_thread(_write)
 
-    from core.api.services.confidential_files import capture_owner
+        from core.api.services.confidential_files import capture_owner
 
-    await capture_owner(db, actor, path)
+        await capture_owner(db, actor, path)
+        await db.commit()
 
     stat = await asyncio.to_thread(target.stat)
     return FinderFileContent(
@@ -520,7 +611,13 @@ async def make_directory(
     if target.exists():
         raise HTTPException(409, "Already exists")
 
-    await asyncio.to_thread(target.mkdir, parents=False, exist_ok=False)
+    async with _finder_project_mutation(
+        db,
+        current_user,
+        paths=[path],
+        writer_kind="finder_mkdir",
+    ):
+        await asyncio.to_thread(target.mkdir, parents=False, exist_ok=False)
     return {"ok": True}
 
 
@@ -552,18 +649,26 @@ async def rename_item(
     if dest.exists():
         raise HTTPException(409, f"'{new_name}' already exists")
 
-    await asyncio.to_thread(target.rename, dest)
-    # RBAC F4: confidentiality travels with the file — a stale file_meta path
-    # would silently declassify the renamed file on DB-authoritative checks.
-    from core.api.services.confidential_files import migrate_file_meta_path
-
-    await migrate_file_meta_path(
+    dest_rel = _rel_path(dest)
+    _reject_project_lifecycle_path(path, dest_rel)
+    async with _finder_project_mutation(
         db,
-        old_path=path,
-        new_path=_rel_path(dest),
-        workspace_id=require_workspace_ctx(_authenticated_actor(current_user)),
-    )
-    await db.commit()
+        current_user,
+        paths=[path, dest_rel],
+        writer_kind="finder_rename",
+    ):
+        await asyncio.to_thread(target.rename, dest)
+        # RBAC F4: confidentiality travels with the file — a stale file_meta path
+        # would silently declassify the renamed file on DB-authoritative checks.
+        from core.api.services.confidential_files import migrate_file_meta_path
+
+        await migrate_file_meta_path(
+            db,
+            old_path=path,
+            new_path=dest_rel,
+            workspace_id=require_workspace_ctx(_authenticated_actor(current_user)),
+        )
+        await db.commit()
     return {"ok": True}
 
 
@@ -580,44 +685,55 @@ async def upload_files(
     if not target_dir.is_dir():
         raise HTTPException(400, "Not a directory")
 
-    results = []
+    prepared_files: list[tuple[UploadFile, str, Path]] = []
     for file in files:
         safe_name = PurePosixPath(file.filename or "unnamed").name
         if not safe_name:
             raise HTTPException(400, "Invalid filename")
-
         dest = target_dir / safe_name
-        if dest.exists():
-            raise HTTPException(409, f"File already exists: {safe_name}")
+        _reject_project_lifecycle_path(_rel_path(dest))
+        prepared_files.append((file, safe_name, dest))
 
-        content = await file.read()
-        if len(content) > settings.finder_max_upload_bytes:
-            raise HTTPException(413, f"File too large: {safe_name}")
+    results = []
+    async with _finder_project_mutation(
+        db,
+        current_user,
+        paths=[path],
+        writer_kind="finder_upload",
+    ):
+        for file, safe_name, dest in prepared_files:
+            if dest.exists():
+                raise HTTPException(409, f"File already exists: {safe_name}")
 
-        await asyncio.to_thread(dest.write_bytes, content)
+            content = await file.read()
+            if len(content) > settings.finder_max_upload_bytes:
+                raise HTTPException(413, f"File too large: {safe_name}")
 
-        from core.api.services.confidential_files import capture_owner
+            await asyncio.to_thread(dest.write_bytes, content)
 
-        await capture_owner(
-            db,
-            _authenticated_actor(current_user),
-            _rel_path(dest),
-        )
+            from core.api.services.confidential_files import capture_owner
 
-        stat = await asyncio.to_thread(dest.stat)
-        results.append(
-            FinderListItem(
-                name=safe_name,
-                path=_rel_path(dest),
-                is_dir=False,
-                size=stat.st_size,
-                modified=datetime.fromtimestamp(
-                    stat.st_mtime, tz=timezone.utc
-                ).isoformat(),
-                mime_type=mimetypes.guess_type(safe_name)[0],
-                extension=Path(safe_name).suffix or None,
+            await capture_owner(
+                db,
+                _authenticated_actor(current_user),
+                _rel_path(dest),
             )
-        )
+
+            stat = await asyncio.to_thread(dest.stat)
+            results.append(
+                FinderListItem(
+                    name=safe_name,
+                    path=_rel_path(dest),
+                    is_dir=False,
+                    size=stat.st_size,
+                    modified=datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                    mime_type=mimetypes.guess_type(safe_name)[0],
+                    extension=Path(safe_name).suffix or None,
+                )
+            )
+        await db.commit()
 
     return results
 
@@ -677,11 +793,18 @@ async def delete_item(
         raise HTTPException(403, "Cannot delete root")
     if target.parent == root and target.is_dir():
         raise HTTPException(403, "Cannot delete top-level directories")
+    _reject_project_lifecycle_path(path)
 
-    if target.is_dir():
-        await asyncio.to_thread(shutil.rmtree, str(target))
-    else:
-        await asyncio.to_thread(target.unlink)
+    async with _finder_project_mutation(
+        db,
+        current_user,
+        paths=[path],
+        writer_kind="finder_delete",
+    ):
+        if target.is_dir():
+            await asyncio.to_thread(shutil.rmtree, str(target))
+        else:
+            await asyncio.to_thread(target.unlink)
 
     return {"ok": True}
 
@@ -712,18 +835,26 @@ async def move_item(
     if final.exists():
         raise HTTPException(409, f"'{src.name}' already exists in destination")
 
-    await asyncio.to_thread(shutil.move, str(src), str(final))
-    # RBAC F4: confidentiality travels with the file (cross-project moves too).
-    from core.api.services.confidential_files import migrate_file_meta_path
-
-    await migrate_file_meta_path(
+    final_rel = _rel_path(final)
+    _reject_project_lifecycle_path(src_path, final_rel)
+    async with _finder_project_mutation(
         db,
-        old_path=src_path,
-        new_path=_rel_path(final),
-        workspace_id=require_workspace_ctx(_authenticated_actor(current_user)),
-    )
-    await db.commit()
-    return {"ok": True, "new_path": _rel_path(final)}
+        current_user,
+        paths=[src_path, final_rel],
+        writer_kind="finder_move",
+    ):
+        await asyncio.to_thread(shutil.move, str(src), str(final))
+        # RBAC F4: confidentiality travels with the file (cross-project moves too).
+        from core.api.services.confidential_files import migrate_file_meta_path
+
+        await migrate_file_meta_path(
+            db,
+            old_path=src_path,
+            new_path=final_rel,
+            workspace_id=require_workspace_ctx(_authenticated_actor(current_user)),
+        )
+        await db.commit()
+    return {"ok": True, "new_path": final_rel}
 
 
 # --- Finder Pins ---
@@ -1084,11 +1215,18 @@ async def save_shared_file(
                 pass
             raise
 
-    await asyncio.to_thread(_write)
+    async with _finder_project_mutation(
+        db,
+        current_user,
+        paths=[rel],
+        writer_kind="finder_shared_file",
+    ):
+        await asyncio.to_thread(_write)
 
-    from core.api.services.confidential_files import capture_owner
+        from core.api.services.confidential_files import capture_owner
 
-    await capture_owner(db, actor, rel)
+        await capture_owner(db, actor, rel)
+        await db.commit()
 
     return {
         "path": rel,

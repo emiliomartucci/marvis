@@ -18,6 +18,7 @@ from core.api.models import UserInfo
 from core.api.routers._browser_mutation_denial import agent_only_route
 from core.api.security import get_agent_user, get_current_user_or_agent
 from core.api.services import access_grants
+from core.api.services import project_lifecycle
 from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import AuthorizationError
 from core.api.visibility import check_project_access
@@ -207,61 +208,69 @@ async def write_file(
         raise HTTPException(status_code=413, detail="Content too large (max 500KB)")
 
     resource_id = f"{slug}/{file_path}"
-    await _append_file_write_audit(
+    async with project_lifecycle.guarded_project_file_write(
+        actor,
         db,
-        user=user,
-        resource_id=resource_id,
-        stage="intent",
-        size=len(content_bytes),
-    )
-
-    # Ensure parent directory exists
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    # Atomic write: tempfile in same dir -> fsync -> os.replace
-    tmp_path: str | None = None
-    try:
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(target.parent),
-            prefix=".pir-write-",
-            suffix=".tmp",
-        )
-        try:
-            os.write(fd, content_bytes)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-        os.replace(tmp_path, str(target))
-        logger.info("File written: %s/%s by %s", slug, file_path, user.username)
-    except OSError as e:
-        # Cleanup temp file on error
-        try:
-            if tmp_path is not None:
-                os.unlink(tmp_path)
-        except OSError:
-            pass
+        project_slug=slug,
+        writer_kind="http_file",
+        resource_ref=file_path,
+        projects_root=project_path.parent,
+    ):
         await _append_file_write_audit(
             db,
             user=user,
             resource_id=resource_id,
-            stage="failed",
+            stage="intent",
             size=len(content_bytes),
-            failure_type=type(e).__name__,
         )
-        raise HTTPException(status_code=500, detail=f"Cannot write file: {e}")
 
-    await _append_file_write_audit(
-        db,
-        user=user,
-        resource_id=resource_id,
-        stage="confirmed",
-        size=len(content_bytes),
-    )
+        # Ensure parent directory exists only while archive is excluded.
+        target.parent.mkdir(parents=True, exist_ok=True)
 
-    from core.api.services.confidential_files import capture_owner
+        # Atomic write: tempfile in same dir -> fsync -> os.replace
+        tmp_path: str | None = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(target.parent),
+                prefix=".pir-write-",
+                suffix=".tmp",
+            )
+            try:
+                os.write(fd, content_bytes)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
-    await capture_owner(db, actor, logical_path)
+            os.replace(tmp_path, str(target))
+            logger.info("File written: %s/%s by %s", slug, file_path, user.username)
+        except OSError as e:
+            try:
+                if tmp_path is not None:
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            await _append_file_write_audit(
+                db,
+                user=user,
+                resource_id=resource_id,
+                stage="failed",
+                size=len(content_bytes),
+                failure_type=type(e).__name__,
+            )
+            raise HTTPException(status_code=500, detail=f"Cannot write file: {e}")
+
+        await _append_file_write_audit(
+            db,
+            user=user,
+            resource_id=resource_id,
+            stage="confirmed",
+            size=len(content_bytes),
+        )
+
+        from core.api.services.confidential_files import capture_owner
+
+        await capture_owner(db, actor, logical_path)
+        await db.commit()
 
     return FileContent(
         content=body.content,

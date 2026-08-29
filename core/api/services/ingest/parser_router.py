@@ -9,13 +9,14 @@ import mimetypes
 import os
 import sqlite3
 from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
 from core.api.config import settings
 from core.api.db import acquire_db, acquire_write_db
-from core.api.services import pii_redactor
+from core.api.services import pii_redactor, project_lifecycle
 from core.api.services.ingest.auto_approve import (
     decide_ingress_routing,
     should_auto_approve,
@@ -1047,6 +1048,7 @@ async def _apply_llm_project_switch_if_safe(
     target_project_slug: str,
     path: Path,
     classification_json: dict[str, Any],
+    lifecycle_lock_held: bool = False,
 ) -> tuple[str, Path, dict[str, Any], str, str | None]:
     new_root = PROJECTS_ROOT / target_project_slug
     if not new_root.is_dir():
@@ -1090,45 +1092,72 @@ async def _apply_llm_project_switch_if_safe(
             "auto_reject:llm_routing_duplicate",
         )
 
-    new_input = new_root / "input"
-    new_input.mkdir(parents=True, exist_ok=True)
-    new_source = new_input / path.name
-    source_sidecar = _metadata_sidecar_path(path)
-    target_sidecar = _metadata_sidecar_path(new_source)
-    if new_source.exists():
-        logger.warning(
-            "llm_routing project switch aborted: %s already exists",
-            new_source,
+    async with AsyncExitStack() as mutation_stack:
+        if not lifecycle_lock_held:
+            await mutation_stack.enter_async_context(
+                project_lifecycle.async_project_mutation_guard(
+                    projects_root=PROJECTS_ROOT
+                )
+            )
+        await project_lifecycle.record_project_write(
+            db,
+            workspace_id=workspace_id,
+            project_slug=current_project_slug,
+            writer_kind="ingest_llm_project_switch_source",
+            actor="pir-ingest",
+            resource_ref=str(path),
+            projects_root=PROJECTS_ROOT,
         )
-        return (
-            current_project_slug,
-            path,
-            _block_llm_auto_approve(
-                classification_json,
-                reason="llm_routing_project_switch_path_collision",
-            ),
-            "awaiting_triage",
-            None,
+        await project_lifecycle.record_project_write(
+            db,
+            workspace_id=workspace_id,
+            project_slug=target_project_slug,
+            writer_kind="ingest_llm_project_switch_target",
+            actor="pir-ingest",
+            resource_ref=path.name,
+            projects_root=PROJECTS_ROOT,
         )
-    if source_sidecar.exists() and target_sidecar.exists():
-        logger.warning(
-            "llm_routing project switch aborted: %s already exists",
-            target_sidecar,
-        )
-        return (
-            current_project_slug,
-            path,
-            _block_llm_auto_approve(
-                classification_json,
-                reason="llm_routing_project_switch_sidecar_collision",
-            ),
-            "awaiting_triage",
-            None,
-        )
+        await db.commit()
 
-    path.replace(new_source)
-    if source_sidecar.exists():
-        source_sidecar.replace(target_sidecar)
+        new_input = new_root / "input"
+        new_input.mkdir(parents=True, exist_ok=True)
+        new_source = new_input / path.name
+        source_sidecar = _metadata_sidecar_path(path)
+        target_sidecar = _metadata_sidecar_path(new_source)
+        if new_source.exists():
+            logger.warning(
+                "llm_routing project switch aborted: %s already exists",
+                new_source,
+            )
+            return (
+                current_project_slug,
+                path,
+                _block_llm_auto_approve(
+                    classification_json,
+                    reason="llm_routing_project_switch_path_collision",
+                ),
+                "awaiting_triage",
+                None,
+            )
+        if source_sidecar.exists() and target_sidecar.exists():
+            logger.warning(
+                "llm_routing project switch aborted: %s already exists",
+                target_sidecar,
+            )
+            return (
+                current_project_slug,
+                path,
+                _block_llm_auto_approve(
+                    classification_json,
+                    reason="llm_routing_project_switch_sidecar_collision",
+                ),
+                "awaiting_triage",
+                None,
+            )
+
+        path.replace(new_source)
+        if source_sidecar.exists():
+            source_sidecar.replace(target_sidecar)
     return (
         target_project_slug,
         new_source,
@@ -1756,64 +1785,71 @@ async def parse_pending(ingest_id: str, workspace_id: str) -> None:
         structure = _reconcile_ingress_metadata(structure, ingress_metadata_raw)
 
         async with acquire_write_db() as db:
-            if (
-                pending_llm_project_slug
-                and next_status == "approved"
-                and triage_decision_id == "auto_approve:llm_routing"
-            ):
-                (
-                    project_slug,
-                    path,
-                    classification_json,
-                    next_status,
-                    triage_decision_id,
-                ) = await _apply_llm_project_switch_if_safe(
-                    db,
-                    ingest_id=ingest_id,
-                    workspace_id=workspace_id,
-                    sha256=row["sha256"],
-                    current_project_slug=project_slug,
-                    target_project_slug=pending_llm_project_slug,
-                    path=path,
-                    classification_json=classification_json,
+            async with AsyncExitStack() as mutation_stack:
+                if (
+                    pending_llm_project_slug
+                    and next_status == "approved"
+                    and triage_decision_id == "auto_approve:llm_routing"
+                ):
+                    await mutation_stack.enter_async_context(
+                        project_lifecycle.async_project_mutation_guard(
+                            projects_root=PROJECTS_ROOT
+                        )
+                    )
+                    (
+                        project_slug,
+                        path,
+                        classification_json,
+                        next_status,
+                        triage_decision_id,
+                    ) = await _apply_llm_project_switch_if_safe(
+                        db,
+                        ingest_id=ingest_id,
+                        workspace_id=workspace_id,
+                        sha256=row["sha256"],
+                        current_project_slug=project_slug,
+                        target_project_slug=pending_llm_project_slug,
+                        path=path,
+                        classification_json=classification_json,
+                        lifecycle_lock_held=True,
+                    )
+                await db.execute(
+                    """
+                    UPDATE ingest_pending
+                       SET status = ?,
+                           project_slug = ?,
+                           file_path = ?,
+                           mime_type = ?,
+                           parser_used = ?,
+                           extracted_text = ?,
+                           structure_json = ?,
+                           classification_json = ?,
+                           target_folder = ?,
+                           target_filename = ?,
+                           triage_decision_id = ?,
+                           error_message = ?,
+                           updated_at = datetime('now')
+                     WHERE id = ?
+                       AND workspace_id = ?
+                    """,
+                    (
+                        next_status,
+                        project_slug,
+                        str(path),
+                        mime_type,
+                        parser_used,
+                        extracted_text,
+                        json.dumps(structure, ensure_ascii=False),
+                        json.dumps(classification_json, ensure_ascii=False),
+                        target_folder,
+                        target_filename,
+                        triage_decision_id,
+                        error_message,
+                        ingest_id,
+                        workspace_id,
+                    ),
                 )
-            await db.execute(
-                """
-                UPDATE ingest_pending
-                   SET status = ?,
-                       project_slug = ?,
-                       file_path = ?,
-                       mime_type = ?,
-                       parser_used = ?,
-                       extracted_text = ?,
-                       structure_json = ?,
-                       classification_json = ?,
-                       target_folder = ?,
-                       target_filename = ?,
-                       triage_decision_id = ?,
-                       error_message = ?,
-                       updated_at = datetime('now')
-                 WHERE id = ?
-                   AND workspace_id = ?
-                """,
-                (
-                    next_status,
-                    project_slug,
-                    str(path),
-                    mime_type,
-                    parser_used,
-                    extracted_text,
-                    json.dumps(structure, ensure_ascii=False),
-                    json.dumps(classification_json, ensure_ascii=False),
-                    target_folder,
-                    target_filename,
-                    triage_decision_id,
-                    error_message,
-                    ingest_id,
-                    workspace_id,
-                ),
-            )
-            await db.commit()
+                await db.commit()
         await broadcast_ingest_changed(
             _ingest_event_for_status(next_status),
             workspace_id=workspace_id,

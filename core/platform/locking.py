@@ -17,13 +17,16 @@ def exclusive_file_lock(
     *,
     mode: int = 0o600,
     nofollow: bool = False,
+    thread_local: bool = True,
 ) -> Iterator[None]:
     """Hold an exclusive cross-process lock until the context exits.
 
     POSIX keeps the existing ``flock`` + optional ``O_NOFOLLOW`` hardening.
     Windows uses the already-declared ``filelock`` runtime dependency, whose
-    native backend locks through ``msvcrt``. Imports stay function-local so a
-    platform never has to import another platform's standard-library module.
+    native backend locks through ``msvcrt``. ``thread_local=False`` is reserved
+    for async adapters that acquire and release through worker threads. Imports
+    stay function-local so a platform never has to import another platform's
+    standard-library module.
     """
     lock_path = os.fspath(path)
     if os.name == "nt":
@@ -41,7 +44,12 @@ def exclusive_file_lock(
         try:
             from filelock import FileLock
 
-            lock = FileLock(lock_path, mode=mode, timeout=-1)
+            lock = FileLock(
+                lock_path,
+                mode=mode,
+                timeout=-1,
+                thread_local=thread_local,
+            )
             lock.acquire()
         except (ImportError, OSError, TimeoutError) as exc:
             raise LockUnavailableError(f"lock is unavailable: {lock_path}") from exc

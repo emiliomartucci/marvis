@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -136,6 +137,138 @@ class ProjectUpdateRequest(BaseModel):
         if not _HEX_COLOR_RE.fullmatch(value):
             raise ValueError("color must be a hex string like '#rrggbb'")
         return value.lower()
+
+
+# --- Project lifecycle / Cloud-F change control (migration 187) ---
+
+
+class ProjectLifecycleRegistrationRequest(BaseModel):
+    """Explicitly register an existing filesystem project with a stable ID."""
+
+    pass
+
+
+class CloudFActivationRequest(BaseModel):
+    subtype: Literal["bootstrap_activation", "existing_live_adoption"]
+    expected_epoch: int = Field(ge=0)
+
+
+class CloudFChangeAcquireRequest(BaseModel):
+    operation_id: str = Field(min_length=1, max_length=128)
+    operation_kind: str = Field(min_length=1, max_length=100)
+    expected_epoch: int = Field(ge=0)
+    lease_expires_at: datetime
+
+
+class CloudFChangeCompleteRequest(BaseModel):
+    operation_id: str = Field(min_length=1, max_length=128)
+    expected_epoch: int = Field(ge=0)
+    advance_epoch: bool = True
+
+
+class ProjectSelectorWatermarkRequest(BaseModel):
+    operation_id: str = Field(min_length=1, max_length=128)
+    expected_epoch: int = Field(ge=0)
+    expected_selector_watermark: str = Field(max_length=256)
+    selector_watermark: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ProjectArchiveApprovalRequest(BaseModel):
+    expected_project_id: str = Field(min_length=5, max_length=80)
+    expected_project_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_f_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    master_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_writer_watermark: int = Field(ge=0)
+    expected_selector_watermark: str = Field(max_length=256)
+    expected_cloud_f_epoch: int = Field(ge=0)
+    expected_active_operations_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expires_at: datetime
+    approval_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class ProjectArchiveRequest(BaseModel):
+    project_id: str = Field(min_length=5, max_length=80)
+    approval_id: str = Field(min_length=1, max_length=128)
+    expected_project_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_f_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    master_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_writer_watermark: int = Field(ge=0)
+    expected_selector_watermark: str = Field(max_length=256)
+    expected_cloud_f_epoch: int = Field(ge=0)
+    expected_active_operations_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    operation_id: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    lease_expires_at: datetime
+
+
+class GovernedDecisionCreateRequest(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=512)
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(max_length=500_000)
+    decision_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+    )
+    operation_id: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    expected_cloud_f_epoch: int = Field(ge=0)
+    lease_expires_at: datetime
+
+
+class GovernedDecisionAcceptRequest(BaseModel):
+    expected_content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    operation_id: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    expected_cloud_f_epoch: int = Field(ge=0)
+    lease_expires_at: datetime
+
+
+class GovernedDecisionSupersedeRequest(BaseModel):
+    source_relative_path: str = Field(min_length=1, max_length=512)
+    expected_source_content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_source_body_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_project_slug: str = Field(
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$",
+    )
+    target_decision_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+    )
+    expected_target_content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    operation_id: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    expected_cloud_f_epoch: int = Field(ge=0)
+    lease_expires_at: datetime
+
+
+class HistoricalArtifactPointerRequest(BaseModel):
+    source_kind: Literal["decision", "handoff", "learning"]
+    source_ref: str = Field(min_length=1, max_length=512)
+    expected_source_body_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    relation: Literal["forward", "applies_to"]
+    target_project_slug: str = Field(
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$",
+    )
+    target_decision_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+    )
+    target_relative_path: str | None = Field(default=None, max_length=512)
+    operation_id: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    expected_cloud_f_epoch: int = Field(ge=0)
+    lease_expires_at: datetime
 
 
 # --- Status Updates ---
