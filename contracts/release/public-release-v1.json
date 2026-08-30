@@ -33,6 +33,7 @@
   "approval_deadline_hours": 24,
   "allowed_release_delta": [
     ".github/workflows/release.yml",
+    ".github/workflows/watchdog-canary.yml",
     "CHANGELOG.md",
     "contracts/ci/collection-v1.json",
     "contracts/release/",
@@ -62,6 +63,7 @@
     "workflow": "release.yml",
     "environment": "pypi",
     "candidate_tag": "v0.4.1",
+    "write_authority_canary_workflow": "watchdog-canary.yml",
     "approval_deadline_hours": 24,
     "late_approval_upload_guard": true
   },

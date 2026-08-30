@@ -73,6 +73,36 @@ class ReleaseCandidateTests(unittest.TestCase):
             "verified_by": "owner",
             "coordinates_sha256": candidate.publisher_coordinates_sha256(policy),
         }
+        write_authority = {
+            "schema": candidate.WATCHDOG_WRITE_AUTHORITY_SCHEMA,
+            "status": "verified",
+            "repository": policy["repository"],
+            "canary_workflow": policy["approval_watchdog"][
+                "write_authority_canary_workflow"
+            ],
+            "environment": policy["github_environment"]["name"],
+            "target_head_sha": self.RELEASE_SOURCE_SHA,
+            "verified_at": now.isoformat(),
+            "verified_by": "github-user:emiliomartucci",
+            "capabilities": {
+                "reject_pending_deployment": {
+                    "status": "verified",
+                    "run_id": 1001,
+                    "run_url": (
+                        "https://github.com/emiliomartucci/marvis/actions/runs/1001"
+                    ),
+                    "observed_state": "rejected",
+                },
+                "cancel_workflow_run": {
+                    "status": "verified",
+                    "run_id": 1002,
+                    "run_url": (
+                        "https://github.com/emiliomartucci/marvis/actions/runs/1002"
+                    ),
+                    "observed_conclusion": "cancelled",
+                },
+            },
+        }
         watchdog = {
             "schema": candidate.EXTERNAL_RECEIPT_SCHEMA,
             "kind": "approval_watchdog",
@@ -87,6 +117,9 @@ class ReleaseCandidateTests(unittest.TestCase):
             "workflow": policy["trusted_publisher"]["workflow"],
             "environment": policy["github_environment"]["name"],
             "candidate_tag": policy["candidate_tag"],
+            "write_authority_canary_workflow": policy["approval_watchdog"][
+                "write_authority_canary_workflow"
+            ],
             "approval_deadline_hours": policy["approval_deadline_hours"],
             "late_approval_upload_guard": True,
             "target_head_sha": self.RELEASE_SOURCE_SHA,
@@ -96,6 +129,10 @@ class ReleaseCandidateTests(unittest.TestCase):
                 "tag": "release-watchdog-041",
                 "timestamp": now.isoformat(),
             },
+            "write_authority": write_authority,
+            "write_authority_sha256": candidate._sha_bytes(
+                candidate._canonical(write_authority)
+            ),
         }
         return trusted, watchdog
 
@@ -543,6 +580,10 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertEqual(
             set(summaries), {"trusted_publisher", "approval_watchdog"}
         )
+        self.assertEqual(
+            summaries["approval_watchdog"]["write_authority_sha256"],
+            watchdog["write_authority_sha256"],
+        )
 
     def test_watchdog_for_another_tag_is_rejected(self) -> None:
         now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
@@ -616,6 +657,102 @@ class ReleaseCandidateTests(unittest.TestCase):
                 trusted_publisher_receipt=trusted,
                 approval_watchdog_receipt=watchdog,
             )
+
+    def test_watchdog_requires_persisted_write_authority_proof(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog.pop("write_authority")
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "write-authority proof"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_write_authority_is_bound_to_the_release_source(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog["write_authority"]["target_head_sha"] = "b" * 40
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "coordinates"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_write_authority_requires_distinct_canary_runs(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        cancel = watchdog["write_authority"]["capabilities"]["cancel_workflow_run"]
+        cancel["run_id"] = 1001
+        cancel["run_url"] = "https://github.com/emiliomartucci/marvis/actions/runs/1001"
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "run identity"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_write_authority_proof_expires_after_24_hours(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog["write_authority"]["verified_at"] = (
+            now - timedelta(hours=25)
+        ).isoformat()
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "stale or unordered"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_write_authority_digest_is_immutable(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog["write_authority_sha256"] = "0" * 64
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "digest"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_write_authority_canary_workflow_is_bounded_and_non_publishing(self) -> None:
+        workflow_path = ROOT / ".github/workflows/watchdog-canary.yml"
+        workflow = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(
+            set(workflow["jobs"]),
+            {"reject-pending-deployment", "cancel-workflow-run"},
+        )
+        self.assertEqual(
+            workflow["jobs"]["reject-pending-deployment"]["environment"], "pypi"
+        )
+        self.assertEqual(
+            workflow["jobs"]["reject-pending-deployment"]["timeout-minutes"], "1"
+        )
+        self.assertEqual(
+            workflow["jobs"]["cancel-workflow-run"]["timeout-minutes"], "2"
+        )
+        source = workflow_path.read_text(encoding="utf-8")
+        self.assertNotIn("uses:", source)
+        self.assertNotIn("publish", source.lower())
 
     def test_manifest_byte_tamper_is_rejected(self) -> None:
         with self.active_candidate_for_unit_test(), tempfile.TemporaryDirectory(

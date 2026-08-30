@@ -1,0 +1,47 @@
+name: OSS release watchdog write-authority canary
+
+run-name: watchdog-canary-${{ inputs.mode }}-${{ inputs.nonce }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Exact write capability to prove
+        required: true
+        type: choice
+        options:
+          - reject-pending-deployment
+          - cancel-workflow-run
+      nonce:
+        description: Operator-generated correlation id
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watchdog-write-authority-${{ inputs.mode }}-${{ inputs.nonce }}
+  cancel-in-progress: false
+
+jobs:
+  reject-pending-deployment:
+    if: inputs.mode == 'reject-pending-deployment'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    environment: pypi
+    steps:
+      - name: Fail if the protected deployment is approved instead of rejected
+        run: exit 1
+
+  cancel-workflow-run:
+    if: inputs.mode == 'cancel-workflow-run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Wait for the watchdog token to cancel this exact run
+        run: |
+          for attempt in {1..24}; do
+            sleep 5
+          done
+          exit 1

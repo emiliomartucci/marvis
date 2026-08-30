@@ -41,6 +41,7 @@ POLICY_SCHEMA = "marvis-public-release-policy/v1"
 MANIFEST_SCHEMA = "marvis-public-release-manifest/v1"
 ACCEPTANCE_SCHEMA = "marvis-public-release-acceptance/v1"
 EXTERNAL_RECEIPT_SCHEMA = "marvis-external-release-receipt/v1"
+WATCHDOG_WRITE_AUTHORITY_SCHEMA = "marvis-watchdog-write-authority/v1"
 POLICY_PATH = Path("contracts/release/public-release-v1.json")
 WORKFLOW_PATH = Path(".github/workflows/release.yml")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -631,6 +632,73 @@ def _strict_external_receipts(
         raise ReleasePolicyError("approval watchdog receipt is stale")
     if not watchdog.get("verified_by"):
         raise ReleasePolicyError("approval watchdog receipt has no verifier")
+    write_authority = watchdog.get("write_authority")
+    if not isinstance(write_authority, dict):
+        raise ReleasePolicyError("approval watchdog has no write-authority proof")
+    expected_canary_workflow = expected_watchdog.get(
+        "write_authority_canary_workflow"
+    )
+    expected_verifier = (
+        f"github-user:{policy['github_environment']['required_reviewer_login']}"
+    )
+    expected_proof_coordinates = {
+        "schema": WATCHDOG_WRITE_AUTHORITY_SCHEMA,
+        "status": "verified",
+        "repository": expected_watchdog.get("repository"),
+        "canary_workflow": expected_canary_workflow,
+        "environment": expected_watchdog.get("environment"),
+        "target_head_sha": release_source_sha,
+        "verified_by": expected_verifier,
+    }
+    observed_proof_coordinates = {
+        key: write_authority.get(key) for key in expected_proof_coordinates
+    }
+    if observed_proof_coordinates != expected_proof_coordinates:
+        raise ReleasePolicyError("watchdog write-authority coordinates do not match")
+    proof_verified_at = _parse_time(
+        str(write_authority.get("verified_at") or "")
+    )
+    proof_age = (current - proof_verified_at).total_seconds()
+    if (
+        proof_age < 0
+        or proof_age > 24 * 3600
+        or proof_verified_at > watchdog_verified_at
+    ):
+        raise ReleasePolicyError("watchdog write-authority proof is stale or unordered")
+    capabilities = write_authority.get("capabilities")
+    if not isinstance(capabilities, dict) or set(capabilities) != {
+        "reject_pending_deployment",
+        "cancel_workflow_run",
+    }:
+        raise ReleasePolicyError("watchdog write-authority capabilities are incomplete")
+    reject_proof = capabilities["reject_pending_deployment"]
+    cancel_proof = capabilities["cancel_workflow_run"]
+    if not isinstance(reject_proof, dict) or not isinstance(cancel_proof, dict):
+        raise ReleasePolicyError("watchdog write-authority capability proof is invalid")
+    reject_run_id = reject_proof.get("run_id")
+    cancel_run_id = cancel_proof.get("run_id")
+    if any(
+        isinstance(run_id, bool)
+        or not isinstance(run_id, int)
+        or run_id <= 0
+        for run_id in (reject_run_id, cancel_run_id)
+    ) or reject_run_id == cancel_run_id:
+        raise ReleasePolicyError("watchdog write-authority run identity is invalid")
+    expected_run_url = (
+        f"https://github.com/{expected_watchdog.get('repository')}/actions/runs/"
+    )
+    if (
+        reject_proof.get("status") != "verified"
+        or reject_proof.get("observed_state") != "rejected"
+        or reject_proof.get("run_url") != f"{expected_run_url}{reject_run_id}"
+        or cancel_proof.get("status") != "verified"
+        or cancel_proof.get("observed_conclusion") != "cancelled"
+        or cancel_proof.get("run_url") != f"{expected_run_url}{cancel_run_id}"
+    ):
+        raise ReleasePolicyError("watchdog write-authority readback is invalid")
+    write_authority_sha256 = _sha_bytes(_canonical(write_authority))
+    if watchdog.get("write_authority_sha256") != write_authority_sha256:
+        raise ReleasePolicyError("watchdog write-authority digest does not match")
     active_until = _parse_time(str(watchdog.get("active_until") or ""))
     required_until = current + timedelta(
         hours=int(policy["approval_deadline_hours"])
@@ -677,6 +745,7 @@ def _strict_external_receipts(
             "target_head_sha": watchdog["target_head_sha"],
             "active_until": watchdog["active_until"],
             "worker_version": worker_version,
+            "write_authority_sha256": write_authority_sha256,
         },
     }
     return summaries
