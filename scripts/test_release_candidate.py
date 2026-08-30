@@ -25,6 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseCandidateTests(unittest.TestCase):
+    RELEASE_SOURCE_SHA = "a" * 40
+
     def policy(self) -> dict:
         return copy.deepcopy(candidate.load_policy(ROOT))
 
@@ -75,7 +77,10 @@ class ReleaseCandidateTests(unittest.TestCase):
             "schema": candidate.EXTERNAL_RECEIPT_SCHEMA,
             "kind": "approval_watchdog",
             "status": "ready",
-            "receipt_ref": "ledger:receipt",
+            "receipt_ref": (
+                "cloudflare-worker://marvis-oss-release-watchdog-041/"
+                f"worker-version-123/{'d' * 64}"
+            ),
             "verified_at": now.isoformat(),
             "verified_by": "owner",
             "repository": policy["repository"],
@@ -84,6 +89,13 @@ class ReleaseCandidateTests(unittest.TestCase):
             "candidate_tag": policy["candidate_tag"],
             "approval_deadline_hours": policy["approval_deadline_hours"],
             "late_approval_upload_guard": True,
+            "target_head_sha": self.RELEASE_SOURCE_SHA,
+            "active_until": (now + timedelta(hours=49)).isoformat(),
+            "worker_version": {
+                "id": "worker-version-123",
+                "tag": "release-watchdog-041",
+                "timestamp": now.isoformat(),
+            },
         }
         return trusted, watchdog
 
@@ -500,7 +512,9 @@ class ReleaseCandidateTests(unittest.TestCase):
         with mock.patch.dict(candidate.os.environ, {}, clear=True), self.assertRaisesRegex(
             candidate.ReleasePolicyError, "receipt is absent"
         ):
-            candidate._strict_external_receipts(self.policy())
+            candidate._strict_external_receipts(
+                self.policy(), release_source_sha=self.RELEASE_SOURCE_SHA
+            )
 
     def test_external_receipt_expires_after_24_hours(self) -> None:
         now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
@@ -509,6 +523,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "stale"):
             candidate._strict_external_receipts(
                 policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
                 now=now,
                 trusted_publisher_receipt=trusted,
                 approval_watchdog_receipt=watchdog,
@@ -520,6 +535,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         trusted, watchdog = self.external_receipts(now - timedelta(minutes=5), policy)
         summaries = candidate._strict_external_receipts(
             policy,
+            release_source_sha=self.RELEASE_SOURCE_SHA,
             now=now,
             trusted_publisher_receipt=trusted,
             approval_watchdog_receipt=watchdog,
@@ -536,6 +552,66 @@ class ReleaseCandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "coordinates"):
             candidate._strict_external_receipts(
                 policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_for_another_release_source_is_rejected(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog["target_head_sha"] = "b" * 40
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "another release source"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_must_cover_the_full_remaining_approval_window(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog["active_until"] = (now + timedelta(hours=23, minutes=59)).isoformat()
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "full approval window"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_receipt_requires_worker_version_identity(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog.pop("worker_version")
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "Worker version identity"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_receipt_ref_binds_worker_version(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog["receipt_ref"] = (
+            "cloudflare-worker://marvis-oss-release-watchdog-041/"
+            f"another-worker/{'e' * 64}"
+        )
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "bind its Worker version"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
                 now=now,
                 trusted_publisher_receipt=trusted,
                 approval_watchdog_receipt=watchdog,
