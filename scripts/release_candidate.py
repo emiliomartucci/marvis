@@ -8,7 +8,7 @@ publisher, and an external 24-hour approval-watchdog receipt before upload.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.parser import Parser
 import hashlib
 import importlib.metadata
@@ -592,11 +592,14 @@ def _external_receipts(
 def _strict_external_receipts(
     policy: dict[str, Any],
     *,
+    release_source_sha: str,
     now: datetime | None = None,
     trusted_publisher_receipt: dict[str, Any] | None = None,
     approval_watchdog_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if not SHA40.fullmatch(release_source_sha):
+        raise ReleasePolicyError("release source SHA for external receipts is invalid")
     if trusted_publisher_receipt is None or approval_watchdog_receipt is None:
         trusted_publisher_receipt, approval_watchdog_receipt = _external_receipts()
     readback = trusted_publisher_receipt
@@ -620,12 +623,45 @@ def _strict_external_receipts(
     observed_watchdog = {key: watchdog.get(key) for key in expected_watchdog}
     if observed_watchdog != expected_watchdog:
         raise ReleasePolicyError("approval watchdog receipt coordinates do not match policy")
+    if watchdog.get("target_head_sha") != release_source_sha:
+        raise ReleasePolicyError("approval watchdog targets another release source")
     watchdog_verified_at = _parse_time(str(watchdog.get("verified_at") or ""))
     watchdog_age = (current - watchdog_verified_at).total_seconds()
     if watchdog_age < 0 or watchdog_age > 24 * 3600:
         raise ReleasePolicyError("approval watchdog receipt is stale")
     if not watchdog.get("verified_by"):
         raise ReleasePolicyError("approval watchdog receipt has no verifier")
+    active_until = _parse_time(str(watchdog.get("active_until") or ""))
+    required_until = current + timedelta(
+        hours=int(policy["approval_deadline_hours"])
+    )
+    if active_until < required_until:
+        raise ReleasePolicyError(
+            "approval watchdog does not cover the full approval window"
+        )
+    worker_version = watchdog.get("worker_version")
+    if not isinstance(worker_version, dict):
+        raise ReleasePolicyError("approval watchdog has no Worker version identity")
+    worker_version_id = worker_version.get("id")
+    worker_version_timestamp = worker_version.get("timestamp")
+    if not isinstance(worker_version_id, str) or not worker_version_id.strip():
+        raise ReleasePolicyError("approval watchdog Worker version id is invalid")
+    if not isinstance(worker_version_timestamp, str):
+        raise ReleasePolicyError("approval watchdog Worker version timestamp is invalid")
+    _parse_time(worker_version_timestamp)
+    expected_receipt_prefix = (
+        "cloudflare-worker://marvis-oss-release-watchdog-041/"
+        f"{worker_version_id}/"
+    )
+    receipt_ref = str(watchdog["receipt_ref"])
+    receipt_digest = receipt_ref.removeprefix(expected_receipt_prefix)
+    if (
+        not receipt_ref.startswith(expected_receipt_prefix)
+        or not SHA256.fullmatch(receipt_digest)
+    ):
+        raise ReleasePolicyError(
+            "approval watchdog receipt does not bind its Worker version"
+        )
     summaries = {
         "trusted_publisher": {
             "sha256": _sha_bytes(_canonical(readback)),
@@ -637,7 +673,10 @@ def _strict_external_receipts(
             "sha256": _sha_bytes(_canonical(watchdog)),
             "verified_at": watchdog["verified_at"],
             "verified_by": watchdog["verified_by"],
-            "receipt_ref": watchdog["receipt_ref"],
+            "receipt_ref": receipt_ref,
+            "target_head_sha": watchdog["target_head_sha"],
+            "active_until": watchdog["active_until"],
+            "worker_version": worker_version,
         },
     }
     return summaries
@@ -1115,7 +1154,9 @@ def preflight(
     report = validate_static(root)
     policy = load_policy(root)
     _require_release_controls_committed(root, report["release_source_sha"])
-    external_receipts = _strict_external_receipts(policy)
+    external_receipts = _strict_external_receipts(
+        policy, release_source_sha=report["release_source_sha"]
+    )
     shared_source = _shared_source_readback(
         root, policy, token=token, api_url=api_url
     )
@@ -1174,7 +1215,9 @@ def tag_preflight(
     report = validate_static(root, tag_build=True)
     policy = load_policy(root)
     _require_release_controls_committed(root, report["release_source_sha"])
-    external_receipts = _strict_external_receipts(policy)
+    external_receipts = _strict_external_receipts(
+        policy, release_source_sha=report["release_source_sha"]
+    )
     shared_source = _shared_source_readback(
         root, policy, token=token, api_url=api_url
     )
@@ -1231,7 +1274,9 @@ def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -
     report = validate_static(root, tag_build=True)
     policy = load_policy(root)
     _require_release_controls_committed(root, report["release_source_sha"])
-    external_receipts = _strict_external_receipts(policy)
+    external_receipts = _strict_external_receipts(
+        policy, release_source_sha=report["release_source_sha"]
+    )
     shared_source = _shared_source_readback(
         root, policy, token=token, api_url=api_url
     )
@@ -1375,7 +1420,7 @@ def build_manifest(
         or os.environ.get(_APPROVAL_WATCHDOG_RECEIPT_ENV)
     )
     external_receipts = (
-        _strict_external_receipts(policy)
+        _strict_external_receipts(policy, release_source_sha=resolved_head)
         if tag_exists or receipt_env_present
         else None
     )
@@ -1778,7 +1823,9 @@ def build_acceptance_receipt(
     verify_manifest(root, github_dist / manifest_path.name, github_dist)
     registry = registry_verify(manifest_path, attempts=1, delay_seconds=0)
     policy = load_policy(root)
-    external_receipts = _strict_external_receipts(policy, now=now)
+    external_receipts = _strict_external_receipts(
+        policy, release_source_sha=source_sha, now=now
+    )
     shared_source = _shared_source_readback(
         root, policy, token=token, api_url=api_url
     )
@@ -1880,9 +1927,14 @@ def publish_window(
     now: datetime | None = None,
     api_url: str = "https://api.github.com",
 ) -> dict[str, Any]:
-    policy = load_policy(root)
-    external_receipts = _strict_external_receipts(policy, now=now)
     manifest = _validated_manifest(manifest_path)
+    source_sha = str(manifest.get("release_source_sha") or "")
+    if not SHA40.fullmatch(source_sha):
+        raise ReleasePolicyError("release manifest source is invalid")
+    policy = load_policy(root)
+    external_receipts = _strict_external_receipts(
+        policy, release_source_sha=source_sha, now=now
+    )
     shared_source = _shared_source_readback(
         root, policy, token=token, api_url=api_url
     )
