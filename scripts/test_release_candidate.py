@@ -82,11 +82,14 @@ class ReleaseCandidateTests(unittest.TestCase):
             ],
             "environment": policy["github_environment"]["name"],
             "target_head_sha": self.RELEASE_SOURCE_SHA,
+            "nonce": "watchdog-20260830-a1b2c3d4",
             "verified_at": now.isoformat(),
             "verified_by": "github-user:emiliomartucci",
             "capabilities": {
                 "reject_pending_deployment": {
                     "status": "verified",
+                    "mode": "reject-pending-deployment",
+                    "nonce": "watchdog-20260830-a1b2c3d4",
                     "run_id": 1001,
                     "run_url": (
                         "https://github.com/emiliomartucci/marvis/actions/runs/1001"
@@ -95,12 +98,19 @@ class ReleaseCandidateTests(unittest.TestCase):
                 },
                 "cancel_workflow_run": {
                     "status": "verified",
+                    "mode": "cancel-workflow-run",
+                    "nonce": "watchdog-20260830-a1b2c3d4",
                     "run_id": 1002,
                     "run_url": (
                         "https://github.com/emiliomartucci/marvis/actions/runs/1002"
                     ),
                     "observed_conclusion": "cancelled",
                 },
+            },
+            "worker_attestation": {
+                "algorithm": "HMAC-SHA256",
+                "worker_version_id": "worker-canary-version-122",
+                "signature": "a" * 64,
             },
         }
         watchdog = {
@@ -694,6 +704,50 @@ class ReleaseCandidateTests(unittest.TestCase):
         cancel["run_id"] = 1001
         cancel["run_url"] = "https://github.com/emiliomartucci/marvis/actions/runs/1001"
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "run identity"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_write_authority_binds_modes_to_one_nonce(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        reject = watchdog["write_authority"]["capabilities"][
+            "reject_pending_deployment"
+        ]
+        reject["nonce"] = "watchdog-20260830-different"
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "readback"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog["write_authority"]["capabilities"]["cancel_workflow_run"][
+            "mode"
+        ] = "reject-pending-deployment"
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "readback"):
+            candidate._strict_external_receipts(
+                policy,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                now=now,
+                trusted_publisher_receipt=trusted,
+                approval_watchdog_receipt=watchdog,
+            )
+
+    def test_watchdog_write_authority_requires_worker_attestation(self) -> None:
+        now = datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+        policy = self.policy()
+        trusted, watchdog = self.external_receipts(now, policy)
+        watchdog["write_authority"]["worker_attestation"]["signature"] = "bad"
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "attestation"):
             candidate._strict_external_receipts(
                 policy,
                 release_source_sha=self.RELEASE_SOURCE_SHA,

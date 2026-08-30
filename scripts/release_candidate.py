@@ -635,6 +635,20 @@ def _strict_external_receipts(
     write_authority = watchdog.get("write_authority")
     if not isinstance(write_authority, dict):
         raise ReleasePolicyError("approval watchdog has no write-authority proof")
+    if set(write_authority) != {
+        "schema",
+        "status",
+        "repository",
+        "canary_workflow",
+        "environment",
+        "target_head_sha",
+        "nonce",
+        "verified_at",
+        "verified_by",
+        "capabilities",
+        "worker_attestation",
+    }:
+        raise ReleasePolicyError("watchdog write-authority proof shape is invalid")
     expected_canary_workflow = expected_watchdog.get(
         "write_authority_canary_workflow"
     )
@@ -655,6 +669,11 @@ def _strict_external_receipts(
     }
     if observed_proof_coordinates != expected_proof_coordinates:
         raise ReleasePolicyError("watchdog write-authority coordinates do not match")
+    proof_nonce = write_authority.get("nonce")
+    if not isinstance(proof_nonce, str) or re.fullmatch(
+        r"[A-Za-z0-9_-]{16,64}", proof_nonce
+    ) is None:
+        raise ReleasePolicyError("watchdog write-authority nonce is invalid")
     proof_verified_at = _parse_time(
         str(write_authority.get("verified_at") or "")
     )
@@ -675,6 +694,22 @@ def _strict_external_receipts(
     cancel_proof = capabilities["cancel_workflow_run"]
     if not isinstance(reject_proof, dict) or not isinstance(cancel_proof, dict):
         raise ReleasePolicyError("watchdog write-authority capability proof is invalid")
+    if set(reject_proof) != {
+        "status",
+        "mode",
+        "nonce",
+        "run_id",
+        "run_url",
+        "observed_state",
+    } or set(cancel_proof) != {
+        "status",
+        "mode",
+        "nonce",
+        "run_id",
+        "run_url",
+        "observed_conclusion",
+    }:
+        raise ReleasePolicyError("watchdog write-authority capability proof is invalid")
     reject_run_id = reject_proof.get("run_id")
     cancel_run_id = cancel_proof.get("run_id")
     if any(
@@ -689,13 +724,34 @@ def _strict_external_receipts(
     )
     if (
         reject_proof.get("status") != "verified"
+        or reject_proof.get("mode") != "reject-pending-deployment"
+        or reject_proof.get("nonce") != proof_nonce
         or reject_proof.get("observed_state") != "rejected"
         or reject_proof.get("run_url") != f"{expected_run_url}{reject_run_id}"
         or cancel_proof.get("status") != "verified"
+        or cancel_proof.get("mode") != "cancel-workflow-run"
+        or cancel_proof.get("nonce") != proof_nonce
         or cancel_proof.get("observed_conclusion") != "cancelled"
         or cancel_proof.get("run_url") != f"{expected_run_url}{cancel_run_id}"
     ):
         raise ReleasePolicyError("watchdog write-authority readback is invalid")
+    worker_attestation = write_authority.get("worker_attestation")
+    if not isinstance(worker_attestation, dict) or set(worker_attestation) != {
+        "algorithm",
+        "worker_version_id",
+        "signature",
+    }:
+        raise ReleasePolicyError("watchdog write-authority attestation is invalid")
+    attestation_version = worker_attestation.get("worker_version_id")
+    attestation_signature = worker_attestation.get("signature")
+    if (
+        worker_attestation.get("algorithm") != "HMAC-SHA256"
+        or not isinstance(attestation_version, str)
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,128}", attestation_version) is None
+        or not isinstance(attestation_signature, str)
+        or SHA256.fullmatch(attestation_signature) is None
+    ):
+        raise ReleasePolicyError("watchdog write-authority attestation is invalid")
     write_authority_sha256 = _sha_bytes(_canonical(write_authority))
     if watchdog.get("write_authority_sha256") != write_authority_sha256:
         raise ReleasePolicyError("watchdog write-authority digest does not match")
