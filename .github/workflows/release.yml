@@ -229,6 +229,7 @@ jobs:
       - name: Create a draft and upload only manifested files
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
@@ -546,6 +547,7 @@ jobs:
       - name: Publish, read back and finalize the verified GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release upload "$GITHUB_REF_NAME" acceptance/release-acceptance.json

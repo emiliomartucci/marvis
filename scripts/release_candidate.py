@@ -988,6 +988,7 @@ def validate_static(
         "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT",
         "MARVIS_APPROVAL_WATCHDOG_RECEIPT",
         "MARVIS_SHARED_SOURCE_OWNER_RECEIPT",
+        "GH_REPO: ${{ github.repository }}",
         "environment: pypi",
         "pypa/gh-action-pypi-publish@" + expected_pins.get("pypa/gh-action-pypi-publish", ""),
     )
@@ -1021,6 +1022,7 @@ def validate_static(
         "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT: ${{ vars.MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT }}",
         "MARVIS_APPROVAL_WATCHDOG_RECEIPT: ${{ vars.MARVIS_APPROVAL_WATCHDOG_RECEIPT }}",
         "MARVIS_SHARED_SOURCE_OWNER_RECEIPT: ${{ vars.MARVIS_SHARED_SOURCE_OWNER_RECEIPT }}",
+        "GH_REPO: ${{ github.repository }}",
         "if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && (needs.build.result != 'success' || needs.release-record.result != 'success' || needs.prepublish.result != 'success' || needs.pypi.result != 'success' || needs.accept.result != 'success' || needs.finalize.result != 'success') }}",
         'echo "::error::Refusing to mutate an already-final GitHub Release."',
         'echo "::error::The failed candidate exists on PyPI; owner verification and yank are required."',
@@ -1043,6 +1045,12 @@ def validate_static(
     if not contain_guard.startswith("${{ always() && github.event_name == 'push'"):
         raise ReleasePolicyError("contain is not confined to a tag-push event")
     blocks = _workflow_job_blocks(workflow)
+    for repository_bound_job in ("release-record", "finalize"):
+        block = blocks.get(repository_bound_job) or ""
+        if "GH_REPO: ${{ github.repository }}" not in block:
+            raise ReleasePolicyError(
+                f"{repository_bound_job} lacks explicit GitHub repository context"
+            )
     for privileged_job in ("release-record", "pypi", "finalize"):
         block = blocks.get(privileged_job) or ""
         if "actions/checkout@" in block or "scripts/" in block or "pip install" in block:

@@ -8,23 +8,31 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 No changes yet.
 
-## [0.4.3] - candidate
+## [0.4.4] - candidate
 
-Recovery candidate for the same reviewed public/shared source as 0.4.2. It
+Recovery candidate for the same reviewed public/shared source as 0.4.3. It
 keeps product behavior unchanged and repairs only the immutable release path.
 
 ### Fixed
 
-- Isolated unit tests from both CI tag variables and real tags already present
-  in the shared Git object store.
-- Checked out the immutable tag before failed-release containment so GitHub can
-  verify the existing tag without creating or moving one.
-- Recorded every failed immutable version explicitly; 0.4.1 and 0.4.2 cannot
-  be reused.
+- Bound the checkout-free draft-release job to the exact GitHub repository so
+  GitHub CLI does not depend on a local Git directory.
+- Added a regression contract for that explicit repository context.
+- Recorded every failed immutable version explicitly; 0.4.1, 0.4.2 and 0.4.3
+  cannot be reused.
 
-This section describes a release candidate only. Version 0.4.3 is not
+This section describes a release candidate only. Version 0.4.4 is not
 published until the separate tag, PyPI and post-publication acceptance gates
 all succeed.
+
+## [0.4.3] - 2026-08-31 (failed, not published)
+
+The exact package candidate built and passed its package checks. The next job
+could not create the draft GitHub Release because its intentionally
+checkout-free environment did not provide GitHub CLI with explicit repository
+context. Automatic containment created a draft prerelease marked
+`FAILED - DO NOT INSTALL`; no files reached PyPI. Version 0.4.3 is burned and
+must never be reused.
 
 ## [0.4.2] - 2026-08-31 (failed, not published)
 
