@@ -44,7 +44,7 @@
     {
       "path": "scripts",
       "pattern": "test_*.py",
-      "minimum_collected": 209,
+      "minimum_collected": 228,
       "allowed_skips": 0,
       "required_node_suffixes": [
         "CompatibilityContractTests.test_current_contract_passes",
