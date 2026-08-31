@@ -22,7 +22,15 @@
     "engine_pin": "contracts/engine-pin.yaml"
   },
   "candidate_state": {
-    "status": "active"
+    "status": "released",
+    "version": "0.4.8",
+    "tag": "v0.4.8",
+    "release_source_sha": "6184db50da31b7bea79d5b45087f6313445c6fdc",
+    "publication_run_id": 33444091968,
+    "publication_run_conclusion": "failure_after_registry_publication",
+    "acceptance_mode": "exact_candidate_local_acceptance_no_republish",
+    "acceptance_content_digest": "fe9c9964018950a1555c8fcd00b0e2f218962f4e60a3ad2fb907a255d9ad8c6b",
+    "published_at": "2026-08-31T22:21:39Z"
   },
   "candidate_version": "0.4.8",
   "candidate_tag": "v0.4.8",

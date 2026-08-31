@@ -72,7 +72,7 @@ jobs:
           elif [[ "${{ steps.candidate.outputs.status }}" == "active" ]]; then
             python scripts/release_candidate.py static
           elif [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
-            echo "::error::The release candidate is invalidated; only pull-request validation may stop before build."
+            echo "::error::The release candidate is not active; only pull-request validation may stop before build."
             exit 1
           fi
           python scripts/validate_surfaces.py
@@ -551,6 +551,8 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.13"
+      - name: Install pinned acceptance helpers
+        run: pip install --require-hashes -r requirements-release.lock
       - name: Download the exact candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:

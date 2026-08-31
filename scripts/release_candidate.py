@@ -156,6 +156,46 @@ def _candidate_state(
         if set(state) != {"status"}:
             raise ReleasePolicyError("active candidate state contains stale evidence")
         return {"status": "active"}
+    released_keys = {
+        "status",
+        "version",
+        "tag",
+        "release_source_sha",
+        "publication_run_id",
+        "publication_run_conclusion",
+        "acceptance_mode",
+        "acceptance_content_digest",
+        "published_at",
+    }
+    if status == "released":
+        if set(state) != released_keys:
+            raise ReleasePolicyError("released candidate state is invalid")
+        source_sha = str(state.get("release_source_sha") or "")
+        acceptance_digest = str(state.get("acceptance_content_digest") or "")
+        run_id = state.get("publication_run_id")
+        published_at = str(state.get("published_at") or "")
+        try:
+            parsed_published_at = datetime.fromisoformat(
+                published_at.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ReleasePolicyError("released candidate timestamp is invalid") from exc
+        if (
+            state.get("version") != policy.get("candidate_version")
+            or state.get("tag") != policy.get("candidate_tag")
+            or not SHA40.fullmatch(source_sha)
+            or not SHA256.fullmatch(acceptance_digest)
+            or isinstance(run_id, bool)
+            or not isinstance(run_id, int)
+            or run_id <= 0
+            or state.get("publication_run_conclusion")
+            != "failure_after_registry_publication"
+            or state.get("acceptance_mode")
+            != "exact_candidate_local_acceptance_no_republish"
+            or parsed_published_at.tzinfo is None
+        ):
+            raise ReleasePolicyError("released candidate evidence is inconsistent")
+        return {key: state[key] for key in released_keys}
     expected_keys = {
         "status",
         "reason",
@@ -885,6 +925,10 @@ def validate_static(
         raise ReleasePolicyError(
             "release candidate is invalidated; merge the product projection "
             "and refresh the exact release foundation"
+        )
+    if candidate_state["status"] == "released":
+        raise ReleasePolicyError(
+            "release candidate is already released; activate a new version before building"
         )
     receipt_policy = policy.get("external_receipts") or {}
     if (
