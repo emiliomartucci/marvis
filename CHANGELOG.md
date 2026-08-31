@@ -8,7 +8,7 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 No changes yet.
 
-## [0.4.1] - candidate
+## [0.4.2] - candidate
 
 Security and provenance refresh based on the exact merged Plan B product base
 and the separately pinned CI evidence foundation from PR #61. The release
@@ -26,9 +26,22 @@ shared engine and its regression coverage.
   database migrations and temporary compatibility tombstones remain.
 - Expanded Python 3.10-3.13, Linux, macOS and Windows install and upgrade proof.
 
-This section describes a release candidate only. Version 0.4.1 is not
+### Fixed
+
+- Isolated release unit tests from live GitHub tag variables so a tag run does
+  not accidentally enter publication mode.
+- Made failed GitHub Release lookups branch on the API exit status instead of
+  treating an error payload as an existing final release.
+
+This section describes a release candidate only. Version 0.4.2 is not
 published until the separate tag, PyPI and post-publication acceptance gates
 all succeed.
+
+## [0.4.1] - 2026-08-31 (failed, not published)
+
+The immutable tag exists, but the tag workflow stopped before the expensive
+build because unit tests inherited the live tag context. No GitHub Release or
+PyPI file was created. Version 0.4.1 is burned and must never be reused.
 
 ## [0.4.0] - 2026-06-19 (tentativo fallito, non pubblicato)
 
