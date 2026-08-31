@@ -72,7 +72,7 @@ jobs:
           elif [[ "${{ steps.candidate.outputs.status }}" == "active" ]]; then
             python scripts/release_candidate.py static
           elif [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
-            echo "::error::The release candidate is invalidated; only pull-request validation may stop before build."
+            echo "::error::The release candidate is not active; only pull-request validation may stop before build."
             exit 1
           fi
           python scripts/validate_surfaces.py

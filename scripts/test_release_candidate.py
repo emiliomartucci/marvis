@@ -215,7 +215,8 @@ class ReleaseCandidateTests(unittest.TestCase):
         }
 
     def test_real_release_candidate_static_policy(self) -> None:
-        report = candidate.validate_static(ROOT)
+        with self.active_candidate_for_unit_test():
+            report = candidate.validate_static(ROOT)
         self.assertEqual(report["status"], "static_green_external_gates_open")
         self.assertEqual(report["version"], "0.4.8")
         self.assertEqual(report["release_branch"], "main")
@@ -244,7 +245,18 @@ class ReleaseCandidateTests(unittest.TestCase):
             "8dfd16e4e275b69435e0348258daf86f67898997",
         )
         self.assertEqual(len(report["action_pins"]), 5)
-        self.assertEqual(candidate.candidate_state_report(ROOT)["status"], "active")
+        released = candidate.candidate_state_report(ROOT)
+        self.assertEqual(released["status"], "released")
+        self.assertEqual(
+            released["state"]["release_source_sha"],
+            "6184db50da31b7bea79d5b45087f6313445c6fdc",
+        )
+        self.assertEqual(
+            released["state"]["acceptance_content_digest"],
+            "fe9c9964018950a1555c8fcd00b0e2f218962f4e60a3ad2fb907a255d9ad8c6b",
+        )
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "already released"):
+            candidate.validate_static(ROOT)
 
     def test_product_projection_precedes_release_activation(self) -> None:
         policy = self.policy()
@@ -274,9 +286,37 @@ class ReleaseCandidateTests(unittest.TestCase):
                 state["invalidated_by_shared_source_sha"],
                 shared_source["merge_sha"],
             )
-        else:
+        elif state["status"] == "active":
             self.assertEqual(state["status"], "active")
             self.assertEqual(policy["plan_b_product_base_sha"], projection_merge)
+        else:
+            self.assertEqual(state["status"], "released")
+            released_ancestry = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(ROOT),
+                    "merge-base",
+                    "--is-ancestor",
+                    state["release_source_sha"],
+                    "HEAD",
+                ],
+                capture_output=True,
+            )
+            self.assertEqual(released_ancestry.returncode, 0)
+
+    def test_released_candidate_requires_closed_acceptance_evidence(self) -> None:
+        policy = self.policy()
+        shared_source = candidate._shared_source_coordinates(ROOT, policy)
+        self.assertEqual(
+            candidate._candidate_state(policy, shared_source=shared_source)["status"],
+            "released",
+        )
+        policy["candidate_state"]["acceptance_content_digest"] = "0" * 63
+        with self.assertRaisesRegex(
+            candidate.ReleasePolicyError, "released candidate evidence is inconsistent"
+        ):
+            candidate._candidate_state(policy, shared_source=shared_source)
 
     def test_candidate_invalidation_cannot_name_an_unrelated_source(self) -> None:
         policy = self.policy()
@@ -294,7 +334,7 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_active_candidate_cannot_keep_stale_invalidation_evidence(self) -> None:
         policy = self.policy()
-        policy["candidate_state"]["reason"] = "stale"
+        policy["candidate_state"] = {"status": "active", "reason": "stale"}
         shared_source = candidate._shared_source_coordinates(ROOT, policy)
         with self.assertRaisesRegex(
             candidate.ReleasePolicyError, "active candidate state contains stale evidence"
@@ -1197,8 +1237,10 @@ class ReleaseCandidateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="release-foundation-manifest-") as raw:
             dist = Path(raw) / "dist"
             self.write_release_artifacts(dist)
-            if state["status"] == "invalidated":
-                with self.assertRaisesRegex(candidate.ReleasePolicyError, "invalidated"):
+            if state["status"] != "active":
+                with self.assertRaisesRegex(
+                    candidate.ReleasePolicyError, "invalidated|already released"
+                ):
                     candidate.build_manifest(ROOT, dist)
                 return
             manifest = candidate.build_manifest(ROOT, dist)
