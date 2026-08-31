@@ -26,7 +26,7 @@ class CICollectionContractTests(unittest.TestCase):
         # 444 API + 32 CLI tests from a clean checkout. Keep this independent
         # from generated Console assets and other local build by-products.
         self.assertGreaterEqual(result["pytest_collected"], 476)
-        self.assertGreaterEqual(result["unittest_collected"], 209)
+        self.assertGreaterEqual(result["unittest_collected"], 228)
 
     def test_lowered_collection_floor_is_not_a_bypass(self) -> None:
         with tempfile.TemporaryDirectory(prefix="marvis-ci-contract-") as raw:
