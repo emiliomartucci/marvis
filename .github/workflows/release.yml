@@ -311,10 +311,11 @@ jobs:
           remote_tag_sha="$(gh api \
             "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}" --jq .sha)"
           test "$remote_tag_sha" = "$GITHUB_SHA"
-          release_state="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
-            --jq '[.draft,.prerelease] | @tsv')"
-          test "$release_state" = $'true\ttrue'
+          release_state="$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease \
+            --jq '[.tagName,.isDraft,.isPrerelease] | @tsv')"
+          test "$release_state" = "$GITHUB_REF_NAME"$'\ttrue\ttrue'
           python - \
             release-artifact/release-manifest.json \
             release-artifact/run-readback.json \
@@ -421,7 +422,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir gh-release-readback
-          gh release download "$GITHUB_REF_NAME" --dir gh-release-readback
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir gh-release-readback
           cmp release-artifact/release-manifest.json gh-release-readback/release-manifest.json
           python scripts/release_candidate.py verify \
             --manifest gh-release-readback/release-manifest.json \
@@ -583,18 +586,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if release_json="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+          if release_json="$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease \
             2>/dev/null)"; then
-            release_state="$(jq -r '[.draft, .prerelease] | @tsv' <<< "$release_json")"
-            IFS=$'\t' read -r draft prerelease <<< "$release_state"
+            release_state="$(jq -r '[.tagName, .isDraft, .isPrerelease] | @tsv' <<< "$release_json")"
+            IFS=$'\t' read -r tag_name draft prerelease <<< "$release_state"
+            test "$tag_name" = "$GITHUB_REF_NAME"
             if [[ "$draft" == "true" ]]; then
               gh release edit "$GITHUB_REF_NAME" \
+                --repo "$GITHUB_REPOSITORY" \
                 --draft=true \
                 --prerelease=true \
                 --title "$GITHUB_REF_NAME [FAILED - DO NOT INSTALL]"
             elif [[ "$prerelease" == "true" ]]; then
               gh release edit "$GITHUB_REF_NAME" \
+                --repo "$GITHUB_REPOSITORY" \
                 --prerelease=true \
                 --title "$GITHUB_REF_NAME [FAILED - DO NOT INSTALL]"
             else
@@ -603,6 +610,7 @@ jobs:
             fi
           else
             gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
               --prerelease \

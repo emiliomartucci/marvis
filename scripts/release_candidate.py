@@ -1051,6 +1051,20 @@ def validate_static(
             raise ReleasePolicyError(
                 f"{repository_bound_job} lacks explicit GitHub repository context"
             )
+    pypi_block = blocks.get("pypi") or ""
+    contain_block = blocks.get("contain") or ""
+    for job_name, block in (("pypi", pypi_block), ("contain", contain_block)):
+        if (
+            'gh release view "$GITHUB_REF_NAME"' not in block
+            or '--repo "$GITHUB_REPOSITORY"' not in block
+        ):
+            raise ReleasePolicyError(
+                f"{job_name} lacks draft-aware GitHub Release readback"
+            )
+        if "/releases/tags/${GITHUB_REF_NAME}" in block:
+            raise ReleasePolicyError(
+                f"{job_name} uses the draft-blind GitHub Release tag endpoint"
+            )
     for privileged_job in ("release-record", "pypi", "finalize"):
         block = blocks.get(privileged_job) or ""
         if "actions/checkout@" in block or "scripts/" in block or "pip install" in block:
@@ -1100,7 +1114,7 @@ def validate_static(
     }
 
 
-def _request_json(url: str, *, token: str | None = None) -> dict[str, Any]:
+def _request_json_value(url: str, *, token: str | None = None) -> Any:
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "marvis-release-preflight"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -1115,8 +1129,20 @@ def _request_json(url: str, *, token: str | None = None) -> dict[str, Any]:
         raise ReleasePolicyError(f"remote preflight failed ({exc.code}): {url}") from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise ReleasePolicyError(f"remote preflight unreadable: {url}") from exc
+    return value
+
+
+def _request_json(url: str, *, token: str | None = None) -> dict[str, Any]:
+    value = _request_json_value(url, token=token)
     if not isinstance(value, dict):
         raise ReleasePolicyError(f"remote preflight returned non-object: {url}")
+    return value
+
+
+def _request_json_list(url: str, *, token: str | None = None) -> list[dict[str, Any]]:
+    value = _request_json_value(url, token=token)
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ReleasePolicyError(f"remote preflight returned non-list: {url}")
     return value
 
 
@@ -1311,19 +1337,39 @@ def _remote_tag_sha(policy: dict[str, Any], *, token: str, api_url: str) -> str:
     return sha
 
 
+def _release_records(
+    policy: dict[str, Any], *, token: str, api_url: str
+) -> list[dict[str, Any]]:
+    repository = str(policy["repository"])
+    tag = str(policy["candidate_tag"])
+    matches: list[dict[str, Any]] = []
+    for page in range(1, 11):
+        releases = _request_json_list(
+            f"{api_url}/repos/{repository}/releases?per_page=100&page={page}",
+            token=token,
+        )
+        matches.extend(release for release in releases if release.get("tag_name") == tag)
+        if len(releases) < 100:
+            return matches
+    raise ReleasePolicyError("GitHub Release inventory exceeds the bounded readback")
+
+
+def _require_release_absence(
+    policy: dict[str, Any], *, token: str, api_url: str
+) -> None:
+    if _release_records(policy, token=token, api_url=api_url):
+        raise ReleasePolicyError("candidate GitHub Release already exists")
+
+
 def _draft_release(
     policy: dict[str, Any], *, token: str, api_url: str
 ) -> dict[str, Any]:
-    repository = str(policy["repository"])
-    tag = str(policy["candidate_tag"])
-    try:
-        release = _request_json(
-            f"{api_url}/repos/{repository}/releases/tags/{tag}", token=token
-        )
-    except FileNotFoundError as exc:
-        raise ReleasePolicyError("contained draft GitHub Release is absent") from exc
-    if release.get("tag_name") != tag:
-        raise ReleasePolicyError("draft GitHub Release names a different tag")
+    matches = _release_records(policy, token=token, api_url=api_url)
+    if not matches:
+        raise ReleasePolicyError("contained draft GitHub Release is absent")
+    if len(matches) != 1:
+        raise ReleasePolicyError("contained draft GitHub Release is ambiguous")
+    release = matches[0]
     if release.get("draft") is not True or release.get("prerelease") is not True:
         raise ReleasePolicyError("GitHub Release became final before registry acceptance")
     return {
@@ -1364,11 +1410,7 @@ def preflight(
         label="candidate Git tag",
         token=token,
     )
-    _require_remote_absence(
-        f"{api_url}/repos/{repository}/releases/tags/{tag}",
-        label="candidate GitHub Release",
-        token=token,
-    )
+    _require_release_absence(policy, token=token, api_url=api_url)
     _require_remote_absence(
         _candidate_pypi_url(policy),
         label="candidate PyPI version",
@@ -1427,13 +1469,7 @@ def tag_preflight(
         token=token,
         api_url=api_url,
     )
-    repository = str(policy["repository"])
-    tag = urllib.parse.quote(str(policy["candidate_tag"]), safe="")
-    _require_remote_absence(
-        f"{api_url}/repos/{repository}/releases/tags/{tag}",
-        label="candidate GitHub Release",
-        token=token,
-    )
+    _require_release_absence(policy, token=token, api_url=api_url)
     _require_remote_absence(
         _candidate_pypi_url(policy),
         label="candidate PyPI version",

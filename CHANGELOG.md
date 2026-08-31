@@ -8,10 +8,28 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 No changes yet.
 
-## [0.4.4] - candidate
+## [0.4.5] - candidate
+
+Recovery candidate for the same reviewed public/shared source as 0.4.4. It
+keeps product behavior unchanged and repairs only the immutable release path.
+
+### Fixed
+
+- Read draft GitHub Releases from the paginated release inventory instead of
+  the tag lookup endpoint, which intentionally returns 404 for drafts.
+- Made the protected PyPI gate and failed-release containment use the
+  draft-aware GitHub CLI lookup with explicit repository context.
+- Fail closed if the candidate release inventory is missing, duplicated or no
+  longer both draft and prerelease.
+
+This section describes a release candidate only. Version 0.4.5 is not
+published until the separate tag, PyPI and post-publication acceptance gates
+all succeed.
+
+## [0.4.4] - 2026-08-31 (failed, not published)
 
 Recovery candidate for the same reviewed public/shared source as 0.4.3. It
-keeps product behavior unchanged and repairs only the immutable release path.
+kept product behavior unchanged and repaired only the immutable release path.
 
 ### Fixed
 
@@ -21,9 +39,12 @@ keeps product behavior unchanged and repairs only the immutable release path.
 - Recorded every failed immutable version explicitly; 0.4.1, 0.4.2 and 0.4.3
   cannot be reused.
 
-This section describes a release candidate only. Version 0.4.4 is not
-published until the separate tag, PyPI and post-publication acceptance gates
-all succeed.
+The exact package candidate built and the draft GitHub Release was created.
+The protected publication gate then used the release-by-tag API, which returns
+404 for draft releases, and stopped before PyPI. Automatic containment used
+the same draft-blind lookup and created a second empty failed draft. Both
+drafts are visibly contained, no package reached PyPI, and version 0.4.4 is
+burned and must never be reused.
 
 ## [0.4.3] - 2026-08-31 (failed, not published)
 
