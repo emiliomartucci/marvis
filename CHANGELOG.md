@@ -6,12 +6,20 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+No changes yet.
+
+## [0.4.8] - 2026-08-31 (candidate)
+
 ### Security
 
 - Raise the direct MCP dependency floor to `1.28.1`, the first accepted
   version that excludes CVE-2026-59950.
 - Bind the public consumer engine contract to MarvisX PR #349, merged as
   `8dfd16e4e275b69435e0348258daf86f67898997`, without changing the public API.
+
+This candidate replaces the contained, unpublished 0.4.7 attempt. It starts
+from Marvis PR #70 and requires MCP 1.28.1 or newer, excluding CVE-2026-59950
+before any package can reach PyPI.
 
 ## [0.4.7] - 2026-08-31 (failed, not published)
 
