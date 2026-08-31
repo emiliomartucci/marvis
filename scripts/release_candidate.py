@@ -937,7 +937,18 @@ def validate_static(
         raise ReleasePolicyError("candidate version/tag does not match pyproject")
     if tag_build:
         _validate_tag_trigger(tag, trigger_ref or os.environ.get("GITHUB_REF"))
-    if version == str(policy.get("historical_failed_version") or ""):
+    failed_versions = policy.get("historical_failed_versions")
+    if (
+        not isinstance(failed_versions, list)
+        or not failed_versions
+        or any(not isinstance(item, str) or not item for item in failed_versions)
+        or len(set(failed_versions)) != len(failed_versions)
+    ):
+        raise ReleasePolicyError("historical failed version inventory is invalid")
+    legacy_failed_version = str(policy.get("historical_failed_version") or "")
+    if legacy_failed_version and legacy_failed_version not in failed_versions:
+        raise ReleasePolicyError("historical failed version inventory is incomplete")
+    if version in failed_versions:
         raise ReleasePolicyError("historical failed version cannot be reused")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     if f"## [{version}]" not in changelog:

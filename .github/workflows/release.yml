@@ -570,6 +570,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out the failed immutable tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          ref: ${{ github.ref }}
+
       - name: Keep any failed release visibly non-final
         env:
           GH_TOKEN: ${{ github.token }}
