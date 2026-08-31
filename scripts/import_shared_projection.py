@@ -65,6 +65,8 @@ ABSOLUTE_MAX_FILE_BYTES = 20971520
 ABSOLUTE_MAX_PAYLOAD_BYTES = 268435456
 ABSOLUTE_MAX_MANIFEST_BYTES = 8388608
 MIGRATIONS_PREFIX = "migrations/"
+MIGRATION_REFRESH_SCHEMA = "marvis-pre-release-migration-refresh/v1"
+PRIOR_DISTRIBUTIONS_REL = "contracts/compatibility/prior-distributions-v1.json"
 MAP_PATH_RULES = ("managed_areas", "oss_owned_areas")
 APPROVED_PRESERVE_KEY = "approved_preserve_paths"
 MAP_DENY_RULES = (
@@ -279,6 +281,165 @@ def load_ownership_map(path: Path) -> tuple[dict, list[str]]:
     compiled[APPROVED_PRESERVE_KEY] = approved_preserve
     compiled["deny_scoped_allowlists"] = scoped_allowlists
     return compiled, deny
+
+
+def load_pre_release_migration_refresh(
+    contract_path: Path | None,
+    bundle_state: dict,
+    repo: Path,
+) -> dict | None:
+    """Validate a narrow exception for migrations never shipped publicly."""
+    if contract_path is None:
+        return None
+    try:
+        raw = contract_path.read_bytes()
+        document = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ImportRefused(
+            f"cannot load pre-release migration refresh contract: {exc}"
+        ) from exc
+    if not isinstance(document, dict):
+        raise ImportRefused("pre-release migration refresh contract must be a mapping")
+    errors: list[str] = []
+    if document.get("schema") != MIGRATION_REFRESH_SCHEMA:
+        errors.append(f"schema must be {MIGRATION_REFRESH_SCHEMA}")
+    source_sha = document.get("source_sha")
+    if source_sha != bundle_state["source_sha"]:
+        errors.append("source_sha does not match the verified candidate")
+
+    prior = document.get("prior_distributions_contract")
+    if not isinstance(prior, dict):
+        errors.append("prior_distributions_contract must be a mapping")
+    else:
+        prior_path = prior.get("path")
+        prior_sha = prior.get("sha256")
+        if prior_path != PRIOR_DISTRIBUTIONS_REL:
+            errors.append(f"prior distribution path must be {PRIOR_DISTRIBUTIONS_REL}")
+        elif not isinstance(prior_sha, str) or not SHA256_RE.fullmatch(prior_sha):
+            errors.append("prior distribution sha256 must be a full digest")
+        else:
+            canonical_prior = repo / PRIOR_DISTRIBUTIONS_REL
+            try:
+                actual_prior_sha = sha256_bytes(canonical_prior.read_bytes())
+            except OSError as exc:
+                raise ImportRefused(
+                    f"cannot read canonical prior distribution contract: {exc}"
+                ) from exc
+            if actual_prior_sha != prior_sha:
+                errors.append("prior distribution contract digest mismatch")
+
+    raw_refreshes = document.get("refreshed_paths")
+    refreshes: dict[str, dict[str, str]] = {}
+    if not isinstance(raw_refreshes, list) or not raw_refreshes:
+        errors.append("refreshed_paths must be a non-empty list")
+    else:
+        tracked = set(git_ls_tree(repo))
+        for row in raw_refreshes:
+            if not isinstance(row, dict):
+                errors.append("refreshed_paths rows must be mappings")
+                continue
+            relative = row.get("path")
+            current_sha = row.get("current_sha256")
+            source_sha256 = row.get("source_sha256")
+            if (
+                not isinstance(relative, str)
+                or not relative.startswith(MIGRATIONS_PREFIX)
+                or PurePosixPath(relative).is_absolute()
+                or "\\" in relative
+                or any(part in {"", ".", ".."} for part in PurePosixPath(relative).parts)
+            ):
+                errors.append(f"invalid migration refresh path: {relative!r}")
+                continue
+            if relative in refreshes:
+                errors.append(f"duplicate migration refresh path: {relative}")
+                continue
+            if not isinstance(current_sha, str) or not SHA256_RE.fullmatch(current_sha):
+                errors.append(f"invalid current_sha256 for {relative}")
+                continue
+            if not isinstance(source_sha256, str) or not SHA256_RE.fullmatch(source_sha256):
+                errors.append(f"invalid source_sha256 for {relative}")
+                continue
+            if relative not in tracked or not (repo / relative).is_file():
+                errors.append(f"migration refresh path is not a tracked file: {relative}")
+                continue
+            candidate = bundle_state["files"].get(relative)
+            if candidate is None:
+                errors.append(f"migration refresh path is absent from candidate: {relative}")
+                continue
+            if sha256_bytes((repo / relative).read_bytes()) != current_sha:
+                errors.append(f"current migration digest mismatch: {relative}")
+            if candidate["sha256"] != source_sha256:
+                errors.append(f"candidate migration digest mismatch: {relative}")
+            if current_sha == source_sha256:
+                errors.append(f"migration refresh is not a byte change: {relative}")
+            refreshes[relative] = {
+                "current_sha256": current_sha,
+                "source_sha256": source_sha256,
+            }
+
+    artifacts = document.get("published_artifacts")
+    artifact_kinds: set[str] = set()
+    artifact_summary: list[dict] = []
+    if not isinstance(artifacts, list) or not artifacts:
+        errors.append("published_artifacts must be a non-empty list")
+    else:
+        for row in artifacts:
+            if not isinstance(row, dict):
+                errors.append("published artifact rows must be mappings")
+                continue
+            kind = row.get("kind")
+            identity = row.get("identity")
+            inventory_count = row.get("migration_path_count")
+            inventory_sha = row.get("migration_paths_sha256")
+            absent = row.get("verified_absent_paths")
+            if kind not in {"pypi_wheel", "github_release_source"}:
+                errors.append(f"unsupported published artifact kind: {kind!r}")
+                continue
+            if kind in artifact_kinds:
+                errors.append(f"duplicate published artifact kind: {kind}")
+            artifact_kinds.add(kind)
+            identity_pattern = SHA256_RE if kind == "pypi_wheel" else SHA40_RE
+            if not isinstance(identity, str) or not identity_pattern.fullmatch(identity):
+                errors.append(f"invalid artifact identity for {kind}")
+            if not isinstance(inventory_count, int) or inventory_count < 0:
+                errors.append(f"invalid migration_path_count for {kind}")
+            if not isinstance(inventory_sha, str) or not SHA256_RE.fullmatch(inventory_sha):
+                errors.append(f"invalid migration_paths_sha256 for {kind}")
+            if not isinstance(absent, list) or any(
+                not isinstance(item, str) for item in absent
+            ):
+                errors.append(f"verified_absent_paths must be a string list for {kind}")
+                absent_set: set[str] = set()
+            else:
+                absent_set = set(absent)
+                if len(absent_set) != len(absent):
+                    errors.append(f"duplicate verified absent path for {kind}")
+            missing = sorted(set(refreshes) - absent_set)
+            if missing:
+                errors.append(
+                    f"published artifact {kind} does not prove paths absent: {missing}"
+                )
+            artifact_summary.append(
+                {
+                    "kind": kind,
+                    "identity": identity,
+                    "migration_path_count": inventory_count,
+                    "migration_paths_sha256": inventory_sha,
+                }
+            )
+    if artifact_kinds != {"pypi_wheel", "github_release_source"}:
+        errors.append("both PyPI wheel and GitHub release source proofs are required")
+    if errors:
+        raise ImportRefused(
+            "pre-release migration refresh contract invalid: "
+            + "; ".join(sorted(set(errors)))
+        )
+    return {
+        "contract_sha256": sha256_bytes(raw),
+        "source_sha": source_sha,
+        "paths": refreshes,
+        "published_artifacts": sorted(artifact_summary, key=lambda item: item["kind"]),
+    }
 
 
 def _rule_matches(path: str, rule: str) -> bool:
@@ -704,6 +865,7 @@ def classify(
     bundle_state: dict,
     ownership: dict,
     repo: Path,
+    migration_refresh: dict | None = None,
 ) -> dict:
     """Classify every payload path and collect every reason to refuse."""
     files = bundle_state["files"]
@@ -818,7 +980,14 @@ def classify(
     # Migration history must be append-only: every migration tracked here must
     # arrive byte-identical or not be carried at all (an upstream rewrite of a
     # historical migration would fork every already-migrated local database).
-    migration_state = {"tracked": 0, "identical_in_payload": 0, "absent_from_payload": 0, "changed_in_payload": 0}
+    migration_state = {
+        "tracked": 0,
+        "identical_in_payload": 0,
+        "absent_from_payload": 0,
+        "changed_in_payload": 0,
+        "pre_release_refresh_allowed": 0,
+    }
+    allowed_refreshes = (migration_refresh or {}).get("paths", {})
     for tracked_path in sorted(tracked):
         if not tracked_path.startswith(MIGRATIONS_PREFIX):
             continue
@@ -827,7 +996,10 @@ def classify(
             migration_state["absent_from_payload"] += 1
         elif sha256_bytes((repo / tracked_path).read_bytes()) != files[tracked_path]["sha256"]:
             migration_state["changed_in_payload"] += 1
-            violations.append(f"migration compatibility: {tracked_path} differs in payload")
+            if tracked_path in allowed_refreshes:
+                migration_state["pre_release_refresh_allowed"] += 1
+            else:
+                violations.append(f"migration compatibility: {tracked_path} differs in payload")
         else:
             migration_state["identical_in_payload"] += 1
 
@@ -1339,7 +1511,14 @@ def run(args: argparse.Namespace) -> int:
             expected,
             max_file_bytes=ownership["max_file_bytes"],
         )
-        classification = classify(bundle_state, ownership, repo)
+        migration_refresh = load_pre_release_migration_refresh(
+            args.pre_release_migration_refresh.resolve()
+            if args.pre_release_migration_refresh is not None
+            else None,
+            bundle_state,
+            repo,
+        )
+        classification = classify(bundle_state, ownership, repo, migration_refresh)
         dirty = worktree_dirty(repo)
         importable = classification["importable"]
         compatibility = read_compatibility(repo, bundle)
@@ -1363,6 +1542,13 @@ def run(args: argparse.Namespace) -> int:
         }
         compatibility["migrations"] = classification["migrations"]
         compatibility["worktree_dirty_entries"] = len(dirty)
+        if migration_refresh is not None:
+            compatibility["pre_release_migration_refresh"] = {
+                "contract_sha256": migration_refresh["contract_sha256"],
+                "source_sha": migration_refresh["source_sha"],
+                "paths": sorted(migration_refresh["paths"]),
+                "published_artifacts": migration_refresh["published_artifacts"],
+            }
 
         blocked_or_violated = bool(classification["violations"] or classification["blocked"])
         status = "blocked" if blocked_or_violated else "verified"
@@ -1417,6 +1603,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-exporter-identity-sha256", default=None)
     parser.add_argument("--expected-payload-sha256", default=None)
     parser.add_argument("--expected-consumer-manifest-sha256", default=None)
+    parser.add_argument("--pre-release-migration-refresh", type=Path, default=None)
     parser.add_argument("--backup-dir", type=Path, default=None)
     parser.add_argument("--report", type=Path, default=None)
     return parser

@@ -93,6 +93,7 @@ def build_repo(base: Path) -> Path:
         "pyproject.toml": '[project]\nname = "test"\n',
         "contracts/engine-pin.yaml": ENGINE_PIN,
         "contracts/shared-ownership.yaml": TEST_MAP,
+        "contracts/compatibility/prior-distributions-v1.json": "{}\n",
         "core/api/engine.py": "ENGINE = 1\n",
         "core/api/local_only.py": "LOCAL = True\n",
         "core/api/tests/test_engine.py": "def test():\n    assert True\n",
@@ -218,6 +219,7 @@ def make_args(repo: Path, bundle: Path, **overrides):
         "expected_exporter_identity_sha256": EXPORTER_IDENTITY,
         "expected_payload_sha256": payload_manifest["payload_sha256"],
         "expected_consumer_manifest_sha256": isp.sha256_bytes(consumer_manifest_bytes),
+        "pre_release_migration_refresh": None,
         "backup_dir": None,
         "report": None,
     }
@@ -700,6 +702,85 @@ class ImportGateTest(unittest.TestCase):
         ownership, _ = isp.load_ownership_map(self.repo / "contracts/shared-ownership.yaml")
         result = isp.classify(state, ownership, self.repo)
         self.assertTrue(any("migration compatibility" in v for v in result["violations"]))
+
+    def _migration_refresh_contract(
+        self, bundle: Path, *, missing_artifact_proof: bool = False
+    ) -> Path:
+        relative = "migrations/001_init.py"
+        current_sha = isp.sha256_bytes((self.repo / relative).read_bytes())
+        source_sha = isp.sha256_bytes((bundle / "payload" / relative).read_bytes())
+        github_absent = [] if missing_artifact_proof else [relative]
+        document = {
+            "schema": isp.MIGRATION_REFRESH_SCHEMA,
+            "source_sha": SOURCE_SHA,
+            "prior_distributions_contract": {
+                "path": isp.PRIOR_DISTRIBUTIONS_REL,
+                "sha256": isp.sha256_bytes(
+                    (self.repo / isp.PRIOR_DISTRIBUTIONS_REL).read_bytes()
+                ),
+            },
+            "published_artifacts": [
+                {
+                    "kind": "pypi_wheel",
+                    "identity": "1" * 64,
+                    "migration_path_count": 1,
+                    "migration_paths_sha256": "2" * 64,
+                    "verified_absent_paths": [relative],
+                },
+                {
+                    "kind": "github_release_source",
+                    "identity": "3" * 40,
+                    "migration_path_count": 1,
+                    "migration_paths_sha256": "4" * 64,
+                    "verified_absent_paths": github_absent,
+                },
+            ],
+            "refreshed_paths": [
+                {
+                    "path": relative,
+                    "current_sha256": current_sha,
+                    "source_sha256": source_sha,
+                }
+            ],
+        }
+        contract = self.base / "migration-refresh.json"
+        contract.write_bytes(isp.canonical_json(document))
+        return contract
+
+    def test_unpublished_migration_refresh_requires_exact_public_absence_proof(self) -> None:
+        files = dict(green_files())
+        files["migrations/001_init.py"] = (b"# corrected before release\n", "100644")
+        bundle = build_bundle(self.base, files)
+        contract = self._migration_refresh_contract(bundle)
+        report_path = self.base / "migration-refresh-report.json"
+        exit_code = isp.run(
+            make_args(
+                self.repo,
+                bundle,
+                pre_release_migration_refresh=contract,
+                report=report_path,
+            )
+        )
+        self.assertEqual(exit_code, 0)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            report["compatibility"]["migrations"]["pre_release_refresh_allowed"],
+            1,
+        )
+        self.assertEqual(
+            report["compatibility"]["pre_release_migration_refresh"]["paths"],
+            ["migrations/001_init.py"],
+        )
+
+    def test_unpublished_migration_refresh_fails_if_one_artifact_lacks_proof(self) -> None:
+        files = dict(green_files())
+        files["migrations/001_init.py"] = (b"# corrected before release\n", "100644")
+        bundle = build_bundle(self.base, files)
+        contract = self._migration_refresh_contract(bundle, missing_artifact_proof=True)
+        message = self.refused(
+            make_args(self.repo, bundle, pre_release_migration_refresh=contract)
+        )
+        self.assertIn("does not prove paths absent", message)
 
     def test_real_ownership_map_loads(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
