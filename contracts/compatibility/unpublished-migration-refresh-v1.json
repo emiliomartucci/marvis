@@ -1,6 +1,6 @@
 {
   "schema": "marvis-pre-release-migration-refresh/v1",
-  "source_sha": "526a3ef076c1f33439c21309ef5fa980fe4b4afc",
+  "source_sha": "ab1fa58eae705a25ca46ea6829eb0d538794ee52",
   "prior_distributions_contract": {
     "path": "contracts/compatibility/prior-distributions-v1.json",
     "sha256": "a02b33bb52577c9b64d84b46895d9f2ef01abe3fd1df1dd1c4e1dff39121af9a"

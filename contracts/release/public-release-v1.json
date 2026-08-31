@@ -19,13 +19,16 @@
   },
   "shared_source": {
     "repository": "emiliomartucci/marvisx",
-    "pull_request": 316,
-    "candidate_sha": "4efd50cbe6b70c0febdd6b9ea0b812aa7d71569d",
-    "merge_sha": "64e96cb7e90292816296750906db68ec81c4a37e",
+    "pull_request": 348,
+    "candidate_sha": "471f88f21dc0880c903ec6401621a52d2a801b0d",
+    "merge_sha": "ab1fa58eae705a25ca46ea6829eb0d538794ee52",
     "engine_pin": "contracts/engine-pin.yaml"
   },
   "candidate_state": {
-    "status": "active"
+    "status": "invalidated",
+    "reason": "shared_source_advanced_after_release_foundation",
+    "invalidated_by_shared_source_sha": "ab1fa58eae705a25ca46ea6829eb0d538794ee52",
+    "required_next_gate": "merge_product_projection_then_refresh_release_foundation"
   },
   "candidate_version": "0.4.1",
   "candidate_tag": "v0.4.1",
