@@ -147,8 +147,21 @@ class ReleaseCandidateTests(unittest.TestCase):
         return trusted, watchdog
 
     def test_real_release_candidate_static_policy(self) -> None:
-        report = candidate.validate_static(ROOT)
+        # This test exercises the repository's static release policy, not the
+        # external owner gates injected by a real CI/release environment.
+        with mock.patch.dict(
+            candidate.os.environ,
+            {
+                candidate._TRUSTED_PUBLISHER_RECEIPT_ENV: "",
+                candidate._APPROVAL_WATCHDOG_RECEIPT_ENV: "",
+            },
+        ):
+            report = candidate.validate_static(ROOT)
         self.assertEqual(report["status"], "static_green_external_gates_open")
+        self.assertEqual(
+            report["external_blockers"],
+            ["trusted_publisher_owner_readback", "external_approval_watchdog"],
+        )
         self.assertEqual(report["version"], "0.4.1")
         self.assertEqual(report["release_branch"], "main")
         self.assertEqual(
