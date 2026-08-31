@@ -2,7 +2,7 @@
   "consumer_base_ref": "6e2bf38dee96465cb4973411ebcfed24fe70befa",
   "generated_from": "core.api.mcp.server:mcp.list_tools",
   "schema": "marvis-mcp-tool-inventory/v1",
-  "source_ref": "ab1fa58eae705a25ca46ea6829eb0d538794ee52",
+  "source_ref": "8dfd16e4e275b69435e0348258daf86f67898997",
   "tool_count": 130,
   "tools": [
     "accept_governed_decision",

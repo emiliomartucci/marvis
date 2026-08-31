@@ -58,9 +58,22 @@ class ReleaseCandidateTests(unittest.TestCase):
     @contextmanager
     def active_candidate_for_unit_test(self):
         """Exercise artifact logic while the real candidate is fail-closed."""
+        policy = self.policy()
+        policy["candidate_state"] = {"status": "active"}
+        policy["historical_failed_versions"] = [
+            version
+            for version in policy["historical_failed_versions"]
+            if version != policy["candidate_version"]
+        ]
         with mock.patch.object(
+            candidate, "load_policy", return_value=policy
+        ), mock.patch.object(
             candidate, "_candidate_state", return_value={"status": "active"}
-        ), mock.patch.object(candidate, "_path_allowed", return_value=True):
+        ), mock.patch.object(
+            candidate, "_path_allowed", return_value=True
+        ), mock.patch.object(
+            candidate, "_validate_pyproject_version_only", return_value=None
+        ):
             yield
 
     def write_manifest(self, path: Path, **values: object) -> dict:
@@ -201,37 +214,17 @@ class ReleaseCandidateTests(unittest.TestCase):
             "verified_by": "github-user:emiliomartucci",
         }
 
-    def test_real_release_candidate_static_policy(self) -> None:
-        report = candidate.validate_static(ROOT)
-        self.assertEqual(report["status"], "static_green_external_gates_open")
-        self.assertEqual(report["version"], "0.4.7")
-        self.assertEqual(report["release_branch"], "main")
+    def test_real_release_candidate_is_invalidated_by_the_source_advance(self) -> None:
+        policy = self.policy()
+        shared_source = candidate._shared_source_coordinates(ROOT, policy)
+        state = candidate._candidate_state(policy, shared_source=shared_source)
+        self.assertEqual(state["status"], "invalidated")
         self.assertEqual(
-            report["product_base_sha"],
-            "285d65d43e53fb4b23bfca770ae79d4ad9056c98",
+            state["invalidated_by_shared_source_sha"],
+            "8dfd16e4e275b69435e0348258daf86f67898997",
         )
-        self.assertEqual(
-            report["release_foundation"]["candidate_sha"],
-            "ce7d6238c789f006284868e209a0712da64c3245",
-        )
-        self.assertEqual(
-            report["release_foundation"]["merge_sha"],
-            "bb66446521ec615ca8598140173ee9d2b3fa7b8e",
-        )
-        self.assertEqual(
-            report["release_foundation"]["changed_paths"],
-            self.policy()["release_foundation"]["expected_changed_paths"],
-        )
-        self.assertEqual(
-            report["shared_source"]["candidate_sha"],
-            "471f88f21dc0880c903ec6401621a52d2a801b0d",
-        )
-        self.assertEqual(
-            report["shared_source"]["merge_sha"],
-            "ab1fa58eae705a25ca46ea6829eb0d538794ee52",
-        )
-        self.assertEqual(len(report["action_pins"]), 5)
-        self.assertEqual(candidate.candidate_state_report(ROOT)["status"], "active")
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "invalidated"):
+            candidate.validate_static(ROOT)
 
     def test_candidate_invalidation_cannot_name_an_unrelated_source(self) -> None:
         policy = self.policy()
@@ -249,7 +242,7 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_active_candidate_cannot_keep_stale_invalidation_evidence(self) -> None:
         policy = self.policy()
-        policy["candidate_state"]["reason"] = "stale"
+        policy["candidate_state"]["status"] = "active"
         shared_source = candidate._shared_source_coordinates(ROOT, policy)
         with self.assertRaisesRegex(
             candidate.ReleasePolicyError, "active candidate state contains stale evidence"
@@ -591,7 +584,9 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_tag_build_accepts_the_exact_candidate_tag(self) -> None:
         source = str(candidate._git(ROOT, "rev-parse", "HEAD"))
-        with mock.patch.object(candidate, "_tag_target", return_value=source):
+        with self.active_candidate_for_unit_test(), mock.patch.object(
+            candidate, "_tag_target", return_value=source
+        ):
             report = candidate.validate_static(
                 ROOT,
                 tag_build=True,
@@ -752,12 +747,20 @@ class ReleaseCandidateTests(unittest.TestCase):
             )
 
     def test_failed_version_inventory_must_include_the_legacy_entry(self) -> None:
+        foundation = candidate._release_foundation_coordinates(ROOT, self.policy())
         policy = self.policy()
+        policy["candidate_state"] = {"status": "active"}
         policy["historical_failed_versions"] = ["0.4.2", "0.4.3"]
         with mock.patch.object(
             candidate,
             "load_policy",
             return_value=policy,
+        ), mock.patch.object(
+            candidate, "_release_foundation_coordinates", return_value=foundation
+        ), mock.patch.object(
+            candidate, "_validate_pyproject_version_only", return_value=None
+        ), mock.patch.object(
+            candidate, "_changed_paths", return_value=[]
         ), self.assertRaisesRegex(candidate.ReleasePolicyError, "inventory is incomplete"):
             candidate.validate_static(ROOT)
 
@@ -767,6 +770,8 @@ class ReleaseCandidateTests(unittest.TestCase):
             candidate, "_release_foundation_coordinates", return_value=foundation
         ), mock.patch.object(
             candidate, "_candidate_state", return_value={"status": "active"}
+        ), mock.patch.object(
+            candidate, "_validate_pyproject_version_only", return_value=None
         ), mock.patch.object(candidate, "_changed_paths", return_value=["core/api/main.py"]):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "product behavior"):
                 candidate.validate_static(ROOT)

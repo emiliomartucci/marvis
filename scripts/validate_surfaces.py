@@ -64,6 +64,7 @@ SHELL_DECISION_RECORD = "docs/decisions/desktop-shell-selection.md"
 # against the release.
 RELEASE_WORKFLOW = Path(".github/workflows/release.yml")
 PYPROJECT = Path("pyproject.toml")
+MIN_SAFE_MCP_REQUIREMENT = "mcp>=1.28.1"
 # Front matter only. A whole-document search matched `status: accepted` inside
 # a fenced example or a migration note and read an open ADR as decided.
 FRONT_MATTER_RE = re.compile(r"\A---\n(.*?)\n---\s*\n", re.DOTALL)
@@ -380,6 +381,20 @@ def validate(root: Path) -> list[str]:
             errors.append("engine-pin: contract_version must be an integer")
         if not SHA_RE.match(str((pin or {}).get("engine_ref", ""))):
             errors.append("engine-pin: engine_ref must be a 40-hex commit SHA")
+
+    try:
+        pyproject = tomllib.loads((root / PYPROJECT).read_text(encoding="utf-8"))
+    except OSError as exc:
+        errors.append(f"cannot read {PYPROJECT}: {exc}")
+    except tomllib.TOMLDecodeError as exc:
+        errors.append(f"{PYPROJECT} is not valid TOML: {exc}")
+    else:
+        dependencies = pyproject.get("project", {}).get("dependencies")
+        if not isinstance(dependencies, list) or MIN_SAFE_MCP_REQUIREMENT not in dependencies:
+            errors.append(
+                "pyproject: MCP security floor must be exactly "
+                f"{MIN_SAFE_MCP_REQUIREMENT} (CVE-2026-59950)"
+            )
 
     return errors
 

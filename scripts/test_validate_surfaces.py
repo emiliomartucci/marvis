@@ -263,6 +263,11 @@ class TestValidator(FixtureCase):
         errors = validate(self.dir)
         self.assertTrue(any("engine_ref" in e for e in errors), errors)
 
+    def test_red_vulnerable_mcp_dependency_floor(self) -> None:
+        self.rewrite("pyproject.toml", '"mcp>=1.28.1"', '"mcp>=1.27.0"')
+        errors = validate(self.dir)
+        self.assertTrue(any("MCP security floor" in e for e in errors), errors)
+
 
 class TestReleasePathRunsTheGate(unittest.TestCase):
     """A `v*` tag starts release.yml directly and skips the CI workflow.

@@ -11,8 +11,8 @@ from verify_compatibility_contract import CompatibilityError, provider_breaks, v
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_REF = "ab1fa58eae705a25ca46ea6829eb0d538794ee52"
-PAYLOAD_SHA256 = "895ec2f5e69ee2c4845c8119d157dca19da700ce7ae7179a574b5dccedcfd15e"
+SOURCE_REF = "8dfd16e4e275b69435e0348258daf86f67898997"
+PAYLOAD_SHA256 = "d41411373ecaf584ee4406a23c9ba7fedc1915a9564f8734983d9a826cd70ae7"
 
 
 class CompatibilityContractTests(unittest.TestCase):

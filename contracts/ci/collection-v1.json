@@ -53,7 +53,7 @@
         "LocalUpgradeTests.test_synthetic_prior_upgrade_and_rollback",
         "LocalUpgradeTests.test_cli_upgrade_uses_settings_projects_root_without_environment",
         "LocalUpgradeTests.test_runtime_settings_preserve_explicit_projects_root",
-        "ReleaseCandidateTests.test_real_release_candidate_static_policy",
+        "ReleaseCandidateTests.test_real_release_candidate_is_invalidated_by_the_source_advance",
         "ReleaseCandidateTests.test_invalidated_pull_request_skips_every_expensive_release_step"
       ]
     }
