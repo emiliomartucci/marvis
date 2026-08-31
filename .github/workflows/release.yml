@@ -242,6 +242,95 @@ jobs:
             --prerelease \
             --title "$TAG release candidate" \
             --notes-file release-artifact/release-notes.md
+          gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json databaseId,tagName,isDraft,isPrerelease,createdAt,assets \
+            > draft-release-readback.json
+          mkdir -p draft-release
+          python3 - \
+            release-artifact/release-manifest.json \
+            draft-release-readback.json \
+            draft-release/draft-release-receipt.json <<'PY'
+          from datetime import datetime, timezone
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          manifest_path, release_path, output_path = map(Path, sys.argv[1:])
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          unsigned_manifest = dict(manifest)
+          claimed_manifest = unsigned_manifest.pop("content_digest")
+          canonical_manifest = json.dumps(
+              unsigned_manifest, sort_keys=True, separators=(",", ":")
+          ).encode()
+          assert claimed_manifest == hashlib.sha256(canonical_manifest).hexdigest()
+          assert manifest["release_source_sha"] == os.environ["GITHUB_SHA"]
+          assert manifest["tag"] == os.environ["GITHUB_REF_NAME"]
+
+          release = json.loads(release_path.read_text(encoding="utf-8"))
+          assert isinstance(release["databaseId"], int) and release["databaseId"] > 0
+          assert release["tagName"] == os.environ["GITHUB_REF_NAME"]
+          assert release["isDraft"] is True
+          assert release["isPrerelease"] is True
+
+          expected = {
+              row["filename"]: {"size": row["size"], "sha256": row["sha256"]}
+              for row in manifest["artifacts"]
+          }
+          expected[manifest_path.name] = {
+              "size": manifest_path.stat().st_size,
+              "sha256": sha256(manifest_path),
+          }
+          observed = {}
+          for asset in release["assets"]:
+              assert asset["state"] == "uploaded"
+              digest = str(asset["digest"])
+              assert digest.startswith("sha256:")
+              observed[asset["name"]] = {
+                  "size": asset["size"],
+                  "sha256": digest.removeprefix("sha256:"),
+              }
+          assert observed == expected
+
+          receipt = {
+              "schema": "marvis-draft-release-receipt/v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "release_source_sha": os.environ["GITHUB_SHA"],
+              "tag": os.environ["GITHUB_REF_NAME"],
+              "verified_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "release": {
+                  "id": release["databaseId"],
+                  "tag_name": release["tagName"],
+                  "draft": release["isDraft"],
+                  "prerelease": release["isPrerelease"],
+                  "created_at": release["createdAt"],
+              },
+              "assets": [
+                  {"filename": name, **identity}
+                  for name, identity in sorted(observed.items())
+              ],
+          }
+          canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+          receipt["content_digest"] = hashlib.sha256(canonical).hexdigest()
+          output_path.write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+      - name: Upload the immutable draft-release receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: immutable-draft-release-receipt
+          path: draft-release/draft-release-receipt.json
+          if-no-files-found: error
+          retention-days: 7
 
   prepublish:
     name: Revalidate before the protected publisher
@@ -272,15 +361,25 @@ jobs:
         with:
           name: immutable-release-candidate
           path: release-artifact
+      - name: Download the immutable draft-release receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: immutable-draft-release-receipt
+          path: draft-release
       - name: Revalidate all external gates before approval
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python scripts/release_candidate.py pretag
+          python scripts/release_candidate.py pretag \
+            --manifest release-artifact/release-manifest.json \
+            --draft-release-receipt draft-release/draft-release-receipt.json \
+            --run-id "$GITHUB_RUN_ID"
           python scripts/release_candidate.py publish-window \
             --manifest release-artifact/release-manifest.json \
-            --dist release-artifact/packages
+            --dist release-artifact/packages \
+            --draft-release-receipt draft-release/draft-release-receipt.json \
+            --run-id "$GITHUB_RUN_ID"
 
   pypi:
     name: Approve and publish the unchanged candidate
@@ -299,6 +398,11 @@ jobs:
         with:
           name: immutable-release-candidate
           path: release-artifact
+      - name: Download the immutable draft-release receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: immutable-draft-release-receipt
+          path: draft-release
       - name: Minimal post-approval readback without candidate execution
         env:
           GH_TOKEN: ${{ github.token }}
@@ -311,13 +415,9 @@ jobs:
           remote_tag_sha="$(gh api \
             "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}" --jq .sha)"
           test "$remote_tag_sha" = "$GITHUB_SHA"
-          release_state="$(gh release view "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json tagName,isDraft,isPrerelease \
-            --jq '[.tagName,.isDraft,.isPrerelease] | @tsv')"
-          test "$release_state" = "$GITHUB_REF_NAME"$'\ttrue\ttrue'
           python - \
             release-artifact/release-manifest.json \
+            draft-release/draft-release-receipt.json \
             release-artifact/run-readback.json \
             release-artifact/environment-readback.json \
             release-artifact/packages <<'PY'
@@ -328,18 +428,58 @@ jobs:
           from pathlib import Path
           import sys
 
-          manifest_path, run_path, environment_path, packages_path = map(Path, sys.argv[1:])
+          manifest_path, draft_receipt_path, run_path, environment_path, packages_path = map(
+              Path, sys.argv[1:]
+          )
           manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-          claimed = manifest.pop("content_digest")
-          canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+          unsigned_manifest = dict(manifest)
+          claimed = unsigned_manifest.pop("content_digest")
+          canonical = json.dumps(
+              unsigned_manifest, sort_keys=True, separators=(",", ":")
+          ).encode()
           assert claimed == hashlib.sha256(canonical).hexdigest()
           assert manifest["release_source_sha"] == os.environ["GITHUB_SHA"]
           assert manifest["tag"] == os.environ["GITHUB_REF_NAME"]
           assert manifest["dispatch_preflight"]["head_sha"] == os.environ["GITHUB_SHA"]
-          receipts = manifest["release_controls"]["external_receipts"]
-          assert receipts and set(receipts) == {"trusted_publisher", "approval_watchdog"}
           now = datetime.now(timezone.utc)
           hours = int(manifest["release_controls"]["approval_deadline_hours"])
+
+          draft_receipt = json.loads(draft_receipt_path.read_text(encoding="utf-8"))
+          unsigned_receipt = dict(draft_receipt)
+          receipt_digest = unsigned_receipt.pop("content_digest")
+          canonical_receipt = json.dumps(
+              unsigned_receipt, sort_keys=True, separators=(",", ":")
+          ).encode()
+          assert receipt_digest == hashlib.sha256(canonical_receipt).hexdigest()
+          assert draft_receipt["schema"] == "marvis-draft-release-receipt/v1"
+          assert draft_receipt["repository"] == os.environ["GITHUB_REPOSITORY"]
+          assert draft_receipt["workflow_run_id"] == os.environ["GITHUB_RUN_ID"]
+          assert draft_receipt["release_source_sha"] == os.environ["GITHUB_SHA"]
+          assert draft_receipt["tag"] == os.environ["GITHUB_REF_NAME"]
+          release = draft_receipt["release"]
+          assert release["tag_name"] == os.environ["GITHUB_REF_NAME"]
+          assert release["draft"] is True and release["prerelease"] is True
+          receipt_time = datetime.fromisoformat(
+              draft_receipt["verified_at"].replace("Z", "+00:00")
+          )
+          assert 0 <= (now - receipt_time).total_seconds() <= hours * 3600
+
+          expected_assets = {
+              row["filename"]: {"size": row["size"], "sha256": row["sha256"]}
+              for row in manifest["artifacts"]
+          }
+          expected_assets[manifest_path.name] = {
+              "size": manifest_path.stat().st_size,
+              "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+          }
+          observed_assets = {
+              row["filename"]: {"size": row["size"], "sha256": row["sha256"]}
+              for row in draft_receipt["assets"]
+          }
+          assert observed_assets == expected_assets
+
+          receipts = manifest["release_controls"]["external_receipts"]
+          assert receipts and set(receipts) == {"trusted_publisher", "approval_watchdog"}
           for receipt in receipts.values():
               verified = datetime.fromisoformat(receipt["verified_at"].replace("Z", "+00:00"))
               assert 0 <= (now - verified).total_seconds() <= hours * 3600
@@ -416,19 +556,19 @@ jobs:
         with:
           name: immutable-release-candidate
           path: release-artifact
+      - name: Download the immutable draft-release receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: immutable-draft-release-receipt
+          path: draft-release
       - name: Re-read PyPI and exercise install, upgrade and recovery
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir gh-release-readback
-          gh release download "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir gh-release-readback
-          cmp release-artifact/release-manifest.json gh-release-readback/release-manifest.json
           python scripts/release_candidate.py verify \
-            --manifest gh-release-readback/release-manifest.json \
-            --dist gh-release-readback
+            --manifest release-artifact/release-manifest.json \
+            --dist release-artifact/packages
           python scripts/release_candidate.py registry \
             --manifest release-artifact/release-manifest.json
           python scripts/release_candidate.py registry-download \
@@ -521,7 +661,8 @@ jobs:
           python scripts/release_candidate.py acceptance \
             --manifest release-artifact/release-manifest.json \
             --registry-dist pypi-readback \
-            --github-dist gh-release-readback \
+            --github-dist release-artifact/packages \
+            --draft-release-receipt draft-release/draft-release-receipt.json \
             --output release-acceptance.json \
             --run-id "$GITHUB_RUN_ID"
       - name: Upload the read-only acceptance receipt
@@ -535,7 +676,7 @@ jobs:
   finalize:
     name: Publish acceptance evidence and finalize
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    needs: [build, accept]
+    needs: [build, release-record, accept]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -547,12 +688,109 @@ jobs:
         with:
           name: immutable-release-acceptance
           path: acceptance
+      - name: Download the exact candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: immutable-release-candidate
+          path: release-artifact
+      - name: Download the immutable draft-release receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: immutable-draft-release-receipt
+          path: draft-release
       - name: Publish, read back and finalize the verified GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json databaseId,tagName,isDraft,isPrerelease,createdAt,assets \
+            > final-draft-readback.json
+          mkdir final-draft-assets
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir final-draft-assets
+          python3 - \
+            release-artifact/release-manifest.json \
+            draft-release/draft-release-receipt.json \
+            final-draft-readback.json \
+            final-draft-assets \
+            release-artifact/packages <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          manifest_path, receipt_path, live_path, live_assets, packages = map(
+              Path, sys.argv[1:]
+          )
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          unsigned_manifest = dict(manifest)
+          claimed_manifest = unsigned_manifest.pop("content_digest")
+          canonical_manifest = json.dumps(
+              unsigned_manifest, sort_keys=True, separators=(",", ":")
+          ).encode()
+          assert claimed_manifest == hashlib.sha256(canonical_manifest).hexdigest()
+          assert manifest["release_source_sha"] == os.environ["GITHUB_SHA"]
+          assert manifest["tag"] == os.environ["GITHUB_REF_NAME"]
+
+          receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+          unsigned_receipt = dict(receipt)
+          claimed_receipt = unsigned_receipt.pop("content_digest")
+          canonical_receipt = json.dumps(
+              unsigned_receipt, sort_keys=True, separators=(",", ":")
+          ).encode()
+          assert claimed_receipt == hashlib.sha256(canonical_receipt).hexdigest()
+          assert receipt["schema"] == "marvis-draft-release-receipt/v1"
+          assert receipt["repository"] == os.environ["GITHUB_REPOSITORY"]
+          assert receipt["workflow_run_id"] == os.environ["GITHUB_RUN_ID"]
+          assert receipt["release_source_sha"] == os.environ["GITHUB_SHA"]
+          assert receipt["tag"] == os.environ["GITHUB_REF_NAME"]
+
+          live = json.loads(live_path.read_text(encoding="utf-8"))
+          assert live["databaseId"] == receipt["release"]["id"]
+          assert live["tagName"] == receipt["release"]["tag_name"]
+          assert live["isDraft"] is True and live["isPrerelease"] is True
+
+          expected = {
+              row["filename"]: {"size": row["size"], "sha256": row["sha256"]}
+              for row in receipt["assets"]
+          }
+          observed = {}
+          for asset in live["assets"]:
+              assert asset["state"] == "uploaded"
+              digest = str(asset["digest"])
+              assert digest.startswith("sha256:")
+              observed[asset["name"]] = {
+                  "size": asset["size"],
+                  "sha256": digest.removeprefix("sha256:"),
+              }
+          assert observed == expected
+
+          downloaded = {
+              path.name: {"size": path.stat().st_size, "sha256": sha256(path)}
+              for path in live_assets.iterdir()
+              if path.is_file()
+          }
+          assert downloaded == expected
+          candidate = {
+              path.name: {"size": path.stat().st_size, "sha256": sha256(path)}
+              for path in packages.iterdir()
+              if path.is_file()
+          }
+          candidate[manifest_path.name] = {
+              "size": manifest_path.stat().st_size,
+              "sha256": sha256(manifest_path),
+          }
+          assert candidate == expected
+          PY
           gh release upload "$GITHUB_REF_NAME" acceptance/release-acceptance.json
           mkdir acceptance-readback
           gh release download "$GITHUB_REF_NAME" \

@@ -71,13 +71,13 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def write_release_artifacts(self, dist: Path) -> tuple[Path, Path]:
         dist.mkdir(parents=True, exist_ok=True)
-        metadata = b"Metadata-Version: 2.1\nName: marvisx-cli\nVersion: 0.4.5\n\n"
-        wheel = dist / "marvisx_cli-0.4.5-py3-none-any.whl"
+        metadata = b"Metadata-Version: 2.1\nName: marvisx-cli\nVersion: 0.4.6\n\n"
+        wheel = dist / "marvisx_cli-0.4.6-py3-none-any.whl"
         with zipfile.ZipFile(wheel, "w") as archive:
-            archive.writestr("marvisx_cli-0.4.5.dist-info/METADATA", metadata)
-        sdist = dist / "marvisx_cli-0.4.5.tar.gz"
+            archive.writestr("marvisx_cli-0.4.6.dist-info/METADATA", metadata)
+        sdist = dist / "marvisx_cli-0.4.6.tar.gz"
         with tarfile.open(sdist, "w:gz") as archive:
-            info = tarfile.TarInfo("marvisx_cli-0.4.5/PKG-INFO")
+            info = tarfile.TarInfo("marvisx_cli-0.4.6/PKG-INFO")
             info.size = len(metadata)
             archive.addfile(info, io.BytesIO(metadata))
         return wheel, sdist
@@ -204,7 +204,7 @@ class ReleaseCandidateTests(unittest.TestCase):
     def test_real_release_candidate_static_policy(self) -> None:
         report = candidate.validate_static(ROOT)
         self.assertEqual(report["status"], "static_green_external_gates_open")
-        self.assertEqual(report["version"], "0.4.5")
+        self.assertEqual(report["version"], "0.4.6")
         self.assertEqual(report["release_branch"], "main")
         self.assertEqual(
             report["product_base_sha"],
@@ -270,7 +270,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         scenarios = {
             ("pull_request", "refs/pull/1/merge"): set(),
             ("workflow_dispatch", "refs/heads/main"): set(),
-            ("push", "refs/tags/v0.4.5"): {
+            ("push", "refs/tags/v0.4.6"): {
                 "release-record",
                 "prepublish",
                 "pypi",
@@ -313,9 +313,16 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertNotIn("/releases/tags/${GITHUB_REF_NAME}", contain_block)
         self.assertNotIn("2>/dev/null || true", contain_block)
         pypi_block = blocks["pypi"]
-        self.assertIn('gh release view "$GITHUB_REF_NAME"', pypi_block)
-        self.assertIn('--repo "$GITHUB_REPOSITORY"', pypi_block)
-        self.assertNotIn("/releases/tags/${GITHUB_REF_NAME}", pypi_block)
+        self.assertNotIn('gh release view "$GITHUB_REF_NAME"', pypi_block)
+        self.assertNotIn('gh release download "$GITHUB_REF_NAME"', pypi_block)
+        for job in ("prepublish", "pypi", "accept"):
+            self.assertIn("immutable-draft-release-receipt", blocks[job])
+            self.assertIn("draft-release-receipt.json", blocks[job])
+            self.assertNotIn('gh release view "$GITHUB_REF_NAME"', blocks[job])
+            self.assertNotIn('gh release download "$GITHUB_REF_NAME"', blocks[job])
+        self.assertIn('gh release view "$GITHUB_REF_NAME"', blocks["release-record"])
+        self.assertIn('gh release view "$GITHUB_REF_NAME"', blocks["finalize"])
+        self.assertIn('gh release download "$GITHUB_REF_NAME"', blocks["finalize"])
         for job in ("release-record", "pypi", "finalize"):
             self.assertNotIn("actions/checkout@", blocks[job])
             self.assertNotIn("scripts/", blocks[job])
@@ -573,7 +580,7 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_tag_build_rejects_another_trigger_tag(self) -> None:
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "another-tag"):
-            candidate._validate_tag_trigger("v0.4.5", "refs/tags/another-tag")
+            candidate._validate_tag_trigger("v0.4.6", "refs/tags/another-tag")
 
     def test_tag_build_accepts_the_exact_candidate_tag(self) -> None:
         source = str(candidate._git(ROOT, "rev-parse", "HEAD"))
@@ -581,9 +588,9 @@ class ReleaseCandidateTests(unittest.TestCase):
             report = candidate.validate_static(
                 ROOT,
                 tag_build=True,
-                trigger_ref="refs/tags/v0.4.5",
+                trigger_ref="refs/tags/v0.4.6",
             )
-        self.assertEqual(report["version"], "0.4.5")
+        self.assertEqual(report["version"], "0.4.6")
         self.assertEqual(report["release_source_sha"], source)
 
     def test_draft_release_is_read_from_the_release_inventory(self) -> None:
@@ -628,6 +635,101 @@ class ReleaseCandidateTests(unittest.TestCase):
                 token="masked",
                 api_url="https://api.example",
             )
+
+    def test_draft_release_receipt_binds_exact_manifest_assets(self) -> None:
+        policy = self.policy()
+        now = datetime(2026, 8, 31, 19, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory(prefix="draft-release-receipt-") as raw:
+            root = Path(raw)
+            wheel = root / "marvisx_cli-0.4.6-py3-none-any.whl"
+            sdist = root / "marvisx_cli-0.4.6.tar.gz"
+            wheel.write_bytes(b"wheel")
+            sdist.write_bytes(b"sdist")
+            manifest_path = root / "release-manifest.json"
+            self.write_manifest(
+                manifest_path,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                tag=policy["candidate_tag"],
+                artifacts=[
+                    {
+                        "filename": wheel.name,
+                        "size": wheel.stat().st_size,
+                        "sha256": candidate._sha_file(wheel),
+                    },
+                    {
+                        "filename": sdist.name,
+                        "size": sdist.stat().st_size,
+                        "sha256": candidate._sha_file(sdist),
+                    },
+                ],
+            )
+            receipt_path = root / "draft-release-receipt.json"
+            receipt = {
+                "schema": candidate.DRAFT_RELEASE_RECEIPT_SCHEMA,
+                "repository": policy["repository"],
+                "workflow_run_id": "123",
+                "release_source_sha": self.RELEASE_SOURCE_SHA,
+                "tag": policy["candidate_tag"],
+                "verified_at": now.isoformat(),
+                "release": {
+                    "id": 42,
+                    "tag_name": policy["candidate_tag"],
+                    "draft": True,
+                    "prerelease": True,
+                    "created_at": now.isoformat(),
+                },
+                "assets": sorted(
+                    [
+                        {
+                            "filename": wheel.name,
+                            "size": wheel.stat().st_size,
+                            "sha256": candidate._sha_file(wheel),
+                        },
+                        {
+                            "filename": sdist.name,
+                            "size": sdist.stat().st_size,
+                            "sha256": candidate._sha_file(sdist),
+                        },
+                        {
+                            "filename": manifest_path.name,
+                            "size": manifest_path.stat().st_size,
+                            "sha256": candidate._sha_file(manifest_path),
+                        },
+                    ],
+                    key=lambda row: row["filename"],
+                ),
+            }
+            receipt["content_digest"] = candidate._sha_bytes(
+                candidate._canonical(receipt)
+            )
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            report = candidate._draft_release_receipt(
+                policy,
+                manifest_path,
+                receipt_path,
+                release_source_sha=self.RELEASE_SOURCE_SHA,
+                run_id="123",
+                now=now,
+            )
+            self.assertEqual(report["id"], 42)
+            self.assertTrue(report["draft"])
+
+            receipt["assets"][0]["size"] += 1
+            receipt.pop("content_digest")
+            receipt["content_digest"] = candidate._sha_bytes(
+                candidate._canonical(receipt)
+            )
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(candidate.ReleasePolicyError, "assets differ"):
+                candidate._draft_release_receipt(
+                    policy,
+                    manifest_path,
+                    receipt_path,
+                    release_source_sha=self.RELEASE_SOURCE_SHA,
+                    run_id="123",
+                    now=now,
+                )
 
     def test_release_absence_detects_an_existing_draft(self) -> None:
         policy = self.policy()
@@ -684,7 +786,7 @@ class ReleaseCandidateTests(unittest.TestCase):
     def test_candidate_version_must_exceed_all_history(self) -> None:
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "above all PyPI"):
             candidate._require_candidate_above_history(
-                self.policy(), ["0.3.8", "0.4.5"], authority="PyPI"
+                self.policy(), ["0.3.8", "0.4.6"], authority="PyPI"
             )
 
     def test_tagged_source_remains_valid_after_release_branch_advances(self) -> None:
@@ -1060,20 +1162,20 @@ class ReleaseCandidateTests(unittest.TestCase):
                 candidate.build_manifest(ROOT, dist, source_sha=base)
 
     def test_sdist_uses_root_metadata_and_ignores_egg_info_copy(self) -> None:
-        metadata = b"Name: marvisx-cli\nVersion: 0.4.5\n\n"
+        metadata = b"Name: marvisx-cli\nVersion: 0.4.6\n\n"
         with tempfile.TemporaryDirectory(prefix="release-sdist-") as raw:
-            archive_path = Path(raw) / "marvisx_cli-0.4.5.tar.gz"
+            archive_path = Path(raw) / "marvisx_cli-0.4.6.tar.gz"
             with tarfile.open(archive_path, "w:gz") as archive:
                 for name in (
-                    "marvisx_cli-0.4.5/PKG-INFO",
-                    "marvisx_cli-0.4.5/marvisx_cli.egg-info/PKG-INFO",
+                    "marvisx_cli-0.4.6/PKG-INFO",
+                    "marvisx_cli-0.4.6/marvisx_cli.egg-info/PKG-INFO",
                 ):
                     info = tarfile.TarInfo(name)
                     info.size = len(metadata)
                     archive.addfile(info, io.BytesIO(metadata))
             self.assertEqual(
                 candidate._distribution_metadata(archive_path),
-                ("marvisx-cli", "0.4.5"),
+                ("marvisx-cli", "0.4.6"),
             )
 
     def test_manifest_rejects_unmanifested_release_asset(self) -> None:
@@ -1152,7 +1254,7 @@ class ReleaseCandidateTests(unittest.TestCase):
                 return_value=manifest["release_source_sha"],
             ), mock.patch.object(
                 candidate,
-                "_draft_release",
+                "_draft_release_receipt",
                 return_value={"id": 1, "draft": True, "prerelease": True},
             ), mock.patch.object(
                 candidate, "_workflow_run_readback", return_value=run
@@ -1164,6 +1266,7 @@ class ReleaseCandidateTests(unittest.TestCase):
                     manifest_path,
                     registry_dist,
                     github_dist,
+                    root / "draft-release-receipt.json",
                     token="masked",
                     run_id="123",
                     now=now,
@@ -1186,11 +1289,11 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.write_manifest(
                 manifest_path,
                 package="marvisx-cli",
-                version="0.4.5",
+                version="0.4.6",
                 artifacts=[{"filename": "a.whl", "size": 7, "sha256": "a" * 64}],
             )
             payload = {
-                "info": {"name": "marvisx-cli", "version": "0.4.5"},
+                "info": {"name": "marvisx-cli", "version": "0.4.6"},
                 "urls": [
                     {
                         "filename": "a.whl",
@@ -1217,11 +1320,11 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.write_manifest(
                 manifest_path,
                 package="marvisx-cli",
-                version="0.4.5",
+                version="0.4.6",
                 artifacts=[{"filename": "a.whl", "size": 7, "sha256": "a" * 64}],
             )
             payload = {
-                "info": {"name": "marvisx-cli", "version": "0.4.5"},
+                "info": {"name": "marvisx-cli", "version": "0.4.6"},
                 "urls": [
                     {
                         "filename": "a.whl",
@@ -1247,13 +1350,13 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.write_manifest(
                 manifest_path,
                 package="marvisx-cli",
-                version="0.4.5",
+                version="0.4.6",
                 artifacts=[
                     {"filename": "a.whl", "size": len(raw_artifact), "sha256": sha256}
                 ],
             )
             payload = {
-                "info": {"name": "marvisx-cli", "version": "0.4.5"},
+                "info": {"name": "marvisx-cli", "version": "0.4.6"},
                 "urls": [
                     {
                         "filename": "a.whl",
@@ -1299,7 +1402,7 @@ class ReleaseCandidateTests(unittest.TestCase):
                 self.write_manifest(
                     manifest_path,
                     package="marvisx-cli",
-                    version="0.4.5",
+                    version="0.4.6",
                     artifacts=[
                         {
                             "filename": "a.whl",
@@ -1309,7 +1412,7 @@ class ReleaseCandidateTests(unittest.TestCase):
                     ],
                 )
                 payload = {
-                    "info": {"name": "marvisx-cli", "version": "0.4.5"},
+                    "info": {"name": "marvisx-cli", "version": "0.4.6"},
                     "urls": [
                         {
                             "filename": "a.whl",
@@ -1347,13 +1450,13 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.write_manifest(
                 manifest_path,
                 package="marvisx-cli",
-                version="0.4.5",
+                version="0.4.6",
                 artifacts=[
                     {"filename": "a.whl", "size": len(raw_artifact), "sha256": sha256}
                 ],
             )
             payload = {
-                "info": {"name": "marvisx-cli", "version": "0.4.5"},
+                "info": {"name": "marvisx-cli", "version": "0.4.6"},
                 "urls": [
                     {
                         "filename": "a.whl",
@@ -1398,7 +1501,7 @@ class ReleaseCandidateTests(unittest.TestCase):
             spec = types.SimpleNamespace(name="_test_upgrade_verifier", loader=loader)
 
             class Distribution:
-                version = "0.4.5"
+                version = "0.4.6"
 
                 @staticmethod
                 def locate_file(_value):
@@ -1429,7 +1532,7 @@ class ReleaseCandidateTests(unittest.TestCase):
                     evidence_dir=Path(raw) / "evidence",
                 )
             self.assertEqual(report["candidate_import_origin"], "installed_distribution")
-            self.assertEqual(report["candidate_distribution_version"], "0.4.5")
+            self.assertEqual(report["candidate_distribution_version"], "0.4.6")
 
     def test_release_entrypoint_does_not_import_build_only_packaging_eagerly(self) -> None:
         with tempfile.TemporaryDirectory(prefix="blocked-packaging-") as raw:
@@ -1481,7 +1584,13 @@ class ReleaseCandidateTests(unittest.TestCase):
             candidate, "_remote_tag_sha", return_value="b" * 40
         ):
             with self.assertRaisesRegex(candidate.ReleasePolicyError, "reviewed"):
-                candidate.pretag(ROOT, token="masked")
+                candidate.pretag(
+                    ROOT,
+                    ROOT / "missing-manifest.json",
+                    ROOT / "missing-draft-release-receipt.json",
+                    token="masked",
+                    run_id="123",
+                )
 
     def test_tag_preflight_requires_unused_release_and_pypi_namespaces(self) -> None:
         policy = self.policy()
@@ -1734,6 +1843,7 @@ class ReleaseCandidateTests(unittest.TestCase):
                         ROOT,
                         manifest_path,
                         Path(raw),
+                        Path(raw) / "draft-release-receipt.json",
                         token="masked",
                         run_id="123",
                         now=now,
@@ -1782,6 +1892,7 @@ class ReleaseCandidateTests(unittest.TestCase):
                         ROOT,
                         manifest_path,
                         Path(raw),
+                        Path(raw) / "draft-release-receipt.json",
                         token="masked",
                         run_id="123",
                         now=now,
@@ -1832,7 +1943,7 @@ class ReleaseCandidateTests(unittest.TestCase):
                 candidate, "_remote_tag_sha", return_value="a" * 40
             ), mock.patch.object(
                 candidate, "_require_remote_release_source", return_value="a" * 40
-            ), mock.patch.object(candidate, "_draft_release"), mock.patch.object(
+            ), mock.patch.object(candidate, "_draft_release_receipt"), mock.patch.object(
                 candidate, "_environment_check", return_value={"name": "pypi"}
             ), mock.patch.object(candidate, "verify_manifest"), mock.patch.object(
                 candidate,
@@ -1844,6 +1955,7 @@ class ReleaseCandidateTests(unittest.TestCase):
                         ROOT,
                         manifest_path,
                         Path(raw),
+                        Path(raw) / "draft-release-receipt.json",
                         token="masked",
                         run_id="123",
                         now=now,
