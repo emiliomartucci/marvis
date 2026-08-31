@@ -27,6 +27,20 @@ ROOT = Path(__file__).resolve().parents[1]
 class ReleaseCandidateTests(unittest.TestCase):
     RELEASE_SOURCE_SHA = "a" * 40
 
+    def setUp(self) -> None:
+        # CI injects the real owner receipts at job scope. Unit tests exercise
+        # synthetic release sources, so inheriting those receipts couples the
+        # suite to whichever SHA the external watchdog currently protects.
+        receipt_env = mock.patch.dict(
+            candidate.os.environ,
+            {
+                candidate._TRUSTED_PUBLISHER_RECEIPT_ENV: "",
+                candidate._APPROVAL_WATCHDOG_RECEIPT_ENV: "",
+            },
+        )
+        receipt_env.start()
+        self.addCleanup(receipt_env.stop)
+
     def policy(self) -> dict:
         return copy.deepcopy(candidate.load_policy(ROOT))
 
