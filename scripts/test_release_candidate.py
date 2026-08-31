@@ -291,13 +291,17 @@ class ReleaseCandidateTests(unittest.TestCase):
             enabled = mutating if event == "push" and ref.startswith("refs/tags/v") else set()
             self.assertEqual(enabled, expected_jobs)
         blocks = candidate._workflow_job_blocks(workflow)
-        release_record = parsed["jobs"]["release-record"]
-        release_step = next(
-            step
-            for step in release_record["steps"]
-            if step.get("name") == "Create a draft and upload only manifested files"
-        )
-        self.assertEqual(release_step["env"]["GH_REPO"], "${{ github.repository }}")
+        repository_bound_steps = {
+            "release-record": "Create a draft and upload only manifested files",
+            "finalize": "Publish, read back and finalize the verified GitHub Release",
+        }
+        for job_name, step_name in repository_bound_steps.items():
+            step = next(
+                step
+                for step in parsed["jobs"][job_name]["steps"]
+                if step.get("name") == step_name
+            )
+            self.assertEqual(step["env"]["GH_REPO"], "${{ github.repository }}")
         contain_block = blocks["contain"]
         self.assertIn(
             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
