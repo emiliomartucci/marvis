@@ -16,7 +16,7 @@
 #
 # Authored against the OSS product line and reviewed again for the exact
 # MarvisX projection candidate at merge SHA
-# ab1fa58eae705a25ca46ea6829eb0d538794ee52.
+# 8dfd16e4e275b69435e0348258daf86f67898997.
 schema: marvis-shared-ownership/v1
 ownership_map_version: 3
 

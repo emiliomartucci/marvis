@@ -6,9 +6,14 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-No changes yet.
+### Security
 
-## [0.4.7] - candidate
+- Raise the direct MCP dependency floor to `1.28.1`, the first accepted
+  version that excludes CVE-2026-59950.
+- Bind the public consumer engine contract to MarvisX PR #349, merged as
+  `8dfd16e4e275b69435e0348258daf86f67898997`, without changing the public API.
+
+## [0.4.7] - 2026-08-31 (failed, not published)
 
 Recovery candidate for the same reviewed public/shared source as 0.4.6. It
 keeps product behavior unchanged and repairs only the immutable release path.
@@ -20,9 +25,10 @@ keeps product behavior unchanged and repairs only the immutable release path.
 - Keep the source-purity gate strict and add a regression contract that rejects
   receipts downloaded into the repository checkout.
 
-This section describes a release candidate only. Version 0.4.7 is not
-published until the separate tag, PyPI and post-publication acceptance gates
-all succeed.
+The tagged build was stopped before PyPI because its resolved MCP 1.27.2
+carried CVE-2026-59950. Automatic containment kept the GitHub release as a
+failed draft; no package reached PyPI. Version 0.4.7 is burned and must never
+be reused.
 
 ## [0.4.6] - 2026-08-31 (failed, not published)
 

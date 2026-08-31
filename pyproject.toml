@@ -102,7 +102,7 @@ dependencies = [
     "Pillow>=10.0.0",
     "openpyxl>=3.1.0",
     # The single-process MCP server (stdio) + remote streamable-http endpoint.
-    "mcp>=1.27.0",
+    "mcp>=1.28.1",
     "fastmcp>=3.4.2,<3.5",
     # --- default search-by-meaning engine (Granite, no API key) ---
     # Granite is the OSS default semantic engine: it must work on a plain
