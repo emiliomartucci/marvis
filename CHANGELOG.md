@@ -8,7 +8,25 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 No changes yet.
 
-## [0.4.2] - candidate
+## [0.4.3] - candidate
+
+Recovery candidate for the same reviewed public/shared source as 0.4.2. It
+keeps product behavior unchanged and repairs only the immutable release path.
+
+### Fixed
+
+- Isolated unit tests from both CI tag variables and real tags already present
+  in the shared Git object store.
+- Checked out the immutable tag before failed-release containment so GitHub can
+  verify the existing tag without creating or moving one.
+- Recorded every failed immutable version explicitly; 0.4.1 and 0.4.2 cannot
+  be reused.
+
+This section describes a release candidate only. Version 0.4.3 is not
+published until the separate tag, PyPI and post-publication acceptance gates
+all succeed.
+
+## [0.4.2] - 2026-08-31 (failed, not published)
 
 Security and provenance refresh based on the exact merged Plan B product base
 and the separately pinned CI evidence foundation from PR #61. The release
@@ -26,16 +44,18 @@ shared engine and its regression coverage.
   database migrations and temporary compatibility tombstones remain.
 - Expanded Python 3.10-3.13, Linux, macOS and Windows install and upgrade proof.
 
-### Fixed
+### Attempted fixes
 
 - Isolated release unit tests from live GitHub tag variables so a tag run does
   not accidentally enter publication mode.
 - Made failed GitHub Release lookups branch on the API exit status instead of
   treating an error payload as an existing final release.
 
-This section describes a release candidate only. Version 0.4.2 is not
-published until the separate tag, PyPI and post-publication acceptance gates
-all succeed.
+The immutable tag exists, but the tag workflow stopped before the package
+build. Unit tests were isolated from CI variables but still observed the real
+tag in the shared Git object store. Failed-release containment then lacked a
+Git checkout. No GitHub Release or PyPI file was created. Version 0.4.2 is
+burned and must never be reused.
 
 ## [0.4.1] - 2026-08-31 (failed, not published)
 

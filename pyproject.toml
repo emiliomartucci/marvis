@@ -18,7 +18,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "marvisx-cli"
-version = "0.4.2"
+version = "0.4.3"
 description = "MarvisX open-core — agent-native company-brain CLI runtime (init, status, brief, triage)"
 # long_description is sourced from this README (rendered on PyPI). BSL-1.1 is
 # source-available; `license` carries the SPDX-style text marker.
