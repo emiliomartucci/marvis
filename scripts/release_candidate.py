@@ -2,8 +2,9 @@
 """Fail-closed public release policy, artifact manifest and registry readback.
 
 The PR path validates and builds but cannot publish. A tag path must additionally
-pass live GitHub-environment checks, a fresh owner readback of the PyPI trusted
-publisher, and an external 24-hour approval-watchdog receipt before upload.
+pass live GitHub-environment checks, a fresh owner readback of the private shared
+source and PyPI trusted publisher, and an external 24-hour approval-watchdog
+receipt before upload.
 """
 from __future__ import annotations
 
@@ -61,6 +62,7 @@ GENERATED_TRACKED_DELETIONS = frozenset({"core/api/console_dist/.gitkeep"})
 _FILE_CHUNK_BYTES = 1024 * 1024
 _TRUSTED_PUBLISHER_RECEIPT_ENV = "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT"
 _APPROVAL_WATCHDOG_RECEIPT_ENV = "MARVIS_APPROVAL_WATCHDOG_RECEIPT"
+_SHARED_SOURCE_RECEIPT_ENV = "MARVIS_SHARED_SOURCE_OWNER_RECEIPT"
 
 
 class ReleasePolicyError(RuntimeError):
@@ -399,23 +401,57 @@ def _shared_source_readback(
     *,
     token: str,
     api_url: str,
+    now: datetime | None = None,
+    receipt_raw: str | None = None,
 ) -> dict[str, Any]:
+    del token, api_url
     expected = _shared_source_coordinates(root, policy)
-    pull = _request_json(
-        f"{api_url}/repos/{expected['repository']}/pulls/{expected['pull_request']}",
-        token=token,
+    receipt = _external_receipt(
+        receipt_raw
+        if receipt_raw is not None
+        else os.environ.get(_SHARED_SOURCE_RECEIPT_ENV),
+        kind="shared_source_owner_readback",
+    )
+    expected_coordinates = {
+        key: expected[key]
+        for key in (
+            "repository",
+            "pull_request",
+            "candidate_sha",
+            "merge_sha",
+            "engine_pin",
+            "engine_pin_sha256",
+        )
+    }
+    expected_coordinates_sha256 = _sha_bytes(_canonical(expected_coordinates))
+    observed_coordinates = {key: receipt.get(key) for key in expected_coordinates}
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    verified_at = _parse_time(str(receipt.get("verified_at") or ""))
+    merged_at = _parse_time(str(receipt.get("merged_at") or ""))
+    age = (current - verified_at).total_seconds()
+    expected_verifier = (
+        f"github-user:{policy['github_environment']['required_reviewer_login']}"
     )
     if (
-        pull.get("state") != "closed"
-        or not pull.get("merged_at")
-        or (pull.get("head") or {}).get("sha") != expected["candidate_sha"]
-        or pull.get("merge_commit_sha") != expected["merge_sha"]
+        receipt.get("status") != "verified"
+        or receipt.get("state") != "closed"
+        or observed_coordinates != expected_coordinates
+        or receipt.get("coordinates_sha256") != expected_coordinates_sha256
+        or receipt.get("verified_by") != expected_verifier
+        or age < 0
+        or age > 24 * 3600
+        or merged_at > verified_at
     ):
-        raise ReleasePolicyError("shared-source PR identity differs from release policy")
+        raise ReleasePolicyError(
+            "shared-source owner readback is stale or differs from release policy"
+        )
     return {
         **expected,
-        "state": pull.get("state"),
-        "merged_at": pull.get("merged_at"),
+        "state": receipt["state"],
+        "merged_at": receipt["merged_at"],
+        "verified_at": receipt["verified_at"],
+        "verified_by": receipt["verified_by"],
+        "receipt_sha256": _sha_bytes(_canonical(receipt)),
     }
 
 
@@ -856,6 +892,8 @@ def validate_static(
         != _TRUSTED_PUBLISHER_RECEIPT_ENV
         or receipt_policy.get("approval_watchdog_variable")
         != _APPROVAL_WATCHDOG_RECEIPT_ENV
+        or receipt_policy.get("shared_source_variable")
+        != _SHARED_SOURCE_RECEIPT_ENV
     ):
         raise ReleasePolicyError("external receipt provider contract is invalid")
     resolved_head = str(_git(root, "rev-parse", head))
@@ -938,6 +976,7 @@ def validate_static(
         "installed-upgrade",
         "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT",
         "MARVIS_APPROVAL_WATCHDOG_RECEIPT",
+        "MARVIS_SHARED_SOURCE_OWNER_RECEIPT",
         "environment: pypi",
         "pypa/gh-action-pypi-publish@" + expected_pins.get("pypa/gh-action-pypi-publish", ""),
     )
@@ -970,6 +1009,7 @@ def validate_static(
         'assert mcp["tool_count"] > 0',
         "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT: ${{ vars.MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT }}",
         "MARVIS_APPROVAL_WATCHDOG_RECEIPT: ${{ vars.MARVIS_APPROVAL_WATCHDOG_RECEIPT }}",
+        "MARVIS_SHARED_SOURCE_OWNER_RECEIPT: ${{ vars.MARVIS_SHARED_SOURCE_OWNER_RECEIPT }}",
         "if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && (needs.build.result != 'success' || needs.release-record.result != 'success' || needs.prepublish.result != 'success' || needs.pypi.result != 'success' || needs.accept.result != 'success' || needs.finalize.result != 'success') }}",
         'echo "::error::Refusing to mutate an already-final GitHub Release."',
         'echo "::error::The failed candidate exists on PyPI; owner verification and yank are required."',
@@ -1020,6 +1060,8 @@ def validate_static(
         external_blockers.append("trusted_publisher_owner_readback")
     if not os.environ.get(_APPROVAL_WATCHDOG_RECEIPT_ENV):
         external_blockers.append("external_approval_watchdog")
+    if not os.environ.get(_SHARED_SOURCE_RECEIPT_ENV):
+        external_blockers.append("shared_source_owner_readback")
     return {
         "schema": "marvis-public-release-static-preflight/v1",
         "product_base_sha": base,

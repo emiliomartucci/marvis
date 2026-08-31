@@ -67,6 +67,7 @@
   "external_receipts": {
     "trusted_publisher_variable": "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT",
     "approval_watchdog_variable": "MARVIS_APPROVAL_WATCHDOG_RECEIPT",
+    "shared_source_variable": "MARVIS_SHARED_SOURCE_OWNER_RECEIPT",
     "schema": "marvis-external-release-receipt/v1"
   },
   "build": {

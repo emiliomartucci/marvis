@@ -36,6 +36,7 @@ class ReleaseCandidateTests(unittest.TestCase):
             {
                 candidate._TRUSTED_PUBLISHER_RECEIPT_ENV: "",
                 candidate._APPROVAL_WATCHDOG_RECEIPT_ENV: "",
+                candidate._SHARED_SOURCE_RECEIPT_ENV: "",
             },
         )
         receipt_env.start()
@@ -160,6 +161,36 @@ class ReleaseCandidateTests(unittest.TestCase):
         }
         return trusted, watchdog
 
+    def shared_source_receipt(
+        self, now: datetime, policy: dict | None = None
+    ) -> dict:
+        policy = policy or self.policy()
+        expected = candidate._shared_source_coordinates(ROOT, policy)
+        coordinates = {
+            key: expected[key]
+            for key in (
+                "repository",
+                "pull_request",
+                "candidate_sha",
+                "merge_sha",
+                "engine_pin",
+                "engine_pin_sha256",
+            )
+        }
+        return {
+            "schema": candidate.EXTERNAL_RECEIPT_SCHEMA,
+            "kind": "shared_source_owner_readback",
+            "status": "verified",
+            **coordinates,
+            "coordinates_sha256": candidate._sha_bytes(
+                candidate._canonical(coordinates)
+            ),
+            "state": "closed",
+            "merged_at": "2026-08-31T11:50:49Z",
+            "verified_at": now.isoformat(),
+            "verified_by": "github-user:emiliomartucci",
+        }
+
     def test_real_release_candidate_static_policy(self) -> None:
         report = candidate.validate_static(ROOT)
         self.assertEqual(report["status"], "static_green_external_gates_open")
@@ -263,6 +294,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         for variable in (
             candidate._TRUSTED_PUBLISHER_RECEIPT_ENV,
             candidate._APPROVAL_WATCHDOG_RECEIPT_ENV,
+            candidate._SHARED_SOURCE_RECEIPT_ENV,
         ):
             self.assertIn("github.event_name != 'pull_request'", build_env[variable])
         steps = workflow["jobs"]["build"]["steps"]
@@ -314,25 +346,43 @@ class ReleaseCandidateTests(unittest.TestCase):
     def test_shared_source_readback_requires_exact_pr_candidate_and_merge(self) -> None:
         policy = self.policy()
         expected = policy["shared_source"]
-        pull = {
-            "state": "closed",
-            "merged_at": "2026-08-28T10:00:00Z",
-            "head": {"sha": expected["candidate_sha"]},
-            "merge_commit_sha": expected["merge_sha"],
-        }
-        with mock.patch.object(candidate, "_request_json", return_value=pull):
-            report = candidate._shared_source_readback(
-                ROOT, policy, token="masked", api_url="https://api.example"
-            )
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+        receipt = self.shared_source_receipt(now, policy)
+        report = candidate._shared_source_readback(
+            ROOT,
+            policy,
+            token="repository-scoped",
+            api_url="https://api.example",
+            now=now,
+            receipt_raw=json.dumps(receipt),
+        )
         self.assertEqual(report["candidate_sha"], expected["candidate_sha"])
         self.assertEqual(report["merge_sha"], expected["merge_sha"])
+        self.assertEqual(report["verified_by"], "github-user:emiliomartucci")
 
-        pull["head"]["sha"] = "a" * 40
-        with mock.patch.object(
-            candidate, "_request_json", return_value=pull
-        ), self.assertRaisesRegex(candidate.ReleasePolicyError, "identity"):
+        receipt["candidate_sha"] = "a" * 40
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "differs"):
             candidate._shared_source_readback(
-                ROOT, policy, token="masked", api_url="https://api.example"
+                ROOT,
+                policy,
+                token="repository-scoped",
+                api_url="https://api.example",
+                now=now,
+                receipt_raw=json.dumps(receipt),
+            )
+
+    def test_shared_source_owner_readback_expires_after_24_hours(self) -> None:
+        policy = self.policy()
+        verified = datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc)
+        receipt = self.shared_source_receipt(verified, policy)
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "stale"):
+            candidate._shared_source_readback(
+                ROOT,
+                policy,
+                token="repository-scoped",
+                api_url="https://api.example",
+                now=verified + timedelta(hours=25),
+                receipt_raw=json.dumps(receipt),
             )
 
     def test_release_foundation_is_exact_and_remotely_read_back(self) -> None:
