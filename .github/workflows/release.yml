@@ -36,8 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT: ${{ vars.MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT }}
-      MARVIS_APPROVAL_WATCHDOG_RECEIPT: ${{ vars.MARVIS_APPROVAL_WATCHDOG_RECEIPT }}
+      MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT: ${{ github.event_name != 'pull_request' && vars.MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT || '' }}
+      MARVIS_APPROVAL_WATCHDOG_RECEIPT: ${{ github.event_name != 'pull_request' && vars.MARVIS_APPROVAL_WATCHDOG_RECEIPT || '' }}
     steps:
       - name: Check out the reviewed source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
