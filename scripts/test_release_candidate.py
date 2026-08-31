@@ -226,6 +226,38 @@ class ReleaseCandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(candidate.ReleasePolicyError, "invalidated"):
             candidate.validate_static(ROOT)
 
+    def test_product_projection_precedes_release_activation(self) -> None:
+        policy = self.policy()
+        shared_source = candidate._shared_source_coordinates(ROOT, policy)
+        state = candidate._candidate_state(policy, shared_source=shared_source)
+        projection_merge = "b96ce42f3331321828dd7f123094b39be07765ac"
+
+        ancestry = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "merge-base",
+                "--is-ancestor",
+                projection_merge,
+                "HEAD",
+            ],
+            capture_output=True,
+        )
+        self.assertEqual(ancestry.returncode, 0)
+        self.assertEqual(
+            shared_source["merge_sha"],
+            "8dfd16e4e275b69435e0348258daf86f67898997",
+        )
+        if state["status"] == "invalidated":
+            self.assertEqual(
+                state["invalidated_by_shared_source_sha"],
+                shared_source["merge_sha"],
+            )
+        else:
+            self.assertEqual(state["status"], "active")
+            self.assertEqual(policy["plan_b_product_base_sha"], projection_merge)
+
     def test_candidate_invalidation_cannot_name_an_unrelated_source(self) -> None:
         policy = self.policy()
         policy["candidate_state"] = {
