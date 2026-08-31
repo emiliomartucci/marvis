@@ -3,18 +3,15 @@
   "package": "marvisx-cli",
   "repository": "emiliomartucci/marvis",
   "release_branch": "main",
-  "plan_b_product_base_sha": "1e8f3977bd1085e358c34e4b08bdcca058130757",
+  "plan_b_product_base_sha": "285d65d43e53fb4b23bfca770ae79d4ad9056c98",
   "release_foundation": {
     "repository": "emiliomartucci/marvis",
-    "pull_request": 56,
-    "candidate_sha": "110317349c3f650cd3043b82080bfe991edcf0ee",
-    "merge_sha": "bab84da1a4c104b6ab273dc5166752c97dac5a1b",
+    "pull_request": 61,
+    "candidate_sha": "ce7d6238c789f006284868e209a0712da64c3245",
+    "merge_sha": "bb66446521ec615ca8598140173ee9d2b3fa7b8e",
     "expected_changed_paths": [
-      ".github/workflows/ci.yml",
       "contracts/ci/collection-v1.json",
-      "scripts/test_release_candidate.py",
-      "scripts/test_verify_ci_collection.py",
-      "scripts/verify_ci_collection.py"
+      "scripts/test_verify_ci_collection.py"
     ]
   },
   "shared_source": {
@@ -25,10 +22,7 @@
     "engine_pin": "contracts/engine-pin.yaml"
   },
   "candidate_state": {
-    "status": "invalidated",
-    "reason": "shared_source_advanced_after_release_foundation",
-    "invalidated_by_shared_source_sha": "ab1fa58eae705a25ca46ea6829eb0d538794ee52",
-    "required_next_gate": "merge_product_projection_then_refresh_release_foundation"
+    "status": "active"
   },
   "candidate_version": "0.4.1",
   "candidate_tag": "v0.4.1",

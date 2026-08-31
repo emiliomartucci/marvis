@@ -160,17 +160,37 @@ class ReleaseCandidateTests(unittest.TestCase):
         }
         return trusted, watchdog
 
-    def test_real_release_candidate_is_invalidated_by_the_source_advance(self) -> None:
-        policy = self.policy()
-        shared_source = candidate._shared_source_coordinates(ROOT, policy)
-        state = candidate._candidate_state(policy, shared_source=shared_source)
-        self.assertEqual(state["status"], "invalidated")
+    def test_real_release_candidate_static_policy(self) -> None:
+        report = candidate.validate_static(ROOT)
+        self.assertEqual(report["status"], "static_green_external_gates_open")
+        self.assertEqual(report["version"], "0.4.1")
+        self.assertEqual(report["release_branch"], "main")
         self.assertEqual(
-            state["invalidated_by_shared_source_sha"],
+            report["product_base_sha"],
+            "285d65d43e53fb4b23bfca770ae79d4ad9056c98",
+        )
+        self.assertEqual(
+            report["release_foundation"]["candidate_sha"],
+            "ce7d6238c789f006284868e209a0712da64c3245",
+        )
+        self.assertEqual(
+            report["release_foundation"]["merge_sha"],
+            "bb66446521ec615ca8598140173ee9d2b3fa7b8e",
+        )
+        self.assertEqual(
+            report["release_foundation"]["changed_paths"],
+            self.policy()["release_foundation"]["expected_changed_paths"],
+        )
+        self.assertEqual(
+            report["shared_source"]["candidate_sha"],
+            "471f88f21dc0880c903ec6401621a52d2a801b0d",
+        )
+        self.assertEqual(
+            report["shared_source"]["merge_sha"],
             "ab1fa58eae705a25ca46ea6829eb0d538794ee52",
         )
-        with self.assertRaisesRegex(candidate.ReleasePolicyError, "invalidated"):
-            candidate.validate_static(ROOT)
+        self.assertEqual(len(report["action_pins"]), 5)
+        self.assertEqual(candidate.candidate_state_report(ROOT)["status"], "active")
 
     def test_candidate_invalidation_cannot_name_an_unrelated_source(self) -> None:
         policy = self.policy()
@@ -188,7 +208,7 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_active_candidate_cannot_keep_stale_invalidation_evidence(self) -> None:
         policy = self.policy()
-        policy["candidate_state"]["status"] = "active"
+        policy["candidate_state"]["reason"] = "stale"
         shared_source = candidate._shared_source_coordinates(ROOT, policy)
         with self.assertRaisesRegex(
             candidate.ReleasePolicyError, "active candidate state contains stale evidence"
@@ -239,6 +259,12 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_invalidated_pull_request_skips_every_expensive_release_step(self) -> None:
         workflow = yaml.safe_load((ROOT / candidate.WORKFLOW_PATH).read_text())
+        build_env = workflow["jobs"]["build"]["env"]
+        for variable in (
+            candidate._TRUSTED_PUBLISHER_RECEIPT_ENV,
+            candidate._APPROVAL_WATCHDOG_RECEIPT_ENV,
+        ):
+            self.assertIn("github.event_name != 'pull_request'", build_env[variable])
         steps = workflow["jobs"]["build"]["steps"]
         protected = {
             "Run the live pre-tag preflight before the expensive build",
@@ -314,7 +340,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         expected = policy["release_foundation"]
         pull = {
             "state": "closed",
-            "merged_at": "2026-08-29T15:01:11Z",
+            "merged_at": "2026-08-31T12:47:21Z",
             "head": {"sha": expected["candidate_sha"]},
             "merge_commit_sha": expected["merge_sha"],
         }
@@ -322,7 +348,7 @@ class ReleaseCandidateTests(unittest.TestCase):
             report = candidate._release_foundation_readback(
                 ROOT, policy, token="masked", api_url="https://api.example"
             )
-        self.assertEqual(report["pull_request"], 56)
+        self.assertEqual(report["pull_request"], 61)
         self.assertEqual(
             report["changed_paths"], expected["expected_changed_paths"]
         )
