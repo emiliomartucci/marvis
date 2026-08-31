@@ -575,17 +575,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release_state="$(gh api \
+          if release_json="$(gh api \
             "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
-            --jq '[.draft, .prerelease] | @tsv' 2>/dev/null || true)"
-          if [[ -z "$release_state" ]]; then
-            gh release create "$GITHUB_REF_NAME" \
-              --verify-tag \
-              --draft \
-              --prerelease \
-              --title "$GITHUB_REF_NAME [FAILED - DO NOT INSTALL]" \
-              --notes "The tagged release failed before acceptance. The tag and version are burned; use a new version after remediation."
-          else
+            2>/dev/null)"; then
+            release_state="$(jq -r '[.draft, .prerelease] | @tsv' <<< "$release_json")"
             IFS=$'\t' read -r draft prerelease <<< "$release_state"
             if [[ "$draft" == "true" ]]; then
               gh release edit "$GITHUB_REF_NAME" \
@@ -600,6 +593,13 @@ jobs:
               echo "::error::Refusing to mutate an already-final GitHub Release."
               exit 1
             fi
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --draft \
+              --prerelease \
+              --title "$GITHUB_REF_NAME [FAILED - DO NOT INSTALL]" \
+              --notes "The tagged release failed before acceptance. The tag and version are burned; use a new version after remediation."
           fi
 
           version="${GITHUB_REF_NAME#v}"
