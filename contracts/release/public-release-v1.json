@@ -3,15 +3,15 @@
   "package": "marvisx-cli",
   "repository": "emiliomartucci/marvis",
   "release_branch": "main",
-  "plan_b_product_base_sha": "285d65d43e53fb4b23bfca770ae79d4ad9056c98",
+  "plan_b_product_base_sha": "b96ce42f3331321828dd7f123094b39be07765ac",
   "release_foundation": {
     "repository": "emiliomartucci/marvis",
-    "pull_request": 61,
-    "candidate_sha": "ce7d6238c789f006284868e209a0712da64c3245",
-    "merge_sha": "bb66446521ec615ca8598140173ee9d2b3fa7b8e",
+    "pull_request": 71,
+    "candidate_sha": "8c5918071652c408c9ff23a268e24016690f6e54",
+    "merge_sha": "6cb5bbce045728fce2b0c76b8a45ea0ccacfb15a",
     "expected_changed_paths": [
       "contracts/ci/collection-v1.json",
-      "scripts/test_verify_ci_collection.py"
+      "scripts/test_release_candidate.py"
     ]
   },
   "shared_source": {
@@ -22,13 +22,10 @@
     "engine_pin": "contracts/engine-pin.yaml"
   },
   "candidate_state": {
-    "status": "invalidated",
-    "reason": "shared_source_advanced_after_release_foundation",
-    "invalidated_by_shared_source_sha": "8dfd16e4e275b69435e0348258daf86f67898997",
-    "required_next_gate": "merge_product_projection_then_refresh_release_foundation"
+    "status": "active"
   },
-  "candidate_version": "0.4.7",
-  "candidate_tag": "v0.4.7",
+  "candidate_version": "0.4.8",
+  "candidate_tag": "v0.4.8",
   "historical_failed_version": "0.4.1",
   "historical_failed_versions": [
     "0.4.1",
@@ -71,7 +68,7 @@
     "repository": "emiliomartucci/marvis",
     "workflow": "release.yml",
     "environment": "pypi",
-    "candidate_tag": "v0.4.7",
+    "candidate_tag": "v0.4.8",
     "write_authority_canary_workflow": "watchdog-canary.yml",
     "approval_deadline_hours": 24,
     "late_approval_upload_guard": true
