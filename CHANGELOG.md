@@ -8,23 +8,30 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 No changes yet.
 
-## [0.4.5] - candidate
+## [0.4.6] - candidate
 
-Recovery candidate for the same reviewed public/shared source as 0.4.4. It
+Recovery candidate for the same reviewed public/shared source as 0.4.5. It
 keeps product behavior unchanged and repairs only the immutable release path.
 
 ### Fixed
 
-- Read draft GitHub Releases from the paginated release inventory instead of
-  the tag lookup endpoint, which intentionally returns 404 for drafts.
-- Made the protected PyPI gate and failed-release containment use the
-  draft-aware GitHub CLI lookup with explicit repository context.
-- Fail closed if the candidate release inventory is missing, duplicated or no
-  longer both draft and prerelease.
+- Record the exact contained draft and asset hashes while the source-free job
+  has write authority, then pass that immutable receipt to read-only jobs.
+- Keep checked-out candidate code away from GitHub and PyPI write authority.
+- Re-read the live draft and exact asset bytes in the source-free finalizer
+  before publishing the accepted GitHub Release.
 
-This section describes a release candidate only. Version 0.4.5 is not
+This section describes a release candidate only. Version 0.4.6 is not
 published until the separate tag, PyPI and post-publication acceptance gates
 all succeed.
+
+## [0.4.5] - 2026-08-31 (failed, not published)
+
+The exact package candidate and contained draft GitHub Release were created.
+The following read-only job could not enumerate that draft with GitHub's
+intentionally limited workflow token and stopped before PyPI. Automatic
+containment kept the draft visibly marked `FAILED - DO NOT INSTALL`; no package
+reached PyPI. Version 0.4.5 is burned and must never be reused.
 
 ## [0.4.4] - 2026-08-31 (failed, not published)
 

@@ -41,6 +41,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 POLICY_SCHEMA = "marvis-public-release-policy/v1"
 MANIFEST_SCHEMA = "marvis-public-release-manifest/v1"
 ACCEPTANCE_SCHEMA = "marvis-public-release-acceptance/v1"
+DRAFT_RELEASE_RECEIPT_SCHEMA = "marvis-draft-release-receipt/v1"
 EXTERNAL_RECEIPT_SCHEMA = "marvis-external-release-receipt/v1"
 WATCHDOG_WRITE_AUTHORITY_SCHEMA = "marvis-watchdog-write-authority/v1"
 POLICY_PATH = Path("contracts/release/public-release-v1.json")
@@ -984,6 +985,9 @@ def validate_static(
         "release_candidate.py tag-preflight",
         "release_candidate.py pretag",
         "release_candidate.py publish-window",
+        "immutable-draft-release-receipt",
+        "draft-release-receipt.json",
+        "--draft-release-receipt",
         "installed-upgrade",
         "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT",
         "MARVIS_APPROVAL_WATCHDOG_RECEIPT",
@@ -1053,7 +1057,8 @@ def validate_static(
             )
     pypi_block = blocks.get("pypi") or ""
     contain_block = blocks.get("contain") or ""
-    for job_name, block in (("pypi", pypi_block), ("contain", contain_block)):
+    for job_name in ("release-record", "finalize", "contain"):
+        block = blocks.get(job_name) or ""
         if (
             'gh release view "$GITHUB_REF_NAME"' not in block
             or '--repo "$GITHUB_REPOSITORY"' not in block
@@ -1065,6 +1070,34 @@ def validate_static(
             raise ReleasePolicyError(
                 f"{job_name} uses the draft-blind GitHub Release tag endpoint"
             )
+    for receipt_bound_job in ("prepublish", "pypi", "accept", "finalize"):
+        block = blocks.get(receipt_bound_job) or ""
+        if (
+            "immutable-draft-release-receipt" not in block
+            or "draft-release-receipt.json" not in block
+        ):
+            raise ReleasePolicyError(
+                f"{receipt_bound_job} lacks the immutable draft-release receipt"
+            )
+    for read_only_job in ("prepublish", "pypi", "accept"):
+        block = blocks.get(read_only_job) or ""
+        if (
+            'gh release view "$GITHUB_REF_NAME"' in block
+            or 'gh release download "$GITHUB_REF_NAME"' in block
+            or "/releases/tags/${GITHUB_REF_NAME}" in block
+        ):
+            raise ReleasePolicyError(
+                f"{read_only_job} performs a live draft read without write authority"
+            )
+    release_record_block = blocks.get("release-record") or ""
+    if (
+        "actions/upload-artifact@" not in release_record_block
+        or "contents: write" not in release_record_block
+    ):
+        raise ReleasePolicyError("release-record does not persist write-authority proof")
+    finalize_block = blocks.get("finalize") or ""
+    if 'gh release download "$GITHUB_REF_NAME"' not in finalize_block:
+        raise ReleasePolicyError("finalize does not re-read exact draft assets")
     for privileged_job in ("release-record", "pypi", "finalize"):
         block = blocks.get(privileged_job) or ""
         if "actions/checkout@" in block or "scripts/" in block or "pip install" in block:
@@ -1380,6 +1413,134 @@ def _draft_release(
     }
 
 
+def _draft_release_receipt(
+    policy: dict[str, Any],
+    manifest_path: Path,
+    receipt_path: Path,
+    *,
+    release_source_sha: str,
+    run_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Validate the source-free write-authority proof of a contained draft."""
+
+    manifest = _validated_manifest(manifest_path)
+    receipt = _load_json(receipt_path)
+    if manifest_path.name != "release-manifest.json" or not str(run_id).isdigit():
+        raise ReleasePolicyError("draft release receipt input coordinates are invalid")
+    if set(receipt) != {
+        "schema",
+        "repository",
+        "workflow_run_id",
+        "release_source_sha",
+        "tag",
+        "verified_at",
+        "release",
+        "assets",
+        "content_digest",
+    }:
+        raise ReleasePolicyError("draft release receipt shape is invalid")
+    if receipt.get("schema") != DRAFT_RELEASE_RECEIPT_SCHEMA:
+        raise ReleasePolicyError("unsupported draft release receipt")
+    claimed = receipt.get("content_digest")
+    unsigned = dict(receipt)
+    unsigned.pop("content_digest", None)
+    if claimed != _sha_bytes(_canonical(unsigned)):
+        raise ReleasePolicyError("draft release receipt content digest mismatch")
+    if (
+        receipt.get("repository") != policy.get("repository")
+        or receipt.get("workflow_run_id") != str(run_id)
+        or receipt.get("release_source_sha") != release_source_sha
+        or receipt.get("tag") != policy.get("candidate_tag")
+        or manifest.get("release_source_sha") != release_source_sha
+        or manifest.get("tag") != policy.get("candidate_tag")
+    ):
+        raise ReleasePolicyError("draft release receipt coordinates differ")
+
+    try:
+        verified = _parse_time(str(receipt.get("verified_at") or ""))
+    except (TypeError, ValueError) as exc:
+        raise ReleasePolicyError("draft release receipt time is invalid") from exc
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    age = (current - verified).total_seconds()
+    if age < 0 or age > int(policy["approval_deadline_hours"]) * 3600:
+        raise ReleasePolicyError("draft release receipt is stale")
+
+    release = receipt.get("release")
+    if not isinstance(release, dict):
+        raise ReleasePolicyError("draft release receipt has no release identity")
+    if set(release) != {
+        "id",
+        "tag_name",
+        "draft",
+        "prerelease",
+        "created_at",
+    }:
+        raise ReleasePolicyError("draft release receipt identity shape is invalid")
+    release_id = release.get("id")
+    if (
+        not isinstance(release_id, int)
+        or isinstance(release_id, bool)
+        or release_id <= 0
+        or release.get("tag_name") != policy.get("candidate_tag")
+        or release.get("draft") is not True
+        or release.get("prerelease") is not True
+    ):
+        raise ReleasePolicyError("draft release receipt is not contained")
+    try:
+        created = _parse_time(str(release.get("created_at") or ""))
+    except (TypeError, ValueError) as exc:
+        raise ReleasePolicyError("draft release creation time is invalid") from exc
+    creation_age = (verified - created).total_seconds()
+    if creation_age < 0 or creation_age > int(policy["approval_deadline_hours"]) * 3600:
+        raise ReleasePolicyError("draft release receipt creation order is invalid")
+
+    expected = {
+        name: {"size": row["size"], "sha256": row["sha256"]}
+        for name, row in _manifest_artifacts(manifest).items()
+    }
+    expected[manifest_path.name] = {
+        "size": manifest_path.stat().st_size,
+        "sha256": _sha_file(manifest_path),
+    }
+    rows = receipt.get("assets")
+    if not isinstance(rows, list) or not rows:
+        raise ReleasePolicyError("draft release receipt asset inventory is empty")
+    observed: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"filename", "size", "sha256"}:
+            raise ReleasePolicyError("draft release receipt asset inventory is invalid")
+        filename = row.get("filename")
+        size = row.get("size")
+        sha256 = row.get("sha256")
+        if (
+            not isinstance(filename, str)
+            or PurePosixPath(filename).name != filename
+            or filename in observed
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(sha256, str)
+            or not SHA256.fullmatch(sha256)
+        ):
+            raise ReleasePolicyError("draft release receipt asset inventory is invalid")
+        observed[filename] = {"size": size, "sha256": sha256}
+    if observed != expected:
+        raise ReleasePolicyError("draft release assets differ from immutable manifest")
+    return {
+        "id": release_id,
+        "tag_name": release["tag_name"],
+        "draft": True,
+        "prerelease": True,
+        "created_at": release["created_at"],
+        "verified_at": receipt["verified_at"],
+        "workflow_run_id": str(run_id),
+        "assets": rows,
+        "receipt_sha256": _sha_file(receipt_path),
+        "receipt_content_digest": claimed,
+    }
+
+
 def preflight(
     root: Path, *, token: str, api_url: str = "https://api.github.com"
 ) -> dict[str, Any]:
@@ -1492,7 +1653,15 @@ def tag_preflight(
     return report
 
 
-def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -> dict[str, Any]:
+def pretag(
+    root: Path,
+    manifest_path: Path,
+    draft_release_receipt: Path,
+    *,
+    token: str,
+    run_id: str,
+    api_url: str = "https://api.github.com",
+) -> dict[str, Any]:
     report = validate_static(root, tag_build=True)
     policy = load_policy(root)
     _require_release_controls_committed(root, report["release_source_sha"])
@@ -1522,7 +1691,13 @@ def pretag(root: Path, *, token: str, api_url: str = "https://api.github.com") -
         token=token,
         api_url=api_url,
     )
-    release = _draft_release(policy, token=token, api_url=api_url)
+    release = _draft_release_receipt(
+        policy,
+        manifest_path,
+        draft_release_receipt,
+        release_source_sha=report["release_source_sha"],
+        run_id=run_id,
+    )
     _require_remote_absence(
         _candidate_pypi_url(policy),
         label="candidate PyPI version",
@@ -2030,6 +2205,7 @@ def build_acceptance_receipt(
     manifest_path: Path,
     registry_dist: Path,
     github_dist: Path,
+    draft_release_receipt: Path,
     *,
     token: str,
     run_id: str,
@@ -2042,7 +2218,7 @@ def build_acceptance_receipt(
     if not SHA40.fullmatch(source_sha):
         raise ReleasePolicyError("release manifest source is invalid")
     verify_manifest(root, manifest_path, registry_dist)
-    verify_manifest(root, github_dist / manifest_path.name, github_dist)
+    verify_manifest(root, manifest_path, github_dist)
     registry = registry_verify(manifest_path, attempts=1, delay_seconds=0)
     policy = load_policy(root)
     external_receipts = _strict_external_receipts(
@@ -2070,7 +2246,14 @@ def build_acceptance_receipt(
         api_url=api_url,
         allow_branch_advance=True,
     )
-    release = _draft_release(policy, token=token, api_url=api_url)
+    release = _draft_release_receipt(
+        policy,
+        manifest_path,
+        draft_release_receipt,
+        release_source_sha=source_sha,
+        run_id=run_id,
+        now=now,
+    )
     run = _workflow_run_readback(
         policy,
         source_sha,
@@ -2143,6 +2326,7 @@ def publish_window(
     root: Path,
     manifest_path: Path,
     dist: Path,
+    draft_release_receipt: Path,
     *,
     token: str,
     run_id: str,
@@ -2199,7 +2383,14 @@ def publish_window(
         api_url=api_url,
         allow_branch_advance=True,
     )
-    _draft_release(policy, token=token, api_url=api_url)
+    release = _draft_release_receipt(
+        policy,
+        manifest_path,
+        draft_release_receipt,
+        release_source_sha=source_sha,
+        run_id=run_id,
+        now=now,
+    )
     environment = _environment_check(policy, token=token, api_url=api_url)
     verify_manifest(root, manifest_path, dist)
     _require_remote_absence(
@@ -2216,6 +2407,7 @@ def publish_window(
         "release_foundation": release_foundation,
         "shared_source": shared_source,
         "dispatch_preflight": dispatch_preflight,
+        "github_release": release,
         "remote_release_branch_sha": remote_branch_sha,
         "registry_latest": (registry.get("info") or {}).get("version"),
     }
@@ -2234,7 +2426,10 @@ def main(argv: list[str] | None = None) -> int:
     static_parser.add_argument("--tag-build", action="store_true")
     static_parser.add_argument("--trigger-ref")
     pretag_parser = sub.add_parser("pretag")
+    pretag_parser.add_argument("--manifest", type=Path, required=True)
+    pretag_parser.add_argument("--draft-release-receipt", type=Path, required=True)
     pretag_parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
+    pretag_parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID"))
     tag_preflight_parser = sub.add_parser("tag-preflight")
     tag_preflight_parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
     preflight_parser = sub.add_parser("preflight")
@@ -2256,6 +2451,7 @@ def main(argv: list[str] | None = None) -> int:
     acceptance_parser.add_argument("--manifest", type=Path, required=True)
     acceptance_parser.add_argument("--registry-dist", type=Path, required=True)
     acceptance_parser.add_argument("--github-dist", type=Path, required=True)
+    acceptance_parser.add_argument("--draft-release-receipt", type=Path, required=True)
     acceptance_parser.add_argument("--output", type=Path, required=True)
     acceptance_parser.add_argument(
         "--token", default=os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -2264,6 +2460,7 @@ def main(argv: list[str] | None = None) -> int:
     window_parser = sub.add_parser("publish-window")
     window_parser.add_argument("--manifest", type=Path, required=True)
     window_parser.add_argument("--dist", type=Path, required=True)
+    window_parser.add_argument("--draft-release-receipt", type=Path, required=True)
     window_parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
     window_parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID"))
     installed_upgrade_parser = sub.add_parser("installed-upgrade")
@@ -2281,9 +2478,17 @@ def main(argv: list[str] | None = None) -> int:
                 trigger_ref=args.trigger_ref,
             )
         elif args.command == "pretag":
-            if not args.token:
-                raise ReleasePolicyError("GITHUB_TOKEN is required for live pretag checks")
-            result = pretag(root, token=args.token)
+            if not args.token or not args.run_id:
+                raise ReleasePolicyError(
+                    "GITHUB_TOKEN and GITHUB_RUN_ID are required for live pretag checks"
+                )
+            result = pretag(
+                root,
+                args.manifest.resolve(),
+                args.draft_release_receipt.resolve(),
+                token=args.token,
+                run_id=args.run_id,
+            )
         elif args.command == "tag-preflight":
             if not args.token:
                 raise ReleasePolicyError(
@@ -2326,6 +2531,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.manifest.resolve(),
                 args.registry_dist.resolve(),
                 args.github_dist.resolve(),
+                args.draft_release_receipt.resolve(),
                 token=args.token,
                 run_id=args.run_id,
             )
@@ -2341,6 +2547,7 @@ def main(argv: list[str] | None = None) -> int:
                 root,
                 args.manifest.resolve(),
                 args.dist.resolve(),
+                args.draft_release_receipt.resolve(),
                 token=args.token,
                 run_id=args.run_id,
             )
