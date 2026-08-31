@@ -988,6 +988,7 @@ def validate_static(
         "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT",
         "MARVIS_APPROVAL_WATCHDOG_RECEIPT",
         "MARVIS_SHARED_SOURCE_OWNER_RECEIPT",
+        "GH_REPO: ${{ github.repository }}",
         "environment: pypi",
         "pypa/gh-action-pypi-publish@" + expected_pins.get("pypa/gh-action-pypi-publish", ""),
     )
@@ -1021,6 +1022,7 @@ def validate_static(
         "MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT: ${{ vars.MARVIS_PYPI_TRUSTED_PUBLISHER_RECEIPT }}",
         "MARVIS_APPROVAL_WATCHDOG_RECEIPT: ${{ vars.MARVIS_APPROVAL_WATCHDOG_RECEIPT }}",
         "MARVIS_SHARED_SOURCE_OWNER_RECEIPT: ${{ vars.MARVIS_SHARED_SOURCE_OWNER_RECEIPT }}",
+        "GH_REPO: ${{ github.repository }}",
         "if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && (needs.build.result != 'success' || needs.release-record.result != 'success' || needs.prepublish.result != 'success' || needs.pypi.result != 'success' || needs.accept.result != 'success' || needs.finalize.result != 'success') }}",
         'echo "::error::Refusing to mutate an already-final GitHub Release."',
         'echo "::error::The failed candidate exists on PyPI; owner verification and yank are required."',
