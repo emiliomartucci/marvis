@@ -379,6 +379,22 @@ class ReleaseCandidateTests(unittest.TestCase):
             self.assertNotIn("actions/checkout@", blocks[job])
             self.assertNotIn("scripts/", blocks[job])
             self.assertNotIn("pip install", blocks[job])
+        accept_steps = parsed["jobs"]["accept"]["steps"]
+        install_index = next(
+            index
+            for index, step in enumerate(accept_steps)
+            if step.get("name") == "Install pinned acceptance helpers"
+        )
+        verification_index = next(
+            index
+            for index, step in enumerate(accept_steps)
+            if step.get("name") == "Re-read PyPI and exercise install, upgrade and recovery"
+        )
+        self.assertLess(install_index, verification_index)
+        self.assertEqual(
+            accept_steps[install_index]["run"],
+            "pip install --require-hashes -r requirements-release.lock",
+        )
         self.assertIn("contents: read", blocks["accept"])
         self.assertNotIn("contents: write", blocks["accept"])
 
