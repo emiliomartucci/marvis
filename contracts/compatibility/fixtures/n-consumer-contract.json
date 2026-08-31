@@ -4157,7 +4157,7 @@
         "projects": "282fa0b047502a094caf236384476bc10b74784317e9f34ce41e902e639210e7",
         "query": "f3cee39e2a25484c35e1a8de133684ad781c9c9cb24396d4903b11c084d2657d",
         "semantic_available": "b7948cf3dc2d6d4d2873c20e9d54ade871a81c77b3f89aa84efe4d95f8d9dc48",
-        "semantic_reason": "88decbe2b45982c3bb164cbbafd29a1249a92ccc244aec829db180a63494b169",
+        "semantic_reason": "7cd9cd51813579d970c90ae444fe1490fbecc07721f4369fe2811131a6e8b0bc",
         "suggested_next_tool": "677c4b0238b048373d6d1c8c05b8d6a369a15ab58031b6568974649c999ae6e0",
         "tasks": "b8186426c77125a8383698603d6bf28c2b711296a72c992b462422aad04088db",
         "total": "8e54a5156908c081db682709ae510dfd381b39fb7408e069c03e78bd11fe13f7"
@@ -5644,7 +5644,7 @@
     "ScanWorkdirRequest": "60368d4682a78b12c53c8b9f12843dab07c6608b20a129dd418b109df5d355df",
     "ScanWorkdirResponse": "bd7942ccbe30fa672ce0dcd2fd719c0167eabd81821567dd4c3497ccee2a5bb1",
     "SearchHit": "4d998b9a11dfb96a475a8de4bb01e792461ea9db2431c82c7f6d23023750bfd7",
-    "SearchResponse": "01884c8299e50ed7a2425590354c0fc487a68c8b4c593045a704e4e1cdea958f",
+    "SearchResponse": "194e33aaf1e3ac31c5f0f164555e71da1fcb15899ce94b45995f9a84b7c3d3ed",
     "SecurityData": "4e8cecd5a87e2bfde18afbf537811e267d6e2f09c41d3a6ccd74de7d6cc9c13b",
     "SecurityEvent": "64735d16abc57a027743eb27f90df6bebad333ba66e820b4665d82923dab891e",
     "SecuritySummary": "ce15af812e85297d20635da96297d9a9b01e1e98687002a842c4051398567e1f",
@@ -15107,6 +15107,6 @@
   },
   "path_count": 293,
   "schema": "marvis-compatibility-fixture/v1",
-  "source_openapi_sha256": "74b4f1e9b91f19059a96b72e71391b831fadcdcb9fd7e4262a63cb4b1aa7604f",
-  "source_ref": "64e96cb7e90292816296750906db68ec81c4a37e"
+  "source_openapi_sha256": "e2416431a33d64c9786e4004c526c196d612536609c5e5b5371a26c411d3ae47",
+  "source_ref": "ab1fa58eae705a25ca46ea6829eb0d538794ee52"
 }

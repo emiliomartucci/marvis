@@ -10,7 +10,7 @@
 contract_version: 3
 lineage: unified-main
 openapi: "3.1.0"
-engine_ref: d11f13d774f7165e0c05b0a0338509f32a44f9c0
+engine_ref: 2ea2c8b4a4e16d4ad775d7954cd8181008e2aaea
 predecessor_contract_version: 2
 predecessor_engine_ref: e0a6994ae2102e3a6a631a11fb9934940e180a60
 paths: 302
@@ -53,7 +53,10 @@ coupled_to: requirements-tenant.txt
 # 2026-08-28 (additive, no version bump): project lifecycle registration,
 # Cloud/F change control, approval-bound archive, governed decisions, and
 # historical pointers become discoverable. Existing routes remain compatible.
-# engine_ref moved to the rebased source commit carrying this spec (d11f13d7)
+# 2026-08-31 (additive, no version bump): SearchResponse accepts the already
+# runtime-emitted `semantic-timeout` reason and exposes sanitized reasons as an
+# extensible client contract. No route or required field changed.
+# engine_ref moved to the source commit carrying this spec (2ea2c8b4)
 # by metadata-only follow-up. Exact-SHA consumers can therefore reproduce the
 # committed contract before reading this metadata commit.
 # The baseline test compares git show <engine_ref>:contracts/openapi/marvisx.json

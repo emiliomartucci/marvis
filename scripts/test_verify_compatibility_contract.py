@@ -11,8 +11,8 @@ from verify_compatibility_contract import CompatibilityError, provider_breaks, v
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_REF = "64e96cb7e90292816296750906db68ec81c4a37e"
-PAYLOAD_SHA256 = "ff3ecafbc097f896bf54bdd3b310f286918d301885ce5161e3aa672b09ffdb58"
+SOURCE_REF = "ab1fa58eae705a25ca46ea6829eb0d538794ee52"
+PAYLOAD_SHA256 = "895ec2f5e69ee2c4845c8119d157dca19da700ce7ae7179a574b5dccedcfd15e"
 
 
 class CompatibilityContractTests(unittest.TestCase):
@@ -28,6 +28,7 @@ class CompatibilityContractTests(unittest.TestCase):
             "core/api/mcp/tools/agent_tokens.py",
             "core/api/mcp/tools/projects.py",
             "core/api/models/auth.py",
+            "core/api/models/search.py",
             "core/api/models/tasks.py",
             "core/api/routers/agent_tokens.py",
             "core/api/routers/auth.py",
@@ -35,6 +36,7 @@ class CompatibilityContractTests(unittest.TestCase):
             "core/api/routers/projects.py",
             "core/api/routers/tasks.py",
             "core/api/services/schema_upgrade.py",
+            "core/api/use_cases/search.py",
             "core/api/tests/test_require_scope_empty_deny.py",
             "core/api/tests/test_schema_compatibility.py",
             "core/cli/marvis_hooks.py",
@@ -74,6 +76,53 @@ class CompatibilityContractTests(unittest.TestCase):
         self.assertEqual(result["projection_payload_sha256"], PAYLOAD_SHA256)
         self.assertGreater(result["n_operations"], result["n_minus_1_operations"])
         self.assertEqual(result["declared_n_minus_1_schema_breaks"], 4)
+        self.assertEqual(result["declared_n_minus_1_response_sanitizers"], 1)
+
+    def test_runtime_search_reason_sanitizer_maps_timeout_to_n_minus_one_value(self) -> None:
+        from core.api.models.search import SearchResponse
+
+        response = SearchResponse(semantic_reason="semantic-timeout")
+
+        self.assertEqual(response.semantic_reason, "runtime-gate")
+        self.assertEqual(response.model_dump()["semantic_reason"], "runtime-gate")
+
+    def test_missing_response_sanitizer_declaration_fails_closed(self) -> None:
+        root = self._copy()
+        path = root / "contracts/compatibility/consumer-matrix-v1.json"
+        matrix = json.loads(path.read_text())
+        matrix.pop("n_minus_1_provider_response_sanitizers")
+        path.write_text(json.dumps(matrix, sort_keys=True, indent=2) + "\n")
+
+        with self.assertRaisesRegex(CompatibilityError, "sanitizer inventory missing"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_response_sanitizer_wrong_wire_mapping_fails_closed(self) -> None:
+        root = self._copy()
+        path = root / "contracts/compatibility/consumer-matrix-v1.json"
+        matrix = json.loads(path.read_text())
+        matrix["n_minus_1_provider_response_sanitizers"][0]["wire_value"] = (
+            "index-building"
+        )
+        path.write_text(json.dumps(matrix, sort_keys=True, indent=2) + "\n")
+
+        with self.assertRaisesRegex(CompatibilityError, "runtime response sanitizer mapping"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_response_sanitizer_missing_evidence_symbol_fails_closed(self) -> None:
+        root = self._copy()
+        path = root / "contracts/compatibility/consumer-matrix-v1.json"
+        matrix = json.loads(path.read_text())
+        row = matrix["n_minus_1_provider_response_sanitizers"][0]
+        row["evidence"] = sorted(
+            [
+                "core/api/models/search.py::does_not_exist",
+                "core/api/use_cases/search.py::_build_response",
+            ]
+        )
+        path.write_text(json.dumps(matrix, sort_keys=True, indent=2) + "\n")
+
+        with self.assertRaisesRegex(CompatibilityError, "evidence symbol missing"):
+            verify(root, expected_source_ref=SOURCE_REF)
 
     def test_manifest_tamper_fails_closed(self) -> None:
         root = self._copy()

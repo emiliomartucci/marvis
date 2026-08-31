@@ -13324,13 +13324,14 @@
           "semantic_reason": {
             "anyOf": [
               {
-                "enum": [
+                "type": "string",
+                "x-extensible-enum": [
                   "model-not-loadable",
                   "vec0-not-loadable",
                   "runtime-gate",
-                  "index-building"
-                ],
-                "type": "string"
+                  "index-building",
+                  "semantic-timeout"
+                ]
               },
               {
                 "type": "null"

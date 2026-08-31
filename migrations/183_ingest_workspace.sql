@@ -184,10 +184,15 @@ INSERT INTO ingest_skipped_v183_new (
 )
 SELECT
     s.id,
-    COALESCE(
-      (SELECT p.workspace_id FROM ingest_pending p
-        WHERE p.id = s.existing_ingest_id),
-      CASE WHEN (
+    CASE
+      -- A declared parent is the authoritative ownership source.  If that
+      -- historical reference is dangling or its parent remains unowned, do
+      -- not fall back to the project slug and manufacture attribution.
+      WHEN s.existing_ingest_id IS NOT NULL THEN (
+        SELECT p.workspace_id FROM ingest_pending p
+         WHERE p.id = s.existing_ingest_id
+      )
+      WHEN (
         SELECT COUNT(DISTINCT wp.workspace_id)
           FROM workspace_projects wp
          WHERE wp.project_slug = s.project_slug
@@ -197,8 +202,9 @@ SELECT
           FROM workspace_projects wp
          WHERE wp.project_slug = s.project_slug
            AND length(trim(wp.workspace_id)) > 0
-      ) ELSE NULL END
-    ),
+      )
+      ELSE NULL
+    END,
     s.file_path_attempted, s.project_slug, s.sha256, s.reason,
     s.existing_ingest_id, s.error_message, s.created_at, s.created_by
 FROM ingest_skipped s;

@@ -25,6 +25,7 @@ import import_shared_projection as isp  # noqa: E402
 SOURCE_SHA = "a" * 40
 EXPORTER_SHA = "b" * 40
 EXPORTER_IDENTITY = "c" * 64
+ROOT = Path(__file__).resolve().parents[1]
 
 TEST_MAP = """\
 schema: marvis-shared-ownership/v1
@@ -785,7 +786,7 @@ class ImportGateTest(unittest.TestCase):
     def test_real_ownership_map_loads(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
         ownership, _ = isp.load_ownership_map(repo_root / "contracts/shared-ownership.yaml")
-        self.assertEqual(ownership["ownership_map_version"], 2)
+        self.assertEqual(ownership["ownership_map_version"], 3)
         self.assertIn("core/api/", ownership["managed_areas"])
 
     def test_forbidden_paths_must_be_exact_files(self) -> None:
@@ -944,6 +945,18 @@ class ImportGateTest(unittest.TestCase):
         state = isp.load_bundle(bundle, bundle_expectations(bundle))
         ownership, _ = isp.load_ownership_map(self.repo / "contracts/shared-ownership.yaml")
         return isp.classify(state, ownership, self.repo)["blocked"]
+
+
+class ProductionOwnershipContractTests(unittest.TestCase):
+    def test_oss_changelog_is_product_owned_and_preserved(self) -> None:
+        ownership, _ = isp.load_ownership_map(ROOT / "contracts/shared-ownership.yaml")
+
+        self.assertIsNone(isp.managed_rule_for("CHANGELOG.md", ownership["managed_areas"]))
+        self.assertEqual(
+            isp.owned_rule_for("CHANGELOG.md", ownership["oss_owned_areas"]),
+            "CHANGELOG.md",
+        )
+        self.assertIn("CHANGELOG.md", ownership[isp.APPROVED_PRESERVE_KEY])
 
 
 if __name__ == "__main__":

@@ -2,9 +2,40 @@
 # v1.2.0 - 2026-04-12 - Add learning, inbox_item, audit doc_types
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator, WithJsonSchema
+
+SEMANTIC_REASON_VALUES = (
+    "model-not-loadable",
+    "vec0-not-loadable",
+    "runtime-gate",
+    "index-building",
+    "semantic-timeout",
+)
+_SEMANTIC_REASON_SET = frozenset(SEMANTIC_REASON_VALUES)
+_INTERNAL_TIMEOUT_REASON = "semantic-timeout"
+
+
+def _normalize_semantic_reason(value: object) -> str:
+    """Keep the client schema open while preserving the N-1 wire values."""
+    if value == _INTERNAL_TIMEOUT_REASON:
+        return "runtime-gate"
+    if not isinstance(value, str) or value not in _SEMANTIC_REASON_SET:
+        raise ValueError("unsupported semantic reason")
+    return value
+
+
+SemanticReason = Annotated[
+    str,
+    BeforeValidator(_normalize_semantic_reason),
+    WithJsonSchema(
+        {
+            "type": "string",
+            "x-extensible-enum": list(SEMANTIC_REASON_VALUES),
+        }
+    ),
+]
 
 
 class SearchHit(BaseModel):
@@ -60,9 +91,7 @@ class SearchResponse(BaseModel):
     # `index-building` (U5): the index was empty and a self-healing background
     # build was just kicked off — the meaning index is not ready YET but is being
     # built; a retry shortly will succeed.
-    semantic_reason: (
-        Literal[
-            "model-not-loadable", "vec0-not-loadable", "runtime-gate", "index-building"
-        ]
-        | None
-    ) = None
+    # A bounded semantic timeout remains distinct in server logs/metadata but is
+    # serialized as `runtime-gate`: that value was already accepted by N-1
+    # clients, so a degraded lane cannot break an otherwise useful response.
+    semantic_reason: SemanticReason | None = None

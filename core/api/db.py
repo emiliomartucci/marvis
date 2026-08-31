@@ -15,12 +15,13 @@ import stat
 import time
 import uuid as uuid_mod
 from collections import Counter, defaultdict, deque
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import AsyncGenerator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, AsyncGenerator
+from typing import Any
 
 import aiosqlite
 from starlette.requests import Request
@@ -200,6 +201,7 @@ SCHEMA_ASSERTIONS: tuple[tuple[int, str, str], ...] = (
     (183, "ingest_webhook_nonces", "workspace_id"),
     (185, "session_costs", "workspace_id"),
     (185, "session_conversations", "workspace_id"),
+    (185, "task_cost_entries_v185_quarantine", "quarantine_reason"),
     (186, "session_operation_leases", "generation"),
     (187, "project_lifecycle_state", "project_id"),
     (187, "project_lifecycle_state", "writer_watermark"),
@@ -216,6 +218,43 @@ SCHEMA_ASSERTIONS: tuple[tuple[int, str, str], ...] = (
     (187, "decision_lifecycle_operations", "cloud_f_epoch"),
     (187, "decision_lifecycle_operations", "request_json"),
     (187, "historical_artifact_pointers", "source_kind"),
+)
+
+SCHEMA_EXACT_COLUMN_ASSERTIONS: tuple[
+    tuple[int, str, dict[str, tuple[str, bool, str | None, int]]], ...
+] = (
+    (
+        185,
+        "task_cost_entries_v185_quarantine",
+        {
+            "id": ("TEXT", False, None, 1),
+            "task_id": ("TEXT", True, None, 0),
+            "entry_type": ("TEXT", True, None, 0),
+            "source": ("TEXT", True, None, 0),
+            "conversation_id": ("TEXT", False, None, 0),
+            "pr_id": ("TEXT", False, None, 0),
+            "cost_usd_delta": ("REAL", True, None, 0),
+            "token_markup_factor": ("REAL", True, None, 0),
+            "agent_seconds": ("INTEGER", True, None, 0),
+            "agent_cost_rate": ("REAL", True, None, 0),
+            "agent_bill_rate": ("REAL", True, None, 0),
+            "human_minutes": ("REAL", True, None, 0),
+            "human_cost_rate": ("REAL", True, None, 0),
+            "human_bill_rate": ("REAL", True, None, 0),
+            "total_cost_usd": ("REAL", True, None, 0),
+            "total_bill_usd": ("REAL", True, None, 0),
+            "is_billable": ("INTEGER", True, None, 0),
+            "billable_reason": ("TEXT", False, None, 0),
+            "billing_notes": ("TEXT", False, None, 0),
+            "idempotency_key": ("TEXT", False, None, 0),
+            "description": ("TEXT", False, None, 0),
+            "created_by": ("TEXT", True, None, 0),
+            "created_at": ("TEXT", True, None, 0),
+            "observed_task_workspace_id": ("TEXT", False, None, 0),
+            "quarantine_reason": ("TEXT", True, None, 0),
+            "quarantined_at": ("TEXT", True, "datetime('now','utc')", 0),
+        },
+    ),
 )
 
 # Exact index contracts for workspace-owned schemas that cannot be represented
@@ -525,6 +564,14 @@ SCHEMA_INDEX_ASSERTIONS: tuple[
         "workspace_id is not null",
     ),
     (
+        185,
+        "task_cost_entries_v185_quarantine",
+        "idx_task_cost_entries_v185_quarantine_task",
+        False,
+        (("task_id", False),),
+        None,
+    ),
+    (
         186,
         "session_operation_leases",
         "idx_session_operation_leases_active",
@@ -720,6 +767,16 @@ SCHEMA_OBJECT_ASSERTIONS: tuple[
 ) + (
     (
         185,
+        "table",
+        "task_cost_entries_v185_quarantine",
+        (
+            "observed_task_workspace_id text",
+            "quarantine_reason text not null",
+            "quarantined_at text not null default (datetime('now', 'utc'))",
+        ),
+    ),
+    (
+        185,
         "trigger",
         "session_costs_workspace_required_insert",
         (
@@ -791,6 +848,33 @@ SCHEMA_OBJECT_ASSERTIONS: tuple[
             "sc.workspace_id = t.workspace_id",
             "sc.conversation_id = new.conversation_id",
             "raise(abort, 'task cost conversation workspace mismatch')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "task_cost_entries_v185_quarantine_no_insert",
+        (
+            "before insert on task_cost_entries_v185_quarantine",
+            "raise(abort, 'task cost quarantine is immutable')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "task_cost_entries_v185_quarantine_no_update",
+        (
+            "before update on task_cost_entries_v185_quarantine",
+            "raise(abort, 'task cost quarantine is immutable')",
+        ),
+    ),
+    (
+        185,
+        "trigger",
+        "task_cost_entries_v185_quarantine_no_delete",
+        (
+            "before delete on task_cost_entries_v185_quarantine",
+            "raise(abort, 'task cost quarantine is immutable')",
         ),
     ),
     (
@@ -1049,6 +1133,16 @@ def assert_schema_compatible(
                     f"(migration {version:03d}) is missing — the version table and the real "
                     "schema diverged; restore from a known-good backup."
                 )
+        for version, table, expected in SCHEMA_EXACT_COLUMN_ASSERTIONS:
+            if known_versions is not None and version not in known_versions:
+                continue
+            if version <= current and _schema_column_contract(conn, table) != expected:
+                raise RuntimeError(
+                    f"schema_versions claims v{current} but table {table} "
+                    f"(migration {version:03d}) has a malformed column contract — "
+                    "the version table and the real schema diverged; restore from a "
+                    "known-good backup."
+                )
         for version, table, index, unique, columns, predicate in SCHEMA_INDEX_ASSERTIONS:
             if known_versions is not None and version not in known_versions:
                 continue
@@ -1135,6 +1229,8 @@ def _database_is_empty_for_security_bootstrap(conn: sqlite3.Connection) -> bool:
 
 def _last_migration_epoch(conn: sqlite3.Connection) -> float | None:
     """Epoch of the newest applied migration (schema_versions.applied_at, UTC)."""
+    if not _table_exists(conn, "schema_versions"):
+        return None
     row = conn.execute("SELECT MAX(applied_at) FROM schema_versions").fetchone()
     if not row or not row[0]:
         return None
@@ -1149,7 +1245,10 @@ def _last_migration_epoch(conn: sqlite3.Connection) -> float | None:
 
 
 def _backup_database_before_migration(
-    conn: sqlite3.Connection, current_version: int
+    conn: sqlite3.Connection,
+    current_version: int,
+    *,
+    pre_update_backup_key: str | None = None,
 ) -> str | None:
     """Fail-closed, hot-safe pre-update backup (IMPL §C + P0-1).
 
@@ -1174,6 +1273,13 @@ def _backup_database_before_migration(
     db_name = os.path.basename(db_path)
     base_dir = settings.db_backup_dir or os.path.dirname(db_path) or "."
     backup_dir = os.path.join(base_dir, PRE_UPDATE_BACKUP_SUBDIR)
+    if pre_update_backup_key is not None:
+        if re.fullmatch(r"[0-9a-f]{64}", pre_update_backup_key) is None:
+            raise RuntimeError("Invalid controlled pre-update backup identity")
+        backup_dir = os.path.join(
+            backup_dir,
+            f"attempt-{pre_update_backup_key}",
+        )
     try:
         os.makedirs(backup_dir, exist_ok=True)
         directory_metadata = os.lstat(backup_dir)
@@ -1211,16 +1317,13 @@ def _backup_database_before_migration(
                 check = existing_connection.execute(
                     "PRAGMA integrity_check"
                 ).fetchone()
-                version_row = existing_connection.execute(
-                    "SELECT MAX(version) FROM schema_versions"
-                ).fetchone()
+                existing_version = _claimed_schema_version(existing_connection)
             finally:
                 existing_connection.close()
             if (
                 not check
                 or str(check[0]).lower() != "ok"
-                or not version_row
-                or int(version_row[0] or 0) != current_version
+                or existing_version != current_version
             ):
                 raise RuntimeError(
                     "Existing pre-migration backup failed integrity/version proof; "
@@ -1278,26 +1381,84 @@ def _backup_database_before_migration(
 
 
 def _prune_pre_update_backups(keep: int = PRE_UPDATE_BACKUP_KEEP) -> None:
-    """Keep the newest ``keep`` pre-update backups. Called ONLY after a successful run."""
+    """Keep the newest ``keep`` complete pre-update backup sets.
+
+    SQLite may leave ``-wal`` and ``-shm`` next to a backup after a read-only
+    verification.  Those sidecars belong to the main backup; they must never
+    consume retention slots and evict the rollback database itself.
+    """
     db_name = os.path.basename(str(settings.db_path))
     base_dir = settings.db_backup_dir or os.path.dirname(str(settings.db_path)) or "."
     backup_dir = os.path.join(base_dir, PRE_UPDATE_BACKUP_SUBDIR)
+    backup_name = re.compile(
+        rf"^{re.escape(db_name)}\.pre-update-v(?P<version>[0-9]+)$"
+    )
     backups = sorted(
-        glob.glob(os.path.join(backup_dir, f"{db_name}.pre-update-v*")),
+        (
+            path
+            for path in glob.glob(
+                os.path.join(backup_dir, f"{db_name}.pre-update-v*")
+            )
+            if backup_name.fullmatch(os.path.basename(path)) is not None
+        ),
         key=os.path.getmtime,
     )
     for old_backup in backups[:-keep] if keep > 0 else backups:
-        try:
-            os.remove(old_backup)
-            logger.info("Pruned old pre-update backup: %s", old_backup)
-        except OSError:
-            pass
+        for candidate in (
+            f"{old_backup}-journal",
+            f"{old_backup}-wal",
+            f"{old_backup}-shm",
+            old_backup,
+        ):
+            try:
+                metadata = os.lstat(candidate)
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
+                    metadata.st_mode
+                ):
+                    logger.warning(
+                        "Refusing to prune unsafe pre-update backup member: %s",
+                        candidate,
+                    )
+                    continue
+                os.remove(candidate)
+                logger.info("Pruned old pre-update backup member: %s", candidate)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """Check if a column exists in a table. Used for migration idempotency (partial failure recovery)."""
     cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(c[1] == column for c in cols)
+
+
+def _schema_column_contract(
+    conn: sqlite3.Connection,
+    table: str,
+) -> dict[str, tuple[str, bool, str | None, int]]:
+    """Return an exact, normalized SQLite column contract."""
+    rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+    contract: dict[str, tuple[str, bool, str | None, int]] = {}
+    for row in rows:
+        default = row[4]
+        normalized_default = None
+        if default is not None:
+            normalized_default = " ".join(str(default).lower().split())
+            normalized_default = normalized_default.replace(", ", ",")
+            while (
+                normalized_default.startswith("(")
+                and normalized_default.endswith(")")
+            ):
+                normalized_default = normalized_default[1:-1].strip()
+        contract[str(row[1])] = (
+            str(row[2]).upper(),
+            bool(row[3]),
+            normalized_default,
+            int(row[5]),
+        )
+    return contract
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -1972,7 +2133,12 @@ async def get_vec_db() -> AsyncGenerator[aiosqlite.Connection, None]:
         await db.close()
 
 
-def run_migrations() -> MigrationResult:
+def run_migrations(
+    *,
+    pre_update_backup_key: str | None = None,
+    backup_ready: Callable[[str], None] | None = None,
+    _migration_lock_held: bool = False,
+) -> MigrationResult:
     """Apply pending SQL migrations in order.
 
     Hardened for unsupervised boots (enterprise kit, IMPL §C dockerization plan):
@@ -1983,7 +2149,12 @@ def run_migrations() -> MigrationResult:
     migration_files = discover_up_migrations()
     code_max = code_max_version(migration_files)
     known_versions = {_migration_version(f) for f in migration_files}
-    with _migration_lock(str(settings.db_path)):
+    lock_context = (
+        nullcontext()
+        if _migration_lock_held
+        else _migration_lock(str(settings.db_path))
+    )
+    with lock_context:
         conn = get_sync_connection()
         try:
             # Read the claimed version without creating or repairing anything.
@@ -2011,14 +2182,30 @@ def run_migrations() -> MigrationResult:
                 fresh_database=fresh_database,
             )
             backup_path: str | None = None
-            # A repair hook mutates an already-versioned database before the
-            # ordinary pending-file loop.  It therefore needs the same durable
-            # rollback point as a SQL migration, created before the first
-            # repair write rather than after it.
-            if claimed_repairs:
+            backup_published = False
+
+            def publish_backup_ready(path: str | None) -> None:
+                """Persist the rollback point before the first schema write."""
+
+                nonlocal backup_published
+                if path is None or backup_ready is None:
+                    return
+                if backup_published:
+                    raise RuntimeError("Pre-migration backup published twice")
+                backup_ready(path)
+                backup_published = True
+
+            # Both the compatibility assertion and a repair hook may write:
+            # the former bootstraps schema_versions on a legacy, unversioned
+            # database, while the latter repairs an already-versioned one.
+            # Anchor the rollback point before either path can mutate schema.
+            if claimed_repairs or claimed_pending:
                 backup_path = _backup_database_before_migration(
-                    conn, claimed_version
+                    conn,
+                    claimed_version,
+                    pre_update_backup_key=pre_update_backup_key,
                 )
+                publish_backup_ready(backup_path)
             if not claimed_repairs:
                 # Preserve the fail-closed version-table drift guard on an
                 # otherwise healthy claimed schema. A concrete recoverable
@@ -2037,8 +2224,6 @@ def run_migrations() -> MigrationResult:
             pending = [
                 f for f in migration_files if _migration_version(f) > current_version
             ]
-            if pending and backup_path is None:
-                backup_path = _backup_database_before_migration(conn, current_version)
 
             for migration_file in pending:
                 version = _migration_version(migration_file)
@@ -2142,7 +2327,7 @@ def run_migrations() -> MigrationResult:
             # Post-run: re-check (spot-checks the real schema at code max) and
             # log the FINAL version — the old runner logged the stale pre-run one.
             final_version = assert_schema_compatible(conn, code_max, known_versions)
-            if pending:
+            if pending and pre_update_backup_key is None:
                 _prune_pre_update_backups()
             logger.info(
                 "Database at version %d (code max v%d)", final_version, code_max
@@ -3465,34 +3650,41 @@ def _migration_187_project_lifecycle_bootstrap(
 
     filesystem_slugs = {path.parent.name for path in project_files}
     missing_slugs = sorted(known_slugs - filesystem_slugs)
-    if missing_slugs:
-        raise RuntimeError(
-            "Migration 187 project metadata missing for: " + ", ".join(missing_slugs)
-        )
 
     import yaml
 
     allowed_lifecycles = {"idea", "planning", "active", "maintenance", "archived"}
     snapshot: list[dict[str, str]] = []
     archived_slugs: set[str] = set()
+    unsupported_lifecycle_slugs: set[str] = set()
+    completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     for metadata_path in project_files:
         slug = metadata_path.parent.name
         if not re.fullmatch(r"[a-z0-9][a-z0-9&+_.\-]{0,62}", slug):
             raise RuntimeError(f"Migration 187 invalid project slug: {slug}")
         raw = metadata_path.read_bytes()
         try:
-            metadata = yaml.safe_load(raw.decode("utf-8")) or {}
+            metadata = yaml.safe_load(raw.decode("utf-8"))
         except (UnicodeDecodeError, yaml.YAMLError) as exc:
             raise RuntimeError(
                 f"Migration 187 invalid project metadata: {slug}"
             ) from exc
         if not isinstance(metadata, dict):
             raise RuntimeError(f"Migration 187 invalid project metadata: {slug}")
-        lifecycle = str(metadata.get("lifecycle") or "active")
-        if lifecycle not in allowed_lifecycles:
-            raise RuntimeError(
-                f"Migration 187 unsupported project lifecycle: {slug}:{lifecycle}"
-            )
+        declared_lifecycle = (
+            metadata["lifecycle"] if "lifecycle" in metadata else "active"
+        )
+        unsupported_lifecycle = (
+            not isinstance(declared_lifecycle, str)
+            or declared_lifecycle not in allowed_lifecycles
+        )
+        lifecycle = "archived" if unsupported_lifecycle else declared_lifecycle
+        archived_by = None
+        if unsupported_lifecycle:
+            unsupported_lifecycle_slugs.add(slug)
+            archived_by = "migration:187:unsupported_lifecycle_quarantine"
+        elif lifecycle == "archived":
+            archived_by = "migration:187"
         if lifecycle == "archived":
             archived_slugs.add(slug)
         project_digest = hashlib.sha256(raw).hexdigest()
@@ -3513,7 +3705,7 @@ def _migration_187_project_lifecycle_bootstrap(
                     f"for {workspace_id}:{slug}"
                 )
             archived_at = (
-                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                completed_at
                 if lifecycle == "archived"
                 else None
             )
@@ -3528,7 +3720,7 @@ def _migration_187_project_lifecycle_bootstrap(
                     lifecycle,
                     project_digest,
                     archived_at,
-                    "migration:187" if archived_at else None,
+                    archived_by,
                 ),
             )
             snapshot.append(
@@ -3540,20 +3732,105 @@ def _migration_187_project_lifecycle_bootstrap(
                 }
             )
 
+    # A database-only slug has no canonical lifecycle bytes to trust.  Keep all
+    # historical rows, but seed an archived state with a deterministic sentinel
+    # digest so lazy writer triggers cannot silently recreate it as active.  The
+    # distinct archived_by marker makes this quarantine reversible by a later
+    # governed reconciliation once real metadata exists.
+    for slug in missing_slugs:
+        project_digest = hashlib.sha256(
+            f"migration:187:missing_metadata:{slug}".encode("utf-8")
+        ).hexdigest()
+        archived_slugs.add(slug)
+        for workspace_id in sorted(bindings[slug]):
+            existing = conn.execute(
+                "SELECT lifecycle,project_digest,archived_by "
+                "FROM project_lifecycle_state "
+                "WHERE workspace_id=? AND project_slug=?",
+                (workspace_id, slug),
+            ).fetchone()
+            if existing is not None and (
+                str(existing[0]) != "archived"
+                or str(existing[1] or "") != project_digest
+                or str(existing[2] or "")
+                != "migration:187:missing_metadata_quarantine"
+            ):
+                raise RuntimeError(
+                    "Migration 187 missing-metadata quarantine conflicts with "
+                    f"persisted state for {workspace_id}:{slug}"
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO project_lifecycle_state "
+                "(workspace_id,project_slug,project_id,lifecycle,project_digest,"
+                "archived_at,archived_by) VALUES (?,?,?,?,?,?,?)",
+                (
+                    workspace_id,
+                    slug,
+                    "prj_" + uuid_mod.uuid4().hex,
+                    "archived",
+                    project_digest,
+                    completed_at,
+                    "migration:187:missing_metadata_quarantine",
+                ),
+            )
+            snapshot.append(
+                {
+                    "workspace_id": workspace_id,
+                    "project_slug": slug,
+                    "lifecycle": "archived",
+                    "project_digest": project_digest,
+                }
+            )
+
     snapshot_digest = hashlib.sha256(
         json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     conn.execute(
         "UPDATE project_lifecycle_bootstrap SET state='complete',project_count=?,"
         "archived_count=?,snapshot_digest=?,completed_at=? WHERE id=1 AND state='pending'",
-        (len(project_files), len(archived_slugs), snapshot_digest, completed_at),
+        (
+            len(filesystem_slugs | set(missing_slugs)),
+            len(archived_slugs),
+            snapshot_digest,
+            completed_at,
+        ),
     )
     conn.commit()
     logger.info(
-        "Migration 187: pinned %d project lifecycle records (%d archived)",
+        "Migration 187: pinned %d project lifecycle records "
+        "(%d archived, %d missing-metadata quarantined, "
+        "%d unsupported-lifecycle quarantined)",
         len(snapshot),
         len(archived_slugs),
+        len(missing_slugs),
+        len(unsupported_lifecycle_slugs),
+    )
+
+
+def _iter_legacy_audit_rows_for_v1_hash(
+    conn: sqlite3.Connection,
+) -> Iterator[dict[str, Any]]:
+    """Stream legacy audit rows in the stable order required by v1 hashing."""
+    return (
+        {
+            "id": row[0],
+            "timestamp": row[1],
+            "action": row[2],
+            "user": row[3],
+            "resource_type": row[4],
+            "resource_id": row[5],
+            "details_json": row[6],
+        }
+        for row in conn.execute(
+            "SELECT id, timestamp, action, user, resource_type, resource_id, "
+            "details_json FROM audit_log "
+            "WHERE workspace_id IS NULL AND workspace_sequence IS NULL "
+            "AND previous_hash IS NULL AND entry_hash IS NULL "
+            "AND hash_version IS NULL "
+            "ORDER BY timestamp COLLATE BINARY, "
+            "CASE WHEN id IS NULL THEN 'None' ELSE CAST(id AS TEXT) END "
+            "COLLATE BINARY, id, rowid"
+        )
     )
 
 
@@ -3620,28 +3897,15 @@ def _migration_175_audit_chain(conn: sqlite3.Connection) -> None:
     if state[0] is None:
         from core.api.services.audit_chain import legacy_root_hash_v1
 
-        legacy_rows = [
-            {
-                "id": row[0],
-                "timestamp": row[1],
-                "action": row[2],
-                "user": row[3],
-                "resource_type": row[4],
-                "resource_id": row[5],
-                "details_json": row[6],
-            }
-            for row in conn.execute(
-                "SELECT id, timestamp, action, user, resource_type, resource_id, "
-                "details_json FROM audit_log "
-                "WHERE workspace_id IS NULL AND workspace_sequence IS NULL "
-                "AND previous_hash IS NULL AND entry_hash IS NULL "
-                "AND hash_version IS NULL ORDER BY timestamp, id"
-            ).fetchall()
-        ]
         conn.execute(
             "UPDATE audit_chain_state SET legacy_root_hash=? "
             "WHERE id=1 AND legacy_root_hash IS NULL",
-            (legacy_root_hash_v1(legacy_rows),),
+            (
+                legacy_root_hash_v1(
+                    _iter_legacy_audit_rows_for_v1_hash(conn),
+                    rows_already_ordered=True,
+                ),
+            ),
         )
 
     conn.execute(
@@ -3738,25 +4002,10 @@ def _migration_176_activate_audit_chain(conn: sqlite3.Connection) -> None:
                 "inactive audit chain has persisted heads or chained rows"
             )
 
-        legacy_rows = [
-            {
-                "id": row[0],
-                "timestamp": row[1],
-                "action": row[2],
-                "user": row[3],
-                "resource_type": row[4],
-                "resource_id": row[5],
-                "details_json": row[6],
-            }
-            for row in conn.execute(
-                "SELECT id, timestamp, action, user, resource_type, resource_id, "
-                "details_json FROM audit_log "
-                "WHERE workspace_id IS NULL AND workspace_sequence IS NULL "
-                "AND previous_hash IS NULL AND entry_hash IS NULL "
-                "AND hash_version IS NULL ORDER BY timestamp, id"
-            ).fetchall()
-        ]
-        legacy_root = legacy_root_hash_v1(legacy_rows)
+        legacy_root = legacy_root_hash_v1(
+            _iter_legacy_audit_rows_for_v1_hash(conn),
+            rows_already_ordered=True,
+        )
         activated_at = datetime.now(timezone.utc).isoformat()
         cursor = conn.execute(
             "UPDATE audit_chain_state SET legacy_root_hash=?, "
@@ -3920,6 +4169,44 @@ def _unique_index_has_columns(
     return False
 
 
+def _foreign_key_violation_counts(
+    conn: sqlite3.Connection,
+    *,
+    child_tables: frozenset[str] | None = None,
+) -> Counter[tuple[object, ...]]:
+    """Return the exact FK-violation multiset without exposing row contents."""
+    if child_tables is None:
+        return Counter(tuple(row) for row in conn.execute("PRAGMA foreign_key_check"))
+
+    violations: Counter[tuple[object, ...]] = Counter()
+    for table in sorted(child_tables):
+        quoted = table.replace('"', '""')
+        violations.update(
+            tuple(row)
+            for row in conn.execute(f'PRAGMA foreign_key_check("{quoted}")')
+        )
+    return violations
+
+
+def _foreign_key_children(
+    conn: sqlite3.Connection,
+    parent_tables: frozenset[str],
+) -> frozenset[str]:
+    """Return tables whose FK integrity can change when parents are rebuilt."""
+    affected = set(parent_tables)
+    for (table_name,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ):
+        table = str(table_name)
+        quoted = table.replace('"', '""')
+        if any(
+            str(row[2]) in parent_tables
+            for row in conn.execute(f'PRAGMA foreign_key_list("{quoted}")')
+        ):
+            affected.add(table)
+    return frozenset(affected)
+
+
 def _rebuild_workspace_keyed_tables(conn: sqlite3.Connection) -> None:
     """Replace legacy global uniqueness with workspace-scoped uniqueness."""
     access_ready = _unique_index_has_columns(
@@ -3937,6 +4224,19 @@ def _rebuild_workspace_keyed_tables(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=OFF")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        rebuilt_parents = frozenset(
+            table
+            for table, ready in (
+                ("access_grants", access_ready),
+                ("file_meta", file_ready),
+            )
+            if not ready
+        )
+        affected_fk_children = _foreign_key_children(conn, rebuilt_parents)
+        baseline_violations = _foreign_key_violation_counts(
+            conn,
+            child_tables=affected_fk_children,
+        )
         if not access_ready:
             access_columns = {
                 str(row[1])
@@ -4054,9 +4354,16 @@ def _rebuild_workspace_keyed_tables(conn: sqlite3.Connection) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_file_meta_confidential "
                 "ON file_meta(project_slug) WHERE confidential = 1"
             )
-        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            raise RuntimeError("migration 179 introduced a foreign-key violation")
+        affected_violations = _foreign_key_violation_counts(
+            conn,
+            child_tables=affected_fk_children,
+        )
+        introduced_violations = affected_violations - baseline_violations
+        if introduced_violations:
+            raise RuntimeError(
+                "migration 179 introduced "
+                f"{sum(introduced_violations.values())} foreign-key violation(s)"
+            )
         conn.commit()
     except Exception:
         conn.rollback()

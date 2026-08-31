@@ -6,6 +6,22 @@
 PRAGMA foreign_keys=OFF;
 BEGIN IMMEDIATE;
 
+-- A downgrade cannot restore quarantined rows to the fleet-global billing
+-- table without reviving the ownership ambiguity.  Old v185 databases did not
+-- create this table, so an empty compatibility shell keeps their rollback
+-- lossless while any real quarantine remains a hard stop.
+CREATE TABLE IF NOT EXISTS task_cost_entries_v185_quarantine (
+    id TEXT PRIMARY KEY
+);
+CREATE TEMP TABLE v185_quarantine_rollback_gate (
+    ok INTEGER NOT NULL CHECK (ok = 1)
+);
+INSERT INTO v185_quarantine_rollback_gate(ok)
+SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM task_cost_entries_v185_quarantine
+) THEN 0 ELSE 1 END;
+DROP TABLE v185_quarantine_rollback_gate;
+
 CREATE TABLE session_costs_v185_down (
     conversation_id TEXT PRIMARY KEY,
     session_name TEXT,
@@ -211,6 +227,8 @@ CREATE UNIQUE INDEX idx_pr_one_active_per_task
 CREATE UNIQUE INDEX idx_pr_branch_active
     ON pull_requests(branch)
     WHERE status IN ('draft', 'open', 'merging');
+
+DROP TABLE task_cost_entries_v185_quarantine;
 
 DELETE FROM schema_versions WHERE version = 185;
 

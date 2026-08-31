@@ -463,6 +463,43 @@ async def read_project_lifecycle(
     return _lifecycle_snapshot(row)
 
 
+async def project_write_fence_required(
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
+    project_slug: str,
+    projects_root: Path | None = None,
+) -> bool:
+    """Whether a ``projects/<name>`` write must pass the lifecycle fence.
+
+    Generic root folders stay writable without the lifecycle registry: a name
+    the slug grammar rejects can never be a canonical project, and a
+    slug-shaped folder without a registered lifecycle row or a canonical
+    ``project.yaml`` is a plain folder.  The raw path component must match the
+    grammar exactly: a name that only matches after trimming whitespace is a
+    different directory and must not alias the trimmed project.  A registered
+    row keeps its fence even when the metadata file disappears out-of-band, so
+    an archived project never loses protection.
+    """
+    slug = project_slug or ""
+    if not _SLUG_RE.fullmatch(slug):
+        return False
+    row = await _fetch_lifecycle_row(
+        db,
+        workspace_id=workspace_id,
+        project_slug=slug,
+    )
+    if row is not None:
+        return True
+    project_dir = project_directory(slug, projects_root=projects_root)
+    project_yaml = project_dir / "project.yaml"
+    return (
+        project_dir.is_dir()
+        and project_yaml.is_file()
+        and not project_yaml.is_symlink()
+    )
+
+
 async def record_project_write(
     db: aiosqlite.Connection,
     *,

@@ -6,7 +6,7 @@ translate that orchestration proof into the private migration-runner flag.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -49,6 +49,8 @@ class SchemaUpgradeReceipt:
     repaired_versions: tuple[int, ...]
     backup_path: str | None
     fresh_database: bool
+    backup_identity: str | None = None
+    backup_sha256: str | None = None
 
 
 def _now() -> str:
@@ -158,11 +160,50 @@ def _backup_root(path: Path) -> Path:
     return Path(os.path.abspath(base))
 
 
-def _expected_backup_path(path: Path, initial_version: int) -> Path:
+def _backup_identity(release_id: str, attempt: int) -> str:
+    return hashlib.sha256(
+        f"{_release_id(release_id)}\0{attempt}".encode("utf-8")
+    ).hexdigest()
+
+
+def _expected_backup_path(
+    path: Path,
+    initial_version: int,
+    backup_identity: str,
+) -> Path:
+    if re.fullmatch(r"[0-9a-f]{64}", backup_identity) is None:
+        raise SchemaUpgradeError("backup_identity_invalid")
     base = _backup_root(path)
-    return base / db_mod.PRE_UPDATE_BACKUP_SUBDIR / (
-        f"{path.name}.pre-update-v{initial_version}"
+    return (
+        base
+        / db_mod.PRE_UPDATE_BACKUP_SUBDIR
+        / f"attempt-{backup_identity}"
+        / f"{path.name}.pre-update-v{initial_version}"
     )
+
+
+def _file_sha256(path: Path) -> str:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise SchemaUpgradeError("backup_unavailable") from exc
+    digest = hashlib.sha256()
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise SchemaUpgradeError("backup_invalid")
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    except OSError as exc:
+        raise SchemaUpgradeError("backup_unavailable") from exc
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
 
 
 def default_receipt_path(release_id: str) -> Path:
@@ -207,13 +248,18 @@ def _write_receipt(path: Path, receipt: SchemaUpgradeReceipt) -> None:
     temp = path.parent / f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temp, flags, 0o600)
     try:
-        os.write(descriptor, raw)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
+        descriptor = os.open(temp, flags, 0o600)
+        try:
+            written = 0
+            while written < len(raw):
+                count = os.write(descriptor, raw[written:])
+                if count <= 0:
+                    raise SchemaUpgradeError("receipt_write_failed")
+                written += count
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         os.replace(temp, path)
         os.chmod(path, 0o600)
         directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -260,6 +306,16 @@ def _read_receipt(path: Path) -> SchemaUpgradeReceipt:
                 else None
             ),
             fresh_database=bool(payload["fresh_database"]),
+            backup_identity=(
+                str(payload["backup_identity"])
+                if payload.get("backup_identity") is not None
+                else None
+            ),
+            backup_sha256=(
+                str(payload["backup_sha256"])
+                if payload.get("backup_sha256") is not None
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise SchemaUpgradeError("receipt_invalid") from exc
@@ -270,6 +326,15 @@ def _read_receipt(path: Path) -> SchemaUpgradeReceipt:
         or receipt.initial_version < 0
         or receipt.code_max_version < 1
         or receipt.database_path != str(_database_path())
+        or (
+            receipt.backup_identity is not None
+            and re.fullmatch(r"[0-9a-f]{64}", receipt.backup_identity) is None
+        )
+        or (
+            receipt.backup_sha256 is not None
+            and re.fullmatch(r"[0-9a-f]{64}", receipt.backup_sha256) is None
+        )
+        or (receipt.backup_path is None) != (receipt.backup_identity is None)
     ):
         raise SchemaUpgradeError("receipt_invalid")
     return receipt
@@ -289,6 +354,24 @@ def run_controlled_upgrade(
     receipt_path = _validate_receipt_path(
         receipt_path or default_receipt_path(release_id)
     )
+    with db_mod._migration_lock(str(database_path)):
+        return _run_controlled_upgrade_locked(
+            release_id,
+            proof_kind=proof_kind,
+            database_path=database_path,
+            receipt_path=receipt_path,
+        )
+
+
+def _run_controlled_upgrade_locked(
+    release_id: str,
+    *,
+    proof_kind: str,
+    database_path: Path,
+    receipt_path: Path,
+) -> SchemaUpgradeReceipt:
+    """Run the complete receipt transition while its database lock is held."""
+
     previous: SchemaUpgradeReceipt | None = None
     if receipt_path.exists():
         previous = _read_receipt(receipt_path)
@@ -303,9 +386,21 @@ def run_controlled_upgrade(
             return previous
 
     initial_version, code_max, fresh, mutates = _planned_mutation(database_path)
-    backup_path = (
-        str(_expected_backup_path(database_path, initial_version))
+    attempt = previous.attempt + 1 if previous is not None else 1
+    backup_identity = (
+        _backup_identity(release_id, attempt)
         if mutates and not fresh
+        else None
+    )
+    backup_path = (
+        str(
+            _expected_backup_path(
+                database_path,
+                initial_version,
+                backup_identity,
+            )
+        )
+        if backup_identity is not None
         else None
     )
     started = SchemaUpgradeReceipt(
@@ -314,7 +409,7 @@ def run_controlled_upgrade(
         database_path=str(database_path),
         status="running",
         proof_kind=proof_kind,
-        attempt=(previous.attempt + 1 if previous is not None else 1),
+        attempt=attempt,
         started_at=_now(),
         completed_at=None,
         initial_version=initial_version,
@@ -324,28 +419,60 @@ def run_controlled_upgrade(
         repaired_versions=(),
         backup_path=backup_path,
         fresh_database=fresh,
+        backup_identity=backup_identity,
+        backup_sha256=None,
     )
     _write_receipt(receipt_path, started)
+    running = started
+
+    def persist_backup_ready(observed_path: str) -> None:
+        """Anchor the complete backup before the migration runner may write."""
+
+        nonlocal running
+        if backup_path is None or observed_path != backup_path:
+            raise SchemaUpgradeError("migration_backup_mismatch")
+        running = replace(
+            running,
+            backup_sha256=_file_sha256(Path(observed_path)),
+        )
+        _write_receipt(receipt_path, running)
 
     prior_flag = os.environ.get(db_mod.QUIESCED_MIGRATION_ENV)
     os.environ[db_mod.QUIESCED_MIGRATION_ENV] = "1"
     try:
-        result = db_mod.run_migrations()
+        result = db_mod.run_migrations(
+            pre_update_backup_key=backup_identity,
+            backup_ready=persist_backup_ready,
+            _migration_lock_held=True,
+        )
         if result.initial_version != initial_version or result.code_max_version != code_max:
             raise SchemaUpgradeError("migration_result_drift")
         if result.backup_path != backup_path:
             raise SchemaUpgradeError("migration_backup_mismatch")
+        if (result.backup_path is None) != (running.backup_sha256 is None):
+            raise SchemaUpgradeError("migration_backup_not_anchored")
     except Exception:
         try:
             observed, _fresh = _schema_state(database_path)
         except SchemaUpgradeError:
             observed = None
+        backup_sha256 = running.backup_sha256
+        if (
+            backup_sha256 is None
+            and backup_path is not None
+            and os.path.lexists(backup_path)
+        ):
+            try:
+                backup_sha256 = _file_sha256(Path(backup_path))
+            except SchemaUpgradeError:
+                backup_sha256 = None
         failed = SchemaUpgradeReceipt(
             **{
-                **asdict(started),
+                **asdict(running),
                 "status": "failed",
                 "completed_at": _now(),
                 "final_version": observed,
+                "backup_sha256": backup_sha256,
             }
         )
         _write_receipt(receipt_path, failed)
@@ -372,6 +499,8 @@ def run_controlled_upgrade(
         repaired_versions=result.repaired_versions,
         backup_path=result.backup_path,
         fresh_database=fresh,
+        backup_identity=backup_identity,
+        backup_sha256=running.backup_sha256,
     )
     _write_receipt(receipt_path, completed)
     return completed
@@ -452,44 +581,98 @@ def restore_controlled_upgrade(
     receipt_path = _validate_receipt_path(
         receipt_path or default_receipt_path(release_id)
     )
-    receipt = _read_receipt(receipt_path)
-    if receipt.release_id != release_id:
-        raise SchemaUpgradeError("receipt_release_mismatch")
-    if receipt.status == "rolled_back":
-        observed, fresh = _schema_state(database_path)
-        if observed != receipt.initial_version or fresh != receipt.fresh_database:
-            raise SchemaUpgradeError("rollback_receipt_database_mismatch")
-        return receipt
-    if receipt.status not in {"running", "failed", "succeeded"}:
-        raise SchemaUpgradeError("receipt_not_restorable")
-
     with db_mod._migration_lock(str(database_path)):
+        # The receipt, its backup digest, and the database form one state
+        # transition. Read and validate all three under the same lock so a
+        # concurrent migration runner cannot change the source after proof.
+        receipt = _read_receipt(receipt_path)
+        if receipt.release_id != release_id:
+            raise SchemaUpgradeError("receipt_release_mismatch")
+        if receipt.status == "rolled_back":
+            observed, fresh = _schema_state(database_path)
+            if observed != receipt.initial_version or fresh != receipt.fresh_database:
+                raise SchemaUpgradeError("rollback_receipt_database_mismatch")
+            return receipt
+        if (
+            receipt.status == "succeeded"
+            and not receipt.fresh_database
+            and receipt.backup_path is None
+            and receipt.final_version == receipt.initial_version
+            and not receipt.applied_versions
+            and not receipt.repaired_versions
+        ):
+            observed, fresh = _schema_state(database_path)
+            if observed != receipt.initial_version or fresh != receipt.fresh_database:
+                raise SchemaUpgradeError("no_op_receipt_database_mismatch")
+            rolled_back = SchemaUpgradeReceipt(
+                **{
+                    **asdict(receipt),
+                    "status": "rolled_back",
+                    "completed_at": _now(),
+                    "final_version": observed,
+                }
+            )
+            _write_receipt(receipt_path, rolled_back)
+            return rolled_back
+        if receipt.status not in {"running", "failed", "succeeded"}:
+            raise SchemaUpgradeError("receipt_not_restorable")
+
+        trusted_backup: Path | None = None
+        if not receipt.fresh_database:
+            if receipt.backup_path is None:
+                raise SchemaUpgradeError("receipt_backup_missing")
+            expected_identity = _backup_identity(
+                release_id,
+                receipt.attempt,
+            )
+            if receipt.backup_identity != expected_identity:
+                raise SchemaUpgradeError("receipt_backup_identity_mismatch")
+            trusted_backup = Path(receipt.backup_path)
+            expected = _expected_backup_path(
+                database_path,
+                receipt.initial_version,
+                expected_identity,
+            )
+            if trusted_backup != expected:
+                raise SchemaUpgradeError("receipt_backup_mismatch")
+            observed_digest = _file_sha256(trusted_backup)
+            if receipt.backup_sha256 is None:
+                if receipt.status != "running":
+                    raise SchemaUpgradeError("receipt_backup_digest_missing")
+                # A hard kill can land after SQLite completed and fsynced the
+                # rollback point but before the callback persisted its digest.
+                # The receipt fixes the exact path and identity; the backup reader
+                # additionally requires a private, regular, single-link file.
+                receipt = replace(
+                    receipt,
+                    backup_sha256=observed_digest,
+                )
+                _write_receipt(receipt_path, receipt)
+            if observed_digest != receipt.backup_sha256:
+                raise SchemaUpgradeError("receipt_backup_digest_mismatch")
+
         if receipt.fresh_database:
             _unlink_sidecars(database_path)
             if database_path.exists():
                 database_path.unlink()
         else:
-            if receipt.backup_path is None:
+            if trusted_backup is None:
                 raise SchemaUpgradeError("receipt_backup_missing")
-            backup_path = Path(receipt.backup_path)
-            expected = _expected_backup_path(database_path, receipt.initial_version)
-            if backup_path != expected:
-                raise SchemaUpgradeError("receipt_backup_mismatch")
-            _restore_backup(database_path, backup_path)
+            _restore_backup(database_path, trusted_backup)
 
-    observed, fresh = _schema_state(database_path)
-    if observed != receipt.initial_version or fresh != receipt.fresh_database:
-        raise SchemaUpgradeError("rollback_database_mismatch")
-    rolled_back = SchemaUpgradeReceipt(
-        **{
-            **asdict(receipt),
-            "status": "rolled_back",
-            "completed_at": _now(),
-            "final_version": observed,
-        }
-    )
-    _write_receipt(receipt_path, rolled_back)
-    return rolled_back
+        observed, fresh = _schema_state(database_path)
+        if observed != receipt.initial_version or fresh != receipt.fresh_database:
+            raise SchemaUpgradeError("rollback_database_mismatch")
+        rolled_back = SchemaUpgradeReceipt(
+            **{
+                **asdict(receipt),
+                "status": "rolled_back",
+                "completed_at": _now(),
+                "final_version": observed,
+            }
+        )
+        _write_receipt(receipt_path, rolled_back)
+        return rolled_back
 
 
 def receipt_as_json(receipt: SchemaUpgradeReceipt) -> str:

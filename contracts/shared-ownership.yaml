@@ -14,11 +14,11 @@
 # Transferring a path between classes is a reviewed change to THIS file, never
 # something an import silently does (KTD3).
 #
-# Authored against OSS base 07821c76b5e890c341eeed80ca2f4002ad482b79
-# (origin/main, 2026-08-27). Final Plan A candidate reviewed at merge SHA
-# 64e96cb7e90292816296750906db68ec81c4a37e.
+# Authored against the OSS product line and reviewed again for the exact
+# MarvisX projection candidate at merge SHA
+# ab1fa58eae705a25ca46ea6829eb0d538794ee52.
 schema: marvis-shared-ownership/v1
-ownership_map_version: 2
+ownership_map_version: 3
 
 # Paths a public/shared payload may write. A rule ending in "/" is a prefix;
 # anything else is an exact file. A payload path must match exactly one rule;
@@ -46,7 +46,6 @@ managed_areas:
   - docs/SEARCH-QUALITY.md
   # Root files whose bytes are product-neutral and already synchronized from
   # the last mirror lineage; receiving them again is a no-op by digest.
-  - CHANGELOG.md
   - LICENSE
   - MANIFEST.in
   - SECURITY.md
@@ -61,6 +60,10 @@ managed_areas:
 # also sit inside a managed area (core/api/tests/, core/api/console_dist/)
 # are the deliberate exceptions documented above.
 oss_owned_areas:
+  # Release history belongs to the product being published. Importing the
+  # platform changelog would falsely describe unpublished OSS versions as
+  # stable and erase the current OSS release candidate.
+  - CHANGELOG.md
   # The README documents this product, including its own GUI and tool count.
   - README.md
   # Packaging is the consumer's: name, version, entry points, wheel contents.
@@ -107,6 +110,7 @@ oss_owned_areas:
 approved_preserve_paths:
   - .github/workflows/release.yml
   - .gitignore
+  - CHANGELOG.md
   - README.md
   - pyproject.toml
 
