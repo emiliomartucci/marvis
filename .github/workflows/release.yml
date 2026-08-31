@@ -365,7 +365,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: immutable-draft-release-receipt
-          path: draft-release
+          path: ${{ runner.temp }}/draft-release
       - name: Revalidate all external gates before approval
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -373,12 +373,12 @@ jobs:
           set -euo pipefail
           python scripts/release_candidate.py pretag \
             --manifest release-artifact/release-manifest.json \
-            --draft-release-receipt draft-release/draft-release-receipt.json \
+            --draft-release-receipt "$RUNNER_TEMP/draft-release/draft-release-receipt.json" \
             --run-id "$GITHUB_RUN_ID"
           python scripts/release_candidate.py publish-window \
             --manifest release-artifact/release-manifest.json \
             --dist release-artifact/packages \
-            --draft-release-receipt draft-release/draft-release-receipt.json \
+            --draft-release-receipt "$RUNNER_TEMP/draft-release/draft-release-receipt.json" \
             --run-id "$GITHUB_RUN_ID"
 
   pypi:
@@ -560,7 +560,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: immutable-draft-release-receipt
-          path: draft-release
+          path: ${{ runner.temp }}/draft-release
       - name: Re-read PyPI and exercise install, upgrade and recovery
         env:
           GH_TOKEN: ${{ github.token }}
@@ -662,7 +662,7 @@ jobs:
             --manifest release-artifact/release-manifest.json \
             --registry-dist pypi-readback \
             --github-dist release-artifact/packages \
-            --draft-release-receipt draft-release/draft-release-receipt.json \
+            --draft-release-receipt "$RUNNER_TEMP/draft-release/draft-release-receipt.json" \
             --output release-acceptance.json \
             --run-id "$GITHUB_RUN_ID"
       - name: Upload the read-only acceptance receipt

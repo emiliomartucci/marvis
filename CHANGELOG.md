@@ -8,22 +8,29 @@ This project uses strict Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 No changes yet.
 
-## [0.4.6] - candidate
+## [0.4.7] - candidate
 
-Recovery candidate for the same reviewed public/shared source as 0.4.5. It
+Recovery candidate for the same reviewed public/shared source as 0.4.6. It
 keeps product behavior unchanged and repairs only the immutable release path.
 
 ### Fixed
 
-- Record the exact contained draft and asset hashes while the source-free job
-  has write authority, then pass that immutable receipt to read-only jobs.
-- Keep checked-out candidate code away from GitHub and PyPI write authority.
-- Re-read the live draft and exact asset bytes in the source-free finalizer
-  before publishing the accepted GitHub Release.
+- Store the immutable draft receipt outside checked-out source in every job
+  that executes the release verifier.
+- Keep the source-purity gate strict and add a regression contract that rejects
+  receipts downloaded into the repository checkout.
 
-This section describes a release candidate only. Version 0.4.6 is not
+This section describes a release candidate only. Version 0.4.7 is not
 published until the separate tag, PyPI and post-publication acceptance gates
 all succeed.
+
+## [0.4.6] - 2026-08-31 (failed, not published)
+
+The exact package candidate and contained draft GitHub Release were created.
+The prepublication verifier then correctly rejected an untracked receipt that
+the workflow had downloaded inside the checked-out source tree. Automatic
+containment marked the draft `FAILED - DO NOT INSTALL`; no package reached
+PyPI. Version 0.4.6 is burned and must never be reused.
 
 ## [0.4.5] - 2026-08-31 (failed, not published)
 
