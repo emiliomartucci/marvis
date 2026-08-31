@@ -1079,6 +1079,16 @@ def validate_static(
             raise ReleasePolicyError(
                 f"{receipt_bound_job} lacks the immutable draft-release receipt"
             )
+    for checkout_receipt_job in ("prepublish", "accept"):
+        block = blocks.get(checkout_receipt_job) or ""
+        if (
+            "path: ${{ runner.temp }}/draft-release" not in block
+            or '"$RUNNER_TEMP/draft-release/draft-release-receipt.json"' not in block
+            or "path: draft-release\n" in block
+        ):
+            raise ReleasePolicyError(
+                f"{checkout_receipt_job} does not isolate the draft receipt from source"
+            )
     for read_only_job in ("prepublish", "pypi", "accept"):
         block = blocks.get(read_only_job) or ""
         if (

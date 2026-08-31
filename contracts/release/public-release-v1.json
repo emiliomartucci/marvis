@@ -24,15 +24,16 @@
   "candidate_state": {
     "status": "active"
   },
-  "candidate_version": "0.4.6",
-  "candidate_tag": "v0.4.6",
+  "candidate_version": "0.4.7",
+  "candidate_tag": "v0.4.7",
   "historical_failed_version": "0.4.1",
   "historical_failed_versions": [
     "0.4.1",
     "0.4.2",
     "0.4.3",
     "0.4.4",
-    "0.4.5"
+    "0.4.5",
+    "0.4.6"
   ],
   "approval_deadline_hours": 24,
   "allowed_release_delta": [
@@ -66,7 +67,7 @@
     "repository": "emiliomartucci/marvis",
     "workflow": "release.yml",
     "environment": "pypi",
-    "candidate_tag": "v0.4.6",
+    "candidate_tag": "v0.4.7",
     "write_authority_canary_workflow": "watchdog-canary.yml",
     "approval_deadline_hours": 24,
     "late_approval_upload_guard": true
