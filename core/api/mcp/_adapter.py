@@ -35,6 +35,8 @@ import time
 from collections.abc import Mapping
 from typing import Any, Literal, NoReturn
 
+from core.api.db import acquire_db, acquire_write_db  # noqa: F401  (re-export)
+from core.api.mcp.token_classes import INTERNAL_TOKEN_CLASS, TOKEN_CLASS_CLAIM
 from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import NotFoundError, ServiceError
 from core.api.use_cases._roles import map_sso_role
@@ -42,10 +44,9 @@ from core.api.use_cases._roles import map_sso_role
 logger = logging.getLogger(__name__)
 _TOOL_ERROR_RUNTIME: Literal["mcp", "fastmcp"] = "mcp"
 
-# Re-export the db context managers so tools import db access from the adapter,
-# not from deep in the api package. ``acquire_db`` = read pool; ``acquire_write_db``
-# = writer + lock (mutators). Both are @asynccontextmanager importable directly.
-from core.api.db import acquire_db, acquire_write_db  # noqa: F401  (re-export)
+# The DB context managers above are intentionally re-exported so tools import DB
+# access from this adapter, not from deep in the API package. ``acquire_db`` is
+# the read pool; ``acquire_write_db`` is the writer plus lock.
 
 # ---------------------------------------------------------------------------
 # MCP identity.
@@ -121,27 +122,37 @@ def _no_token_mcp_context() -> CallerContext:
 # viewer fleet-wide. When the claim is absent, honor the persisted
 # users.system_role (seeded by provisioning/add_user, by an admin, or by a prior
 # claim-bearing sync). This readonly, TTL-cached lookup keeps the sync identity
-# path off the async DB pool and out of the hot path; it can only RESTORE a role
-# the DB already recorded — never an escalation.
-_DB_ROLE_CACHE: dict[tuple[str, str], tuple[str | None, float]] = {}
+# path off the async DB pool and out of the hot path; it can only RESTORE an
+# identity and role the DB already recorded — never an escalation.
+_DB_ROLE_CACHE: dict[
+    tuple[str, str, str], tuple[tuple[str, str | None] | None, float]
+] = {}
 _DB_ROLE_TTL_SECONDS = 30.0
 
 
-def _db_system_role(user_id: str, workspace_id: str) -> str | None:
-    """Persisted ``users.system_role`` for an OAuth person, or None when unknown.
+def _db_oauth_identity(
+    user_id: str,
+    workspace_id: str,
+    *,
+    external_provider: str | None = None,
+) -> tuple[str, str | None] | None:
+    """Canonical DB identity and role for a workspace-bound OAuth principal.
 
     Readonly + TTL-cached so the sync identity path never blocks on or writes to
-    the DB. Fail-closed: any error or missing row yields None and the caller
-    keeps the viewer default.
+    the DB. An exact workspace-bound user id always wins. A WorkOS person may
+    then resolve through one unique ``external_id`` alias in the same workspace,
+    preserving pre-OAuth roles, teams, and grants. Missing, cross-workspace, or
+    ambiguous aliases fail closed and leave the verified token subject unchanged.
     """
     if not user_id or user_id == "local" or not workspace_id:
         return None
+    provider = (external_provider or "").strip().lower()
     now = time.monotonic()
-    cache_key = (workspace_id, user_id)
+    cache_key = (workspace_id, user_id, provider)
     cached = _DB_ROLE_CACHE.get(cache_key)
     if cached is not None and cached[1] > now:
         return cached[0]
-    role: str | None = None
+    identity: tuple[str, str | None] | None = None
     db_path = os.environ.get("MARVIS_DB_PATH")
     if db_path:
         import sqlite3
@@ -150,35 +161,93 @@ def _db_system_role(user_id: str, workspace_id: str) -> str | None:
             con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
             try:
                 cur = con.execute(
-                    "SELECT system_role FROM users"
+                    "SELECT id, system_role FROM users"
                     " WHERE id = ? AND workspace_id = ?"
                     " AND deleted_at IS NULL LIMIT 1",
                     (user_id, workspace_id),
                 )
                 row = cur.fetchone()
+                if row is not None:
+                    identity = (str(row[0]), str(row[1]) if row[1] else None)
+                elif provider:
+                    cur = con.execute(
+                        "SELECT id, system_role FROM users"
+                        " WHERE auth_provider = ? AND external_id = ?"
+                        " AND workspace_id = ? AND deleted_at IS NULL LIMIT 2",
+                        (provider, user_id, workspace_id),
+                    )
+                    aliases = cur.fetchall()
+                    if len(aliases) == 1:
+                        alias = aliases[0]
+                        identity = (
+                            str(alias[0]),
+                            str(alias[1]) if alias[1] else None,
+                        )
+                        logger.info(
+                            "oauth identity: resolved one %s subject alias",
+                            provider,
+                        )
+                    elif len(aliases) > 1:
+                        logger.warning(
+                            "oauth identity: ambiguous %s external identity in workspace",
+                            provider,
+                        )
             finally:
                 con.close()
-            role = str(row[0]) if row and row[0] else None
-            if role and role != "viewer":
-                logger.info(
-                    "oauth role: DB fallback %s -> %s (interactive token lacks role claim)",
-                    user_id,
-                    role,
-                )
         except Exception:
             logger.warning(
-                "current_mcp_context: DB role lookup failed for %s",
+                "current_mcp_context: DB identity lookup failed for %s",
                 user_id,
                 exc_info=True,
             )
-            role = None
-    _DB_ROLE_CACHE[cache_key] = (role, now + _DB_ROLE_TTL_SECONDS)
-    return role
+            identity = None
+    _DB_ROLE_CACHE[cache_key] = (identity, now + _DB_ROLE_TTL_SECONDS)
+    return identity
+
+
+def _db_system_role(user_id: str, workspace_id: str) -> str | None:
+    """Backwards-compatible exact-id role lookup used by older callers/tests."""
+    identity = _db_oauth_identity(user_id, workspace_id)
+    return identity[1] if identity is not None else None
 
 
 def _invalidate_db_role_cache(user_id: str, workspace_id: str) -> None:
     """Drop a cached role so the next request re-reads a freshly-synced row."""
-    _DB_ROLE_CACHE.pop((workspace_id, user_id), None)
+    for key, cached in tuple(_DB_ROLE_CACHE.items()):
+        cached_identity = cached[0]
+        if key[0] != workspace_id:
+            continue
+        if key[1] == user_id or (
+            cached_identity is not None and cached_identity[0] == user_id
+        ):
+            _DB_ROLE_CACHE.pop(key, None)
+
+
+def _is_verified_workos_person(
+    claims: Mapping[str, Any], *, is_app_token: bool
+) -> bool:
+    """Allow legacy aliases only for a provider-proven WorkOS person token.
+
+    Direct tenant servers prove the provider through their mutually-exclusive
+    WorkOS configuration. The private Emilio backend receives only short-lived
+    assertions minted by its WorkOS-only root gateway. Enterprise OIDC/Entra
+    claims never gain WorkOS alias semantics merely by carrying ``org_id``.
+    """
+    if (
+        is_app_token
+        or not claims.get("org_id")
+        or claims.get("tid")
+        or claims.get("oid")
+    ):
+        return False
+    if (
+        claims.get(TOKEN_CLASS_CLAIM) == INTERNAL_TOKEN_CLASS
+        and os.environ.get("MARVIS_INTERNAL_VERIFYING_KEY_FILE", "").strip()
+    ):
+        return True
+    workos_configured = bool(os.environ.get("WORKOS_AUTHKIT_DOMAIN", "").strip())
+    oidc_configured = bool(os.environ.get("OIDC_ISSUER", "").strip())
+    return workos_configured and not oidc_configured
 
 
 def _authenticated_mcp_workspace(claims: Mapping[str, Any]) -> str:
@@ -243,6 +312,24 @@ def current_mcp_context() -> CallerContext:
     # it, not the rotating pairwise sub (IMPL §A.0c, security A2). No-op for
     # WorkOS tokens (no oid claim).
     user_id = str(claims.get("user_id") or claims.get("oid") or subject or "")
+    # Only interactive WorkOS people may use the legacy ``external_id`` alias.
+    # App tokens keep their stable token identity, and every provider still gets
+    # the exact-id lookup first. This closes a hosted migration gap without
+    # weakening workspace isolation or permitting ambiguous identity matches.
+    is_app_token = claims.get("idtyp") == "app"
+    external_provider = (
+        "workos"
+        if _is_verified_workos_person(claims, is_app_token=is_app_token)
+        else None
+    )
+    db_identity = _db_oauth_identity(
+        user_id,
+        workspace_id,
+        external_provider=external_provider,
+    )
+    db_role: str | None = None
+    if db_identity is not None:
+        user_id, db_role = db_identity
     raw_role = _role_claim(claims)
     system_role, role_known = map_sso_role(raw_role)
     if raw_role is not None and not role_known:
@@ -251,15 +338,17 @@ def current_mcp_context() -> CallerContext:
             raw_role,
             subject,
         )
-    elif raw_role is None:
+    elif raw_role is None and db_role:
         # Interactive AuthKit token: no role claim. Fall back to the persisted
         # role so a real browser login is not silently downgraded to viewer.
-        db_role = _db_system_role(user_id, workspace_id)
-        if db_role:
-            system_role = db_role
+        system_role = db_role
+        if db_role != "viewer":
+            logger.info(
+                "oauth role: restored persisted %s role for an interactive token",
+                db_role,
+            )
     # Entra client-credentials (M2M) tokens declare idtyp=app — that caller is
     # an agent, not a person (IMPL §A.0c). No-op for WorkOS tokens.
-    is_app_token = claims.get("idtyp") == "app"
     return CallerContext(
         username=str(subject),
         system_role=system_role,

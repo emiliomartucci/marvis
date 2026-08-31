@@ -173,6 +173,13 @@ async def _finder_project_mutation(
         projects_root=projects_root
     ):
         for project_slug, refs in sorted(grouped.items()):
+            if not await project_lifecycle.project_write_fence_required(
+                db,
+                workspace_id=require_workspace_ctx(actor),
+                project_slug=project_slug,
+                projects_root=projects_root,
+            ):
+                continue
             await project_lifecycle.record_project_write(
                 db,
                 workspace_id=require_workspace_ctx(actor),

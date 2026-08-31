@@ -336,6 +336,168 @@ def _validate_evidence(root: Path, reference: str) -> None:
             raise CompatibilityError(f"evidence symbol missing: {reference}")
 
 
+def _schema_property_values(
+    spec: dict[str, Any], schema_name: str, property_name: str
+) -> set[str]:
+    try:
+        value = spec["components"]["schemas"][schema_name]["properties"][property_name]
+    except (KeyError, TypeError) as exc:
+        raise CompatibilityError(
+            f"response sanitizer schema property missing: {schema_name}.{property_name}"
+        ) from exc
+
+    collected: set[str] = set()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key in ("enum", "x-extensible-enum"):
+                raw_values = node.get(key)
+                if isinstance(raw_values, list):
+                    collected.update(item for item in raw_values if isinstance(item, str))
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return collected
+
+
+def _validate_provider_response_sanitizers(
+    root: Path,
+    matrix: dict[str, Any],
+    *,
+    provider_breaks_found: set[str],
+    current_openapi: dict[str, Any],
+    previous_openapi: dict[str, Any],
+) -> set[str]:
+    declarations = matrix.get("n_minus_1_provider_response_sanitizers")
+    if not isinstance(declarations, list):
+        raise CompatibilityError("N-1 provider response sanitizer inventory missing")
+
+    rows = matrix.get("rows")
+    if not isinstance(rows, list):
+        raise CompatibilityError("consumer matrix rows missing")
+    by_surface = {row.get("surface"): row for row in rows if isinstance(row, dict)}
+    required_keys = {
+        "failure",
+        "schema",
+        "property",
+        "internal_value",
+        "wire_value",
+        "surfaces",
+        "evidence",
+    }
+    declared: set[str] = set()
+
+    for item in declarations:
+        if not isinstance(item, dict) or set(item) != required_keys:
+            raise CompatibilityError("invalid N-1 provider response sanitizer row")
+        schema_name = item["schema"]
+        property_name = item["property"]
+        internal_value = item["internal_value"]
+        wire_value = item["wire_value"]
+        failure = item["failure"]
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                schema_name,
+                property_name,
+                internal_value,
+                wire_value,
+                failure,
+            )
+        ):
+            raise CompatibilityError("response sanitizer values must be non-empty strings")
+        expected_failure = f"schema_property_changed:{schema_name}.{property_name}"
+        if failure != expected_failure or failure in declared:
+            raise CompatibilityError("invalid or duplicate response sanitizer failure")
+        if failure not in provider_breaks_found:
+            raise CompatibilityError(f"response sanitizer declaration is stale: {failure}")
+        if internal_value == wire_value:
+            raise CompatibilityError("response sanitizer must change the internal value")
+
+        surfaces = item["surfaces"]
+        if (
+            not isinstance(surfaces, list)
+            or surfaces != sorted(set(surfaces))
+            or not surfaces
+            or not set(surfaces).issubset(EXPECTED_SURFACES)
+        ):
+            raise CompatibilityError(f"response sanitizer has invalid surfaces: {failure}")
+        for surface in surfaces:
+            row = by_surface.get(surface)
+            if not isinstance(row, dict) or row.get("n_minus_1_consumer_n_contract") != "pass":
+                raise CompatibilityError(
+                    f"{surface}: response sanitizer cannot certify a non-passing N-1 row"
+                )
+
+        evidence = item["evidence"]
+        if (
+            not isinstance(evidence, list)
+            or evidence != sorted(set(evidence))
+            or len(evidence) < 2
+        ):
+            raise CompatibilityError(f"response sanitizer evidence invalid: {failure}")
+        for reference in evidence:
+            _validate_evidence(root, str(reference))
+
+        previous_values = _schema_property_values(
+            previous_openapi, schema_name, property_name
+        )
+        current_values = _schema_property_values(
+            current_openapi, schema_name, property_name
+        )
+        if (
+            wire_value not in previous_values
+            or internal_value in previous_values
+            or internal_value not in current_values
+        ):
+            raise CompatibilityError(
+                f"response sanitizer mapping is not bounded by N/N-1 schemas: {failure}"
+            )
+
+        if (schema_name, property_name) != ("SearchResponse", "semantic_reason"):
+            raise CompatibilityError(f"unsupported runtime response sanitizer: {failure}")
+        try:
+            from core.api.models.search import SearchResponse
+
+            normalized = SearchResponse(semantic_reason=internal_value).model_dump()
+            preserved = SearchResponse(semantic_reason=wire_value).model_dump()
+            if (
+                normalized.get(property_name) != wire_value
+                or preserved.get(property_name) != wire_value
+            ):
+                raise CompatibilityError(
+                    f"runtime response sanitizer mapping failed: {failure}"
+                )
+            try:
+                SearchResponse(semantic_reason="compatibility-gate-unsanitized")
+            except Exception:  # noqa: BLE001 - rejection is the required proof
+                pass
+            else:
+                raise CompatibilityError(
+                    f"runtime response sanitizer accepts unknown values: {failure}"
+                )
+        except CompatibilityError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - fail closed on runtime proof
+            raise CompatibilityError(
+                f"runtime response sanitizer proof failed: {failure}"
+            ) from exc
+
+        declared.add(failure)
+
+    if declared != provider_breaks_found:
+        missing = sorted(provider_breaks_found - declared)
+        stale = sorted(declared - provider_breaks_found)
+        raise CompatibilityError(
+            f"N-1 response sanitizer inventory drift: missing={missing}, stale={stale}"
+        )
+    return declared
+
+
 def _validate_matrix(
     root: Path,
     matrix: dict[str, Any],
@@ -581,15 +743,17 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
     n_raw = n_path.read_bytes()
     consumer_raw = consumer_path.read_bytes()
     try:
+        current_openapi = json.loads(n_raw)
+        consumer_openapi = json.loads(consumer_raw)
         rebuilt_current = compact_spec(
-            json.loads(n_raw),
+            current_openapi,
             contract_version=pinned_version,
             source_ref=pinned_ref,
             source_bytes=n_raw,
             consumer_bytes=consumer_raw,
         )
         rebuilt_consumer = compact_spec(
-            json.loads(consumer_raw),
+            consumer_openapi,
             contract_version=pinned_version,
             source_ref=pinned_ref,
             source_bytes=consumer_raw,
@@ -604,8 +768,9 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         )
     previous_raw = previous_openapi_path.read_bytes()
     try:
+        previous_openapi = json.loads(previous_raw)
         rebuilt_previous = compact_spec(
-            json.loads(previous_raw),
+            previous_openapi,
             contract_version=previous["contract_version"],
             source_ref=previous_ref,
             source_bytes=previous_raw,
@@ -620,8 +785,6 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         raise CompatibilityError("N fixture is not bound to the consumer OpenAPI bytes")
 
     old_to_new = provider_breaks(previous, current)
-    if old_to_new:
-        raise CompatibilityError(f"N breaks N-1 consumers: {old_to_new}")
     consumer_to_n = provider_breaks(consumer, current, consumer_view=True)
     if consumer_to_n:
         raise CompatibilityError(f"N does not satisfy its consumer contract: {consumer_to_n}")
@@ -675,12 +838,20 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         raise CompatibilityError("deliberate breaking fixture did not fail as declared")
 
     matrix = _load(root / "contracts/compatibility/consumer-matrix-v1.json")
+    declared_response_sanitizers = _validate_provider_response_sanitizers(
+        root,
+        matrix,
+        provider_breaks_found=set(old_to_new),
+        current_openapi=current_openapi,
+        previous_openapi=previous_openapi,
+    )
+    traced_schema_breaks = consumer_previous_breaks - declared_response_sanitizers
     _validate_matrix(
         root,
         matrix,
         n_consumer=consumer,
         previous=previous,
-        consumer_previous_breaks=consumer_previous_breaks,
+        consumer_previous_breaks=traced_schema_breaks,
         current_mcp_tools=current_mcp_tools,
         previous_mcp_tools=previous_mcp_tools,
     )
@@ -699,7 +870,10 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         "n_minus_1_mcp_tools": len(previous_mcp_tools),
         "n_only_mcp_tools": len(current_mcp_tools - previous_mcp_tools),
         "deliberate_breaks_detected": len(break_failures),
-        "declared_n_minus_1_schema_breaks": len(consumer_previous_breaks),
+        "declared_n_minus_1_schema_breaks": len(traced_schema_breaks),
+        "declared_n_minus_1_response_sanitizers": len(
+            declared_response_sanitizers
+        ),
     }
 
 

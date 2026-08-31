@@ -14,40 +14,10 @@
 PRAGMA foreign_keys=OFF;
 BEGIN IMMEDIATE;
 
--- Stop before any table rebuild if an existing task-cost conversation cannot
--- be proven to have the same workspace as its task. Silent copying (or NULLing)
--- would turn an ownership mismatch into trusted billing history.
-CREATE TEMP TABLE v185_task_cost_workspace_gate (
-    ok INTEGER NOT NULL CHECK (ok = 1)
-);
-INSERT INTO v185_task_cost_workspace_gate(ok)
-SELECT CASE WHEN EXISTS (
-    SELECT 1
-      FROM task_cost_entries tce
-      JOIN tasks task ON task.id = tce.task_id
-      LEFT JOIN session_costs sc
-        ON sc.conversation_id = tce.conversation_id
-     WHERE tce.conversation_id IS NOT NULL
-       AND (
-           task.workspace_id IS NULL
-           OR length(trim(task.workspace_id)) = 0
-           OR sc.conversation_id IS NULL
-           OR (
-               SELECT COUNT(DISTINCT sm.workspace_id)
-                 FROM sessions_meta sm
-                WHERE sm.name = sc.session_name
-                  AND sm.workspace_id IS NOT NULL
-                  AND length(trim(sm.workspace_id)) > 0
-           ) != 1
-           OR NOT EXISTS (
-               SELECT 1
-                 FROM sessions_meta sm
-                WHERE sm.name = sc.session_name
-                  AND sm.workspace_id = task.workspace_id
-           )
-       )
-) THEN 0 ELSE 1 END;
-DROP TABLE v185_task_cost_workspace_gate;
+-- Historical task costs whose conversation ownership cannot be proven are
+-- preserved byte-for-byte in an immutable quarantine table below.  They are
+-- never copied into the trusted billing table and are never silently assigned
+-- from task ownership alone.
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_workspace_name_unique
     ON sessions_meta(workspace_id, name);
@@ -362,6 +332,88 @@ END;
 DROP TRIGGER IF EXISTS tce_no_update;
 DROP TRIGGER IF EXISTS tce_no_delete;
 
+CREATE TABLE task_cost_entries_v185_quarantine (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    conversation_id TEXT,
+    pr_id TEXT,
+    cost_usd_delta REAL NOT NULL,
+    token_markup_factor REAL NOT NULL,
+    agent_seconds INTEGER NOT NULL,
+    agent_cost_rate REAL NOT NULL,
+    agent_bill_rate REAL NOT NULL,
+    human_minutes REAL NOT NULL,
+    human_cost_rate REAL NOT NULL,
+    human_bill_rate REAL NOT NULL,
+    total_cost_usd REAL NOT NULL,
+    total_bill_usd REAL NOT NULL,
+    is_billable INTEGER NOT NULL,
+    billable_reason TEXT,
+    billing_notes TEXT,
+    idempotency_key TEXT,
+    description TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    observed_task_workspace_id TEXT,
+    quarantine_reason TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL DEFAULT (datetime('now', 'utc'))
+);
+
+INSERT INTO task_cost_entries_v185_quarantine (
+    id, task_id, entry_type, source, conversation_id, pr_id,
+    cost_usd_delta, token_markup_factor, agent_seconds, agent_cost_rate,
+    agent_bill_rate, human_minutes, human_cost_rate, human_bill_rate,
+    total_cost_usd, total_bill_usd, is_billable, billable_reason,
+    billing_notes, idempotency_key, description, created_by, created_at,
+    observed_task_workspace_id, quarantine_reason
+)
+SELECT
+    tce.id, tce.task_id, tce.entry_type, tce.source, tce.conversation_id,
+    tce.pr_id, tce.cost_usd_delta, tce.token_markup_factor,
+    tce.agent_seconds, tce.agent_cost_rate, tce.agent_bill_rate,
+    tce.human_minutes, tce.human_cost_rate, tce.human_bill_rate,
+    tce.total_cost_usd, tce.total_bill_usd, tce.is_billable,
+    tce.billable_reason, tce.billing_notes, tce.idempotency_key,
+    tce.description, tce.created_by, tce.created_at, task.workspace_id,
+    'unproven_conversation_workspace'
+FROM task_cost_entries tce
+LEFT JOIN tasks task ON task.id = tce.task_id
+WHERE tce.conversation_id IS NOT NULL
+  AND (
+      task.id IS NULL
+      OR task.workspace_id IS NULL
+      OR length(trim(task.workspace_id)) = 0
+      OR NOT EXISTS (
+          SELECT 1
+            FROM session_costs sc
+           WHERE sc.workspace_id = task.workspace_id
+             AND sc.conversation_id = tce.conversation_id
+      )
+  );
+
+CREATE INDEX idx_task_cost_entries_v185_quarantine_task
+    ON task_cost_entries_v185_quarantine(task_id);
+
+CREATE TRIGGER task_cost_entries_v185_quarantine_no_insert
+BEFORE INSERT ON task_cost_entries_v185_quarantine
+BEGIN
+  SELECT RAISE(ABORT, 'task cost quarantine is immutable');
+END;
+
+CREATE TRIGGER task_cost_entries_v185_quarantine_no_update
+BEFORE UPDATE ON task_cost_entries_v185_quarantine
+BEGIN
+  SELECT RAISE(ABORT, 'task cost quarantine is immutable');
+END;
+
+CREATE TRIGGER task_cost_entries_v185_quarantine_no_delete
+BEFORE DELETE ON task_cost_entries_v185_quarantine
+BEGIN
+  SELECT RAISE(ABORT, 'task cost quarantine is immutable');
+END;
+
 CREATE TABLE task_cost_entries_v185_new (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
@@ -406,7 +458,18 @@ SELECT
     agent_bill_rate, human_minutes, human_cost_rate, human_bill_rate,
     total_cost_usd, total_bill_usd, is_billable, billable_reason,
     billing_notes, idempotency_key, description, created_by, created_at
-FROM task_cost_entries;
+FROM task_cost_entries tce
+WHERE tce.conversation_id IS NULL
+   OR EXISTS (
+       SELECT 1
+         FROM tasks task
+         JOIN session_costs sc
+           ON sc.workspace_id = task.workspace_id
+          AND sc.conversation_id = tce.conversation_id
+        WHERE task.id = tce.task_id
+          AND task.workspace_id IS NOT NULL
+          AND length(trim(task.workspace_id)) > 0
+   );
 
 DROP TABLE task_cost_entries;
 ALTER TABLE task_cost_entries_v185_new RENAME TO task_cost_entries;

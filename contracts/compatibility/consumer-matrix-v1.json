@@ -192,6 +192,20 @@
       "evidence": ["core/api/models/tasks.py", "core/api/routers/tasks.py"]
     }
   ],
+  "n_minus_1_provider_response_sanitizers": [
+    {
+      "failure": "schema_property_changed:SearchResponse.semantic_reason",
+      "schema": "SearchResponse",
+      "property": "semantic_reason",
+      "internal_value": "semantic-timeout",
+      "wire_value": "runtime-gate",
+      "surfaces": ["cli", "gui", "http", "local_mcp"],
+      "evidence": [
+        "core/api/models/search.py::_normalize_semantic_reason",
+        "core/api/use_cases/search.py::_build_response"
+      ]
+    }
+  ],
   "rows": [
     {
       "surface": "cli",

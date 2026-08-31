@@ -1,0 +1,51 @@
+{
+  "schema": "marvis-pre-release-migration-refresh/v1",
+  "source_sha": "ab1fa58eae705a25ca46ea6829eb0d538794ee52",
+  "prior_distributions_contract": {
+    "path": "contracts/compatibility/prior-distributions-v1.json",
+    "sha256": "a02b33bb52577c9b64d84b46895d9f2ef01abe3fd1df1dd1c4e1dff39121af9a"
+  },
+  "published_artifacts": [
+    {
+      "kind": "pypi_wheel",
+      "version": "0.3.8",
+      "identity": "77a00a1eedaf6d6d6284ba3d0a5a66da665d35e035a140caaf733a339bad46a2",
+      "migration_path_count": 199,
+      "migration_paths_sha256": "e264784cc3ee3b5d26acfd5e4ac9a8104c17f6c634c088ee32b1dc190bd6591f",
+      "verified_absent_paths": [
+        "migrations/183_ingest_workspace.sql",
+        "migrations/185_session_cost_workspace.sql",
+        "migrations/185_session_cost_workspace_down.sql"
+      ]
+    },
+    {
+      "kind": "github_release_source",
+      "tag": "v0.4.0",
+      "identity": "22b943c761e75764cf4bca75bdbbdfbfbc2863fa",
+      "migration_path_count": 209,
+      "migration_paths_sha256": "dc34e7bdc2bbf78985c9f39fd723f8ee8bf79f24a6c275abac79e08ffcac5598",
+      "verified_absent_paths": [
+        "migrations/183_ingest_workspace.sql",
+        "migrations/185_session_cost_workspace.sql",
+        "migrations/185_session_cost_workspace_down.sql"
+      ]
+    }
+  ],
+  "refreshed_paths": [
+    {
+      "path": "migrations/183_ingest_workspace.sql",
+      "current_sha256": "9c6af0bdc80fa25782067c5b9a6898097b6242b1485968927ef97dd650e40c63",
+      "source_sha256": "719df87e52510bff40cbb54856ac419d14dfbdb9955a6e88aceaeedb8597c39c"
+    },
+    {
+      "path": "migrations/185_session_cost_workspace.sql",
+      "current_sha256": "80b70a9dcc5321ddbfc99ddc181053d48a525f43d945c93ac4451bcd3627f117",
+      "source_sha256": "b56c83cb10392c42f3e0993e2f667c08c4f6ea884373b1fd58fcd8b9694baade"
+    },
+    {
+      "path": "migrations/185_session_cost_workspace_down.sql",
+      "current_sha256": "6d3286d8a17f6f9d2ed48087bdaaf4efeb912d4d5698774197a8fe41ffb0a2cd",
+      "source_sha256": "44b4693369ccc2026fe11c9d0483f84944f325cb5dd53cd095a0c13d7ccdc56a"
+    }
+  ]
+}

@@ -579,8 +579,9 @@ def _http_host_from_env() -> str:
 def _enforce_db_path_env_invariant() -> None:
     """S2 (IMPL §E): keep ``MARVIS_DB_PATH`` == the settings-resolved db_path.
 
-    ``_db_system_role`` — the DB fallback that keeps interactive OAuth logins
-    from collapsing to viewer (d8d9af95) — reads ``MARVIS_DB_PATH`` from env,
+    ``_db_oauth_identity`` — the DB fallback that keeps interactive OAuth logins
+    bound to their persisted identity and role (d8d9af95) — reads
+    ``MARVIS_DB_PATH`` from env,
     while the server resolves its database from ``settings.yaml`` (the env
     alone is ignored, learning 10e5c09f). Unset → export the resolved path so
     the fallback reads the SAME database the server serves. Set to something

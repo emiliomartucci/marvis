@@ -157,15 +157,26 @@ def _normalize_sql(value: object) -> str:
     return normalized.rstrip(";")
 
 
-def legacy_root_hash_v1(rows: Iterable[Mapping[str, Any]]) -> str:
-    """Bind every legacy row in deterministic ``timestamp, id`` order."""
-    ordered = sorted(
-        (dict(row) for row in rows),
-        key=lambda row: (str(row["timestamp"]), str(row["id"])),
+def legacy_root_hash_v1(
+    rows: Iterable[Mapping[str, Any]], *, rows_already_ordered: bool = False
+) -> str:
+    """Bind legacy rows in deterministic ``timestamp, id`` order.
+
+    Callers that already enforce this order may opt into one-pass hashing to
+    avoid materializing a large legacy prefix in application memory.
+    """
+    normalized_rows = (dict(row) for row in rows)
+    ordered_rows = (
+        normalized_rows
+        if rows_already_ordered
+        else sorted(
+            normalized_rows,
+            key=lambda row: (str(row["timestamp"]), str(row["id"])),
+        )
     )
     digest = hashlib.sha256()
     digest.update(_LEGACY_ROOT_DOMAIN)
-    for row in ordered:
+    for row in ordered_rows:
         payload = canonical_json(
             {
                 "action": row["action"],
