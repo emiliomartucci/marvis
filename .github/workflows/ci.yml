@@ -137,6 +137,8 @@ jobs:
           # Release-contract tests read the exact Plan B base and prove
           # ancestry; a shallow clone turns valid evidence into false RED.
           fetch-depth: 0
+          # Don't leave the job's git token in .git/config: no step here pushes.
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -177,6 +179,9 @@ jobs:
         working-directory: apps/desktop-ui
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Don't leave the job's git token in .git/config: no step here pushes.
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
