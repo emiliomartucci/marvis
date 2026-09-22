@@ -2,6 +2,10 @@ name: E2E Install Cross-OS
 
 on:
   pull_request:
+    # A draft pull request is a workbench: its pushes run no CI. The jobs below
+    # refuse draft runs, and marking the pull request ready for review triggers
+    # them (same policy as bonusimmobiliare quality.yml).
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - ".github/workflows/e2e-macos.yml"
       - "pyproject.toml"
@@ -34,10 +38,99 @@ permissions:
   contents: read
 
 concurrency:
-  group: e2e-install-cross-os-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Successive pushes to a pull request supersede one another; only the newest
+  # must finish. A push to main is merge evidence and is never cancelled.
+  group: e2e-install-cross-os-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  main-dedupe:
+    # A merge of an up-to-date pull request publishes exactly the tree the
+    # pull-request run already validated, so the main run would repeat the same
+    # OS matrix (macOS ×10 minutes) for zero new evidence. The gate skips every
+    # downstream job only when all of the following hold, and any error fails
+    # open to a full run:
+    #   - the pushed commit is a merge commit (two parents);
+    #   - its tree is byte-identical to the second parent's (the PR head);
+    #   - the merge changes nothing under .github/workflows/;
+    #   - a pull_request run of THIS workflow succeeded on that head SHA.
+    # Harmless on the private repo: config/windows already skip there.
+    name: Skip main run already proven by its PR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      skip: ${{ steps.dedupe.outputs.skip }}
+    steps:
+      - name: Skip when the merge tree was already validated by a green PR run
+        id: dedupe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_SHA: ${{ github.sha }}
+          WORKFLOW_FILE: e2e-macos.yml
+        run: |
+          set -euo pipefail
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          gate() {
+            local push_sha="$PUSH_SHA"
+            local commit parent1 parent2 tree_push tree_p2 compare runs green
+            if ! commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${push_sha}")" \
+               || ! parent1="$(jq -er '.parents[0].sha | strings' <<<"$commit")" \
+               || ! tree_push="$(jq -er '.tree.sha | strings' <<<"$commit")"; then
+              echo "::warning::could not read commit ${push_sha}; running full matrix"
+              return 0
+            fi
+            parent2="$(jq -r '.parents[1].sha // empty' <<<"$commit")"
+            if [ -z "$parent2" ]; then
+              echo "not a merge commit (single parent); running full matrix"
+              return 0
+            fi
+            if ! tree_p2="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${parent2}" --jq '.tree.sha')" \
+               || ! [[ "$tree_p2" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::warning::could not read the pull-request head commit ${parent2}; running full matrix"
+              return 0
+            fi
+            if [ "$tree_push" != "$tree_p2" ]; then
+              echo "merge tree differs from the pull-request head tree; running full matrix"
+              return 0
+            fi
+            if ! compare="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${parent1}...${push_sha}")"; then
+              echo "::warning::could not read the merge diff; running full matrix"
+              return 0
+            fi
+            if [ "$(jq -r '.truncated // false' <<<"$compare")" = "true" ]; then
+              echo "::warning::merge diff truncated by the API; running full matrix"
+              return 0
+            fi
+            if jq -e '.files // [] | any(.filename | startswith(".github/workflows/"))' <<<"$compare" >/dev/null; then
+              echo "merge changes CI workflows; running full matrix"
+              return 0
+            fi
+            if ! runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${parent2}&per_page=100")"; then
+              echo "::warning::could not read the workflow runs for ${parent2}; running full matrix"
+              return 0
+            fi
+            green="$(jq -r '[.workflow_runs[]? | select(.conclusion == "success")] | length' <<<"$runs")"
+            if ! [[ "$green" =~ ^[0-9]+$ ]]; then
+              echo "::warning::could not parse the workflow runs for ${parent2}; running full matrix"
+              return 0
+            fi
+            if [ "$green" -eq 0 ]; then
+              echo "no successful pull_request run for head ${parent2}; running full matrix"
+              return 0
+            fi
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "tree ${tree_push} already validated by a green pull-request run on ${parent2}; skipping matrix"
+          }
+
+          if ! gate; then
+            echo "::warning::dedupe gate errored; running full matrix"
+          fi
+
   # Repo-aware matrix. The expensive macOS leg (10x GitHub-minutes) runs ONLY on
   # the public mirror (emiliomartucci/marvis), where Actions are free; the
   # private source repo keeps a cheap ubuntu+windows pre-merge gate. Same file on
@@ -48,7 +141,14 @@ jobs:
     # CI cost: run only on the PUBLIC mirror (free, unlimited Actions). On the
     # private repo this skips — the full cross-OS matrix already runs free on
     # marvis, so re-running it on paid private minutes is redundant.
-    if: ${{ github.repository == 'emiliomartucci/marvis' }}
+    needs: main-dedupe
+    # Draft PRs run nothing; a main push defers to the main-dedupe gate; every
+    # other event (and any gate skip/failure) runs in full.
+    if: >-
+      always() && !cancelled() &&
+      github.repository == 'emiliomartucci/marvis' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.main-dedupe.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -244,7 +344,12 @@ jobs:
     name: windows-latest / Python ${{ matrix.python-version }}
     # CI cost: PUBLIC mirror only (free). Windows minutes bill at 2x on private —
     # this was the single most expensive private job; it runs free on marvis.
-    if: ${{ github.repository == 'emiliomartucci/marvis' }}
+    needs: main-dedupe
+    if: >-
+      always() && !cancelled() &&
+      github.repository == 'emiliomartucci/marvis' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.main-dedupe.outputs.skip != 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     env:

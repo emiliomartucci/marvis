@@ -2,14 +2,135 @@ name: CI
 
 on:
   pull_request:
+    # A draft pull request is a workbench: its pushes run no CI (minutes,
+    # even when free on this public mirror, still occupy the Actions queue).
+    # The jobs below also refuse draft runs, and marking the pull request
+    # ready for review triggers them (same policy as bonusimmobiliare
+    # quality.yml).
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  # Successive pushes to a pull request supersede one another, so only the
+  # newest needs to finish. A push to main is merge evidence and is never
+  # cancelled.
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  main-dedupe:
+    # A merge of an up-to-date pull request publishes exactly the tree the
+    # pull-request CI run already validated, so the main run would pay the same
+    # minutes again for zero new evidence. This repository merges via merge
+    # commits, so the gate fires often. It skips the CI jobs only when all of
+    # the following hold, and any error fails open to a full run:
+    #   - the pushed commit is a merge commit (two parents);
+    #   - its tree is byte-identical to the second parent's (the pull-request
+    #     head), which means the merge contributed nothing the PR lacked;
+    #   - the merge does not change anything under .github/workflows/ (a green
+    #     run made by a weakened workflow must never vouch for main);
+    #   - a pull_request run of THIS workflow succeeded on that head SHA.
+    name: Skip main run already proven by its PR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      skip: ${{ steps.dedupe.outputs.skip }}
+    steps:
+      - name: Skip when the merge tree was already validated by a green PR run
+        id: dedupe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_SHA: ${{ github.sha }}
+          WORKFLOW_FILE: ci.yml
+        run: |
+          set -euo pipefail
+          # Default first: run the full CI. Only a fully proven already-validated
+          # tree overwrites this with skip=true (the last value written to
+          # $GITHUB_OUTPUT wins).
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          gate() {
+            local push_sha="$PUSH_SHA"
+            local commit parent1 parent2 tree_push tree_p2 compare runs green
+            if ! commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${push_sha}")" \
+               || ! parent1="$(jq -er '.parents[0].sha | strings' <<<"$commit")" \
+               || ! tree_push="$(jq -er '.tree.sha | strings' <<<"$commit")"; then
+              echo "::warning::could not read commit ${push_sha}; running full CI"
+              return 0
+            fi
+            parent2="$(jq -r '.parents[1].sha // empty' <<<"$commit")"
+            if [ -z "$parent2" ]; then
+              echo "not a merge commit (single parent); running full CI"
+              return 0
+            fi
+            if ! tree_p2="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${parent2}" --jq '.tree.sha')" \
+               || ! [[ "$tree_p2" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::warning::could not read the pull-request head commit ${parent2}; running full CI"
+              return 0
+            fi
+            if [ "$tree_push" != "$tree_p2" ]; then
+              echo "merge tree differs from the pull-request head tree; running full CI"
+              return 0
+            fi
+            if ! compare="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${parent1}...${push_sha}")"; then
+              echo "::warning::could not read the merge diff; running full CI"
+              return 0
+            fi
+            if [ "$(jq -r '.truncated // false' <<<"$compare")" = "true" ]; then
+              echo "::warning::merge diff truncated by the API; running full CI"
+              return 0
+            fi
+            if jq -e '.files // [] | any(.filename | startswith(".github/workflows/"))' <<<"$compare" >/dev/null; then
+              echo "merge changes CI workflows; running full CI"
+              return 0
+            fi
+            if ! runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${parent2}&per_page=100")"; then
+              echo "::warning::could not read the workflow runs for ${parent2}; running full CI"
+              return 0
+            fi
+            green="$(jq -r '[.workflow_runs[]? | select(.conclusion == "success")] | length' <<<"$runs")"
+            if ! [[ "$green" =~ ^[0-9]+$ ]]; then
+              echo "::warning::could not parse the workflow runs for ${parent2}; running full CI"
+              return 0
+            fi
+            if [ "$green" -eq 0 ]; then
+              echo "no successful pull_request CI run for head ${parent2}; running full CI"
+              return 0
+            fi
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "tree ${tree_push} already validated by a green pull-request run on ${parent2}; skipping CI"
+          }
+
+          # set -e is suppressed inside a function invoked from `if !`, so every
+          # command that can fail is checked explicitly above; this arm is the
+          # last-resort fail-open.
+          if ! gate; then
+            echo "::warning::dedupe gate errored; running full CI"
+          fi
+
   # One consolidated Python job keeps per-job minute rounding low while the
   # checked collection contract prevents a green result from hiding a suite.
   python-contract:
+    needs: main-dedupe
+    # Draft pull requests run nothing (see on.pull_request.types). On a main
+    # push the main-dedupe gate decides; on every other event, and whenever the
+    # gate itself fails or is skipped, the job runs in full.
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.main-dedupe.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,7 +163,15 @@ jobs:
   # arrived from the shared console with 17 failing tests and a suite that did
   # not compile, and nothing said so.
   desktop-ui:
+    needs: main-dedupe
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.main-dedupe.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: apps/desktop-ui
