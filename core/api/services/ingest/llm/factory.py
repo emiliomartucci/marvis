@@ -18,7 +18,11 @@ def get_classifier() -> LLMClassifier:
         from core.api.services.ingest.llm.local_gateway import LocalGatewayClassifier
 
         return LocalGatewayClassifier()
+    if provider == "jev":
+        from core.api.services.ingest.llm.jev_provider import JevClassifier
+
+        return JevClassifier()
     raise ValueError(
         f"Unknown INGEST_LLM_PROVIDER: {provider!r} "
-        "(expected one of: local, gateway, mac, tier-fast)"
+        "(expected one of: local, gateway, mac, tier-fast, jev)"
     )

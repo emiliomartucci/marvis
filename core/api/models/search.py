@@ -95,3 +95,35 @@ class SearchResponse(BaseModel):
     # serialized as `runtime-gate`: that value was already accepted by N-1
     # clients, so a degraded lane cannot break an otherwise useful response.
     semantic_reason: SemanticReason | None = None
+    # Plan 2026-09-21 U2/R16: Jev re-rank receipt. None when rerank did not
+    # run (flag off / not requested) — wire shape unchanged for N-1 clients.
+    curation: "SearchCuration | None" = None
+
+
+class SearchCurationDemotion(BaseModel):
+    """One demoted hit in the search curation receipt (plan R16)."""
+
+    doc_type: str
+    doc_id: str
+    title: str = ""
+    relevance: float
+    confidence: float
+
+
+class SearchCuration(BaseModel):
+    """Jev re-rank receipt attached to the search response (plan R16/R17).
+
+    ``status`` uses the closed outcome vocabulary (ok | disabled_tenant |
+    timeout_fallback | breaker_open | ceiling_hit | provider_error | error):
+    the agent sees exactly why the curation ran or degraded, and can challenge
+    any demotion listed in ``demoted`` (context parity).
+    """
+
+    surface: str = "search_rerank"
+    status: str
+    demoted: list[SearchCurationDemotion] = []
+    scored: int = 0
+    truncated: int = 0
+
+
+SearchResponse.model_rebuild()

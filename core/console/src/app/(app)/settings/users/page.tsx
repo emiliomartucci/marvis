@@ -236,6 +236,8 @@ function CreateUserModal({
   const [error, setError] = useState<string | null>(null);
   const [teams, setTeams] = useState<Team[]>([]);
   const [selectedTeamIds, setSelectedTeamIds] = useState<Set<string>>(new Set());
+  const [createdUser, setCreatedUser] = useState<User | null>(null);
+  const assignedTeamIds = useRef<Set<string>>(new Set());
   const teamsLoaded = useRef(false);
 
   // Fetch teams on mount
@@ -276,18 +278,35 @@ function CreateUserModal({
         email: form.email.trim() || null,
         avatar_color: form.avatar_color,
       };
-      const user = await createUser(req);
-
-      // Add user to selected teams (best-effort, don't block on failure)
-      for (const teamId of selectedTeamIds) {
-        try {
-          await addTeamMember(teamId, { user_id: user.id });
-        } catch {
-          // Silently skip — team membership is a bonus, not critical
-        }
+      const user = createdUser ?? await createUser(req);
+      if (!createdUser) {
+        setCreatedUser(user);
+        onCreated(user);
       }
 
-      onCreated(user);
+      const failedTeams: string[] = [];
+      for (const teamId of selectedTeamIds) {
+        if (assignedTeamIds.current.has(teamId)) continue;
+        try {
+          await addTeamMember(teamId, { user_id: user.id });
+          assignedTeamIds.current.add(teamId);
+        } catch {
+          failedTeams.push(teams.find((team) => team.id === teamId)?.display_name ?? teamId);
+        }
+      }
+      if (failedTeams.length) {
+        setError(`Utente creato, ma non assegnato a: ${failedTeams.join(", ")}. Riprova per completare i team.`);
+        return;
+      }
+      onCreated({
+        ...user,
+        teams: teams.filter((team) => assignedTeamIds.current.has(team.id)).map((team) => ({
+          id: team.id,
+          slug: team.slug,
+          display_name: team.display_name,
+          role: "member" as const,
+        })),
+      });
       onClose();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Errore nella creazione");
@@ -727,7 +746,9 @@ export default function UsersPage() {
       {showCreate && (
         <CreateUserModal
           onClose={() => setShowCreate(false)}
-          onCreated={(u) => setUsers((us) => [...us, u])}
+          onCreated={(u) => setUsers((us) => us.some((existing) => existing.id === u.id)
+            ? us.map((existing) => existing.id === u.id ? u : existing)
+            : [...us, u])}
         />
       )}
 

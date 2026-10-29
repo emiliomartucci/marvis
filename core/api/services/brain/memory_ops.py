@@ -35,6 +35,7 @@ from typing import Any, Iterable
 import aiosqlite
 
 from core.api.db import acquire_db, write_db
+from core.api.services.brain.run_selection import latest_readable_run
 from core.api.models import UserInfo
 from core.api.models.brain import (
     ApplyNextAction,
@@ -56,6 +57,7 @@ from core.api.services.brain.compound_bridge import (
 )
 from core.api.services.brain.edge_metrics import compute_reinforce_score
 from core.api.visibility import get_visible_projects
+from core.api.services.brain.visibility_policy import enterprise_strict, scope_sql, scope_visible
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +209,7 @@ class DriftSignalRow:
     confidence: float
     recurrence_key: str
     involved_projects: list[str]
+    expected_direction_ref: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -282,7 +285,10 @@ async def build_snapshot(
             await db.execute(
                 "SELECT event_id, cycle_key, event_type, source_system, source_project,"
                 " target_project, program_key, source_ref, title, summary, observed_at,"
-                " evidence_json FROM brain_digest_events WHERE run_id = ?",
+                " evidence_json FROM brain_digest_events WHERE run_id IN ("
+            "SELECT r.run_id FROM brain_runs r JOIN brain_runs selected "
+            "ON selected.workspace_id=r.workspace_id AND selected.cycle_key=r.cycle_key "
+            "WHERE selected.run_id=?)",
                 (run_id,),
             )
         ).fetchall()
@@ -298,7 +304,7 @@ async def build_snapshot(
             await db.execute(
                 "SELECT signal_id, cycle_key, rule_id, signal_type, knowledge_form,"
                 " scope_type, scope_key, program_key, observed_direction_ref,"
-                " severity, confidence, recurrence_key, involved_projects_json"
+                " severity, confidence, recurrence_key, involved_projects_json, expected_direction_ref"
                 " FROM brain_drift_signals WHERE run_id = ?",
                 (run_id,),
             )
@@ -355,6 +361,7 @@ async def build_snapshot(
             scope_key=r["scope_key"],
             program_key=r["program_key"],
             observed_direction_ref=r["observed_direction_ref"],
+            expected_direction_ref=r["expected_direction_ref"],
             severity=r["severity"],
             confidence=float(r["confidence"]),
             recurrence_key=r["recurrence_key"],
@@ -606,6 +613,10 @@ async def _m4_supersede(snapshot: OpSnapshot, *, run_id: str, now: datetime) -> 
     for sig in snapshot.drift_signals:
         if sig.signal_type != "docs_governance_drift":
             continue
+        expected = sig.expected_direction_ref or ""
+        if not expected.startswith("doc:") or not expected[4:].strip():
+            continue
+        doc_path = expected[4:]
         observed = sig.observed_direction_ref
         evidence_refs = [f"drift:{sig.signal_id}"]
         scope_type, scope_key = sig.scope_type, sig.scope_key  # type: ignore[assignment]
@@ -623,7 +634,7 @@ async def _m4_supersede(snapshot: OpSnapshot, *, run_id: str, now: datetime) -> 
                 evidence=evidence_refs,
                 summary=f"Supersede candidate: docs governance drift on {observed}.",
                 proposed_write=build_proposed_write_doc_patch(
-                    path=observed,
+                    path=doc_path,
                     unified_diff="--- a/old\n+++ b/new\n@@\n# Flag for supersede review\n",
                     base_sha="",
                     rationale=f"Drift signal {sig.signal_id} flags {observed} as governance-drift.",
@@ -816,6 +827,40 @@ async def _m7_contradiction(snapshot: OpSnapshot, *, run_id: str, now: datetime)
     return drafts
 
 
+
+
+
+
+async def _m8_jev_contradiction_semantic(snapshot, *, run_id: str, now: datetime):
+    """M8 semantic contradiction (plan SP-A U2): Jev-judged learning pairs.
+
+    Lazy import: the rule module imports THIS module (OperationDraft,
+    make_operation_id), so a top-level import would be circular.
+    Fail-closed by design: no provider -> no drafts (see the rule module).
+    """
+    from core.api.services.brain.rules.m8_jev_contradiction import (
+        _m8_contradiction_semantic,
+    )
+
+    return await _m8_contradiction_semantic(snapshot, run_id=run_id, now=now)
+
+
+#: Registered M-rules (plan SP-A U2 adds M8 AFTER its wrapper definition —
+#: the rule module imports this one, so the wrapper must exist first).
+
+
+
+async def _m9_similar_semantic_wrapper(snapshot, *, run_id: str, now: datetime):
+    """M9 semantic similar_to (plan SP-A U3): Jev-judged same-problem pairs
+    become CONSOLIDATE proposals (pending human approval). Lazy: the rule
+    module imports THIS module. Fail-closed: no provider -> no drafts."""
+    from core.api.services.brain.rules.m9_jev_similar import _m9_similar_semantic
+
+    return await _m9_similar_semantic(snapshot, run_id=run_id, now=now)
+
+
+#: Registered M-rules (SP-A U2 adds M8, U3 adds M9 — wrappers precede this
+#: tuple because the rule modules import this module's types).
 REGISTERED_RULES: tuple[tuple[str, Any], ...] = (
     ("M1", _m1_reinforce),
     ("M2", _m2_consolidate),
@@ -824,8 +869,9 @@ REGISTERED_RULES: tuple[tuple[str, Any], ...] = (
     ("M5", _m5_provenance),
     ("M6", _m6_orphan),
     ("M7", _m7_contradiction),
+    ("M8", _m8_jev_contradiction_semantic),
+    ("M9", _m9_similar_semantic_wrapper),
 )
-
 
 # ---------------------------------------------------------------------------
 # Persistence
@@ -854,7 +900,7 @@ async def _fetch_existing_operation_id(
 
 
 async def _persist_operations(
-    *, run_id: str, operations: list[MemoryOperation]
+    *, run_id: str, operations: list[MemoryOperation], deduplicate_across_cycles: bool = False
 ) -> tuple[int, list[str]]:
     if not operations:
         return (0, [])
@@ -862,6 +908,15 @@ async def _persist_operations(
     recurrence_keys: list[str] = []
     async with write_db() as db:
         for op in operations:
+            if deduplicate_across_cycles:
+                prior = await (await db.execute(
+                    "SELECT 1 FROM brain_memory_operations o JOIN brain_runs r ON r.run_id=o.run_id "
+                    "WHERE r.workspace_id=(SELECT workspace_id FROM brain_runs WHERE run_id=?) "
+                    "AND o.operation_type=? AND o.scope_type=? AND o.scope_key=? AND o.evidence_hash=? LIMIT 1",
+                    (run_id, op.operation_type, op.scope_type, op.scope_key, op.evidence_hash),
+                )).fetchone()
+                if prior:
+                    continue
             existing = await _fetch_existing_operation_id(db, op.operation_id)
             target_type, pw_json = _serialize_proposed_write(op.proposed_write)
             if existing is not None:
@@ -1181,12 +1236,10 @@ def _redact(op: MemoryOperation) -> MemoryOperationRedacted:
     )
 
 
-def _is_visible(visible: set[str] | None, involved_projects: list[str]) -> bool:
-    if visible is None:
-        return True
-    if not involved_projects:
-        return True
-    return set(involved_projects).issubset(visible)
+def _is_visible(
+    visible: set[str] | None, involved_projects: list[str], scope_type: str, scope_key: str
+) -> bool:
+    return scope_visible(visible, involved_projects, scope_type, scope_key)
 
 
 _SEVERITY_RANK: dict[str, int] = {"low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -1232,18 +1285,8 @@ async def _resolve_run(
             return None
         return {"run_id": row[0], "cycle_key": row[1]}
     if not cycle_key or cycle_key == "latest":
-        row = await (
-            await db.execute(
-                "SELECT run_id, cycle_key FROM brain_runs"
-                " WHERE workspace_id = ? AND status IN ('succeeded','partial')"
-                "  AND superseded_by_run_id IS NULL"
-                " ORDER BY cycle_key DESC, started_at DESC LIMIT 1",
-                (workspace_id,),
-            )
-        ).fetchone()
-        if row is None:
-            return None
-        return {"run_id": row[0], "cycle_key": row[1]}
+        return await latest_readable_run(db, workspace_id=workspace_id)
+
     row = await (
         await db.execute(
             "SELECT run_id, cycle_key FROM brain_runs"
@@ -1348,6 +1391,11 @@ async def list_memory_operations(
             where.append("o.score >= ?")
             params.append(score_min)
 
+        visibility_sql, visibility_params = scope_sql("o", visible)
+        if visibility_sql is not None:
+            where.append(visibility_sql)
+            params.extend(visibility_params)
+
         if cursor:
             decoded = _decode_cursor(cursor)
             if decoded:
@@ -1376,7 +1424,9 @@ async def list_memory_operations(
         for row in page_rows:
             evidence = await _fetch_evidence(db, row["operation_id"])
             op = _row_to_operation(row, evidence)
-            if not _is_visible(visible, op.involved_projects):
+            if not _is_visible(visible, op.involved_projects, op.scope_type, op.scope_key):
+                if enterprise_strict():
+                    continue
                 redacted_count += 1
                 items.append(_redact(op))
                 continue
@@ -1413,7 +1463,7 @@ async def fetch_single_operation(
         evidence = await _fetch_evidence(db, operation_id)
         visible = await get_visible_projects(db, user, workspace_id) if user else None
     op = _row_to_operation(row, evidence)
-    if not _is_visible(visible, op.involved_projects):
+    if not _is_visible(visible, op.involved_projects, op.scope_type, op.scope_key):
         return None
     return op
 
@@ -1457,7 +1507,7 @@ async def apply_lifecycle_patch(
     action: str,
     reason: str | None,
     applied_artifact_ref: str | None,
-    user: UserInfo,
+    user: UserInfo | None,
     workspace_id: str = "ws_default",
     now: datetime,
     idempotency_key: str | None = None,
@@ -1480,6 +1530,7 @@ async def apply_lifecycle_patch(
         raise LifecycleConflict(current=current, attempted=target_state)
 
     iso_now = _utc_iso(now)
+    actor_user_id = user.user_id if user is not None else None
     async with write_db() as db:
         if target_state == "applied":
             await db.execute(
@@ -1490,7 +1541,7 @@ async def apply_lifecycle_patch(
                 (
                     target_state,
                     iso_now,
-                    user.user_id,
+                    actor_user_id,
                     applied_artifact_ref,
                     operation_id,
                 ),
@@ -1512,7 +1563,7 @@ async def apply_lifecycle_patch(
                 operation_id,
                 current,
                 target_state,
-                user.user_id,
+                actor_user_id,
                 reason,
                 applied_artifact_ref,
             ),
@@ -1537,6 +1588,21 @@ def _next_action_for(op: MemoryOperation) -> ApplyNextAction:
     rationale = ""
     pw = op.proposed_write
     target_type = pw.target_type  # type: ignore[union-attr]
+
+    # Older M2 proposals used a record ref as a file path. Adapt the guidance
+    # without rewriting stored proposals, recurrence keys or operation IDs.
+    if (
+        op.operation_type == "consolidate" and target_type == "doc_patch"
+        and op.scope_type == "project"
+        and getattr(pw, "path", None) == op.source_ref
+        and op.source_ref.startswith(("task:", "learning:"))
+    ):
+        pw = build_proposed_write_task(
+            operation_id=op.operation_id, title="Review duplicate records",
+            description=pw.rationale, project=op.scope_key,
+            impact=4, confidence=5, ease=6,
+        )
+        target_type = "task"
 
     if op.operation_type == "reinforce":
         if target_type == "none":
@@ -1590,9 +1656,9 @@ def _next_action_for(op: MemoryOperation) -> ApplyNextAction:
                 "ease": pw.ease,
                 "tags": list(pw.tags),
             }
-    elif op.operation_type == "contradiction_detected":
+    elif op.operation_type == "contradiction_detected" or (op.operation_type == "consolidate" and target_type == "task"):
         tool = "mcp__marvis__create_task"
-        rationale = "contradiction_detected → resolution task."
+        rationale = f"{op.operation_type} → human-reviewed resolution task."
         if hasattr(pw, "title"):
             args = {
                 "title": pw.title,

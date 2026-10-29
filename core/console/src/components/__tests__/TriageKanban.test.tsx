@@ -22,6 +22,7 @@ function makeMockTask(overrides: Partial<TaskResponse> = {}): TaskResponse {
   return {
     id: "task-001",
     title: "Fix null pointer",
+    kind: "normal",
     description: null,
     status: "pending",
     project: "marvisx",
@@ -88,6 +89,14 @@ describe("TriageKanban", () => {
     expect(screen.getByText("Add monitoring")).toBeInTheDocument();
     expect(screen.getByText("Deploy staging")).toBeInTheDocument();
     expect(screen.getByText("Review migration")).toBeInTheDocument();
+  });
+
+  it("hides mutation controls for a view-only project", () => {
+    render(<TriageKanban {...defaultProps} canEditTask={() => false} />);
+    expect(screen.getByText("Fix null pointer")).toBeInTheDocument();
+    expect(screen.queryByTitle("Reject")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Move to approved")).not.toBeInTheDocument();
+    expect(screen.queryByText("Merge")).not.toBeInTheDocument();
   });
 
   it("shows task project badge", () => {

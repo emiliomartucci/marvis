@@ -9,21 +9,17 @@ brain → DO the work (capability-tiered, no Claude-Task assumption) → SAVE ba
 a persistence callback that writes the artifact in the right folder AND embeds it
 so the next session finds it by meaning (the compounding loop, B1 depends on A1).
 
-Testability seam: the real logic lives in module-level async helpers
-(:func:`_build_plan_playbook`, :func:`_save_plan_artifact`); the ``@mcp.tool()``
-``plan`` / ``save_plan`` are thin wrappers. Tests import and call the helpers
-WITHOUT importing the MCP SDK (``mcp.server.fastmcp`` is not a runtime dep of this
-module — parity with ``server.py`` / ``_adapter.py``).
+Planning and brainstorming use the installed agent skills. Their ``save_*``
+callbacks remain the governed persistence surface; ``compound`` retains its
+bundled playbook. Helpers are independently testable without importing the SDK.
 
 fastapi-free invariant: this module imports no ``fastapi``. The project-path
 resolver (``routers.projects._find_project_path``, whose module pulls fastapi) and
 the use_cases are imported FUNCTION-LOCALLY, exactly as ``use_cases.search`` does
 to stay fastapi-free at import time.
 
-B2 adds ``brainstorm`` / ``compound`` by dropping ``workflow_playbooks/brainstorm.md``
-etc. and copying the helper+wrapper pair below. The three ``save_*`` callbacks share
-one private writer (:func:`_save_doc_artifact`, parametrized by subdir + suffix) so the
-folder/dating/kebab/embed logic lives in exactly one place — no copy-paste drift.
+The three ``save_*`` callbacks share one private writer so folder, dating and
+embedding behavior stays consistent.
 """
 from __future__ import annotations
 
@@ -101,7 +97,7 @@ def _require_visible_project(
 
 
 def _load_playbook(name: str) -> str:
-    """Read a bundled playbook markdown file by stem (e.g. ``plan``).
+    """Read a bundled playbook markdown file by stem (e.g. ``compound``).
 
     Raises ``FileNotFoundError`` if the file is missing — a packaging error, not a
     runtime condition, so it surfaces loudly rather than degrading to an empty
@@ -234,62 +230,8 @@ def _format_brain_context(
     return "\n".join(lines)
 
 
-async def _build_plan_playbook(
-    feature: str,
-    project: str | None = None,
-    *,
-    ctx: CallerContext | None = None,
-    visible_projects: set[str] | None = None,
-) -> str:
-    """Build the plan playbook text, with the brain prefetch spliced into CONSULT.
-
-    The bundled ``plan.md`` carries the 3-beat skeleton with ``{brain_context}`` and
-    ``{feature}`` placeholders; this fills them. The prefetch is best-effort
-    (degrades to a self-consult instruction) so the returned playbook is always
-    runnable. Module-level + SDK-free so tests call it directly.
-    """
-    template = _load_playbook("plan")
-    if ctx is None:
-        brain_context = await _prefetch_brain_context(feature, project)
-    else:
-        brain_context = await _prefetch_brain_context(
-            feature,
-            project,
-            ctx=ctx,
-            visible_projects=visible_projects,
-        )
-    return template.replace("{brain_context}", brain_context).replace(
-        "{feature}", feature
-    )
 
 
-async def _build_brainstorm_playbook(
-    topic: str,
-    project: str | None = None,
-    *,
-    ctx: CallerContext | None = None,
-    visible_projects: set[str] | None = None,
-) -> str:
-    """Build the brainstorm playbook text, brain prefetch spliced into CONSULT.
-
-    Twin of :func:`_build_plan_playbook` — same prefetch (best-effort, degrades to a
-    self-consult line) so the returned playbook always runs. The bundled
-    ``brainstorm.md`` carries ``{brain_context}`` + ``{topic}`` placeholders; this
-    fills them. Module-level + SDK-free so tests call it directly.
-    """
-    template = _load_playbook("brainstorm")
-    if ctx is None:
-        brain_context = await _prefetch_brain_context(topic, project)
-    else:
-        brain_context = await _prefetch_brain_context(
-            topic,
-            project,
-            ctx=ctx,
-            visible_projects=visible_projects,
-        )
-    return template.replace("{brain_context}", brain_context).replace(
-        "{topic}", topic
-    )
 
 
 async def _build_compound_playbook(
@@ -301,7 +243,7 @@ async def _build_compound_playbook(
 ) -> str:
     """Build the compound playbook text, brain prefetch spliced into CONSULT.
 
-    Twin of :func:`_build_plan_playbook`. The bundled ``compound.md`` carries
+    The bundled ``compound.md`` carries
     ``{brain_context}`` + ``{what}`` placeholders; this fills them. The prefetch is
     best-effort (degrades to a self-consult instruction). Module-level + SDK-free so
     tests call it directly.
@@ -403,6 +345,12 @@ async def _save_doc_artifact(
     docs_dir = project_path / "docs" / subdir
     doc_path = project_path / relative_path
     async with acquire_write_db(label=f"mcp.save_{subdir}") as db:
+        if ctx is not LOCAL_CTX:
+            from core.api.services.access_grants import file_writable
+
+            logical_path = f"{project}/{relative_path}"
+            if not await file_writable(db, ctx, logical_path):
+                raise NotFoundError(code="project_not_found", message="Project not found")
         async with project_lifecycle.guarded_project_file_write(
             ctx,
             db,
@@ -444,9 +392,9 @@ async def _save_doc_artifact(
             project=project,
             workspace_id=workspace_id,
         )
-        # is_available() gates the embed; treat a no-op (unavailable) as not embedded
+        # Document readiness gates the embed; report unavailable no-ops honestly
         # so the return reflects reality.
-        embedded = embedding_service.is_available()
+        embedded = await embedding_service.is_available_async(input_type="document")
     except Exception:
         logger.debug(
             "doc embed-on-save failed for %s (non-critical)",
@@ -533,26 +481,6 @@ async def _save_compound_artifact(
 def register(mcp) -> None:
     """Register the workflows tool group on the shared FastMCP instance."""
 
-    @mcp.tool()
-    async def plan(
-        feature: Annotated[str, Field(min_length=1, max_length=2000)],
-        project: str | None = None,
-    ) -> str:
-        """Return a planning playbook (istruzioni) — NON pianifica e NON esegue nulla.
-
-        QUANDO USARLO: stai per pianificare un lavoro (feature/bug/refactor) e vuoi un piano strutturato che parte dalla memoria invece che da zero. Il tool pre-carica il contesto rilevante dal cervello (lavori correlati + learning applicabili) e lo mette in cima al playbook, poi ti guida CONSULT -> DO -> SAVE.
-        QUANDO NON USARLO: NOT per eseguire il piano (questo restituisce solo le istruzioni; l'agente ospite le esegue). NOT per cercare contesto puntuale -> usa search / check_learnings direttamente.
-        RESTITUISCE: il testo del playbook (markdown) con il bundle di contesto gia' incorporato. Poi save_plan salva IL PIANO che scrivi tu eseguendo il playbook, NON il testo del playbook."""
-        try:
-            ctx, visible_projects = await _current_workflow_scope()
-            return await _build_plan_playbook(
-                feature,
-                project,
-                ctx=ctx,
-                visible_projects=visible_projects,
-            )
-        except ServiceError as e:
-            raise_mcp_error(e)
 
     @mcp.tool()
     async def save_plan(
@@ -562,9 +490,9 @@ def register(mcp) -> None:
     ) -> dict[str, Any]:
         """Persist a new plan to the project's docs/plans/ folder and embed it into the brain.
 
-        QUANDO USARLO: hai finito di redigere un piano nuovo (tipicamente al passo SAVE del playbook plan) e vuoi creare il suo carrier. Il tool sceglie il nome file datato/kebab corretto, lo scrive nella cartella giusta, e lo embedda cosi' che la prossima ricerca lo trovi per significato. NON scrivere il file a mano.
-        QUANDO NON USARLO: NOT per ottenere il playbook -> usa plan. NOT per artefatti diversi da un piano -> brainstorm in docs/brainstorms/ con save_brainstorm, documento-soluzione in docs/solutions/ con save_compound. NOT per review, approfondimento o modifica di un piano esistente: usa read_file, poi write_file sullo stesso path con if_match_sha256, infine read_file per verificare.
-        RESTITUISCE: {path, indexed, embedded} — il percorso del file scritto, se l'indice testuale e' stato aggiornato e se l'embedding e' andato a buon fine (best-effort: il salvataggio riesce anche se l'index/embed fallisce)."""
+        QUANDO USARLO: hai redatto un piano nuovo: il tool sceglie nome file e cartella e lo rende ricercabile. Non scrivere il file a mano.
+        QUANDO NON USARLO: per modificare un piano esistente usa read_file, poi write_file sullo stesso path con if_match_sha256, poi read_file per verificare. Brainstorm -> save_brainstorm; soluzioni -> save_compound.
+        RESTITUISCE: {path, indexed, embedded}; il salvataggio riesce anche se index o embed falliscono."""
         try:
             ctx, visible_projects = await _current_workflow_scope()
             return await _save_plan_artifact(
@@ -577,26 +505,6 @@ def register(mcp) -> None:
         except ServiceError as e:
             raise_mcp_error(e)
 
-    @mcp.tool()
-    async def brainstorm(
-        topic: Annotated[str, Field(min_length=1, max_length=2000)],
-        project: str | None = None,
-    ) -> str:
-        """Return a brainstorming playbook (istruzioni) — NON esplora e NON esegue nulla.
-
-        QUANDO USARLO: stai per esplorare un'idea/funzionalita' e vuoi ragionare sul COSA costruire (approcci, tradeoff) prima di pianificare il COME. Il tool pre-carica il contesto rilevante dal cervello (lavori correlati + learning) e lo mette in cima al playbook, poi ti guida CONSULT -> DO (esplora 2-3 approcci concreti, applica YAGNI, una domanda alla volta) -> SAVE.
-        QUANDO NON USARLO: NOT per pianificare l'implementazione -> usa plan. NOT per eseguire (questo restituisce solo le istruzioni). NOT per cercare contesto puntuale -> usa search / check_learnings.
-        RESTITUISCE: il testo del playbook (markdown) con il bundle di contesto gia' incorporato. Poi save_brainstorm salva IL BRAINSTORM che scrivi tu eseguendo il playbook, NON il testo del playbook."""
-        try:
-            ctx, visible_projects = await _current_workflow_scope()
-            return await _build_brainstorm_playbook(
-                topic,
-                project,
-                ctx=ctx,
-                visible_projects=visible_projects,
-            )
-        except ServiceError as e:
-            raise_mcp_error(e)
 
     @mcp.tool()
     async def save_brainstorm(
@@ -606,8 +514,8 @@ def register(mcp) -> None:
     ) -> dict[str, Any]:
         """Persist a brainstorm to the project's docs/brainstorms/ folder and embed it.
 
-        QUANDO USARLO: hai finito di esplorare un'idea (tipicamente al passo SAVE del playbook brainstorm) e vuoi salvarla. Il tool sceglie il nome file datato/kebab corretto, lo scrive nella cartella giusta, e lo embedda cosi' che la prossima ricerca lo trovi per significato. NON scrivere il file a mano.
-        QUANDO NON USARLO: NOT per ottenere il playbook -> usa brainstorm. NOT per artefatti diversi da un brainstorm -> piano in docs/plans/ con save_plan, documento-soluzione in docs/solutions/ con save_compound.
+        QUANDO USARLO: hai finito di esplorare un'idea (usando la skill di brainstorming installata) e vuoi salvarla. Il tool sceglie il nome file datato/kebab corretto, lo scrive nella cartella giusta, e lo embedda cosi' che la prossima ricerca lo trovi per significato. NON scrivere il file a mano.
+        QUANDO NON USARLO: NOT per ricevere istruzioni di brainstorming: usa la skill installata. NOT per artefatti diversi da un brainstorm -> piano in docs/plans/ con save_plan, documento-soluzione in docs/solutions/ con save_compound.
         RESTITUISCE: {path, indexed, embedded} — il percorso del file scritto, se l'indice testuale e' stato aggiornato e se l'embedding e' andato a buon fine (best-effort: il salvataggio riesce anche se l'index/embed fallisce)."""
         try:
             ctx, visible_projects = await _current_workflow_scope()
@@ -629,7 +537,7 @@ def register(mcp) -> None:
         """Return a knowledge-capture playbook (istruzioni) — NON cattura e NON esegue nulla.
 
         QUANDO USARLO: hai appena risolto un problema / costruito qualcosa e vuoi catturarlo come conoscenza durevole e riusabile. Il tool pre-carica il contesto rilevante dal cervello e ti guida CONSULT -> DO (distilla problema, soluzione, trappole, cosa faresti diversamente) -> SAVE, dove salvi sia il documento-soluzione sia una regola di prevenzione (learning) immediatamente recuperabile.
-        QUANDO NON USARLO: NOT prima di aver finito il lavoro (cattura conoscenza gia' verificata, non piani). NOT per pianificare -> usa plan. NOT per eseguire (questo restituisce solo le istruzioni).
+        QUANDO NON USARLO: NOT prima di aver finito il lavoro (cattura conoscenza gia' verificata, non piani). NOT per pianificare -> usa la skill di pianificazione installata. NOT per eseguire (questo restituisce solo le istruzioni).
         RESTITUISCE: il testo del playbook (markdown) con il bundle di contesto gia' incorporato. Poi save_compound (+ create_learning) salva IL DOCUMENTO-SOLUZIONE che scrivi tu eseguendo il playbook, NON il testo del playbook."""
         try:
             ctx, visible_projects = await _current_workflow_scope()

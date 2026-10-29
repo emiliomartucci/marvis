@@ -16,10 +16,13 @@ archive.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
+import sys
 import tempfile
 import uuid
 from contextlib import ExitStack, asynccontextmanager, contextmanager
@@ -53,6 +56,11 @@ _OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _OPERATION_KIND_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,99}$")
 _HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 _LIFECYCLES = {"idea", "planning", "active", "maintenance", "archived"}
+# Program names share the project slug grammar; "standalone" is the synthetic
+# group for projects without a program and can never be assigned.
+_PROGRAM_RE = _SLUG_RE
+_RESERVED_PROGRAMS = {"standalone"}
+_POSIX_ACL_ACCESS = "system.posix_acl_access"
 _EMPTY_ACTIVE_OPERATIONS_DIGEST = hashlib.sha256(b"[]").hexdigest()
 _ASYNC_MUTATION_LOCKS: WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
@@ -331,6 +339,31 @@ def _read_project_yaml(project_dir: Path) -> tuple[dict[str, Any], bytes]:
     return parsed, raw
 
 
+def metadata_program(metadata: Mapping[str, Any]) -> str | None:
+    """Return the program a project.yaml mapping declares, or None."""
+    value = metadata.get("program")
+    if not isinstance(value, str):
+        return None
+    program = value.strip()
+    if not program or program in _RESERVED_PROGRAMS:
+        return None
+    return program
+
+
+def _validate_program(program: str | None) -> str | None:
+    if program is None:
+        return None
+    value = program.strip()
+    if not value:
+        return None
+    if value in _RESERVED_PROGRAMS or not _PROGRAM_RE.fullmatch(value):
+        raise ValidationError(
+            code="invalid_project_program",
+            message="Program must match the project slug grammar and not be reserved",
+        )
+    return value
+
+
 def _fsync_directory(directory: Path) -> None:
     descriptor = os.open(directory, os.O_RDONLY | os.O_CLOEXEC)
     try:
@@ -348,28 +381,112 @@ def _render_project_yaml(data: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def _copy_project_yaml_access_metadata(
+    source_descriptor: int,
+    destination_descriptor: int,
+) -> None:
+    """Preserve the access contract when atomically replacing project.yaml.
+
+    Hosted grants the read-only control-plane user access with a named POSIX
+    ACL. ``mkstemp`` deliberately starts at 0600, so replacing the file without
+    copying its mode and access ACL silently removes that grant. Copy only the
+    access metadata needed by the same file; unrelated extended attributes are
+    not propagated.
+    """
+    source = os.fstat(source_descriptor)
+    destination = os.fstat(destination_descriptor)
+    if not stat.S_ISREG(source.st_mode):
+        raise OSError(errno.EINVAL, "project metadata source is not a regular file")
+    if (destination.st_uid, destination.st_gid) != (source.st_uid, source.st_gid):
+        os.fchown(destination_descriptor, source.st_uid, source.st_gid)
+    os.fchmod(destination_descriptor, stat.S_IMODE(source.st_mode))
+    if not hasattr(os, "getxattr"):
+        # Linux Hosted relies on a named POSIX ACL and must never replace the
+        # file when that state cannot be inspected. Other supported local
+        # platforms do not expose Linux's system.posix_acl_access contract;
+        # their existing owner/group/mode contract remains portable.
+        if sys.platform.startswith("linux"):
+            raise OSError(errno.ENOSYS, "access ACL inspection is unavailable")
+        return
+
+    missing = {
+        errno.ENODATA,
+        getattr(errno, "ENOATTR", errno.ENODATA),
+    }
+    unsupported = {
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }
+    try:
+        access_acl = os.getxattr(source_descriptor, _POSIX_ACL_ACCESS)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return
+        if exc.errno not in missing:
+            raise
+        if not hasattr(os, "removexattr"):
+            raise OSError(errno.ENOSYS, "access ACL removal is unavailable") from exc
+        try:
+            os.removexattr(destination_descriptor, _POSIX_ACL_ACCESS)
+        except OSError as remove_error:
+            if remove_error.errno not in missing:
+                raise
+        try:
+            inherited_acl = os.getxattr(
+                destination_descriptor,
+                _POSIX_ACL_ACCESS,
+            )
+        except OSError as readback_error:
+            if readback_error.errno in missing:
+                return
+            raise
+        raise OSError(
+            errno.EIO,
+            "project metadata inherited an unexpected access ACL: "
+            f"{len(inherited_acl)} bytes",
+        )
+    if not hasattr(os, "setxattr"):
+        raise OSError(errno.ENOSYS, "access ACL preservation is unavailable")
+    os.setxattr(destination_descriptor, _POSIX_ACL_ACCESS, access_acl)
+    if os.getxattr(destination_descriptor, _POSIX_ACL_ACCESS) != access_acl:
+        raise OSError(errno.EIO, "project metadata access ACL readback mismatch")
+
+
 def _atomic_write_project_yaml(project_dir: Path, data: Mapping[str, Any]) -> str:
     target = project_dir / "project.yaml"
     rendered = _render_project_yaml(data)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=".project.yaml.",
-        suffix=".tmp",
-        dir=project_dir,
+    source_descriptor = os.open(
+        target,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            handle.write(rendered)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        _fsync_directory(project_dir)
-    except Exception:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".project.yaml.",
+            suffix=".tmp",
+            dir=project_dir,
+        )
         try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
+            with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                handle.write(rendered)
+                handle.flush()
+                # Keep the temporary file private while its contents are
+                # incomplete; publish the source access contract only after
+                # the full replacement payload exists.
+                _copy_project_yaml_access_metadata(
+                    source_descriptor,
+                    handle.fileno(),
+                )
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            _fsync_directory(project_dir)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        os.close(source_descriptor)
     return hashlib.sha256(rendered).hexdigest()
 
 
@@ -1329,6 +1446,147 @@ async def update_project_selector_watermark(
             workspace_id=workspace_id,
             project_slug=slug,
         )
+
+
+async def set_project_program(
+    ctx: CallerContext,
+    db: aiosqlite.Connection,
+    *,
+    project_slug: str,
+    program: str | None,
+    projects_root: Path | None = None,
+) -> dict[str, Any]:
+    """Set or clear the ``program`` of one project.yaml under the lifecycle fence.
+
+    Journal first, then publish: the writer event, the ``project.program.set``
+    audit entry and the new lifecycle digest commit before the ACL-preserving
+    atomic replace.  A failed replace leaves project.yaml untouched, restores
+    the previous digest and appends ``project.program.set_failed``; a crash in
+    between leaves a digest mismatch that fails archive approvals closed.
+    Setting the current value again is a no-op without journal or audit.
+    """
+    require_role_ctx(ctx, "operator", "admin", "super_admin")
+    workspace_id = require_workspace_ctx(ctx)
+    slug = _validate_slug(project_slug)
+    next_program = _validate_program(program)
+    actor = ctx.user_id or ctx.username
+    project_dir = project_directory(slug, projects_root=projects_root)
+
+    async with async_project_mutation_guard(projects_root=projects_root):
+        state = await ensure_project_lifecycle(
+            db,
+            workspace_id=workspace_id,
+            project_slug=slug,
+            projects_root=projects_root,
+        )
+        if state.lifecycle == "archived" or state.transition_operation_id is not None:
+            await db.rollback()
+            raise ConflictError(
+                code="project_not_writable",
+                message="Project is archived or a lifecycle transition is active",
+            )
+        metadata, raw = _read_project_yaml(project_dir)
+        previous_digest = hashlib.sha256(raw).hexdigest()
+        stored = metadata.get("program")
+        previous_program = metadata_program(metadata)
+        result: dict[str, Any] = {
+            "project_slug": slug,
+            "project_id": state.project_id,
+            "program": next_program,
+            "previous_program": previous_program,
+            "previous_project_digest": previous_digest,
+            "project_digest": previous_digest,
+            "changed": False,
+            "audit_entry_id": None,
+        }
+        # Only an exact stored match is a no-op: a reserved or non-string
+        # value must stay clearable through this governed path.
+        unchanged = (
+            stored in (None, "") if next_program is None else stored == next_program
+        )
+        if unchanged:
+            await db.commit()
+            return result
+
+        updated = dict(metadata)
+        if next_program is None:
+            updated.pop("program", None)
+        else:
+            updated["program"] = next_program
+        next_digest = hashlib.sha256(_render_project_yaml(updated)).hexdigest()
+        details = {
+            "project_id": state.project_id,
+            "previous_program": previous_program,
+            "program": next_program,
+            "previous_project_digest": previous_digest,
+            "project_digest": next_digest,
+        }
+        from core.api.services.audit import log_audit  # local: avoid import cycle
+
+        await record_project_write(
+            db,
+            workspace_id=workspace_id,
+            project_slug=slug,
+            writer_kind="project_program",
+            actor=actor,
+            resource_ref=next_program or "",
+            projects_root=projects_root,
+        )
+        receipt = await log_audit(
+            db,
+            "project.program.set",
+            actor or "unknown",
+            "project",
+            slug,
+            details,
+            workspace_id=workspace_id,
+        )
+        await _set_lifecycle_digest(
+            db, workspace_id=workspace_id, project_slug=slug, digest=next_digest
+        )
+        await db.commit()
+
+        try:
+            written_digest = _atomic_write_project_yaml(project_dir, updated)
+        except Exception:
+            await _set_lifecycle_digest(
+                db,
+                workspace_id=workspace_id,
+                project_slug=slug,
+                digest=previous_digest,
+            )
+            await log_audit(
+                db,
+                "project.program.set_failed",
+                actor or "unknown",
+                "project",
+                slug,
+                {**details, "audit_entry_id": receipt.entry_id},
+                workspace_id=workspace_id,
+            )
+            await db.commit()
+            raise
+        result.update(
+            project_digest=written_digest,
+            changed=True,
+            audit_entry_id=receipt.entry_id,
+        )
+        return result
+
+
+async def _set_lifecycle_digest(
+    db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
+    project_slug: str,
+    digest: str,
+) -> None:
+    await db.execute(
+        "UPDATE project_lifecycle_state SET project_digest=?,"
+        "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+        "WHERE workspace_id=? AND project_slug=?",
+        (digest, workspace_id, project_slug),
+    )
 
 
 async def create_archive_approval(

@@ -22,6 +22,7 @@ import aiosqlite
 from core.api.config import settings
 from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import NotFoundError, ServiceError
+from core.api.use_cases._roles import ROLE_HIERARCHY
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,6 @@ def _record_grants_query_error(exc: Exception) -> None:
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 _VALID_ROLES = {"admin", "member", "viewer", "membro"}
-_ROLE_RANK = {"viewer": 0, "member": 1, "membro": 1, "admin": 2}
 _CLEARANCE_LEVELS = {"public": 0, "internal": 1, "confidential": 2}
 _CONFIDENTIAL_RE = re.compile(r"^\s*confidential\s*:\s*(true|yes|1)\s*$", re.I)
 _CLEARANCE_RE = re.compile(r"^\s*clearance\s*:\s*(public|internal|confidential)\s*$", re.I)
@@ -165,9 +165,6 @@ def _scope_allows_project(scope: str, project_slug: str) -> bool:
         return True
     if scope == f"project:{project_slug}":
         return True
-    if scope.startswith("file:"):
-        scoped_project, _ = _path_parts(scope.removeprefix("file:"))
-        return scoped_project == project_slug
     return False
 
 
@@ -217,6 +214,7 @@ def actor_from_user_info(user: Any) -> CallerContext:
         is_human_session=str(getattr(user, "user_type", "human") or "human") == "human",
         user_id=str(getattr(user, "user_id", "") or ""),
         local_runtime=getattr(user, "auth_mechanism", "unknown") == "local",
+        auth_mechanism=getattr(user, "auth_mechanism", "unknown"),
     )
 
 
@@ -235,7 +233,51 @@ def _is_local_single_user(actor: CallerContext) -> bool:
     return actor.is_local_os_account
 
 
+def _enterprise_strict() -> bool:
+    return os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1"
+
+
+def _enterprise_static_admin(actor: CallerContext) -> bool:
+    """The exact tenant static credential is an intentional recovery principal."""
+    tenant_id = os.environ.get("TENANT_ID", "").strip()
+    return bool(
+        tenant_id
+        and actor.auth_mechanism == "mcp_static"
+        and actor.user_type == "agent"
+        and actor.system_role == "admin"
+        and actor.user_id == f"tenant:{tenant_id}"
+    )
+
+
+async def _explicit_denied_projects(
+    db: aiosqlite.Connection, actor: CallerContext
+) -> set[str] | None:
+    """Return Enterprise project denials, or None when policy storage is unsafe.
+
+    Strict mode needs migration 189 even when no denial has been recorded. A
+    missing table or failed query must never turn a revocation into access.
+    """
+    if not _enterprise_strict():
+        return set()
+    if not actor.user_id or not actor.workspace_id:
+        return None
+    try:
+        cur = await db.execute(
+            "SELECT project_slug FROM access_denials "
+            "WHERE workspace_id = ? AND identity = ?",
+            (actor.workspace_id, actor.user_id),
+        )
+        return {str(row[0]) for row in await cur.fetchall() if row[0]}
+    except Exception as exc:
+        _record_grants_query_error(exc)
+        return None
+
+
 def identity_candidates(actor: CallerContext) -> tuple[str, ...]:
+    if os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1":
+        # A display name is mutable and non-unique. In Enterprise, only the
+        # locally bound user ID may carry an individual grant.
+        return (actor.user_id,) if actor.user_id else ()
     raw = [actor.user_id, actor.username, actor.username.removeprefix("agent:")]
     seen: list[str] = []
     for value in raw:
@@ -458,6 +500,10 @@ async def _workspace_public_projects(
     readable by workspace members, while a public project owned by another
     workspace remains invisible.
     """
+    if _enterprise_strict() and actor.user_type != "human":
+        # A service principal sees only its own explicit grants. Public team
+        # assignments are a human workspace-membership policy.
+        return set()
     if not await _table_exists(db, "teams") or not await _table_exists(
         db, "project_teams"
     ):
@@ -490,51 +536,24 @@ async def _workspace_wide_project_allowed(
     actor: CallerContext,
     project_slug: str | None,
 ) -> bool:
+    denied = await _explicit_denied_projects(db, actor)
+    if denied is None or (project_slug is not None and project_slug in denied):
+        return False
     if _is_local_single_user(actor):
         return True
     if not await _workspace_isolation_enabled(db):
+        if _enterprise_strict():
+            return False
         return unrestricted_actor(actor)
     if actor.system_role not in {"admin", "super_admin"} or not project_slug:
         return False
     return project_slug in await _workspace_projects(db, actor)
 
 
-def _merge_grant(current: AccessGrant | None, grant: AccessGrant) -> AccessGrant:
-    if current is None:
-        return grant
-    # Additive max-wins, each dimension independent. Provenance follows the
-    # grant that supplied the winning role (ties keep the current one, so a
-    # direct grant loaded first is never re-labelled "via team").
-    if _ROLE_RANK.get(grant.role, -1) > _ROLE_RANK.get(current.role, -1):
-        role = grant.role
-        via_team = grant.via_team
-    else:
-        role = current.role
-        via_team = current.via_team
-    clearance = grant.clearance if _CLEARANCE_LEVELS[grant.clearance] > _CLEARANCE_LEVELS[current.clearance] else current.clearance
-    if current.scope == "all" or grant.scope == "all":
-        scope = "all"
-    elif current.scope.startswith("project:"):
-        scope = current.scope
-    elif grant.scope.startswith("project:"):
-        scope = grant.scope
-    else:
-        scope = grant.scope
-    return AccessGrant(
-        identity=current.identity or grant.identity,
-        project_slug=grant.project_slug,
-        role=role,
-        confidential_clearance=current.confidential_clearance or grant.confidential_clearance,
-        clearance=clearance,
-        scope=scope,
-        via_team=via_team,
-    )
-
-
-async def _load_direct_grants(db: aiosqlite.Connection, actor: CallerContext) -> dict[str, AccessGrant]:
+async def _load_direct_grant_candidates(db: aiosqlite.Connection, actor: CallerContext) -> list[AccessGrant]:
     identities = identity_candidates(actor)
     if not identities:
-        return {}
+        return []
     placeholders = ",".join("?" for _ in identities)
     try:
         columns = await _grant_columns(db)
@@ -557,8 +576,8 @@ async def _load_direct_grants(db: aiosqlite.Connection, actor: CallerContext) ->
         rows = await cur.fetchall()
     except Exception as exc:
         _record_grants_query_error(exc)
-        return {}
-    grants: dict[str, AccessGrant] = {}
+        return []
+    grants: list[AccessGrant] = []
     for row in rows:
         identity = str(_row_get(row, "identity", 0, ""))
         project = str(_row_get(row, "project_slug", 1, ""))
@@ -579,7 +598,7 @@ async def _load_direct_grants(db: aiosqlite.Connection, actor: CallerContext) ->
             clearance=clearance,
             scope=scope,
         )
-        grants[project] = _merge_grant(grants.get(project), grant)
+        grants.append(grant)
     return grants
 
 
@@ -594,6 +613,11 @@ async def _load_team_grants(db: aiosqlite.Connection, actor: CallerContext) -> l
     Isolated from the direct-grant query: a failure here (e.g. missing 160
     columns) must not lock the actor out of their direct grants.
     """
+    # Enterprise service principals carry their own explicit grants. A stale
+    # or accidental team_members row must never turn an agent into a human team
+    # member or widen its project scope.
+    if _enterprise_strict() and actor.user_type != "human":
+        return []
     user_id = (actor.user_id or "").strip()
     if not user_id or user_id == "local":
         return []
@@ -655,22 +679,55 @@ async def _load_team_grants(db: aiosqlite.Connection, actor: CallerContext) -> l
     return grants
 
 
-async def load_grants(db: aiosqlite.Connection, actor: CallerContext) -> dict[str, AccessGrant]:
-    """Effective grants: direct rows merged with team-conferred rows.
+async def load_grants(
+    db: aiosqlite.Connection, actor: CallerContext
+) -> dict[str, list[AccessGrant]]:
+    """Authorization candidates with Enterprise individual-over-team precedence."""
+    candidates: dict[str, list[AccessGrant]] = {}
+    denied = await _explicit_denied_projects(db, actor)
+    if denied is None:
+        return candidates
+    if _enterprise_strict() and not await _workspace_isolation_enabled(db):
+        return candidates
+    direct = await _load_direct_grant_candidates(db, actor)
+    team = await _load_team_grants(db, actor)
+    if _enterprise_strict() and actor.user_type != "human":
+        # Old rows or a direct database write must not promote an app principal
+        # to project administrator. Service identities can only read or edit.
+        direct = [grant for grant in direct if grant.role != "admin"]
+    if os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1":
+        # A person's explicit project grant is the ceiling for that project.
+        # A broader team membership cannot silently widen its role, path or
+        # clearance; removing the individual grant restores team inheritance.
+        direct_projects = {grant.project_slug for grant in direct}
+        team = [grant for grant in team if grant.project_slug not in direct_projects]
+    for grant in [*direct, *team]:
+        if grant.project_slug in denied:
+            continue
+        candidates.setdefault(grant.project_slug, []).append(grant)
+    return candidates
 
-    Two isolated queries, additive max-wins merge per dimension (never a deny).
-    """
-    grants = await _load_direct_grants(db, actor)
-    for team_grant in await _load_team_grants(db, actor):
-        grants[team_grant.project_slug] = _merge_grant(grants.get(team_grant.project_slug), team_grant)
-    return grants
+
+def _project_admin_grant(grant: AccessGrant, project: str) -> bool:
+    return (
+        grant.role == "admin"
+        and not grant.scope.startswith("file:")
+        and _scope_allows_project(grant.scope, project)
+    )
 
 
 async def visible_projects_for_actor(db: aiosqlite.Connection, actor: CallerContext) -> set[str] | None:
     require_workspace_ctx(actor)
+    denied = await _explicit_denied_projects(db, actor)
+    if denied is None:
+        return set()
+    if _enterprise_strict() and not await _workspace_isolation_enabled(db):
+        return set()
     if _is_local_single_user(actor):
         return None
     if not await _workspace_isolation_enabled(db) and unrestricted_actor(actor):
+        if _enterprise_strict():
+            return set()
         return None
     if actor.system_role in {"admin", "super_admin"}:
         visible = await _workspace_projects(db, actor)
@@ -678,21 +735,28 @@ async def visible_projects_for_actor(db: aiosqlite.Connection, actor: CallerCont
         grants = await load_grants(db, actor)
         visible = {
             project
-            for project, grant in grants.items()
-            if _scope_allows_project(grant.scope, project)
+            for project, candidates in grants.items()
+            if any(_scope_allows_project(grant.scope, project) for grant in candidates)
         }
         visible.update(await _workspace_public_projects(db, actor))
-    return visible
+    return visible - denied
 
 
 async def has_confidential_clearance(db: aiosqlite.Connection, actor: CallerContext, project_slug: str | None) -> bool:
+    denied = await _explicit_denied_projects(db, actor)
+    if denied is None or (project_slug is not None and project_slug in denied):
+        return False
     if await _workspace_wide_project_allowed(db, actor, project_slug):
         return True
     if not project_slug:
         return False
     grants = await load_grants(db, actor)
-    grant = grants.get(project_slug)
-    return bool(grant and (grant.role == "admin" or _clearance_allows(grant.clearance, "confidential")))
+    return any(
+        not grant.scope.startswith("file:")
+        and _scope_allows_project(grant.scope, project_slug)
+        and (grant.role == "admin" or _clearance_allows(grant.clearance, "confidential"))
+        for grant in grants.get(project_slug, [])
+    )
 
 
 async def can_read_project(
@@ -704,6 +768,9 @@ async def can_read_project(
     clearance: str | None = None,
     path: str | None = None,
 ) -> bool:
+    denied = await _explicit_denied_projects(db, actor)
+    if denied is None or (project_slug is not None and project_slug in denied):
+        return False
     if await _workspace_wide_project_allowed(db, actor, project_slug):
         return True
     if not project_slug:
@@ -716,31 +783,59 @@ async def can_read_project(
         if project_slug in public_projects and resource_clearance == "public":
             return True
     grants = await load_grants(db, actor)
-    grant = grants.get(project_slug)
-    if grant is None:
-        return False
-    if path is not None and not _scope_allows_path(grant.scope, project_slug, path):
-        return False
-    if path is None and not _scope_allows_project(grant.scope, project_slug):
-        return False
     resource_clearance = clearance or ("confidential" if confidential else "public")
-    if grant.role == "admin":
-        return True
-    return _clearance_allows(grant.clearance, resource_clearance)
+    return any(
+        (
+            _scope_allows_path(grant.scope, project_slug, path)
+            if path is not None
+            else _scope_allows_project(grant.scope, project_slug)
+        )
+        and (grant.role == "admin" or _clearance_allows(grant.clearance, resource_clearance))
+        for grant in grants.get(project_slug, [])
+    )
 
 
 async def can_write_project(db: aiosqlite.Connection, actor: CallerContext, project_slug: str | None, *, path: str | None = None) -> bool:
+    if _enterprise_strict() and actor.system_role not in {"operator", "admin", "super_admin"}:
+        return False
+    denied = await _explicit_denied_projects(db, actor)
+    if denied is None or (project_slug is not None and project_slug in denied):
+        return False
     if await _workspace_wide_project_allowed(db, actor, project_slug):
         return True
     if not project_slug:
         return False
     grants = await load_grants(db, actor)
-    grant = grants.get(project_slug)
-    if grant is None or grant.role == "viewer":
-        return False
-    if path is not None:
-        return _scope_allows_path(grant.scope, project_slug, path)
-    return _scope_allows_project(grant.scope, project_slug) and not grant.scope.startswith("file:")
+    return any(
+        grant.role != "viewer"
+        and (
+            _scope_allows_path(grant.scope, project_slug, path)
+            if path is not None
+            else not grant.scope.startswith("file:")
+            and _scope_allows_project(grant.scope, project_slug)
+        )
+        for grant in grants.get(project_slug, [])
+    )
+
+
+async def require_enterprise_project_edit(
+    db: aiosqlite.Connection,
+    actor: CallerContext,
+    project_slug: str | None,
+    *,
+    error: ServiceError,
+) -> None:
+    """Enterprise strict mode: writing project data needs an edit grant.
+
+    Visibility alone (a view grant, public project or view-only team) must not
+    authorize a write. ``error`` is the caller's hidden-resource answer so a
+    view-only project stays indistinguishable from an unknown one. Hosted keeps
+    its existing grant semantics until strict mode is enabled.
+    """
+    if not _enterprise_strict() or project_slug is None:
+        return
+    if not await can_write_project(db, actor, project_slug):
+        raise error
 
 
 async def file_writable(db: aiosqlite.Connection, actor: CallerContext, path: str) -> bool:
@@ -935,8 +1030,69 @@ async def can_read_path(db: aiosqlite.Connection, actor: CallerContext, path: st
     return await file_readable(db, actor, path, direct_read=False)
 
 
+def _search_project_path(project: str | None, path: str) -> str | None:
+    """Bind an indexed file to a current, safe source before authorizing it.
+
+    Relative index paths need the same symlink and existence checks as absolute
+    paths. Otherwise a stale snippet or a link into another project can be
+    returned under the visible project's grant.
+    """
+
+    from core.api.services.workspace_path_safety import resolve_path_in_root
+    from core.scripts._projects_root import resolve_projects_root
+
+    try:
+        root = resolve_projects_root()
+        if not root.is_dir():
+            return None
+        if Path(path).is_absolute():
+            relative = Path(path).relative_to(root)
+        else:
+            logical = project_qualified_path(project, path)
+            if not logical:
+                return None
+            parts = PurePosixPath(logical).parts
+            relative = Path(*(parts[1:] if parts[0] == "projects" else parts))
+        if len(relative.parts) < 2 or relative.parts[0] != project:
+            return None
+        # Reuse the reader's traversal, secret-path and symlink protections.
+        target = resolve_path_in_root(root, PurePosixPath(relative.as_posix()))
+        if not target.is_file():
+            return None
+    except (OSError, ValueError, RuntimeError, ServiceError):
+        return None
+    return f"projects/{relative.as_posix()}"
+
+
+# Row-backed index documents store their row key in documents.file_path.
+_ROW_DOCUMENT_KEY_PREFIXES = ("task:", "project:", "learning:", "inbox_item:")
+# Rows that can move between projects without a content change, so the
+# indexed documents.project may be stale. Authorize by the canonical row.
+_MOVABLE_ROW_TABLES = {"task:": "tasks", "learning:": "learnings"}
+
+
+async def _row_document_project(
+    db: aiosqlite.Connection,
+    workspace_id: str,
+    key: str,
+    indexed_project: str | None,
+) -> tuple[bool, str | None]:
+    """Return (found, project) for a row-backed search hit."""
+    if key.startswith("project:"):
+        return True, key.removeprefix("project:")
+    for prefix, table in _MOVABLE_ROW_TABLES.items():
+        if key.startswith(prefix):
+            cursor = await db.execute(
+                f"SELECT project FROM {table} WHERE id = ? AND workspace_id = ?",
+                (key.removeprefix(prefix), workspace_id),
+            )
+            row = await cursor.fetchone()
+            return (row is not None), (row["project"] if row is not None else None)
+    return True, indexed_project
+
+
 async def filter_search_grouped(actor: CallerContext, grouped: dict[str, list[dict]]) -> dict[str, list[dict]]:
-    require_workspace_ctx(actor)
+    workspace_id = require_workspace_ctx(actor)
     if _is_local_single_user(actor):
         return grouped
     db = await aiosqlite.connect(settings.db_path)
@@ -947,10 +1103,33 @@ async def filter_search_grouped(actor: CallerContext, grouped: dict[str, list[di
             kept: list[dict] = []
             for item in items:
                 project = item.get("project")
+                span_path = item.get("span_path")
+                if span_path is not None or item.get("span_text") is not None:
+                    # The ranked hit and its evidence span may come from
+                    # different indexed files. Authorize both before any
+                    # snippet or span metadata reaches the response.
+                    if not isinstance(span_path, str) or not span_path:
+                        continue
+                    logical_span_path = _search_project_path(
+                        str(project) if project else None, span_path,
+                    )
+                    if not logical_span_path or not await file_readable(
+                        db, actor, logical_span_path,
+                    ):
+                        continue
                 path = item.get("path")
                 item_path = str(path) if path else None
+                if item_path and item_path.startswith(_ROW_DOCUMENT_KEY_PREFIXES):
+                    # Not a file: authorize the row by its current project below.
+                    found, project = await _row_document_project(
+                        db, workspace_id, item_path,
+                        str(project) if project else None,
+                    )
+                    if not found:
+                        continue
+                    item_path = None
                 if item_path:
-                    logical_path = project_qualified_path(
+                    logical_path = _search_project_path(
                         str(project) if project else None,
                         item_path,
                     )
@@ -1015,7 +1194,10 @@ async def _node_readable(db: aiosqlite.Connection, actor: CallerContext, node_id
     )
     row = await cur.fetchone()
     if row is None:
-        return await can_read_project(db, actor, fallback_project)
+        # A supplied graph node ID is an object lookup, not a project-wide
+        # request. A visible fallback project cannot authenticate an absent or
+        # stale node and its attached evidence.
+        return False
     project = row["project_id"] or fallback_project
     path = row["file_path"] if "file_path" in row.keys() else None
     if path:
@@ -1178,6 +1360,16 @@ async def _actor_is_grant_admin(
     "admin somewhere" semantics as an entry gate for listing (rows are then
     filtered to the actor's admin projects).
     """
+    if _enterprise_strict() and not (
+        (actor.user_type == "human" and actor.system_role in {"admin", "super_admin"})
+        or _enterprise_static_admin(actor)
+    ):
+        return False
+    denied = await _explicit_denied_projects(db, actor)
+    if denied is None or (project_slug is not None and project_slug in denied):
+        return False
+    if _enterprise_strict() and not await _workspace_isolation_enabled(db):
+        return False
     if project_slug is None:
         if _is_local_single_user(actor):
             return True
@@ -1191,14 +1383,13 @@ async def _actor_is_grant_admin(
     grants = await load_grants(db, actor)
     if project_slug is None:
         return any(
-            grant.role == "admin" and _scope_allows_project(grant.scope, project)
-            for project, grant in grants.items()
+            _project_admin_grant(grant, project)
+            for project, candidates in grants.items()
+            for grant in candidates
         )
-    grant = grants.get(project_slug)
-    return bool(
-        grant
-        and grant.role == "admin"
-        and _scope_allows_project(grant.scope, project_slug)
+    return any(
+        _project_admin_grant(grant, project_slug)
+        for grant in grants.get(project_slug, [])
     )
 
 
@@ -1248,14 +1439,17 @@ async def _canonical_identity(
     if workspace_clause:
         params.append(workspace_id)
     cur = await db.execute(
-        "SELECT id FROM users WHERE deleted_at IS NULL "
+        "SELECT DISTINCT id FROM users WHERE deleted_at IS NULL "
         "AND (id = ? OR slug = ? OR email = ?)"
-        f"{workspace_clause} LIMIT 1",
+        f"{workspace_clause} LIMIT 2",
         params,
     )
-    row = await cur.fetchone()
-    if row is None:
+    rows = await cur.fetchall()
+    if not rows:
         raise AccessGrantError(code="identity_not_found", message="identity is not a tenant member")
+    if len(rows) != 1:
+        raise AccessGrantError(code="identity_ambiguous", message="identity matches multiple tenant members")
+    row = rows[0]
     return str(row["id"] if hasattr(row, "keys") else row[0])
 
 
@@ -1310,9 +1504,27 @@ async def grant_access(db: aiosqlite.Connection, actor: CallerContext, *, identi
     workspace_id = require_workspace_ctx(actor)
     canonical_identity = await _canonical_identity(db, identity, workspace_id)
     normalized_role = _normalize_role(role)
+    if _enterprise_strict() and normalized_role == "admin":
+        target = await (await db.execute(
+            "SELECT type FROM users WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL",
+            (canonical_identity, workspace_id),
+        )).fetchone()
+        if target is None or str(_row_get(target, "type", 0, "")) != "human":
+            raise AccessGrantError(
+                code="agent_admin_denied",
+                message="Only human users may hold project admin grants",
+            )
     normalized_clearance = _normalize_clearance(clearance)
     normalized_scope = _normalize_scope(scope, project_slug=project)
     confidential = 1 if normalized_clearance == "confidential" else 0
+    if _enterprise_strict():
+        if await _explicit_denied_projects(db, actor) is None:
+            raise AccessGrantError(code="access_policy_unavailable", message="Access policy unavailable")
+        # An explicit grant is the only way to clear a prior Enterprise deny.
+        await db.execute(
+            "DELETE FROM access_denials WHERE workspace_id=? AND identity=? AND project_slug=?",
+            (workspace_id, canonical_identity, project),
+        )
     columns = await _grant_columns(db)
     if "workspace_id" in columns:
         cursor = await db.execute(
@@ -1382,7 +1594,8 @@ async def seed_creator_grant(
 ) -> None:
     """Bootstrap grant for a project creator (RBAC F2.6).
 
-    admin + confidential clearance, scope ``project:<slug>``. Deliberately NOT
+    Human admin (service-agent member in Enterprise strict mode) with
+    confidential clearance and scope ``project:<slug>``. Deliberately NOT
     gated on grant-admin: at creation time nobody holds a grant on the new
     project yet. Callers decide WHO qualifies (persons, or an explicit
     ``owner=`` named by a service caller). INSERT OR IGNORE: never clobbers an
@@ -1392,6 +1605,20 @@ async def seed_creator_grant(
     project = (project_slug or "").strip()
     if not project:
         raise AccessGrantError(code="invalid_project_slug", message="project slug is required")
+    role = "admin"
+    if _enterprise_strict():
+        if not await _table_exists(db, "users"):
+            raise AccessGrantError(code="access_policy_unavailable", message="User identity store is unavailable")
+        cur = await db.execute(
+            "SELECT type FROM users WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL",
+            (canonical_identity, workspace_id),
+        )
+        row = await cur.fetchone()
+        user_type = str(row[0]) if row is not None else ""
+        if user_type not in {"human", "agent"}:
+            raise AccessGrantError(code="identity_not_found", message="identity is not an active tenant member")
+        if user_type == "agent":
+            role = "member"
     columns = await _grant_columns(db)
     if "workspace_id" in columns:
         cursor = await db.execute(
@@ -1399,10 +1626,10 @@ async def seed_creator_grant(
             INSERT OR IGNORE INTO access_grants(
                 identity, project_slug, role, confidential_clearance, clearance,
                 scope, updated_at, workspace_id
-            ) VALUES (?, ?, 'admin', 1, 'confidential', ?,
+            ) VALUES (?, ?, ?, 1, 'confidential', ?,
                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?)
             """,
-            (canonical_identity, project, f"project:{project}", workspace_id),
+            (canonical_identity, project, role, f"project:{project}", workspace_id),
         )
     else:
         cursor = await db.execute(
@@ -1410,10 +1637,10 @@ async def seed_creator_grant(
             INSERT OR IGNORE INTO access_grants(
                 identity, project_slug, role, confidential_clearance, clearance,
                 scope, updated_at
-            ) VALUES (?, ?, 'admin', 1, 'confidential', ?,
+            ) VALUES (?, ?, ?, 1, 'confidential', ?,
                 strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             """,
-            (canonical_identity, project, f"project:{project}"),
+            (canonical_identity, project, role, f"project:{project}"),
         )
     if cursor.rowcount > 0:
         await _audit_access_grant(
@@ -1427,7 +1654,7 @@ async def seed_creator_grant(
                 user_id=granted_by or canonical_identity,
             ),
             identity=canonical_identity, project_slug=project,
-            role="admin", clearance="confidential", scope=f"project:{project}",
+            role=role, clearance="confidential", scope=f"project:{project}",
         )
     if commit:
         await db.commit()
@@ -1438,6 +1665,36 @@ async def revoke_access(db: aiosqlite.Connection, actor: CallerContext, *, ident
     project = await _validate_project(project_slug)
     workspace_id = require_workspace_ctx(actor)
     canonical_identity = await _canonical_identity(db, identity, workspace_id)
+    if _enterprise_strict() and canonical_identity == actor.user_id:
+        raise AccessGrantError(
+            code="self_revoke_denied",
+            message="Another administrator must revoke this access",
+        )
+    if _enterprise_strict():
+        # A denial outranks even workspace-wide super_admin visibility. Apply
+        # the same target-role hierarchy as user management before persisting
+        # one, so a lower-ranked administrator cannot lock out a peer/owner.
+        try:
+            target = await (await db.execute(
+                "SELECT system_role FROM users WHERE id=? AND workspace_id=? "
+                "AND deleted_at IS NULL",
+                (canonical_identity, workspace_id),
+            )).fetchone()
+        except aiosqlite.Error as exc:
+            raise AccessGrantError(
+                code="access_policy_unavailable", message="Access policy unavailable"
+            ) from exc
+        if target is None:
+            raise AccessGrantError(
+                code="identity_not_found", message="identity is not a tenant member"
+            )
+        target_role = str(_row_get(target, "system_role", 0, ""))
+        if ROLE_HIERARCHY.get(target_role, -1) >= ROLE_HIERARCHY.get(actor.system_role, -1):
+            raise AccessGrantError(
+                code="target_role_denied", message="Cannot revoke a peer or higher-ranked user"
+            )
+    if _enterprise_strict() and await _explicit_denied_projects(db, actor) is None:
+        raise AccessGrantError(code="access_policy_unavailable", message="Access policy unavailable")
     columns = await _grant_columns(db)
     workspace_clause = " AND workspace_id = ?" if "workspace_id" in columns else ""
     params = [canonical_identity, project]
@@ -1449,6 +1706,15 @@ async def revoke_access(db: aiosqlite.Connection, actor: CallerContext, *, ident
         params,
     )
     removed = cur.rowcount > 0
+    if _enterprise_strict():
+        # Removing only the direct row would silently restore inherited team
+        # or public read access. Persist a deny before reporting revocation.
+        marker = await db.execute(
+            "INSERT OR IGNORE INTO access_denials "
+            "(workspace_id, identity, project_slug, created_by) VALUES (?,?,?,?)",
+            (workspace_id, canonical_identity, project, actor.user_id or actor.username),
+        )
+        removed = removed or marker.rowcount > 0
     if removed:
         await _audit_access_grant(db, action="revoke", actor=actor, identity=canonical_identity, project_slug=project)
     await db.commit()
@@ -1466,9 +1732,14 @@ async def list_access(db: aiosqlite.Connection, actor: CallerContext, *, identit
         actor_grants = await load_grants(db, actor)
         admin_projects = {
             project
-            for project, grant in actor_grants.items()
-            if grant.role == "admin" and _scope_allows_project(grant.scope, project)
+            for project, candidates in actor_grants.items()
+            if any(_project_admin_grant(grant, project) for grant in candidates)
         }
+    denied = await _explicit_denied_projects(db, actor)
+    if denied is None:
+        raise AccessGrantError(code="access_policy_unavailable", message="Access policy unavailable")
+    if admin_projects is not None:
+        admin_projects -= denied
     conditions: list[str] = []
     params: list[str] = []
     if "workspace_id" in columns:
@@ -1506,4 +1777,22 @@ async def list_access(db: aiosqlite.Connection, actor: CallerContext, *, identit
                 scope=_normalize_scope(_row_get(row, "scope", 5, None), project_slug=project),
             )
         )
+    if _enterprise_strict():
+        deny_where = " AND ".join(conditions) if conditions else "1=1"
+        cur = await db.execute(
+            "SELECT identity, project_slug FROM access_denials WHERE "
+            + deny_where + " ORDER BY identity, project_slug",
+            params,
+        )
+        for row in await cur.fetchall():
+            project = str(_row_get(row, "project_slug", 1, ""))
+            if admin_projects is not None and project not in admin_projects:
+                continue
+            grants.append(AccessGrant(
+                identity=str(_row_get(row, "identity", 0, "")),
+                project_slug=project,
+                role="denied", confidential_clearance=False,
+                clearance="public", scope=f"project:{project}",
+            ))
+        grants.sort(key=lambda grant: (grant.identity, grant.project_slug))
     return grants

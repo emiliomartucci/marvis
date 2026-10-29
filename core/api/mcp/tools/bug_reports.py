@@ -45,6 +45,16 @@ def _not_configured() -> dict[str, Any]:
     }
 
 
+def _enterprise_report_read_denied() -> bool:
+    # The ingest token scopes reports to a tenant, not to the person who filed
+    # them. Until reports carry authenticated per-user ownership, only tenant
+    # admins may use tenant-wide readback in strict mode.
+    return (
+        os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1"
+        and current_mcp_context().system_role not in ("admin", "super_admin")
+    )
+
+
 def register(mcp) -> None:
     """Register the bug-report tool group on the shared FastMCP instance."""
 
@@ -61,7 +71,7 @@ def register(mcp) -> None:
     ) -> dict[str, Any]:
         """Report a bug you hit while working, so the operator's QA can triage it.
 
-        QUANDO USARLO: quando un tool MCP o una superficie del prodotto si rompe o si comporta male (errore inatteso, 500, risultato palesemente sbagliato). Prima controlla list_bug_reports per non ri-segnalare lo stesso.
+        QUANDO USARLO: quando un tool MCP o una superficie del prodotto si rompe o si comporta male (errore inatteso, 500, risultato palesemente sbagliato). Se hai accesso alla lista, controlla prima i duplicati.
         QUANDO NON USARLO: NOT per richieste di feature o dubbi d'uso; NOT per errori attesi (validazione/permessi). NON incollare segreti: il testo viene comunque redatto.
         PROVA: ritorna {report_id, status:"logged"}; se deduplicated=true era gia' segnalato.
         RESTITUISCE: {ok, report_id, status, deduplicated} — usa report_id con bug_status."""
@@ -119,14 +129,16 @@ def register(mcp) -> None:
     async def bug_status(
         report_id: Annotated[str, Field(min_length=1, description="The report_id returned by report_bug")],
     ) -> dict[str, Any]:
-        """Check the triage status of a bug report YOU filed.
+        """Check the triage status of a bug report. Enterprise: tenant admins only.
 
         QUANDO USARLO: per sapere se un tuo report e' ancora pending o e' stato preso in carico/risolto.
-        QUANDO NON USARLO: NOT per report di altri (ritorna not_found).
+        QUANDO NON USARLO: in Enterprise, non usarlo senza ruolo admin; il token di raccolta non distingue gli autori dello stesso tenant.
         RESTITUISCE: {ok, report_id, status, title, created_at} oppure {ok:false, code:not_found}."""
         cfg = _config()
         if cfg is None:
             return _not_configured()
+        if _enterprise_report_read_denied():
+            return {"ok": False, "code": "forbidden", "hint": "admin access required"}
         base, tenant, token = cfg
         import httpx
 
@@ -149,13 +161,15 @@ def register(mcp) -> None:
         since: Annotated[str | None, Field(default=None, description="ISO date/datetime lower bound on created_at")] = None,
         limit: Annotated[int, Field(default=50, ge=1, le=200, description="Max rows")] = 50,
     ) -> dict[str, Any]:
-        """List the bug reports YOU filed (this tenant only).
+        """List this tenant's bug reports. Enterprise: tenant admins only.
 
-        QUANDO USARLO: PRIMA di segnalare, per non duplicare; per rivedere i tuoi report dopo un /clear che ti ha fatto perdere il report_id.
+        QUANDO USARLO: per evitare duplicati o rivedere i report del tenant, se hai accesso alla lista.
         RESTITUISCE: {ok, reports:[{report_id, status, title, created_at}]}."""
         cfg = _config()
         if cfg is None:
             return _not_configured()
+        if _enterprise_report_read_denied():
+            return {"ok": False, "code": "forbidden", "hint": "admin access required"}
         base, tenant, token = cfg
         import httpx
 
@@ -187,6 +201,8 @@ def register(mcp) -> None:
         QUANDO USARLO: triage operatore - i report dei tenant arrivano con workspace_id=reporter e NON compaiono in list_bug_reports (che mostra solo i tuoi) ne nelle viste task default. Questo li enumera tutti.
         QUANDO NON USARLO: NOT dai tenant non-operatore (ritorna not_operator); NOT per non-admin (forbidden).
         RESTITUISCE: {ok, reports:[{report_id, workspace, status, title, created_at, updated_at}]}."""
+        if os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1":
+            return {'ok': False, 'code': 'not_operator', 'hint': 'fleet triage is unavailable in Enterprise'}
         secret = getattr(settings, 'bugreport_ingest_secret', '') or ''
         if not secret:
             return {'ok': False, 'code': 'not_operator', 'hint': 'this tenant is not the fleet bug-report operator'}

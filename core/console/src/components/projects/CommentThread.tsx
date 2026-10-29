@@ -79,6 +79,7 @@ function CommentItem({
   onUpdate,
   onDelete,
   onReaction,
+  canWrite,
   depth,
 }: {
   comment: CommentResponse;
@@ -87,6 +88,7 @@ function CommentItem({
   onUpdate: (id: number, body: string, status: CommentStatus) => void;
   onDelete: (id: number) => void;
   onReaction: (commentId: number, reaction: ReactionType, add: boolean) => void;
+  canWrite: boolean;
   depth: number;
 }) {
   const [editing, setEditing] = useState(false);
@@ -166,7 +168,7 @@ function CommentItem({
         )}
 
         {/* Actions */}
-        {!isDeleted && !editing && (
+        {canWrite && !isDeleted && !editing && (
           <div className="flex items-center gap-3 mt-2">
             <ReactionBar
               reactions={comment.reactions}
@@ -217,6 +219,7 @@ function CommentItem({
           onUpdate={onUpdate}
           onDelete={onDelete}
           onReaction={onReaction}
+          canWrite={canWrite}
           depth={depth + 1}
         />
       ))}
@@ -228,10 +231,12 @@ export default function CommentThread({
   targetType,
   targetId,
   currentUser,
+  canWrite = true,
 }: {
   targetType: TargetType;
   targetId: string;
   currentUser: string;
+  canWrite?: boolean;
 }) {
   const [comments, setComments] = useState<CommentResponse[]>([]);
   const [loading, setLoading] = useState(true);
@@ -258,7 +263,7 @@ export default function CommentThread({
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!newBody.trim() || submitting) return;
+    if (!canWrite || !newBody.trim() || submitting) return;
     setSubmitting(true);
     try {
       const data: CommentCreate = {
@@ -328,12 +333,13 @@ export default function CommentThread({
           onUpdate={handleUpdate}
           onDelete={handleDelete}
           onReaction={handleReaction}
+          canWrite={canWrite}
           depth={0}
         />
       ))}
 
       {/* New comment form */}
-      <form onSubmit={handleSubmit} className="bg-pir-surface-0 border border-pir rounded p-3">
+      {canWrite && <form onSubmit={handleSubmit} className="bg-pir-surface-0 border border-pir rounded p-3">
         {replyTo && (
           <div className="flex items-center gap-2 mb-2">
             <span className="text-caption text-pir-text-muted">Replying to #{replyTo}</span>
@@ -371,7 +377,7 @@ export default function CommentThread({
             {submitting ? "Posting..." : replyTo ? "Reply" : "Comment"}
           </button>
         </div>
-      </form>
+      </form>}
     </div>
   );
 }

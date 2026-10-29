@@ -185,12 +185,10 @@ async def run_warehouse_consolidation(
 ) -> dict[str, int]:
     """Full-store learning dedup pass. PROPOSALS ONLY (approval_state=pending).
 
-    Reuses the memory_ops persist path so re-runs are idempotent: the stable
-    operation_id (cycle_key + natural key + evidence_hash) collides on the
-    natural unique key and _persist_operations dedups instead of creating a
-    new pending proposal. Across cycles, _supersede_prior (run by run_phase
-    for window ops) is NOT invoked here — the daily cadence guard in jobs.py
-    bounds re-emission; within a cycle, operation_id collision is the guard.
+    The shared persistence path atomically suppresses unchanged proposals by
+    workspace, scope, operation type and evidence, across cycles and approval
+    states. Prior decisions remain untouched; changed evidence permits a new
+    proposal. Exact same-cycle retries also retain their existing identity.
 
     Returns a small summary dict {groups_found, operations_persisted, skipped}.
     """
@@ -211,7 +209,7 @@ async def run_warehouse_consolidation(
         for d in drafts
     ]
     persisted, _recurrence_keys = await _persist_operations(
-        run_id=run_id, operations=operations
+        run_id=run_id, operations=operations, deduplicate_across_cycles=True
     )
 
     return {

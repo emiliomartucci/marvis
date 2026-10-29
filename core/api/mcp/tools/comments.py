@@ -51,6 +51,10 @@ def register(mcp) -> None:
         RESTITUISCE: il commento creato {id, status, created_by, created_at, parent_id}."""
         ctx = current_mcp_context()
         try:
+            async with acquire_db() as read_db:
+                prepared = await comments_uc.prepare_create_body(
+                    ctx, read_db, target_type="task", target_id=task_id, body=body,
+                )
             async with acquire_write_db(label="mcp.comment_task") as db:
                 result = await comments_uc.create_comment(
                     ctx,
@@ -60,6 +64,7 @@ def register(mcp) -> None:
                     body=body,
                     status=status,
                     parent_id=parent_id,
+                    prepared_body=prepared,
                 )
                 return dump(result)
         except ServiceError as e:

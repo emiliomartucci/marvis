@@ -12,6 +12,7 @@ import {
   getProjectCosts,
   listTasks,
   getProjectRaci,
+  getEffectiveProjectAccess,
 } from "@/lib/api";
 import type {
   ConversationCost,
@@ -242,6 +243,8 @@ function MetricCard({ label, value, subtitle, accentColor = "border-l-pir-accent
 }
 
 export default function OverviewTab({ project }: { project: ProjectDetail }) {
+  const enterpriseMode = process.env.NEXT_PUBLIC_ENTERPRISE_MODE === "1";
+  const [canEdit, setCanEdit] = useState(!enterpriseMode);
   const [updates, setUpdates] = useState<StatusUpdateResponse[]>([]);
   const [handoffs, setHandoffs] = useState<HandoffEntry[]>([]);
   const [commits, setCommits] = useState<GitGraphCommit[]>([]);
@@ -254,6 +257,16 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
   const [costData, setCostData] = useState<ConversationCost[]>([]);
   const [openTaskCount, setOpenTaskCount] = useState<number | null>(null);
   const [raciEntries, setRaciEntries] = useState<RaciEntry[]>([]);
+
+  useEffect(() => {
+    if (!enterpriseMode) return;
+    let active = true;
+    setCanEdit(false);
+    getEffectiveProjectAccess(project.slug)
+      .then((access) => { if (active) setCanEdit(access.can_edit); })
+      .catch(() => { if (active) setCanEdit(false); });
+    return () => { active = false; };
+  }, [enterpriseMode, project.slug]);
 
   useEffect(() => {
     getMe()
@@ -272,9 +285,11 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
       .then(setHandoffs)
       .catch(() => {});
 
-    getProjectGitGraph(project.slug, 10, 0, true, { signal: controller.signal })
-      .then((res) => setCommits(res.commits))
-      .catch(() => {});
+    if (!enterpriseMode) {
+      getProjectGitGraph(project.slug, 10, 0, true, { signal: controller.signal })
+        .then((res) => setCommits(res.commits))
+        .catch(() => {});
+    }
 
     getProjectCosts(project.slug, {}, { signal: controller.signal })
       .then(setCostData)
@@ -296,6 +311,7 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (!canEdit) return;
     setSubmitting(true);
     try {
       const res = await createStatusUpdate({
@@ -371,7 +387,7 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
           }
           subtitle={costData.length > 0 ? `${costData.length} conversations` : undefined}
         />
-        <MetricCard
+        {!enterpriseMode && <MetricCard
           label="Git"
           accentColor="border-l-pir-purple"
           value={
@@ -382,7 +398,7 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
             )
           }
           subtitle={latestCommit ? timeAgo(latestCommit.date) : undefined}
-        />
+        />}
       </div>
 
       {/* RACI chips */}
@@ -458,7 +474,7 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
         </div>
 
         {/* Recent Activity — mini git graph */}
-        <div className="bg-pir-surface-1 border border-pir rounded p-3">
+        {!enterpriseMode && <div className="bg-pir-surface-1 border border-pir rounded p-3">
           <div className="text-label text-pir-text-primary mb-2 flex items-center gap-2">
             <span className="w-1.5 h-1.5 rounded-full bg-pir-purple shrink-0" />
             Recent Activity
@@ -468,7 +484,7 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
           ) : (
             <MiniGitGraph commits={commits.slice(0, 10)} />
           )}
-        </div>
+        </div>}
       </div>
 
       {/* Project Info (from project.yaml) */}
@@ -552,7 +568,7 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
       )}
 
       {/* Status update form */}
-      <div className="bg-pir-surface-1 border border-pir rounded p-3">
+      {canEdit && <div className="bg-pir-surface-1 border border-pir rounded p-3">
         <form onSubmit={handleSubmit} className="space-y-2">
           <div className="flex items-center gap-2">
             <h3 className="text-label text-pir-text-primary">Status Update</h3>
@@ -599,7 +615,7 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
             {submitting ? "Saving..." : "Submit"}
           </button>
         </form>
-      </div>
+      </div>}
 
       {/* Status history */}
       {updates.length > 0 && (
@@ -643,6 +659,7 @@ export default function OverviewTab({ project }: { project: ProjectDetail }) {
             targetType="project"
             targetId={project.slug}
             currentUser={currentUser}
+            canWrite={canEdit}
           />
         </div>
       )}

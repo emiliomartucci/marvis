@@ -238,24 +238,20 @@ class ReleaseCandidateTests(unittest.TestCase):
         )
         self.assertEqual(
             report["shared_source"]["candidate_sha"],
-            "77c865633b7447c4a778b2569f4ceec9a3b7dce6",
+            "719fce488c55d9b36b91daec613195e2a04ea8de",
         )
         self.assertEqual(
             report["shared_source"]["merge_sha"],
-            "8dfd16e4e275b69435e0348258daf86f67898997",
+            "f113a0454836603731fbe630fc16c34fb9e5af23",
         )
         self.assertEqual(len(report["action_pins"]), 5)
-        released = candidate.candidate_state_report(ROOT)
-        self.assertEqual(released["status"], "released")
+        invalidated = candidate.candidate_state_report(ROOT)
+        self.assertEqual(invalidated["status"], "invalidated")
         self.assertEqual(
-            released["state"]["release_source_sha"],
-            "6184db50da31b7bea79d5b45087f6313445c6fdc",
+            invalidated["state"]["invalidated_by_shared_source_sha"],
+            "f113a0454836603731fbe630fc16c34fb9e5af23",
         )
-        self.assertEqual(
-            released["state"]["acceptance_content_digest"],
-            "fe9c9964018950a1555c8fcd00b0e2f218962f4e60a3ad2fb907a255d9ad8c6b",
-        )
-        with self.assertRaisesRegex(candidate.ReleasePolicyError, "already released"):
+        with self.assertRaisesRegex(candidate.ReleasePolicyError, "invalidated"):
             candidate.validate_static(ROOT)
 
     def test_product_projection_precedes_release_activation(self) -> None:
@@ -279,7 +275,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertEqual(ancestry.returncode, 0)
         self.assertEqual(
             shared_source["merge_sha"],
-            "8dfd16e4e275b69435e0348258daf86f67898997",
+            "f113a0454836603731fbe630fc16c34fb9e5af23",
         )
         if state["status"] == "invalidated":
             self.assertEqual(
@@ -307,6 +303,20 @@ class ReleaseCandidateTests(unittest.TestCase):
 
     def test_released_candidate_requires_closed_acceptance_evidence(self) -> None:
         policy = self.policy()
+        # The 0.4.8 publication evidence, before the f113a045 source advance.
+        policy["candidate_state"] = {
+            "status": "released",
+            "version": "0.4.8",
+            "tag": "v0.4.8",
+            "release_source_sha": "6184db50da31b7bea79d5b45087f6313445c6fdc",
+            "publication_run_id": 33444091968,
+            "publication_run_conclusion": "failure_after_registry_publication",
+            "acceptance_mode": "exact_candidate_local_acceptance_no_republish",
+            "acceptance_content_digest": (
+                "fe9c9964018950a1555c8fcd00b0e2f218962f4e60a3ad2fb907a255d9ad8c6b"
+            ),
+            "published_at": "2026-08-31T22:21:39Z",
+        }
         shared_source = candidate._shared_source_coordinates(ROOT, policy)
         self.assertEqual(
             candidate._candidate_state(policy, shared_source=shared_source)["status"],

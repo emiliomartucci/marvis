@@ -14,13 +14,14 @@ each tool requires. This middleware turns that map into live exposure:
   message reach the client verbatim.
 
 Fail-CLOSED by contract: an unresolvable role is treated as ``viewer`` and an
-untiered tool requires ``admin`` (see ``guidance.min_role_for_tool``). STDIO and
-the static tenant Bearer are unaffected — stdio is skipped here (and never wired,
-since the SDK stdio server has no middleware), and the Bearer resolves to
-``admin`` in :func:`current_mcp_context`.
+untiered tool requires ``admin`` (see ``guidance.min_role_for_tool``). STDIO is
+skipped here (the SDK stdio server has no middleware). Enterprise strict mode
+accepts bound OIDC people and service agents; service agents are capped at
+operator. Graph traversal remains admin-only until its retrieval predicate is
+permission-aware.
 
-Kill-switch: ``MARVIS_TOOL_PROFILES=0`` disables the role gate (the usage counter
-still runs) for instant per-tenant rollback via env + restart.
+Kill-switch: ``MARVIS_TOOL_PROFILES=0`` disables the hosted role gate (the usage
+counter still runs). Enterprise strict mode always enforces the role gate.
 
 Usage counter (P3 F4): every ``tools/call`` emits one structured journald line
 ``marvis.tool_call {tool, role, user, ms, ok}`` — the data for the future
@@ -38,7 +39,14 @@ from typing import Any
 from fastmcp.exceptions import AuthorizationError, ToolError
 from fastmcp.server.middleware.middleware import Middleware
 
-from core.api.mcp.guidance import min_role_for_tool
+from core.api.observability import phase_timing
+from core.api.mcp.guidance import TOOL_DIET_CORE, min_role_for_tool
+from core.api.mcp.tool_gateway_names import (
+    FIND_TOOL,
+    GATEWAY_TOOLS,
+    find_tool_description,
+    gateway_enabled,
+)
 from core.api.services.repository_authority import (
     REPOSITORY_TOOL_ROUTE,
     RETIRED_REPOSITORY_TOOLS,
@@ -49,6 +57,45 @@ logger = logging.getLogger("marvis.tool_profiles")
 
 _FALSEY = {"0", "false", "no", "off"}
 _VIEWER_RANK = ROLE_HIERARCHY["viewer"]
+_ENTERPRISE_GRAPH_TOOLS = {
+    "project_impact", "list_graph_pins", "pin_graph_node", "unpin_graph_node",
+    "mint_graph_ingest_token", "kg_reindex_path",
+}
+_ENTERPRISE_CLOUD_F_LEASE_TOOLS = {
+    "get_cloud_f_control", "acquire_cloud_f_change", "complete_cloud_f_change",
+    "get_cloud_f_change_operation",
+}
+
+
+def _enterprise_strict() -> bool:
+    return os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1"
+
+
+def _required_role(tool_name: str) -> str:
+    # The gateway itself is open to every role: find_tool only returns, and
+    # call_tool only runs, tools the caller's own role may call.
+    if tool_name in GATEWAY_TOOLS:
+        return "viewer"
+    # Enterprise provisions bound Entra identities locally; the replacement
+    # add_user/list_user_requests implementation requires a tenant admin.
+    if _enterprise_strict() and tool_name in {"add_user", "list_user_requests", "list_access"}:
+        return "admin"
+    # The Cloud/F lease is one tenant-wide lock with no project boundary; a
+    # scoped operator must not hold or inspect it.
+    if _enterprise_strict() and tool_name in _ENTERPRISE_CLOUD_F_LEASE_TOOLS:
+        return "admin"
+    # The bug intake token is tenant-scoped. Individual reporter ownership is
+    # unavailable, so its readback must match the runtime tenant-admin gate.
+    if _enterprise_strict() and tool_name in {"bug_status", "list_bug_reports"}:
+        return "admin"
+    # Graph traversal/ranking still reads hidden nodes before the response
+    # filter. Keep the full graph surface closed to scoped Enterprise actors
+    # until its SQL/traversal accepts the same project/path predicate as search.
+    if _enterprise_strict() and (
+        tool_name.startswith("graph_") or tool_name in _ENTERPRISE_GRAPH_TOOLS
+    ):
+        return "admin"
+    return min_role_for_tool(tool_name)
 
 def _current_mcp_context():
     """Resolve request identity without loading the application during import.
@@ -84,9 +131,9 @@ def _caller_role() -> str:
     means an unauthenticated / unresolvable caller → ``viewer`` — never the
     ``LOCAL_CTX`` operator default, which is a trusted stdio-only identity and
     would be a silent fail-open here (reviewed constraint #1: "claim assente →
-    viewer, mai default-allow"). A PRESENT token (OAuth person OR the static
-    tenant Bearer) resolves through the shared ``current_mcp_context`` (Bearer →
-    admin, OAuth → claim/DB role, else viewer).
+    viewer, mai default-allow"). A PRESENT token resolves through the shared
+    ``current_mcp_context``. Enterprise strict mode validates its bound OIDC
+    principal separately before this role is used.
     """
     try:
         from fastmcp.server.dependencies import get_access_token
@@ -103,9 +150,89 @@ def _caller_role() -> str:
         return "viewer"
 
 
+def _enterprise_principal_role() -> str | None:
+    """Return a bound OIDC principal's maximum tool role, or deny the principal.
+
+    The adapter proves the user row is active on every request. This transport
+    gate preserves that proof's mechanism and caps service agents even if a
+    future adapter accidentally supplies an administrative role.
+    """
+    principal = _current_mcp_context()
+    if not getattr(principal, "workspace_id", None) or not getattr(principal, "user_id", None):
+        return None
+    mechanism = getattr(principal, "auth_mechanism", None)
+    role = getattr(principal, "system_role", None)
+    if mechanism == "mcp_oauth_person":
+        return role if isinstance(role, str) and role else "viewer"
+    if mechanism == "mcp_oauth_agent" and getattr(principal, "user_type", None) == "agent":
+        return "operator" if role in {"operator", "admin", "super_admin"} else "viewer"
+    tenant_id = os.environ.get("TENANT_ID", "").strip()
+    if (
+        mechanism == "mcp_static" and tenant_id
+        and getattr(principal, "user_type", None) == "agent"
+        and principal.user_id == f"tenant:{tenant_id}"
+        and role == "admin"
+    ):
+        return "admin"
+    return None
+
+
 def is_authorized(tool_name: str, role: str) -> bool:
     """True when ``role`` may see/call ``tool_name`` under the tier map."""
-    return _role_rank(role) >= _role_rank(min_role_for_tool(tool_name))
+    return _role_rank(role) >= _role_rank(_required_role(tool_name))
+
+
+def diet_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Core-tool diet is ON for every tenant (owner decision 2026-09-30).
+
+    ``MARVIS_TOOL_DIET=0`` opts a tenant out. The diet keeps only
+    ``guidance.TOOL_DIET_CORE`` in ``tools/list`` after the role filter.
+    ``tools/call`` of a hidden tool still succeeds, but agents never call a tool
+    they cannot see (0 of 51 requests in task 2951f474), so the hidden tools
+    stay reachable only through the tool gateway (``find_tool``/``call_tool``),
+    listed next to the diet. Rollout history: shipped default-off on
+    2026-09-29 behind an explicit env, measured for a day on the main agent
+    tenant, then made the fleet default.
+    """
+    source = os.environ if env is None else env
+    raw = source.get("MARVIS_TOOL_DIET")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _FALSEY
+
+
+def _diet_filter(tools: list) -> list:  # noqa: ANN001
+    """Trim to the diet core; add the gateway, naming the tools it hides."""
+    kept = [t for t in tools if getattr(t, "name", "") in TOOL_DIET_CORE]
+    if not gateway_enabled():
+        return kept
+    hidden = [
+        t.name for t in tools
+        if t.name not in TOOL_DIET_CORE and t.name not in GATEWAY_TOOLS
+    ]
+    for tool in tools:
+        if tool.name == FIND_TOOL:
+            kept.append(tool.model_copy(update={"description": find_tool_description(hidden)}))
+        elif tool.name in GATEWAY_TOOLS:
+            kept.append(tool)
+    return kept
+
+
+def caller_may_call(tool_name: str) -> bool:
+    """Whether the current HTTP caller's role passes the gate for ``tool_name``.
+
+    Mirrors ``ToolProfilesMiddleware.on_call_tool`` for the gateway's search, so
+    ``find_tool`` never names a tool the caller would be denied.
+    """
+    if _enterprise_strict():
+        try:
+            role = _enterprise_principal_role()
+        except Exception:
+            return False
+        return role is not None and is_authorized(tool_name, role)
+    if not profiles_enabled():
+        return True
+    return is_authorized(tool_name, _caller_role())
 
 
 class ToolProfilesMiddleware(Middleware):
@@ -116,18 +243,44 @@ class ToolProfilesMiddleware(Middleware):
 
     async def on_list_tools(self, context, call_next):  # noqa: ANN001
         tools = await call_next(context)
-        if not self.enabled or self._is_stdio():
+        if self._is_stdio():
             return tools
-        role = _caller_role()
-        return [t for t in tools if is_authorized(getattr(t, "name", ""), role)]
+        strict_role = None
+        if _enterprise_strict():
+            try:
+                strict_role = _enterprise_principal_role()
+            except Exception:
+                return []
+            if strict_role is None:
+                return []
+        role = strict_role if strict_role is not None else _caller_role()
+        if self.enabled or _enterprise_strict():
+            tools = [t for t in tools if is_authorized(getattr(t, "name", ""), role)]
+        # P4 tool diet: trim the role-filtered list to the data-driven core.
+        # SOFT by design — on_call_tool never checks TOOL_DIET_CORE, so a
+        # hidden tool stays callable for flows that name it explicitly.
+        if diet_enabled():
+            tools = _diet_filter(tools)
+        else:
+            tools = [t for t in tools if getattr(t, "name", "") not in GATEWAY_TOOLS]
+        return tools
 
     async def on_call_tool(self, context, call_next):  # noqa: ANN001
         tool_name = getattr(context.message, "name", "") or ""
         is_stdio = self._is_stdio()
-        role = "local" if is_stdio else _caller_role()
+        strict_role = None
+        if not is_stdio and _enterprise_strict():
+            try:
+                strict_role = _enterprise_principal_role()
+                if strict_role is None:
+                    raise RuntimeError("Enterprise identity is not active")
+            except Exception as exc:
+                self._log_call(tool_name, "unbound", 0.0, ok=False, denied=True)
+                raise AuthorizationError("Enterprise identity is not active") from exc
+        role = "local" if is_stdio else strict_role if strict_role is not None else _caller_role()
 
-        if self.enabled and not is_stdio:
-            required = min_role_for_tool(tool_name)
+        if (self.enabled or _enterprise_strict()) and not is_stdio:
+            required = _required_role(tool_name)
             if _role_rank(role) < _role_rank(required):
                 self._log_call(tool_name, role, 0.0, ok=False, denied=True)
                 raise AuthorizationError(
@@ -137,6 +290,7 @@ class ToolProfilesMiddleware(Middleware):
 
         start = time.monotonic()
         ok = True
+        phases_token = phase_timing.begin()
         try:
             return await call_next(context)
         except Exception:
@@ -144,7 +298,12 @@ class ToolProfilesMiddleware(Middleware):
             raise
         finally:
             self._log_call(
-                tool_name, role, (time.monotonic() - start) * 1000.0, ok=ok, denied=False
+                tool_name,
+                role,
+                (time.monotonic() - start) * 1000.0,
+                ok=ok,
+                denied=False,
+                phases=phase_timing.end(phases_token),
             )
 
     @staticmethod
@@ -158,7 +317,13 @@ class ToolProfilesMiddleware(Middleware):
 
     @staticmethod
     def _log_call(
-        tool: str, role: str, ms: float, *, ok: bool, denied: bool
+        tool: str,
+        role: str,
+        ms: float,
+        *,
+        ok: bool,
+        denied: bool,
+        phases: dict[str, float] | None = None,
     ) -> None:
         user = "?"
         try:
@@ -174,6 +339,8 @@ class ToolProfilesMiddleware(Middleware):
         }
         if denied:
             payload["denied"] = True
+        if phases:
+            payload["phases"] = {name: round(value, 1) for name, value in phases.items()}
         logger.info("marvis.tool_call %s", json.dumps(payload, sort_keys=True))
 
 

@@ -103,11 +103,12 @@ def register(mcp) -> None:
         ctx = current_mcp_context()
         try:
             async with acquire_write_db(label="mcp.ack_notification") as db:
-                effective, _visible = await _resolve_scope(db, ctx, user_id)
+                effective, visible = await _resolve_scope(db, ctx, user_id)
                 result = await notifications_uc.ack_notification(
                     ctx,
                     db,
                     effective_user_id=effective,
+                    visible_projects=visible,
                     notification_id=notification_id,
                     target_id=target_id,
                 )

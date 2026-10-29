@@ -80,10 +80,12 @@ async def mark_read(
     """Mark a single notification as read."""
     ctx = CallerContext.from_user_info(user, is_human_session=True)
     try:
+        visible = await access_grants.visible_projects_for_actor(db, ctx)
         return await notifications_uc.mark_notification(
             ctx,
             db,
             effective_user_id=user.user_id,
+            visible_projects=visible,
             notification_id=notification_id,
         )
     except ServiceError as e:
@@ -101,10 +103,12 @@ async def mark_acted(
     """Mark a notification as acted upon (approve/reject done)."""
     ctx = CallerContext.from_user_info(user, is_human_session=True)
     try:
+        visible = await access_grants.visible_projects_for_actor(db, ctx)
         return await notifications_uc.mark_notification(
             ctx,
             db,
             effective_user_id=user.user_id,
+            visible_projects=visible,
             notification_id=notification_id,
             acted=True,
         )
@@ -122,10 +126,12 @@ async def mark_all_read(
     """Mark all notifications as read for the current user."""
     ctx = CallerContext.from_user_info(user, is_human_session=True)
     try:
+        visible = await access_grants.visible_projects_for_actor(db, ctx)
         return await notifications_uc.mark_all_read(
             ctx,
             db,
             effective_user_id=user.user_id,
+            visible_projects=visible,
         )
     except ServiceError as e:
         raise to_http(e)

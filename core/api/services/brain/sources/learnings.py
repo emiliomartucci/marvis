@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from core.api.db import acquire_db
 from core.api.services.brain.digest_collector import SourceCollector
 from core.api.services.brain.models import EventDraft, SourceCollectorContext
+from core.api.services.brain.semantic_context import capture_source_context
 from core.api.services.brain.sources.base import (
     normalize_iso,
     resolve_source_project,
@@ -50,13 +51,14 @@ async def collect(ctx: SourceCollectorContext) -> AsyncIterator[EventDraft]:
         async with acquire_db() as db:
             cur = await db.execute(
                 "SELECT id, title, category, severity, module, project, tags, "
-                "       created_at, updated_at "
+                "       created_at, updated_at, description, prevention "
                 "FROM learnings "
                 "WHERE COALESCE(updated_at, created_at) > ? "
                 "  AND COALESCE(updated_at, created_at) <= ? "
+                "  AND invalid_at IS NULL AND COALESCE(workspace_id,'ws_default') = ? "
                 "ORDER BY COALESCE(updated_at, created_at) ASC "
                 "LIMIT ? OFFSET ?",
-                (lower_iso, upper_iso, _PAGE_SIZE, offset),
+                (lower_iso, upper_iso, ctx.workspace_id, _PAGE_SIZE, offset),
             )
             rows = await cur.fetchall()
         if not rows:
@@ -72,6 +74,8 @@ async def collect(ctx: SourceCollectorContext) -> AsyncIterator[EventDraft]:
             tags_raw = row[6] if not hasattr(row, "keys") else row["tags"]
             created_at_raw = row[7] if not hasattr(row, "keys") else row["created_at"]
             updated_at_raw = row[8] if not hasattr(row, "keys") else row["updated_at"]
+            description = row[9] if not hasattr(row, "keys") else row["description"]
+            prevention = row[10] if not hasattr(row, "keys") else row["prevention"]
 
             observed_at = (
                 normalize_iso(updated_at_raw) or normalize_iso(created_at_raw)
@@ -89,6 +93,8 @@ async def collect(ctx: SourceCollectorContext) -> AsyncIterator[EventDraft]:
                 "module": module,
                 "tags_hash": _tags_hash(tags_raw),
                 "updated_at": observed_at.isoformat(),
+                **capture_source_context(title=title, description=description,
+                                         prevention=prevention, updated_at=observed_at.isoformat()),
             }
 
             # Decision marker (sub-01 §5.1): a critical learning is treated as a

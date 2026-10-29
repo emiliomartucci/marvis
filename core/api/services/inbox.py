@@ -556,9 +556,6 @@ def _schedule_embed_inbox(
     """
     from core.api.services import embedding_service
 
-    if not embedding_service.is_available():
-        return
-
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:

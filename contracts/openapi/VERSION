@@ -10,10 +10,10 @@
 contract_version: 3
 lineage: unified-main
 openapi: "3.1.0"
-engine_ref: 2ea2c8b4a4e16d4ad775d7954cd8181008e2aaea
+engine_ref: ac38759e07ec53024498da24ceedfce23e0c8b0e
 predecessor_contract_version: 2
 predecessor_engine_ref: e0a6994ae2102e3a6a631a11fb9934940e180a60
-paths: 302
+paths: 304
 generator: contracts/openapi/generate.py
 # Profile (ratified by owner 2026-07-27): the governed contract covers all public,
 # discoverable routes registered in the app, optional routers included. Historical
@@ -56,9 +56,23 @@ coupled_to: requirements-tenant.txt
 # 2026-08-31 (additive, no version bump): SearchResponse accepts the already
 # runtime-emitted `semantic-timeout` reason and exposes sanitized reasons as an
 # extensible client contract. No route or required field changed.
-# engine_ref moved to the source commit carrying this spec (2ea2c8b4)
+# 2026-09-06 (documentation only, no version bump): Brain latest selection
+# describes readable succeeded/partial cycles. No HTTP schema changed.
+# engine_ref moved to the source commit carrying this spec (f6b84a0e)
 # by metadata-only follow-up. Exact-SHA consumers can therefore reproduce the
 # committed contract before reading this metadata commit.
 # The baseline test compares git show <engine_ref>:contracts/openapi/marvisx.json
 # byte-for-byte with the committed file — keep this repoint rule on every
 # future contract change.
+
+# 2026-09-07 (additive, no version bump): tenant-local consumer search and
+# document reads preserve the signed human reader behind the reserved relay.
+
+# 2026-09-21 (additive, no version bump): SearchResponse exposes the optional
+# `curation` receipt (Jev re-rank, plan U2/R16) — null when rerank did not run,
+# wire shape unchanged for N-1 clients. engine_ref repointed to the spec
+# source commit by this metadata-only follow-up.
+# 2026-09-24 (compatible request expansion): omitted team-project assignment
+# role, clearance, and public visibility fields now mean "preserve existing"
+# rather than silently resetting them. Explicit legacy values still work.
+# Both all-surfaces and public/shared baselines were regenerated from runtime.

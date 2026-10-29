@@ -49,6 +49,9 @@ class CallerContext:
     # Adapter-set provenance for the local single-user process. Identity claims
     # alone never turn a remote principal into the local OS account.
     local_runtime: bool = False
+    # Set only by the authenticated adapter. A human-owned PAT is still a
+    # scoped credential; user_type and approval delegation cannot broaden it.
+    auth_mechanism: str = "unknown"
 
     @property
     def can_act_as_approver(self) -> bool:
@@ -85,6 +88,7 @@ class CallerContext:
             is_human_session=True,
             user_id="local",
             local_runtime=True,
+            auth_mechanism="local",
         )
 
     @classmethod
@@ -103,6 +107,7 @@ class CallerContext:
             is_human_session=False,
             user_id="local",
             local_runtime=True,
+            auth_mechanism="local",
         )
 
     @classmethod
@@ -131,7 +136,28 @@ class CallerContext:
             user_id=u.user_id,
             delegation_grant_id=delegation_grant_id,
             local_runtime=getattr(u, "auth_mechanism", "unknown") == "local",
+            auth_mechanism=getattr(u, "auth_mechanism", "unknown"),
         )
+
+
+def require_task_write_capability(ctx: CallerContext) -> None:
+    """Check the credential independently of project and approval authority."""
+    if ctx.is_local_os_account:
+        return
+    if ctx.auth_mechanism in {"session", "mcp_oauth_person"} and ctx.user_type == "human":
+        return
+    if ctx.auth_mechanism in {"agent_token", "delegated_agent_token"}:
+        if "tasks:write" in ctx.scopes:
+            return
+    elif ctx.auth_mechanism in {"mcp_static", "mcp_app", "mcp_oauth_agent"}:
+        # MCP service credentials use the server's data capability vocabulary;
+        # HTTP PATs cannot gain this mapping by supplying the same scope text.
+        if {"tasks:write", "write:data"}.intersection(ctx.scopes):
+            return
+    raise AuthorizationError(
+        code="task_write_scope_required",
+        message="This credential does not permit task writes (tasks:write required).",
+    )
 
 
 @dataclass(frozen=True)

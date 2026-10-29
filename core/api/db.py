@@ -83,6 +83,14 @@ QUIESCED_REQUIRED_MIGRATIONS = frozenset(
 QUIESCED_MIGRATION_ENV = "MARVIS_SCHEMA_WRITERS_QUIESCED"
 
 
+class MigrationBackupError(RuntimeError):
+    """Backup failed before the migration runner could write any schema."""
+
+    def __init__(self, message: str, *, code: str = "backup_failed") -> None:
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class MigrationResult:
     """Machine-readable evidence from one migration runner invocation."""
@@ -1072,8 +1080,19 @@ def _migration_trigger_contract(path: Path) -> dict[str, str]:
     return statements
 
 
+# Migrations after 187 that replace lifecycle trigger bodies, in version order.
+# Each one redefines only triggers 187 already created.
+_LIFECYCLE_TRIGGER_REVISIONS = (
+    (190, "190_lifecycle_state_upsert_safe_triggers.sql"),
+)
+
+
 def _migration_187_trigger_contract_valid(conn: sqlite3.Connection) -> bool:
-    """Prove every lifecycle trigger is present with its canonical SQL body."""
+    """Prove every lifecycle trigger is present with its canonical SQL body.
+
+    The canonical body is the latest applied revision: migration 187, with the
+    triggers redefined by each later revision whose version is recorded.
+    """
     expected = _migration_trigger_contract(
         MIGRATIONS_DIR / "187_project_lifecycle_control.sql"
     )
@@ -1084,6 +1103,14 @@ def _migration_187_trigger_contract_valid(conn: sqlite3.Connection) -> bool:
     }
     if not expected:
         return False
+    applied = _claimed_schema_version(conn)
+    for version, filename in _LIFECYCLE_TRIGGER_REVISIONS:
+        if applied < version:
+            break
+        revision = _migration_trigger_contract(MIGRATIONS_DIR / filename)
+        if not revision or not set(revision) <= set(expected):
+            return False
+        expected.update(revision)
     rows = conn.execute(
         "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
         "AND (name LIKE 'project_write_events_%' OR name LIKE 'project_writes_%')"
@@ -1348,10 +1375,11 @@ def _backup_database_before_migration(
     db_size = os.path.getsize(db_path)
     free = shutil.disk_usage(backup_dir).free
     if free < 2 * db_size:
-        raise RuntimeError(
+        raise MigrationBackupError(
             f"Refusing to migrate: free space in {backup_dir} ({free} B) is below 2x "
             f"the database size ({db_size} B) — a backup would fill the volume "
-            "(learning b5275327)."
+            "(learning b5275327).",
+            code="backup_space_insufficient",
         )
 
     try:
@@ -1471,6 +1499,23 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 def get_sync_connection() -> sqlite3.Connection:
     """Synchronous connection for startup migrations."""
+    tenant_id = os.environ.get("TENANT_ID", "").strip()
+    if tenant_id and os.environ.get("DEPLOY_MODE", "").strip() == "hosted-tenant":
+        # Managed hosted tenants share their read model with the dedicated
+        # control-plane account.  Establish the exact ACL before SQLite opens
+        # (and potentially recreates WAL sidecars).  OSS/Enterprise processes
+        # do not set this DEPLOY_MODE and never import the hosted-only helper.
+        try:
+            from core.hosted_control.consumer_db_acl import (
+                ensure_consumer_database_acl,
+            )
+        except ImportError as exc:
+            raise RuntimeError("hosted consumer database ACL helper unavailable") from exc
+
+        ensure_consumer_database_acl(
+            Path(settings.db_path),
+            tenant_id=tenant_id,
+        )
     conn = sqlite3.connect(settings.db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -1908,6 +1953,41 @@ class WriterLockTimeout(TimeoutError):
     """
 
 
+async def _rollback_or_quarantine_writer(writer: aiosqlite.Connection) -> bool:
+    """Run behind any queued SQLite work; never circulate a dirty connection."""
+    global _writer
+    try:
+        # Always enqueue rollback, even if in_transaction currently looks false:
+        # cancellation can leave an execute queued on aiosqlite's worker thread.
+        await writer.rollback()
+        if writer.in_transaction:
+            raise RuntimeError("Writer still has an open transaction after rollback")
+        return True
+    except BaseException:
+        if _writer is writer:
+            _writer = None
+        logger.error("Writer transaction reset failed; writer disabled", exc_info=True)
+        try:
+            await writer.close()
+        except BaseException:
+            logger.error("Failed to close disabled writer", exc_info=True)
+        return False
+
+
+async def _finish_writer_transaction(writer: aiosqlite.Connection) -> tuple[bool, bool]:
+    """Finish cleanup under the lock despite repeated cancellation of its owner."""
+    cleanup = asyncio.create_task(_rollback_or_quarantine_writer(writer))
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # Shield alone returns early on cancellation. Keep the lock until
+            # cleanup really finishes; propagate cancellation after that point.
+            cancelled = True
+    return cleanup.result(), cancelled
+
+
 @asynccontextmanager
 async def _acquire_writer(
     *, label: str | None = None, timeout: float | None = None
@@ -1952,16 +2032,17 @@ async def _acquire_writer(
     try:
         if not _writer:
             raise RuntimeError("DB not initialized — call init_pool() first")
+        writer = _writer
         try:
-            yield _writer
-        except aiosqlite.IntegrityError as exc:
-            await _writer.rollback()
+            yield writer
+        except BaseException as exc:
+            await _finish_writer_transaction(writer)
             # Migration 187 intentionally aborts the *outer* project mutation
             # from its append-only write journal.  Translate that one stable
             # SQLite reason at the shared writer boundary so HTTP's global
             # ServiceError handler and MCP's surrounding adapter both expose a
             # typed 409/tool error instead of a transport-specific 500.
-            if "project_not_writable" in str(exc):
+            if isinstance(exc, aiosqlite.IntegrityError) and "project_not_writable" in str(exc):
                 from core.api.use_cases._errors import ConflictError
 
                 raise ConflictError(
@@ -1970,7 +2051,7 @@ async def _acquire_writer(
                         "Project is archived or a lifecycle transition is active"
                     ),
                 ) from exc
-            if "project_workspace_ambiguous" in str(exc):
+            if isinstance(exc, aiosqlite.IntegrityError) and "project_workspace_ambiguous" in str(exc):
                 from core.api.use_cases._errors import ConflictError
 
                 raise ConflictError(
@@ -1978,9 +2059,12 @@ async def _acquire_writer(
                     message="Project workspace ownership is ambiguous",
                 ) from exc
             raise
-        except Exception:
-            await _writer.rollback()
-            raise
+        else:
+            healthy, cancelled = await _finish_writer_transaction(writer)
+            if cancelled:
+                raise asyncio.CancelledError
+            if not healthy:
+                raise RuntimeError("Writer transaction reset failed; writer disabled")
     finally:
         _finish_writer_hold(holder)
         _write_lock.release()
@@ -2200,11 +2284,16 @@ def run_migrations(
             # database, while the latter repairs an already-versioned one.
             # Anchor the rollback point before either path can mutate schema.
             if claimed_repairs or claimed_pending:
-                backup_path = _backup_database_before_migration(
-                    conn,
-                    claimed_version,
-                    pre_update_backup_key=pre_update_backup_key,
-                )
+                try:
+                    backup_path = _backup_database_before_migration(
+                        conn,
+                        claimed_version,
+                        pre_update_backup_key=pre_update_backup_key,
+                    )
+                except MigrationBackupError:
+                    raise
+                except Exception as exc:
+                    raise MigrationBackupError(str(exc)) from exc
                 publish_backup_ready(backup_path)
             if not claimed_repairs:
                 # Preserve the fail-closed version-table drift guard on an

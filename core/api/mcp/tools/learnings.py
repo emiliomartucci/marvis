@@ -201,11 +201,11 @@ def register(mcp) -> None:
         tags: list[str] | None = None,
         project: str | None = None,
     ) -> dict[str, Any]:
-        """Update an existing learning (operator+), then re-embed it so search/check_learnings see the new content immediately.
+        """Update an existing learning in place (operator+) and re-embed it, preserving its history.
 
-        QUANDO USARLO: il contenuto di un learning e' obsoleto/incompleto (prevention piu' precisa, severity ricalibrata, nuovo modulo) ma vuoi PRESERVARE la history. BOUNDARY: update_learning aggiorna in-place + re-embed; delete_learning cancella permanente; create_learning scrive nuovo.
-        QUANDO NON USARLO: NOT per un learning nuovo -> usa create_learning. NOT per azzerare un campo a null: da questa superficie NON e' possibile (omettere un campo lo lascia invariato, e nessun tool MCP setta null) — serve l'API HTTP PATCH /learnings/{id}, che vive fuori dai tool MCP.
-        RESTITUISCE: il learning aggiornato {id, title, category, severity, prevention, tags, module, project, updated_at} — gia' ri-embeddato (retrievable by meaning, non solo keyword)."""
+        QUANDO USARLO: prevention piu' precisa, severity ricalibrata o nuovo modulo su un learning esistente.
+        QUANDO NON USARLO: learning nuovo -> create_learning. Non azzera campi: un campo omesso resta invariato (per null serve PATCH /learnings/{id} via HTTP).
+        RESTITUISCE: il learning aggiornato {id, title, category, severity, prevention, tags, module, project, updated_at}, gia' ricercabile per significato."""
         fields = {
             k: v
             for k, v in {

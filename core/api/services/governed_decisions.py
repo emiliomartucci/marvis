@@ -1499,10 +1499,13 @@ async def _learning_body_digest(
     project_slug: str,
     learning_id: str,
 ) -> str:
+    # Migration 041 assigns legacy NULL rows to ws_default.  Keep the fallback
+    # one-way so another workspace can never adopt an unscoped learning.
     cursor = await db.execute(
         "SELECT id,title,description,prevention,project,invalid_at,superseded_by "
-        "FROM learnings WHERE id=? AND workspace_id=?",
-        (learning_id, workspace_id),
+        "FROM learnings WHERE id=? AND (workspace_id=? OR "
+        "(workspace_id IS NULL AND ?='ws_default'))",
+        (learning_id, workspace_id, workspace_id),
     )
     row = await cursor.fetchone()
     if row is None or row["project"] != project_slug:

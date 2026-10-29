@@ -42,26 +42,60 @@ class RequiredCheck:
 # not run is not the same thing as a check that failed. Without the distinction
 # the gate demands a green it can never receive, and every PR outside the API
 # surface is blocked forever — which is how this scoping came to exist.
+#
+# Must stay identical, together with the hosted-only half, to the `paths:`
+# filter in .github/workflows/openapi-diff.yml (both the pull_request and the
+# push trigger carry the same list). Hand-copying it here drifted once already
+# and silently waived a check GitHub does run, so
+# test_encoded_scope_matches_the_workflow pins the two together.
+#
+# This file ships in the public/shared projection, so it names only public
+# paths. Entries for hosted-only modules and their tests live in a hosted-only
+# module that the projection excludes, and are merged in below whenever that
+# module is importable.
+_OPENAPI_DIFF_PUBLIC_PATHS: tuple[str, ...] = (
+    "core/api/**",
+    "contracts/openapi/**",
+    "contracts/actions/**",
+    "tests/contracts/**",
+    "tests/test_ci_webhook_routing.py",
+    "tests/use_cases/test_search.py",
+    "tests/perf/**",
+    "tests/mcp/test_phase_timing.py",
+    "tests/use_cases/test_projects.py",
+    "tests/test_confidential_files.py",
+    "tests/test_mcp_teams_tools.py",
+    "tests/mcp/test_bug_report_user_acl.py",
+    "tests/mcp/test_workspace_tools_mcp.py",
+    "tests/test_workspace_grep.py",
+    "tests/test_project_lifecycle_control.py",
+    "tests/test_project_ownership_recovery.py",
+    "tests/mcp/test_admin_access_tools.py",
+    "tests/mcp/test_server_public_health.py",
+    "tests/mcp/test_tool_profiles.py",
+    "tests/test_ci_required_check_scope.py",
+    "tests/mcp/test_tool_list_budget.py",
+    "tests/mcp/test_remote_tool_identity_threading.py",
+    "tests/mcp/test_ingest_workspace_identity.py",
+    "tests/test_brain_*.py",
+    "tests/mcp/tool_list_budget.json",
+    "requirements-tenant.txt",
+    "requirements-test.txt",
+    ".github/workflows/openapi-diff.yml",
+)
+
+
+def _openapi_diff_paths() -> tuple[str, ...]:
+    try:
+        from core.hosted_control.ci_scope import OPENAPI_DIFF_PRIVATE_PATHS
+    except ImportError:
+        return _OPENAPI_DIFF_PUBLIC_PATHS
+    return _OPENAPI_DIFF_PUBLIC_PATHS + OPENAPI_DIFF_PRIVATE_PATHS
+
+
 _REQUIRED_CHECK_FLOOR: dict[str, tuple[RequiredCheck, ...]] = {
     "marvisx": (
-        RequiredCheck(
-            name="OpenAPI Diff",
-            # Must stay identical to the `paths:` filter in
-            # .github/workflows/openapi-diff.yml (both the pull_request and the
-            # push trigger carry the same list). Hand-copying it here drifted
-            # once already and silently waived a check GitHub does run, so
-            # test_encoded_scope_matches_the_workflow pins the two together.
-            paths=(
-                "core/api/**",
-                "contracts/openapi/**",
-                "contracts/actions/**",
-                "tests/contracts/**",
-                "tests/test_ci_webhook_routing.py",
-                "requirements-tenant.txt",
-                "requirements-test.txt",
-                ".github/workflows/openapi-diff.yml",
-            ),
-        ),
+        RequiredCheck(name="OpenAPI Diff", paths=_openapi_diff_paths()),
     ),
 }
 

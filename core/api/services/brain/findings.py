@@ -30,9 +30,9 @@ import hashlib
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 import aiosqlite
 
@@ -155,6 +155,114 @@ def make_proposal_fingerprint(
         f"{'|'.join(evidence_source_refs_sorted)}|{closure_condition_hash_hex}"
     ).encode("utf-8")
     return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+
+def _make_structural_finding_id(
+    *,
+    finding_type: FindingType,
+    scope_type: ScopeTypeL4,
+    scope_key: str,
+    structural_key: str,
+    closure_condition_hash_hex: str,
+) -> str:
+    """Stable BLAKE2b-16 id for AGGREGATED pattern findings (task 74f312f9).
+
+    Deviates from sub-04 §7.2 on purpose: cycle_key is EXCLUDED and evidence
+    refs are replaced by the structural group key, so the same pattern in a
+    later cycle resolves to the SAME finding_id and the existing UPDATE path
+    in _persist_findings bumps recurrence_count instead of inserting a clone.
+    A dismissed/resolved aggregated row likewise absorbs future cycles of the
+    same pattern (owner said "handled" — the digest stops re-raising it).
+    """
+    payload = (
+        f"structural|{finding_type}|{scope_type}|{scope_key}|"
+        f"{structural_key}|{closure_condition_hash_hex}"
+    ).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+
+def _structural_group_key(draft: FindingDraft) -> tuple[str, str, str, str, str]:
+    """Deterministic dedup group: same shape, same scope, same remedy.
+
+    Deliberately EXCLUDES volatile evidence refs and prose (titles embed
+    event ids) — the deterministic aggregation asked for in task 74f312f9.
+    """
+    return (
+        draft.finding_type,
+        draft.scope_type,
+        draft.scope_key,
+        draft.suggested_artifact,
+        type(draft.closure_condition).__name__,
+    )
+
+
+def _aggregate_drafts(drafts: list[FindingDraft]) -> list[FindingDraft]:
+    """Collapse same-shape rule outputs within one cycle into one draft.
+
+    Before this, N drift signals of one rule produced N near-identical
+    findings ("Decision without ADR on event:X" x10, all severity high) —
+    the digest noise observed on the 2026-10-09 spike backlog. Single-member
+    groups pass through untouched (per-evidence identity, old behaviour).
+    """
+    groups: dict[tuple[str, str, str, str, str], list[FindingDraft]] = {}
+    order: list[tuple[str, str, str, str, str]] = []
+    for d in drafts:
+        key = _structural_group_key(d)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(d)
+    merged: list[FindingDraft] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            group[0].structural_key = None
+            merged.append(group[0])
+            continue
+        first = group[0]
+        n = len(group)
+        evidence = sorted({ref for d in group for ref in d.evidence})
+        involved = sorted({p for d in group for p in d.involved_projects})
+        severity = max(
+            (d.severity for d in group),
+            key=lambda s: _SEVERITY_RANK_INT.get(s, 0),  # type: ignore[arg-type]
+        )
+        drift_refs = sum(1 for ref in evidence if ref.startswith("drift_signal:"))
+        memory_op_refs = sum(1 for ref in evidence if ref.startswith("memory_op:"))
+        label = first.finding_type.replace("_", " ")
+        title = _truncate(
+            f"{label} — {n} occurrences this cycle ({first.scope_key})",
+            limit=200,
+        )
+        summary = _truncate(
+            first.summary
+            + f" Deterministically aggregated with {n - 1} further occurrence(s)"
+            + f" of the same pattern this cycle; evidence carries all"
+            + f" {len(evidence)} ref(s).",
+            limit=2000,
+        )
+        why_now = _truncate(
+            f"{n} occurrences of the same pattern fired this cycle.",
+            limit=500,
+        )
+        merged.append(
+            replace(
+                first,
+                title=title,
+                summary=summary,
+                why_now=why_now,
+                evidence=evidence,
+                involved_projects=involved,
+                severity=severity,
+                confidence=_derive_confidence(
+                    drift_refs=drift_refs,
+                    memory_op_refs=memory_op_refs,
+                    recurrence_count=1,
+                ),
+                structural_key="|".join(key),
+            )
+        )
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +393,10 @@ async def build_snapshot(
             await db.execute(
                 "SELECT event_id, cycle_key, event_type, source_system, source_project,"
                 " target_project, program_key, source_ref, title, summary, observed_at,"
-                " evidence_json FROM brain_digest_events WHERE run_id = ?",
+                " evidence_json FROM brain_digest_events WHERE run_id IN ("
+            "SELECT r.run_id FROM brain_runs r JOIN brain_runs selected "
+            "ON selected.workspace_id=r.workspace_id AND selected.cycle_key=r.cycle_key "
+            "WHERE selected.run_id=?)",
                 (run_id,),
             )
         ).fetchall()
@@ -422,6 +533,12 @@ class FindingDraft:
     involved_projects: list[str] = field(default_factory=list)
     owner_hint: OwnerHint | None = None
     closure_condition_human: str | None = None
+    authored_by_agent: str | None = None
+    # Task 74f312f9: set when this draft is an aggregated pattern (N same-shape
+    # rule outputs in one cycle). Aggregated drafts take a STRUCTURAL identity —
+    # stable across cycles, without volatile evidence refs — so the existing
+    # recurrence UPDATE path in _persist_findings can fire cycle over cycle.
+    structural_key: str | None = None
 
 
 def _derive_confidence(
@@ -467,21 +584,34 @@ async def finalize_finding(
     evidence_sorted = sorted(set(draft.evidence))
     ev_hash = evidence_hash(evidence_sorted)
     cc_hash = _closure_condition_hash(draft.closure_condition)
-    finding_id = make_finding_id(
-        cycle_key=cycle_key,
-        finding_type=draft.finding_type,
-        scope_type=draft.scope_type,
-        scope_key=draft.scope_key,
-        evidence_source_refs_sorted=evidence_sorted,
-        closure_condition_hash_hex=cc_hash,
-    )
-    proposal_fp = make_proposal_fingerprint(
-        finding_type=draft.finding_type,
-        scope_type=draft.scope_type,
-        scope_key=draft.scope_key,
-        evidence_source_refs_sorted=evidence_sorted,
-        closure_condition_hash_hex=cc_hash,
-    )
+    if draft.structural_key is not None:
+        # Aggregated pattern (task 74f312f9): identity WITHOUT cycle_key and
+        # WITHOUT volatile evidence refs, so the next cycle's aggregate of the
+        # same pattern resolves to this same finding_id (recurrence path).
+        finding_id = _make_structural_finding_id(
+            finding_type=draft.finding_type,
+            scope_type=draft.scope_type,
+            scope_key=draft.scope_key,
+            structural_key=draft.structural_key,
+            closure_condition_hash_hex=cc_hash,
+        )
+        proposal_fp = finding_id  # same natural key, same fingerprint semantics
+    else:
+        finding_id = make_finding_id(
+            cycle_key=cycle_key,
+            finding_type=draft.finding_type,
+            scope_type=draft.scope_type,
+            scope_key=draft.scope_key,
+            evidence_source_refs_sorted=evidence_sorted,
+            closure_condition_hash_hex=cc_hash,
+        )
+        proposal_fp = make_proposal_fingerprint(
+            finding_type=draft.finding_type,
+            scope_type=draft.scope_type,
+            scope_key=draft.scope_key,
+            evidence_source_refs_sorted=evidence_sorted,
+            closure_condition_hash_hex=cc_hash,
+        )
 
     owner_hint = draft.owner_hint
     if owner_hint is None:
@@ -494,6 +624,7 @@ async def finalize_finding(
 
     return Finding(
         finding_id=finding_id,
+        authored_by_agent=draft.authored_by_agent,
         run_id=run_id,
         cycle_key=cycle_key,
         detected_at=now.astimezone(timezone.utc),
@@ -950,30 +1081,33 @@ def _serialize_closure(closure: ClosureCondition) -> tuple[str, str]:
     raise TypeError(f"closure must be a Pydantic model, got {type(closure)!r}")
 
 
+_EVIDENCE_KINDS = {
+    "event": "digest_event",
+    "digest_event": "digest_event",
+    "drift": "drift_signal",
+    "drift_signal": "drift_signal",
+    "journal": "journal_entry",
+    "journal_entry": "journal_entry",
+    "memory_op": "memory_op",
+    "handoff": "handoff",
+    "learning": "learning",
+    "kg": "kg_node",
+    "kg_node": "kg_node",
+    "audit": "audit_log",
+    "audit_log": "audit_log",
+    "task": "task",
+    "pr": "pr",
+    "commit": "commit",
+}
+
+
 def _evidence_kind_for(ref: str) -> tuple[str, str]:
     if ":" in ref:
         prefix, rest = ref.split(":", 1)
     else:
         prefix, rest = "kg_node", ref
-    mapping = {
-        "event": "digest_event",
-        "digest_event": "digest_event",
-        "drift": "drift_signal",
-        "drift_signal": "drift_signal",
-        "journal": "journal_entry",
-        "journal_entry": "journal_entry",
-        "memory_op": "memory_op",
-        "handoff": "handoff",
-        "learning": "learning",
-        "kg": "kg_node",
-        "kg_node": "kg_node",
-        "audit": "audit_log",
-        "audit_log": "audit_log",
-        "task": "task",
-        "pr": "pr",
-        "commit": "commit",
-    }
-    return (mapping.get(prefix, "kg_node"), rest)
+
+    return (_EVIDENCE_KINDS.get(prefix, "kg_node"), rest)
 
 
 async def _fetch_existing_finding(
@@ -989,13 +1123,16 @@ async def _fetch_existing_finding(
 
 
 async def _persist_findings(
-    *, run_id: str, findings: list[Finding]
+    *, run_id: str, findings: list[Finding],
+    prewrite_validate: Callable[[aiosqlite.Connection], Awaitable[None]] | None = None,
 ) -> tuple[int, list[str]]:
     if not findings:
         return (0, [])
     persisted = 0
     fingerprints: list[str] = []
     async with write_db() as db:
+        if prewrite_validate is not None:
+            await prewrite_validate(db)
         for f in findings:
             existing = await _fetch_existing_finding(db, f.finding_id)
             closure_kind, closure_json = _serialize_closure(f.closure_condition)
@@ -1009,6 +1146,42 @@ async def _persist_findings(
                         " WHERE finding_id = ?",
                         (f.cycle_key, f.finding_id),
                     )
+                    # Task 74f312f9: on the recurrence path, attach any NEW
+                    # evidence refs of this cycle to the existing row so an
+                    # aggregated pattern keeps accumulating its occurrences.
+                    next_pos = await (
+                        await db.execute(
+                            "SELECT COALESCE(MAX(position) + 1, 0)"
+                            " FROM brain_finding_evidence WHERE finding_id = ?",
+                            (f.finding_id,),
+                        )
+                    ).fetchone()
+                    pos = next_pos[0] if not hasattr(next_pos, "keys") else next_pos[0]
+                    # The PK is (finding_id, position), so INSERT OR IGNORE
+                    # alone never skips a ref that is already attached.
+                    known = {
+                        (r[0], r[1])
+                        for r in await (
+                            await db.execute(
+                                "SELECT evidence_kind, evidence_ref"
+                                " FROM brain_finding_evidence WHERE finding_id = ?",
+                                (f.finding_id,),
+                            )
+                        ).fetchall()
+                    }
+                    for ev in f.evidence:
+                        kind, ref = _evidence_kind_for(ev)
+                        if (kind, ref) in known:
+                            continue
+                        known.add((kind, ref))
+                        await db.execute(
+                            "INSERT OR IGNORE INTO brain_finding_evidence ("
+                            " finding_id, position, evidence_kind, evidence_ref,"
+                            " weight, cycle_key"
+                            ") VALUES (?, ?, ?, ?, 1.0, ?)",
+                            (f.finding_id, pos, kind, ref, f.cycle_key),
+                        )
+                        pos += 1
                 continue
             await db.execute(
                 "INSERT INTO brain_findings ("
@@ -1019,9 +1192,9 @@ async def _persist_findings(
                 " closure_condition_json, closure_condition_human,"
                 " severity, confidence, approval_state, regression_of_finding_id,"
                 " proposal_fingerprint, recurrence_count, first_seen_cycle_key,"
-                " last_seen_cycle_key, expires_at"
+                " last_seen_cycle_key, expires_at, authored_by_agent"
                 ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                " ?, ?, 'open', ?, ?, ?, ?, ?, ?)",
+                " ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     f.finding_id,
                     f.run_id,
@@ -1050,6 +1223,7 @@ async def _persist_findings(
                     f.first_seen_cycle_key,
                     f.last_seen_cycle_key,
                     _utc_iso(f.expires_at),
+                    f.authored_by_agent,
                 ),
             )
             await db.execute(
@@ -1144,6 +1318,7 @@ async def run_phase(
 
     all_findings: list[Finding] = []
     partial_failures: list[dict[str, str]] = []
+    all_drafts: list[FindingDraft] = []
 
     for rule_id, builder in REGISTERED_RULES:
         try:
@@ -1174,11 +1349,16 @@ async def run_phase(
                 }
             )
             continue
-        for draft in drafts:
-            finding = await finalize_finding(
-                draft=draft, run_id=run_id, cycle_key=cycle_key, now=now,
-            )
-            all_findings.append(finding)
+        all_drafts.extend(drafts)
+
+    # Task 74f312f9: deterministic dedup BEFORE finalize — same-shape rule
+    # outputs within this cycle collapse into one aggregated finding instead
+    # of N near-identical clones flooding the owner triage queue.
+    for draft in _aggregate_drafts(all_drafts):
+        finding = await finalize_finding(
+            draft=draft, run_id=run_id, cycle_key=cycle_key, now=now,
+        )
+        all_findings.append(finding)
 
     persisted, fingerprints = await _persist_findings(
         run_id=run_id, findings=all_findings

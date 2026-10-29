@@ -155,14 +155,15 @@ async def ack_notification(
     db: aiosqlite.Connection,
     *,
     effective_user_id: str | None,
+    visible_projects: set[str] | None,
     notification_id: str | None = None,
     target_id: str | None = None,
 ) -> dict:
     """Mark the caller's notification(s) as read (dismiss). Returns ``{acked: n}``.
 
     Exactly one of ``notification_id`` or ``target_id`` must be given. Only the
-    caller's OWN unread rows are touched (``user_id = ?``), so acking another
-    user's id/target is a silent no-op (``acked: 0``), never a cross-user write.
+    caller's own, currently visible unread rows are touched, so a revoked
+    project cannot be acknowledged or probed through the returned count.
     Sets ``read_at`` only — the notice counter (F4) keys on ``read_at IS NULL``, so
     an ack makes the notice disappear; ``acted_at`` (the task_pending badge axis)
     is left untouched.
@@ -178,19 +179,21 @@ async def ack_notification(
         )
 
     now = _now()
+    visibility_clause, visibility_params = _visibility_clause(visible_projects)
+    visibility_sql = f" AND {visibility_clause}" if visibility_clause else ""
     if notification_id:
         cur = await db.execute(
             "UPDATE notifications SET read_at = ? "
             "WHERE id = ? AND user_id = ? AND workspace_id = ? "
-            "AND read_at IS NULL",
-            (now, notification_id, effective_user_id, workspace_id),
+            f"AND read_at IS NULL{visibility_sql}",
+            (now, notification_id, effective_user_id, workspace_id, *visibility_params),
         )
     else:
         cur = await db.execute(
             "UPDATE notifications SET read_at = ? "
             "WHERE user_id = ? AND workspace_id = ? AND target_id = ? "
-            "AND read_at IS NULL",
-            (now, effective_user_id, workspace_id, target_id),
+            f"AND read_at IS NULL{visibility_sql}",
+            (now, effective_user_id, workspace_id, target_id, *visibility_params),
         )
     await db.commit()
     return {"acked": cur.rowcount or 0}
@@ -275,6 +278,7 @@ async def mark_notification(
     db: aiosqlite.Connection,
     *,
     effective_user_id: str | None,
+    visible_projects: set[str] | None,
     notification_id: str,
     acted: bool = False,
 ) -> dict[str, bool]:
@@ -286,17 +290,19 @@ async def mark_notification(
         )
     workspace_id = await _require_effective_user(ctx, db, effective_user_id)
     now = _now()
+    visibility_clause, visibility_params = _visibility_clause(visible_projects)
+    visibility_sql = f" AND {visibility_clause}" if visibility_clause else ""
     if acted:
         cursor = await db.execute(
             "UPDATE notifications SET acted_at = ?, read_at = COALESCE(read_at, ?) "
-            "WHERE id = ? AND user_id = ? AND workspace_id = ?",
-            (now, now, notification_id, effective_user_id, workspace_id),
+            f"WHERE id = ? AND user_id = ? AND workspace_id = ?{visibility_sql}",
+            (now, now, notification_id, effective_user_id, workspace_id, *visibility_params),
         )
     else:
         cursor = await db.execute(
             "UPDATE notifications SET read_at = COALESCE(read_at, ?) "
-            "WHERE id = ? AND user_id = ? AND workspace_id = ?",
-            (now, notification_id, effective_user_id, workspace_id),
+            f"WHERE id = ? AND user_id = ? AND workspace_id = ?{visibility_sql}",
+            (now, notification_id, effective_user_id, workspace_id, *visibility_params),
         )
     if cursor.rowcount != 1:
         await db.rollback()
@@ -310,16 +316,19 @@ async def mark_all_read(
     db: aiosqlite.Connection,
     *,
     effective_user_id: str | None,
+    visible_projects: set[str] | None,
 ) -> dict[str, bool]:
-    """Mark only the caller's exact-workspace unread rows."""
+    """Mark only the caller's exact-workspace, currently visible unread rows."""
     require_role_ctx(ctx, "viewer", "operator", "admin", "super_admin")
     if not effective_user_id:
         return {"ok": True}
     workspace_id = await _require_effective_user(ctx, db, effective_user_id)
+    visibility_clause, visibility_params = _visibility_clause(visible_projects)
+    visibility_sql = f" AND {visibility_clause}" if visibility_clause else ""
     await db.execute(
         "UPDATE notifications SET read_at = ? "
-        "WHERE user_id = ? AND workspace_id = ? AND read_at IS NULL",
-        (_now(), effective_user_id, workspace_id),
+        f"WHERE user_id = ? AND workspace_id = ? AND read_at IS NULL{visibility_sql}",
+        (_now(), effective_user_id, workspace_id, *visibility_params),
     )
     await db.commit()
     return {"ok": True}

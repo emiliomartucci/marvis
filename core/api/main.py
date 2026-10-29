@@ -24,7 +24,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from core.api.config import settings
 from core.api.db import cleanup_expired_blacklist, cleanup_expired_tickets, run_migrations
 from core.api.security import is_local_single_user_mode, is_loopback_request
-from core.api.ui_static import apply_ui_response_headers, mount_ui
+from core.api.ui_static import (
+    apply_ui_response_headers,
+    mount_ui,
+    retired_ui_redirect,
+)
 from core.api.use_cases._errors import ServiceError
 from core.api.routers import auth, sessions
 from core.api.routers.comments import router as comments_router
@@ -93,6 +97,10 @@ try:
     from core.api.routers.account import router as hosted_account_router
 except ImportError:  # Hosted control-plane account module, absent in public projection
     hosted_account_router = None
+try:
+    from core.hosted_control.routers.consumer_runtime import router as consumer_runtime_router
+except ImportError:  # Hosted consumer relay, absent in public projection
+    consumer_runtime_router = None
 from core.api.routers.terminal import router as terminal_metrics_router
 from core.api.routers.brain import router as brain_router
 from core.api.routers.brain_directions import router as brain_directions_router
@@ -1087,6 +1095,10 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to apply settings.yaml runtime settings")
 
+    from core.api.services.jev import check_provider_configuration
+
+    check_provider_configuration()
+
     # OSS local tier: auto-provision the BYOK encryption secret so the Console
     # "Add provider key" flow works out-of-the-box (gh #36). crypto.py is
     # fail-closed on a missing BYOK_FERNET_SECRET (provider-key save → 503), and
@@ -1376,6 +1388,10 @@ async def lifespan(app: FastAPI):
     await metrics_collector.stop()
     await security_collector.stop()
 
+    from core.api.services.jev import close_provider
+
+    await close_provider()
+
     # Close connection pool
     from core.api.db import close_pool
 
@@ -1432,7 +1448,8 @@ app.add_middleware(MCPToolCallAuditMiddleware)
 @app.middleware("http")
 async def security_headers(request: Request, call_next) -> Response:
     """Add security headers to all responses."""
-    if is_local_single_user_mode() and not is_loopback_request(request):
+    response = retired_ui_redirect(request)
+    if response is None and is_local_single_user_mode() and not is_loopback_request(request):
         return JSONResponse(
             status_code=403,
             content={
@@ -1444,7 +1461,8 @@ async def security_headers(request: Request, call_next) -> Response:
             },
         )
 
-    response = await call_next(request)
+    if response is None:
+        response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
@@ -1498,6 +1516,8 @@ app.include_router(onboarding_router)
 app.include_router(push_router)
 app.include_router(ci_checks_router)
 app.include_router(search_router)
+if consumer_runtime_router is not None:
+    app.include_router(consumer_runtime_router)
 app.include_router(documents_router)
 app.include_router(docs_coverage_router)
 app.include_router(docs_governance_router)

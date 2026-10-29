@@ -209,9 +209,9 @@ async def assign_team_project(
             _ctx(current_user),
             team=team_id,
             project=body.project,
-            role=body.role,
-            clearance=body.clearance,
-            is_public=body.is_public,
+            role=body.role if "role" in body.model_fields_set else None,
+            clearance=body.clearance if "clearance" in body.model_fields_set else None,
+            is_public=body.is_public if "is_public" in body.model_fields_set else None,
         )
         await invalidate_visibility_cache_for_team(result["team_id"], db)
         return result

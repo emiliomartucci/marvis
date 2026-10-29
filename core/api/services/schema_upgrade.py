@@ -51,6 +51,8 @@ class SchemaUpgradeReceipt:
     fresh_database: bool
     backup_identity: str | None = None
     backup_sha256: str | None = None
+    failure_stage: str | None = None
+    failure_code: str | None = None
 
 
 def _now() -> str:
@@ -316,6 +318,8 @@ def _read_receipt(path: Path) -> SchemaUpgradeReceipt:
                 if payload.get("backup_sha256") is not None
                 else None
             ),
+            failure_stage=payload.get("failure_stage"),
+            failure_code=payload.get("failure_code"),
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise SchemaUpgradeError("receipt_invalid") from exc
@@ -335,6 +339,20 @@ def _read_receipt(path: Path) -> SchemaUpgradeReceipt:
             and re.fullmatch(r"[0-9a-f]{64}", receipt.backup_sha256) is None
         )
         or (receipt.backup_path is None) != (receipt.backup_identity is None)
+        or receipt.failure_stage not in (None, "backup")
+        or receipt.failure_code not in (None, "backup_failed", "backup_space_insufficient")
+        or (receipt.failure_stage is None) != (receipt.failure_code is None)
+        or (
+            receipt.failure_stage == "backup"
+            and (
+                receipt.status not in {"failed", "rolled_back"}
+                or receipt.backup_sha256 is not None
+                or receipt.applied_versions
+                or receipt.repaired_versions
+                or receipt.final_version != receipt.initial_version
+                or receipt.fresh_database
+            )
+        )
     ):
         raise SchemaUpgradeError("receipt_invalid")
     return receipt
@@ -451,7 +469,7 @@ def _run_controlled_upgrade_locked(
             raise SchemaUpgradeError("migration_backup_mismatch")
         if (result.backup_path is None) != (running.backup_sha256 is None):
             raise SchemaUpgradeError("migration_backup_not_anchored")
-    except Exception:
+    except Exception as exc:
         try:
             observed, _fresh = _schema_state(database_path)
         except SchemaUpgradeError:
@@ -459,6 +477,7 @@ def _run_controlled_upgrade_locked(
         backup_sha256 = running.backup_sha256
         if (
             backup_sha256 is None
+            and not isinstance(exc, db_mod.MigrationBackupError)
             and backup_path is not None
             and os.path.lexists(backup_path)
         ):
@@ -473,6 +492,14 @@ def _run_controlled_upgrade_locked(
                 "completed_at": _now(),
                 "final_version": observed,
                 "backup_sha256": backup_sha256,
+                # Only the typed pre-write boundary can prove no mutation.
+                # A missing backup on an older/unknown failure is not proof.
+                "failure_stage": (
+                    "backup" if isinstance(exc, db_mod.MigrationBackupError) else None
+                ),
+                "failure_code": (
+                    exc.code if isinstance(exc, db_mod.MigrationBackupError) else None
+                ),
             }
         )
         _write_receipt(receipt_path, failed)
@@ -594,9 +621,9 @@ def restore_controlled_upgrade(
                 raise SchemaUpgradeError("rollback_receipt_database_mismatch")
             return receipt
         if (
-            receipt.status == "succeeded"
+            (receipt.status == "succeeded" or receipt.failure_stage == "backup")
             and not receipt.fresh_database
-            and receipt.backup_path is None
+            and (receipt.backup_path is None or receipt.failure_stage == "backup")
             and receipt.final_version == receipt.initial_version
             and not receipt.applied_versions
             and not receipt.repaired_versions

@@ -66,6 +66,7 @@ DECISION (request models stay in the router). The router-defined Pydantic reques
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -325,6 +326,12 @@ async def patch_drift_signal(
 ) -> "DriftSignal":
     """Drift lifecycle action (operator+). Raises :class:`NotFoundError` if absent."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    if _enterprise_brain_strict():
+        signal = await get_drift_signal(ctx, signal_id=signal_id, user=user)
+        await _authorize_brain_write_scope(
+            user, scope_type=signal.scope_type, scope_key=signal.scope_key,
+            involved_projects=signal.involved_projects,
+        )
     from core.api.services.brain.drift_router import apply_drift_patch
     from core.api.use_cases._errors import NotFoundError
 
@@ -427,6 +434,12 @@ async def patch_memory_operation(
     forward-only conflict, or :class:`NotFoundError` if the op is absent.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    if _enterprise_brain_strict():
+        operation = await get_memory_operation(ctx, operation_id=operation_id, user=user)
+        await _authorize_brain_write_scope(
+            user, scope_type=operation.scope_type, scope_key=operation.scope_key,
+            involved_projects=operation.involved_projects,
+        )
     from core.api.services.brain.memory_ops import (
         LifecycleConflict,
         apply_lifecycle_patch,
@@ -620,6 +633,14 @@ async def patch_finding(
     :class:`NotFoundError` if absent.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    if _enterprise_brain_strict():
+        finding = await _get_finding_for_enterprise_write(
+            ctx, finding_id=finding_id, user=user
+        )
+        await _authorize_brain_write_scope(
+            user, scope_type=finding.scope_type, scope_key=finding.scope_key,
+            involved_projects=finding.involved_projects,
+        )
     from core.api.services.brain.findings_reader import (
         FindingValidationError,
         LifecycleConflict,
@@ -676,6 +697,16 @@ async def bulk_patch_findings(
     conflict, 404 when an id is missing/invisible, 422 on other validation.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    if _enterprise_brain_strict():
+        # Authorize the whole batch before the service starts its lifecycle write.
+        for finding_id in finding_ids:
+            finding = await _get_finding_for_enterprise_write(
+                ctx, finding_id=finding_id, user=user
+            )
+            await _authorize_brain_write_scope(
+                user, scope_type=finding.scope_type, scope_key=finding.scope_key,
+                involved_projects=finding.involved_projects,
+            )
     from core.api.services.brain.findings_reader import (
         BULK_PATCH_MAX,
         FindingValidationError,
@@ -820,20 +851,21 @@ async def list_journal(
     # ``list_entries_for_cycle`` has no visibility param — so filter here. A
     # non-admin caller sees ONLY project-scoped entries for projects they can
     # see; the company/program aggregate narrative stays admin-only (mirrors the
-    # write gate). ``user is None`` (admin/bearer/local) keeps the full set.
-    if user is not None:
+    # write gate). Preserve the authenticated context's local provenance;
+    # a remote username or absent legacy UserInfo never grants visibility.
+    if not ctx.is_local_os_account:
         from core.api.db import acquire_db
-        from core.api.visibility import get_visible_projects
+        from core.api.services.access_grants import visible_projects_for_actor
 
         async with acquire_db() as _vis_db:
-            visible = await get_visible_projects(
-                _vis_db, user, ctx.workspace_id or "ws_default"
-            )
+            visible = await visible_projects_for_actor(_vis_db, ctx)
         if visible is not None:
             entries = [
                 e
                 for e in entries
-                if e.scope_type == "project" and e.scope_key in visible
+                if (e.scope_type == "project" and e.scope_key in visible)
+                or (ctx.system_role in {"admin", "super_admin"}
+                    and e.scope_type in {"company", "program"})
             ]
     resolved_cycle = entries[0].cycle_key if entries else (
         cycle_key if cycle_key not in (None, "latest") else None
@@ -849,6 +881,26 @@ async def list_journal(
     )
 
 
+def _enterprise_brain_strict() -> bool:
+    return os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1"
+
+
+async def _get_finding_for_enterprise_write(
+    ctx: CallerContext, *, finding_id: str, user: "UserInfo | None"
+) -> "Finding":
+    """Read the raw finding for authorization without scheduling LLM polish."""
+    from core.api.services.brain.findings_reader import fetch_single_finding
+    from core.api.use_cases._errors import NotFoundError
+
+    finding = await fetch_single_finding(
+        finding_id=finding_id, user=user,
+        workspace_id=ctx.workspace_id or "ws_default",
+    )
+    if finding is None:
+        raise NotFoundError(code="not_found", message="Not found")
+    return finding
+
+
 async def _authorize_brain_write_scope(
     user: "UserInfo | None",
     *,
@@ -856,18 +908,18 @@ async def _authorize_brain_write_scope(
     scope_key: str,
     involved_projects: list[str] | None = None,
 ) -> None:
-    """Gate an agent-native brain write by the caller's project visibility.
+    """Gate Brain writes by project visibility and Enterprise edit permission.
 
     Brain RBAC fix (2026-07-03 plan Cross-Review §1): the agent-native writes
     (``write_journal_narrative`` / ``write_finding``) previously performed no
     scope check — any authenticated caller could write the narrative of company
     or of projects that are not theirs, later read by everyone's LLMs. Gate:
 
-    - ``user is None`` (admin / super_admin / static bearer / local single-user)
-      -> unrestricted, unchanged.
+    - ``user is None`` (legacy admin / local single-user) -> unrestricted.
     - non-admin caller: ``company`` / ``program`` scope is admin-only; ``project``
       (and each ``involved_projects`` entry, and an ``artifact`` scope's declared
       projects) must be inside the caller's visible set.
+    - Enterprise strict mode also requires an edit grant on every target project.
 
     Raises :class:`AuthorizationError` (403) when the scope is not permitted.
     """
@@ -880,13 +932,20 @@ async def _authorize_brain_write_scope(
     async with acquire_db() as _vis_db:
         visible = await get_visible_projects(_vis_db, user)
     if visible is None:
-        # admin / super_admin / agent-bypass resolve unrestricted downstream.
+        if _enterprise_brain_strict():
+            raise AuthorizationError(
+                code="forbidden_brain_scope",
+                message="brain write scope requires explicit project access",
+            )
+        # Local single-user and legacy agent bypass remain unrestricted.
         return
     if scope_type in ("company", "program"):
-        raise AuthorizationError(
-            code="forbidden_brain_scope",
-            message="company/program brain writes are admin-only",
-        )
+        if user.system_role not in ("admin", "super_admin"):
+            raise AuthorizationError(
+                code="forbidden_brain_scope",
+                message="company/program brain writes are admin-only",
+            )
+        return
     targets: set[str] = set()
     if scope_type == "project":
         targets.add(scope_key)
@@ -906,6 +965,17 @@ async def _authorize_brain_write_scope(
             code="forbidden_brain_scope",
             message="brain write scope not visible to caller",
         )
+    if _enterprise_brain_strict():
+        from core.api.services import access_grants
+
+        actor = access_grants.actor_from_user_info(user)
+        async with acquire_db() as _grant_db:
+            for project in targets:
+                if not await access_grants.can_write_project(_grant_db, actor, project):
+                    raise AuthorizationError(
+                        code="forbidden_brain_scope",
+                        message="brain write scope requires edit access",
+                    )
 
 
 async def write_journal_narrative(
@@ -958,13 +1028,13 @@ async def get_brain_staleness(
 ) -> dict[str, Any]:
     """Agent-native: freshness of the agent synthesis vs the mechanical cycle.
 
-    Mechanical (no LLM). ``last_synthesis_at`` = last agent write; ``last_cycle_key``
-    = last mechanical cycle. An agent reads this on connect to decide whether to
-    re-synthesize before answering.
+    Returns a conservative journal watermark for visible scopes, the last
+    mechanical cycle and an advisory judgment of the accumulated delta.
+    The caller decides whether to synthesize; no work is dispatched.
     """
     from core.api.services.brain.agent_synthesis import get_staleness
 
-    return await get_staleness(workspace_id=ctx.workspace_id or "ws_default")
+    return await get_staleness(workspace_id=ctx.workspace_id or "ws_default", caller_ctx=ctx)
 
 
 async def write_finding(
@@ -982,6 +1052,7 @@ async def write_finding(
     program_key: str | None = None,
     involved_projects: list[str] | None = None,
     closure_instruction: str | None = None,
+    evidence_refs: list[str] | None = None,
     user: "UserInfo | None" = None,
 ) -> dict[str, Any]:
     """Agent-native: persist an agent-authored finding into the Triage queue.
@@ -994,11 +1065,15 @@ async def write_finding(
     with a reason when there is no run to attach to or the content dedups.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    effective_projects = list(dict.fromkeys(
+        ([scope_key] if scope_type == "project" else [])
+        + list(involved_projects or [])
+    ))
     await _authorize_brain_write_scope(
         user,
         scope_type=scope_type,
         scope_key=scope_key,
-        involved_projects=involved_projects,
+        involved_projects=effective_projects,
     )
     from core.api.services.brain.agent_synthesis import persist_agent_finding
 
@@ -1013,11 +1088,19 @@ async def write_finding(
         confidence=confidence,
         suggested_artifact=suggested_artifact,
         program_key=program_key,
-        involved_projects=involved_projects,
+        involved_projects=effective_projects,
         closure_instruction=closure_instruction,
+        evidence_refs=evidence_refs,
         agent_by=(ctx.user_id or ctx.username or "agent"),
         workspace_id=ctx.workspace_id or "ws_default",
+        caller_ctx=ctx,
     )
+
+
+def _run_for_caller(ctx: CallerContext, run: "BrainRun") -> "BrainRun":
+    if _enterprise_brain_strict() and ctx.system_role not in ("admin", "super_admin"):
+        return run.model_copy(update={"partial_failures": [], "error_summary": None})
+    return run
 
 
 async def list_brain_runs(
@@ -1035,7 +1118,7 @@ async def list_brain_runs(
     succeeded, non-superseded cycle."""
     from core.api.services.brain.runs_reader import list_runs
 
-    return await list_runs(
+    response = await list_runs(
         cycle_key=cycle_key,
         status=status,
         trigger=trigger,
@@ -1044,6 +1127,9 @@ async def list_brain_runs(
         limit=limit,
         workspace_id=ctx.workspace_id or "ws_default",
     )
+    return response.model_copy(update={
+        "items": [_run_for_caller(ctx, run) for run in response.items]
+    })
 
 
 async def trigger_brain_run(
@@ -1099,7 +1185,7 @@ async def get_brain_run(
     )
     if result is None:
         raise NotFoundError(code="not_found", message="Not found")
-    return result
+    return _run_for_caller(ctx, result)
 
 
 async def discard_brain_run(
@@ -1116,9 +1202,9 @@ async def discard_brain_run(
     from core.api.services.brain.runs_reader import DiscardError, discard_run
 
     try:
-        return await discard_run(
+        return _run_for_caller(ctx, await discard_run(
             run_id=run_id, workspace_id=ctx.workspace_id or "ws_default"
-        )
+        ))
     except DiscardError as exc:
         status_code = 404 if exc.kind == "not_found" else 422
         raise BrainDetailError(
@@ -1143,9 +1229,9 @@ async def promote_brain_run(
     from core.api.services.brain.runs_reader import PromoteError, promote_run
 
     try:
-        return await promote_run(
+        return _run_for_caller(ctx, await promote_run(
             run_id=run_id, workspace_id=ctx.workspace_id or "ws_default"
-        )
+        ))
     except PromoteError as exc:
         status_code = 404 if exc.kind == "not_found" else 422
         raise BrainDetailError(

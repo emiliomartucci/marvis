@@ -14,6 +14,7 @@ from typing import Any
 import aiosqlite
 
 from core.api.db import acquire_db
+from core.api.services.brain.run_selection import latest_readable_run
 from core.api.models import UserInfo
 from core.api.models.brain import (
     DigestEvent,
@@ -22,6 +23,7 @@ from core.api.models.brain import (
     EventType,
 )
 from core.api.visibility import get_visible_projects
+from core.api.services.brain.visibility_policy import enterprise_strict
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +59,7 @@ def _is_visible(
         return True
     projects = {p for p in (source_project, target_project) if p}
     if not projects:
-        return True
+        return not enterprise_strict()
     return projects.issubset(visible)
 
 
@@ -71,8 +73,8 @@ async def _resolve_run(
     if run_id:
         row = await (
             await db.execute(
-                "SELECT run_id, cycle_key FROM brain_runs WHERE run_id = ?",
-                (run_id,),
+                "SELECT run_id, cycle_key FROM brain_runs WHERE run_id = ? AND workspace_id = ?",
+                (run_id, workspace_id),
             )
         ).fetchone()
         if row is None:
@@ -80,18 +82,7 @@ async def _resolve_run(
         return {"run_id": row[0], "cycle_key": row[1]}
 
     if not cycle_key or cycle_key == "latest":
-        row = await (
-            await db.execute(
-                "SELECT run_id, cycle_key FROM brain_runs "
-                "WHERE workspace_id = ? AND status IN ('succeeded', 'partial') "
-                "AND superseded_by_run_id IS NULL "
-                "ORDER BY cycle_key DESC, started_at DESC LIMIT 1",
-                (workspace_id,),
-            )
-        ).fetchone()
-        if row is None:
-            return None
-        return {"run_id": row[0], "cycle_key": row[1]}
+        return await latest_readable_run(db, workspace_id=workspace_id)
 
     row = await (
         await db.execute(
@@ -133,7 +124,11 @@ async def list_events_for_cycle(
 
         visible = await get_visible_projects(db, user, workspace_id) if user else None
 
-        where = ["e.run_id = ?"]
+        where = ["e.run_id = ?" if run_id else (
+            "e.run_id IN (SELECT r.run_id FROM brain_runs r JOIN brain_runs selected "
+            "ON selected.workspace_id=r.workspace_id AND selected.cycle_key=r.cycle_key "
+            "WHERE selected.run_id=?)"
+        )]
         params: list[Any] = [run["run_id"]]
 
         if event_type:
@@ -144,6 +139,19 @@ async def list_events_for_cycle(
         if source_project:
             where.append("(e.source_project = ? OR e.target_project = ?)")
             params.extend([source_project, source_project])
+
+        if enterprise_strict() and visible is not None:
+            # A workspace event with no project attribution may describe
+            # hidden projects; scoped callers see only fully visible events.
+            where.append("(e.source_project IS NOT NULL OR e.target_project IS NOT NULL)")
+            if not visible:
+                where.append("0")
+            else:
+                placeholders = ",".join("?" for _ in visible)
+                where.append(f"(e.source_project IS NULL OR e.source_project IN ({placeholders}))")
+                params.extend(sorted(visible))
+                where.append(f"(e.target_project IS NULL OR e.target_project IN ({placeholders}))")
+                params.extend(sorted(visible))
 
         if cursor:
             decoded = _decode_cursor(cursor)
@@ -175,6 +183,8 @@ async def list_events_for_cycle(
 
     for row in page_rows:
         if not _is_visible(visible, row["source_project"], row["target_project"]):
+            if enterprise_strict():
+                continue
             redacted_count += 1
             items.append(
                 DigestEventRedacted(

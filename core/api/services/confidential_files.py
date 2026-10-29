@@ -34,7 +34,10 @@ def canonical_file_key(path: str) -> tuple[str, str] | None:
     includes the slug. Returns None for paths outside a project (repos/, root
     files) — those are git/system surfaces, out of the F4 perimeter (D5).
     """
-    pure = PurePosixPath((path or "").strip().strip("/"))
+    raw = (path or "").strip().strip("/")
+    if "\x00" in raw or "\\" in raw or ".." in raw.split("/"):
+        return None
+    pure = PurePosixPath(raw)
     parts = pure.parts
     if not parts:
         return None
@@ -222,9 +225,14 @@ async def _audit_external_failure(
 
 
 def _resolve_fs_path(project: str, rel_path: str) -> Path:
-    root = Path(os.environ.get("MARVIS_PROJECTS_ROOT", "/data/projects").strip() or "/data/projects").expanduser()
-    target = (root / project / rel_path).resolve()
-    target.relative_to(root.resolve())  # ValueError on escape
+    from core.api.services.workspace_path_safety import resolve_path_in_root
+
+    root = Path(os.environ.get("MARVIS_PROJECTS_ROOT", "/data/projects").strip() or "/data/projects").expanduser().resolve()
+    try:
+        target = resolve_path_in_root(root, PurePosixPath(project, rel_path))
+        target.relative_to(root / project)
+    except (OSError, ValueError, ServiceError) as exc:
+        raise ConfidentialFileError(code="invalid_path", message="file path is outside its project or uses a symlink") from exc
     return target
 
 
@@ -239,6 +247,22 @@ async def _require_project_write(
 
     if not await can_write_project(db, actor, project, path=path):
         raise ConfidentialFileError(code="not_found", message="Not found")
+
+
+async def _require_flip_authority(
+    db: aiosqlite.Connection,
+    actor: CallerContext,
+    *,
+    project: str,
+    path: str,
+) -> None:
+    """Pre-guard check for a confidentiality flip: edit grant and file owner."""
+    await _require_project_write(db, actor, project=project, path=path)
+    meta = await get_file_meta(db, path, workspace_id=require_workspace_ctx(actor))
+    if meta and meta.get("owner_user_id") and meta["owner_user_id"] != actor.user_id:
+        raise ConfidentialFileError(
+            code="not_owner", message="only the file owner can change its confidentiality"
+        )
 
 
 _CLEARANCE_LINE_RE = re.compile(r"^\s*clearance\s*:.*$", re.M)
@@ -355,12 +379,16 @@ async def mark_confidential(
             code="invalid_path",
             message="path is not inside a project",
         )
+    _resolve_fs_path(*key)
     from core.api.services import project_lifecycle
 
     projects_root = Path(
         os.environ.get("MARVIS_PROJECTS_ROOT", "/data/projects").strip()
         or "/data/projects"
     ).expanduser().resolve()
+    # Authorize before the write fence records anything for this project; the
+    # locked path re-checks under the guard.
+    await _require_flip_authority(db, actor, project=key[0], path=path)
     async with project_lifecycle.async_project_mutation_guard(
         projects_root=projects_root
     ):
@@ -478,6 +506,10 @@ async def _mark_confidential_locked(
         _write_frontmatter_confidential(fs_path, confidential=True)
 
         # (iii) purge the existing derivatives + nul the content_hash in one tx.
+        # A not-yet-indexed file has nothing to purge, so no DML opens the
+        # transaction the confirmed audit entry requires; open it explicitly.
+        if not db.in_transaction:
+            await db.execute("BEGIN IMMEDIATE")
         purged = await _purge_index_rows(
             db, fs_path, project, rel_path, workspace_id
         )
@@ -511,12 +543,16 @@ async def unmark_confidential(
             code="invalid_path",
             message="path is not inside a project",
         )
+    _resolve_fs_path(*key)
     from core.api.services import project_lifecycle
 
     projects_root = Path(
         os.environ.get("MARVIS_PROJECTS_ROOT", "/data/projects").strip()
         or "/data/projects"
     ).expanduser().resolve()
+    # Authorize before the write fence records anything for this project; the
+    # locked path re-checks under the guard.
+    await _require_flip_authority(db, actor, project=key[0], path=path)
     async with project_lifecycle.async_project_mutation_guard(
         projects_root=projects_root
     ):

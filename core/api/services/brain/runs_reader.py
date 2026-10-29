@@ -11,6 +11,7 @@ from typing import Any
 import aiosqlite
 
 from core.api.db import acquire_db, write_db
+from core.api.services.brain.run_selection import latest_readable_run
 from core.api.models.brain import BrainRun, PipelineCounters, RunsListResponse
 
 DEFAULT_LIMIT = 50
@@ -79,17 +80,10 @@ def _row_to_run(row: aiosqlite.Row) -> BrainRun:
 
 
 async def _resolve_latest_cycle_key(
-    db: aiosqlite.Connection, *, workspace_id: str
+    db: aiosqlite.Connection, *, workspace_id: str, statuses: list[str] | None = None
 ) -> str | None:
-    async with db.execute(
-        "SELECT cycle_key FROM brain_runs "
-        "WHERE workspace_id = ? AND status = 'succeeded' "
-        "AND superseded_by_run_id IS NULL "
-        "ORDER BY cycle_key DESC LIMIT 1",
-        (workspace_id,),
-    ) as cur:
-        row = await cur.fetchone()
-    return row["cycle_key"] if row else None
+    run = await latest_readable_run(db, workspace_id=workspace_id, statuses=statuses)
+    return run["cycle_key"] if run else None
 
 
 async def list_runs(
@@ -111,7 +105,7 @@ async def list_runs(
         async with acquire_db() as db:
             db.row_factory = aiosqlite.Row
             resolved_cycle = await _resolve_latest_cycle_key(
-                db, workspace_id=workspace_id
+                db, workspace_id=workspace_id, statuses=status
             )
         if resolved_cycle:
             where.append("cycle_key = ?")

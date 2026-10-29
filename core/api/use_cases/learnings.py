@@ -608,6 +608,12 @@ async def create_learning(
         and project not in visible_projects
     ):
         raise NotFoundError(code="learning_not_found", message="Learning not found")
+    from core.api.services.access_grants import require_enterprise_project_edit
+
+    await require_enterprise_project_edit(
+        db, ctx, project,
+        error=NotFoundError(code="learning_not_found", message="Learning not found"),
+    )
     _validate_category(category)
     _validate_severity(severity)
 
@@ -839,6 +845,13 @@ async def update_learning(
         and target_project not in visible_projects
     ):
         raise NotFoundError(code="learning_not_found", message="Learning not found")
+    from core.api.services.access_grants import require_enterprise_project_edit
+
+    for project in {row["project"], target_project}:
+        await require_enterprise_project_edit(
+            db, ctx, project,
+            error=NotFoundError(code="learning_not_found", message="Learning not found"),
+        )
 
     updates: dict[str, str | int | None] = {}
 

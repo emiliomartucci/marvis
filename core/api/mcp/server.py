@@ -483,9 +483,19 @@ def _build_http_mcp():
             return JSONResponse({"detail": exc.message, "code": exc.code}, status_code=400)
         return JSONResponse(result)
 
+    @server.custom_route("/health", methods=["GET"])
+    async def public_health(_request):  # noqa: ANN001
+        # Tenant ingress and the watchdog use this public liveness route.
+        # Keep diagnostic paths and tenant configuration on /healthz only.
+        return JSONResponse(
+            {"status": "ok", "service": "marvis-mcp"},
+            headers={"Cache-Control": "no-store"},
+        )
+
     @server.custom_route("/healthz", methods=["GET"])
     async def healthz(_request):  # noqa: ANN001
         from core.api.services.access_grants import grants_query_error_count
+        from core.api.services.jev import provider_health
 
         return JSONResponse(
             {
@@ -497,6 +507,7 @@ def _build_http_mcp():
                 or os.environ.get("PIR_DB_PATH"),
                 "projects_root": os.environ.get("MARVIS_PROJECTS_ROOT"),
                 "grants_query_error_count": grants_query_error_count(),
+                "scoring_provider": provider_health(),
             }
         )
 
@@ -516,6 +527,10 @@ def _build_http_mcp():
             )
 
     register_all(server)
+    # find_tool/call_tool for the diet-hidden tools (HTTP only: stdio has no diet).
+    from core.api.mcp.tools.tool_gateway import register_tool_gateway
+
+    register_tool_gateway(server)
     _apply_core_tool_meta(server)
     # P3 tool profiles RBAC: wire the per-role exposure gate + usage counter.
     # DELIBERATELY outside the metadata try/except — a wiring failure MUST raise
@@ -680,6 +695,9 @@ def main(transport: Literal["stdio", "http"] | None = None) -> None:
     )
 
     async def _serve() -> None:
+        from core.api.services.jev import check_provider_configuration
+
+        check_provider_configuration()
         await init_pool(size=settings.db_pool_size)
         try:
             if selected_transport == "stdio":
@@ -698,7 +716,12 @@ def main(transport: Literal["stdio", "http"] | None = None) -> None:
                     stateless_http=stateless_http,
                 )
         finally:
-            await close_pool()
+            from core.api.services.jev import close_provider
+
+            try:
+                await close_provider()
+            finally:
+                await close_pool()
 
     asyncio.run(_serve())
 

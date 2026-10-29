@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -214,6 +215,38 @@ async def _impacted_projects(
         return [str(row["project"]) for row in await cursor.fetchall()]
 
 
+async def _hide_invisible_project(
+    db: aiosqlite.Connection,
+    ctx: CallerContext,
+    project: str,
+) -> None:
+    """Enterprise strict mode: a project the caller cannot see answers like an
+    unknown slug, so a permission error cannot confirm that it exists."""
+    if os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() != "1":
+        return
+    visible = await access_grants.visible_projects_for_actor(db, ctx)
+    if visible is not None and project not in visible:
+        raise NotFoundError(code="project_not_found", message="Not found")
+
+
+async def _require_membership_project_edit(
+    db: aiosqlite.Connection,
+    ctx: CallerContext,
+    team_id: str,
+) -> None:
+    """A team membership edit changes inherited project access for others."""
+    if os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() != "1":
+        return
+    if ctx.system_role == "super_admin" and ctx.user_type == "human":
+        return
+    for project in await _impacted_projects(db, team_id):
+        if not await access_grants.can_write_project(db, ctx, project):
+            raise AuthorizationError(
+                code="project_edit_required",
+                message="Project edit access required for team membership changes",
+            )
+
+
 async def create_team(
     db: aiosqlite.Connection,
     ctx: CallerContext,
@@ -408,6 +441,10 @@ async def list_teams(
     result: list[dict[str, Any]] = []
     for row in rows:
         members, projects = await _counts(db, str(row["id"]))
+        if access_grants._enterprise_strict():
+            projects = 0
+            for slug in await _impacted_projects(db, str(row["id"])):
+                projects += await access_grants.can_read_project(db, ctx, slug)
         result.append(
             _row_payload(
                 row,
@@ -460,6 +497,7 @@ async def add_team_member(
     team_row = await _get_team(db, team, workspace_id)
     team_id = str(team_row["id"])
     await _require_team_admin(db, ctx, team_id)
+    await _require_membership_project_edit(db, ctx, team_id)
     if not _is_global_admin(ctx) and role == "admin":
         raise AuthorizationError(
             code="lead_cannot_assign_admin",
@@ -473,6 +511,23 @@ async def add_team_member(
             code="target_role_exceeds_caller",
             message="Cannot add user with higher role than your own",
         )
+    if target["id"] == ctx.user_id and role != "admin" and not _is_global_admin(ctx):
+        async with db.execute(
+            "SELECT role FROM team_members WHERE team_id=? AND user_id=?",
+            (team_id, target["id"]),
+        ) as cursor:
+            membership = await cursor.fetchone()
+        if membership is not None and membership["role"] == "admin":
+            async with db.execute(
+                "SELECT COUNT(*) FROM team_members WHERE team_id=? AND role='admin'",
+                (team_id,),
+            ) as cursor:
+                lead_count = (await cursor.fetchone())[0]
+            if lead_count <= 1:
+                raise ConflictError(
+                    code="sole_lead_self_removal",
+                    message="Sole team lead cannot demote itself — ask an admin to hand the team over first",
+                )
     joined_at = _now()
     try:
         await db.execute(
@@ -522,6 +577,7 @@ async def remove_team_member(
     team_row = await _get_team(db, team, workspace_id)
     team_id = str(team_row["id"])
     await _require_team_admin(db, ctx, team_id)
+    await _require_membership_project_edit(db, ctx, team_id)
     target = await _resolve_user(db, user, workspace_id)
     async with db.execute(
         "SELECT role FROM team_members WHERE team_id=? AND user_id=?",
@@ -595,7 +651,13 @@ async def list_team_projects(
         "FROM project_teams WHERE team_id=? ORDER BY project",
         (team_id,),
     ) as cursor:
-        return [
+        rows = await cursor.fetchall()
+    if access_grants._enterprise_strict():
+        rows = [
+            item for item in rows
+            if await access_grants.can_read_project(db, ctx, str(item["project"]))
+        ]
+    return [
             {
                 "project": item["project"],
                 "is_public": bool(item["is_public"]),
@@ -603,7 +665,7 @@ async def list_team_projects(
                 "role": item["role"] or "member",
                 "clearance": item["clearance"] or "internal",
             }
-            for item in await cursor.fetchall()
+            for item in rows
         ]
 
 
@@ -613,12 +675,13 @@ async def assign_team_project(
     *,
     team: str,
     project: str,
-    role: str,
-    clearance: str,
+    role: str | None,
+    clearance: str | None,
     is_public: bool | None = None,
 ) -> dict[str, Any]:
     workspace_id = require_workspace_ctx(ctx)
     await access_grants.require_workspace_project_bound(db, ctx, project)
+    await _hide_invisible_project(db, ctx, project)
     team_row = await _get_team(db, team, workspace_id)
     team_id = str(team_row["id"])
     if not await access_grants.is_project_grant_admin(db, ctx, project):
@@ -647,8 +710,8 @@ async def assign_team_project(
                 project,
                 team_id,
                 int(is_public) if is_public is not None else 0,
-                role,
-                clearance,
+                role or "viewer",
+                clearance or "internal",
                 assigned_at,
             ),
         )
@@ -656,25 +719,28 @@ async def assign_team_project(
         if "UNIQUE" not in str(exc):
             raise
         action = "team.project_update"
-        if is_public is None:
-            await db.execute(
-                "UPDATE project_teams SET role=?,clearance=? "
-                "WHERE project=? AND team_id=?",
-                (role, clearance, project, team_id),
-            )
-        else:
-            await db.execute(
-                "UPDATE project_teams SET is_public=?,role=?,clearance=? "
-                "WHERE project=? AND team_id=?",
-                (int(is_public), role, clearance, project, team_id),
-            )
+        await db.execute(
+            "UPDATE project_teams SET "
+            "is_public=COALESCE(?,is_public),"
+            "role=COALESCE(?,role),clearance=COALESCE(?,clearance) "
+            "WHERE project=? AND team_id=?",
+            (int(is_public) if is_public is not None else None,
+             role, clearance, project, team_id),
+        )
+    async with db.execute(
+        "SELECT role,clearance,is_public FROM project_teams "
+        "WHERE project=? AND team_id=?",
+        (project, team_id),
+    ) as cursor:
+        assignment = await cursor.fetchone()
     await log_audit(
         db,
         action,
         ctx.user_id or ctx.username,
         "team",
         team_id,
-        {"project": project, "role": role, "clearance": clearance},
+        {"project": project, "role": assignment["role"],
+         "clearance": assignment["clearance"], "is_public": bool(assignment["is_public"])},
         workspace_id=workspace_id,
     )
     await db.commit()
@@ -682,8 +748,9 @@ async def assign_team_project(
         "status": "ok",
         "project": project,
         "team_id": team_id,
-        "role": role,
-        "clearance": clearance,
+        "role": assignment["role"],
+        "clearance": assignment["clearance"],
+        "is_public": bool(assignment["is_public"]),
     }
 
 
@@ -696,6 +763,7 @@ async def unassign_team_project(
 ) -> dict[str, Any]:
     workspace_id = require_workspace_ctx(ctx)
     await access_grants.require_workspace_project_bound(db, ctx, project)
+    await _hide_invisible_project(db, ctx, project)
     team_row = await _get_team(db, team, workspace_id)
     team_id = str(team_row["id"])
     if not await access_grants.is_project_grant_admin(db, ctx, project):

@@ -26,9 +26,15 @@ from core.api.services.newsletter_llm_gateway import (
 logger = logging.getLogger(__name__)
 
 # Cloud model used as canonical / shadow comparison baseline. If we ever rotate
-# Sonnet revision, update this constant + audit `local_llm_shadow_comparisons.model_cloud`
-# rows so judge LLM A/B does not mix revisions.
-_CLOUD_TLDR_MODEL = "claude-sonnet-4-20250514"
+# the revision, update this constant + audit `local_llm_shadow_comparisons.model_cloud`
+# rows so judge LLM A/B does not mix revisions. 2026-10-08: claude-sonnet-4-20250514
+# was retired from the Claude API; TL;DR moves to Claude Haiku 5.5 and the Deep
+# Analysis cloud fallback to Claude Sonnet 5.5. Both think adaptively and the
+# thinking counts toward max_tokens, so the budgets leave room above the answer.
+_CLOUD_TLDR_MODEL = "claude-haiku-5-5"
+_CLOUD_TLDR_MAX_TOKENS = 4000
+_CLOUD_DEEP_RESEARCH_MODEL = "claude-sonnet-5-5"
+_CLOUD_DEEP_RESEARCH_MAX_TOKENS = 8000
 _LOCAL_TLDR_MAX_TOKENS = 2500
 _LOCAL_DEEP_RESEARCH_MODEL = "tier-fast"
 _LOCAL_DEEP_RESEARCH_MAX_TOKENS = 2000
@@ -156,14 +162,14 @@ async def generate_tldr(content: str, api_key: str) -> tuple[str, dict[str, Any]
     started = time.monotonic()
     message = await client.messages.create(
         model=_CLOUD_TLDR_MODEL,
-        max_tokens=500,
+        max_tokens=_CLOUD_TLDR_MAX_TOKENS,
         system=TLDR_SYSTEM_PROMPT,
         messages=[
             {"role": "user", "content": f"Articolo da riassumere:\n\n{content[:8000]}"}
         ],
     )
     latency_ms = int((time.monotonic() - started) * 1000)
-    text = message.content[0].text
+    text = _anthropic_text(message)
     usage = {
         "tokens_in": getattr(message.usage, "input_tokens", None),
         "tokens_out": getattr(message.usage, "output_tokens", None),
@@ -520,12 +526,31 @@ async def _deep_research_cloud_sonnet(
 
     client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
     message = await client.messages.create(
-        model=_CLOUD_TLDR_MODEL,
-        max_tokens=800,
+        model=_CLOUD_DEEP_RESEARCH_MODEL,
+        max_tokens=_CLOUD_DEEP_RESEARCH_MAX_TOKENS,
         system=DEEP_RESEARCH_PROMPT,
         messages=[{"role": "user", "content": research_context}],
+        extra_body={"output_config": {"effort": "medium"}},
     )
-    return message.content[0].text
+    return _anthropic_text(message)
+
+
+def _anthropic_text(message: Any) -> str:
+    """Join the text blocks of a Messages API answer.
+
+    Adaptive thinking can put a thinking block first, so content[0] is not the
+    answer. A refusal, a truncated answer or an answer without text raises, and
+    the callers turn that into their existing error path.
+    """
+    stop_reason = getattr(message, "stop_reason", None)
+    if stop_reason in {"refusal", "max_tokens"}:
+        raise RuntimeError(f"Anthropic answer unusable: stop_reason={stop_reason}")
+    text = "".join(
+        block.text for block in message.content if getattr(block, "type", None) == "text"
+    ).strip()
+    if not text:
+        raise RuntimeError("Anthropic answer has no text block")
+    return text
 
 
 def _normalize_deep_research_response(response_text: str) -> str:

@@ -1,8 +1,14 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { loadTriageTasks } = vi.hoisted(() => ({
+const { loadTriageTasks, getEffectiveProjectAccess } = vi.hoisted(() => ({
   loadTriageTasks: vi.fn(),
+  getEffectiveProjectAccess: vi.fn(),
+}));
+
+vi.mock("@/lib/api", async () => ({
+  ...await vi.importActual<typeof import("@/lib/api")>("@/lib/api"),
+  getEffectiveProjectAccess,
 }));
 
 vi.mock("next/navigation", () => ({
@@ -22,8 +28,8 @@ vi.mock("@/components/triage/TriageSidebar", () => ({
 }));
 
 vi.mock("@/components/triage/TriageKanban", () => ({
-  default: ({ tasks }: { tasks: Array<{ title: string }> }) => (
-    <div data-testid="triage-kanban">{tasks.map((task) => task.title).join(",")}</div>
+  default: ({ tasks, canEditTask }: { tasks: Array<{ title: string; project: string }>; canEditTask: (task: { project: string }) => boolean }) => (
+    <div data-testid="triage-kanban">{tasks.map((task) => `${task.title}:${canEditTask(task) ? "edit" : "view"}`).join(",")}</div>
   ),
 }));
 
@@ -37,6 +43,8 @@ describe("TriagePage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
+
+  afterEach(() => vi.unstubAllEnvs());
 
   it("refreshes tasks when the tab becomes visible again", async () => {
     loadTriageTasks
@@ -58,5 +66,23 @@ describe("TriagePage", () => {
 
     await waitFor(() => expect(screen.getByTestId("triage-kanban").textContent).toContain("Working A"));
     expect(loadTriageTasks).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps view-only Enterprise projects read-only in the task board", async () => {
+    vi.stubEnv("NEXT_PUBLIC_ENTERPRISE_MODE", "1");
+    loadTriageTasks.mockResolvedValue([
+      { id: "task-a", title: "Pending A", status: "pending", project: "alpha" },
+      { id: "task-b", title: "Pending B", status: "pending", project: "beta" },
+    ]);
+    getEffectiveProjectAccess.mockImplementation(async (project: string) => ({
+      project, can_view: true, can_edit: project === "alpha", sources: [],
+    }));
+
+    render(<TriagePage />);
+
+    await waitFor(() => expect(screen.getByTestId("triage-kanban").textContent).toContain("Pending A:edit"));
+    expect(screen.getByTestId("triage-kanban").textContent).toContain("Pending B:view");
+    expect(getEffectiveProjectAccess).toHaveBeenCalledWith("alpha");
+    expect(getEffectiveProjectAccess).toHaveBeenCalledWith("beta");
   });
 });

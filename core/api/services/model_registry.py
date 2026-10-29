@@ -92,9 +92,18 @@ def _load_pricing_from_json() -> dict[str, ModelPricing]:
             logger.debug("Loaded pricing from %s (%d models)", pricing_path, len(result))
             return result
 
-    # Hard-coded fallback mirrors kb/claude-pricing-2026-04-22.json
+    # Hard-coded fallback mirrors kb/claude-pricing-2026-10-08.json (Enterprise ships without kb/).
     logger.info("Using hard-coded pricing fallback (no kb/claude-pricing-*.json found)")
     return {
+        "claude-fable-5-1": ModelPricing(10.0, 50.0, 0.25, 12.5, 20.0),
+        "claude-fable-5": ModelPricing(10.0, 50.0, 1.0, 12.5, 20.0),
+        "claude-opus-5-5": ModelPricing(4.0, 20.0, 0.2, 5.0, 8.0),
+        "claude-opus-5": ModelPricing(5.0, 25.0, 0.5, 6.25, 10.0),
+        "claude-opus-4-8": ModelPricing(5.0, 25.0, 0.5, 6.25, 10.0),
+        "claude-sonnet-5-5": ModelPricing(2.0, 10.0, 0.1, 2.5, 4.0),
+        "claude-sonnet-5": ModelPricing(2.0, 10.0, 0.2, 2.5, 4.0),
+        # Up to 100k prompt tokens; longer prompts pay 5x (not modelled here).
+        "claude-haiku-5-5": ModelPricing(0.1, 0.5, 0.01, 0.125, 0.2),
         "claude-opus-4-7": ModelPricing(5.0, 25.0, 0.5, 6.25, 10.0),
         "claude-opus-4-6": ModelPricing(5.0, 25.0, 0.5, 6.25, 10.0),
         "claude-sonnet-4-6": ModelPricing(3.0, 15.0, 0.3, 3.75, 6.0),

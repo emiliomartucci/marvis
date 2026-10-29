@@ -489,12 +489,135 @@ def _validate_provider_response_sanitizers(
 
         declared.add(failure)
 
-    if declared != provider_breaks_found:
-        missing = sorted(provider_breaks_found - declared)
-        stale = sorted(declared - provider_breaks_found)
-        raise CompatibilityError(
-            f"N-1 response sanitizer inventory drift: missing={missing}, stale={stale}"
-        )
+    return declared
+
+
+_WIDENING_ANNOTATIONS = {"default", "title", "description"}
+
+
+def _schema_used_in_responses(spec: dict[str, Any], schema_name: str) -> bool:
+    target = f"#/components/schemas/{schema_name}"
+
+    def references(node: Any) -> bool:
+        if isinstance(node, dict):
+            if node.get("$ref") == target:
+                return True
+            return any(references(child) for child in node.values())
+        if isinstance(node, list):
+            return any(references(child) for child in node)
+        return False
+
+    for methods in spec.get("paths", {}).values():
+        if not isinstance(methods, dict):
+            continue
+        for operation in methods.values():
+            if isinstance(operation, dict) and references(operation.get("responses", {})):
+                return True
+    return False
+
+
+def _validate_provider_request_widenings(
+    root: Path,
+    matrix: dict[str, Any],
+    *,
+    provider_breaks_found: set[str],
+    current_openapi: dict[str, Any],
+    previous_openapi: dict[str, Any],
+) -> set[str]:
+    """Certify request-only properties that N widened to also accept null.
+
+    Every N-1 payload stays valid against N only when the N property is
+    exactly ``anyOf: [<N-1 shape without annotations>, {"type": "null"}]``,
+    carries no non-null default, and the schema never appears in a response.
+    """
+
+    declarations = matrix.get("n_minus_1_provider_request_widenings")
+    if not isinstance(declarations, list):
+        raise CompatibilityError("N-1 provider request widening inventory missing")
+    rows = matrix.get("rows")
+    if not isinstance(rows, list):
+        raise CompatibilityError("consumer matrix rows missing")
+    by_surface = {row.get("surface"): row for row in rows if isinstance(row, dict)}
+    required_keys = {"failure", "schema", "property", "surfaces", "evidence"}
+    declared: set[str] = set()
+
+    for item in declarations:
+        if not isinstance(item, dict) or set(item) != required_keys:
+            raise CompatibilityError("invalid N-1 provider request widening row")
+        schema_name = item["schema"]
+        property_name = item["property"]
+        failure = item["failure"]
+        if not all(
+            isinstance(value, str) and value
+            for value in (schema_name, property_name, failure)
+        ):
+            raise CompatibilityError("request widening values must be non-empty strings")
+        if (
+            failure != f"schema_property_changed:{schema_name}.{property_name}"
+            or failure in declared
+        ):
+            raise CompatibilityError("invalid or duplicate request widening failure")
+        if failure not in provider_breaks_found:
+            raise CompatibilityError(f"request widening declaration is stale: {failure}")
+
+        surfaces = item["surfaces"]
+        if (
+            not isinstance(surfaces, list)
+            or surfaces != sorted(set(surfaces))
+            or not surfaces
+            or not set(surfaces).issubset(EXPECTED_SURFACES)
+        ):
+            raise CompatibilityError(f"request widening has invalid surfaces: {failure}")
+        for surface in surfaces:
+            row = by_surface.get(surface)
+            if not isinstance(row, dict) or row.get("n_minus_1_consumer_n_contract") != "pass":
+                raise CompatibilityError(
+                    f"{surface}: request widening cannot certify a non-passing N-1 row"
+                )
+
+        evidence = item["evidence"]
+        if (
+            not isinstance(evidence, list)
+            or evidence != sorted(set(evidence))
+            or len(evidence) < 2
+        ):
+            raise CompatibilityError(f"request widening evidence invalid: {failure}")
+        for reference in evidence:
+            _validate_evidence(root, str(reference))
+
+        for spec in (previous_openapi, current_openapi):
+            if _schema_used_in_responses(spec, schema_name):
+                raise CompatibilityError(
+                    f"request widening schema appears in a response: {failure}"
+                )
+        try:
+            old = previous_openapi["components"]["schemas"][schema_name]["properties"][
+                property_name
+            ]
+            new = current_openapi["components"]["schemas"][schema_name]["properties"][
+                property_name
+            ]
+        except (KeyError, TypeError) as exc:
+            raise CompatibilityError(
+                f"request widening schema property missing: {failure}"
+            ) from exc
+        old_shape = {k: v for k, v in old.items() if k not in _WIDENING_ANNOTATIONS}
+        new_shape = {k: v for k, v in new.items() if k not in _WIDENING_ANNOTATIONS}
+        if (
+            "anyOf" in old_shape
+            or new.get("default") is not None
+            or set(new_shape) != {"anyOf"}
+            or not isinstance(new_shape["anyOf"], list)
+            or len(new_shape["anyOf"]) != 2
+            or new_shape["anyOf"][0] != old_shape
+            or new_shape["anyOf"][1] != {"type": "null"}
+        ):
+            raise CompatibilityError(
+                f"request widening is not a nullable superset of N-1: {failure}"
+            )
+
+        declared.add(failure)
+
     return declared
 
 
@@ -845,7 +968,24 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         current_openapi=current_openapi,
         previous_openapi=previous_openapi,
     )
-    traced_schema_breaks = consumer_previous_breaks - declared_response_sanitizers
+    declared_request_widenings = _validate_provider_request_widenings(
+        root,
+        matrix,
+        provider_breaks_found=set(old_to_new),
+        current_openapi=current_openapi,
+        previous_openapi=previous_openapi,
+    )
+    overlap = declared_response_sanitizers & declared_request_widenings
+    if overlap:
+        raise CompatibilityError(f"N-1 provider break declared twice: {sorted(overlap)}")
+    declared_provider_breaks = declared_response_sanitizers | declared_request_widenings
+    if declared_provider_breaks != set(old_to_new):
+        missing = sorted(set(old_to_new) - declared_provider_breaks)
+        stale = sorted(declared_provider_breaks - set(old_to_new))
+        raise CompatibilityError(
+            f"N-1 response sanitizer inventory drift: missing={missing}, stale={stale}"
+        )
+    traced_schema_breaks = consumer_previous_breaks - declared_provider_breaks
     _validate_matrix(
         root,
         matrix,
@@ -874,6 +1014,7 @@ def verify(root: Path, *, expected_source_ref: str | None = None) -> dict[str, A
         "declared_n_minus_1_response_sanitizers": len(
             declared_response_sanitizers
         ),
+        "declared_n_minus_1_request_widenings": len(declared_request_widenings),
     }
 
 

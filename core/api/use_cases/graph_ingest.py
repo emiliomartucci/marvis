@@ -254,12 +254,26 @@ async def ingest_graph(
             node_ids=node_ids,
             edge_endpoints=edge_endpoints,
         )
-        # Order matters: edges first (FK children), then nodes — but on DELETE
-        # the FK is ON DELETE CASCADE, so deleting nodes removes their edges.
-        # Delete edges explicitly first anyway to be robust if FK enforcement
-        # is off in a given runtime.
-        await db.execute("DELETE FROM graph_edges WHERE project_id = ?", (project,))
-        await db.execute("DELETE FROM graph_nodes WHERE project_id = ?", (project,))
+        # Graph parity (task d87d545e, 2026-09-22): the DELETE is scoped to
+        # CODE nodes only. Artifact nodes (task:artifact:*, file:artifact:*,
+        # project:artifact:* — anything whose ID contains ':artifact:') are
+        # created by the KG indexer and the task sync, NOT by this parser.
+        # Wiping them on every code reindex silently erased the document
+        # graph. Edges survive iff both endpoints survive; edges touching
+        # a replaced code node are cascade-deleted (or deleted explicitly
+        # below when FK enforcement is off).
+        await db.execute(
+            "DELETE FROM graph_edges WHERE project_id = ? AND source_id NOT LIKE '%:artifact:%'",
+            (project,),
+        )
+        await db.execute(
+            "DELETE FROM graph_edges WHERE project_id = ? AND target_id NOT LIKE '%:artifact:%'",
+            (project,),
+        )
+        await db.execute(
+            "DELETE FROM graph_nodes WHERE project_id = ? AND id NOT LIKE '%:artifact:%'",
+            (project,),
+        )
         # Insert nodes BEFORE edges so edge FK targets already exist (the batch
         # is self-consistent: the parser emits a stub node for every call/import
         # target).

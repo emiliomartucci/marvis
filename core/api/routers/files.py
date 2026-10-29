@@ -21,7 +21,6 @@ from core.api.services import access_grants
 from core.api.services import project_lifecycle
 from core.api.use_cases._context import CallerContext, require_workspace_ctx
 from core.api.use_cases._errors import AuthorizationError
-from core.api.visibility import check_project_access
 
 logger = logging.getLogger(__name__)
 
@@ -126,10 +125,8 @@ async def read_file(
     _validate_file_path(file_path)
     actor = _authenticated_actor(user)
 
-    # Visibility gate BEFORE project resolution: non-visible projects 404
-    # without revealing whether they exist (same contract as finder).
-    await check_project_access(slug, user, db)
-
+    # The path-aware predicate checks workspace ownership, revocation, scope,
+    # and clearance. A file grant need not make the whole project visible.
     logical_path = f"{slug}/{file_path}"
     if not await access_grants.file_readable(
         db, actor, logical_path, direct_read=True
@@ -182,8 +179,8 @@ async def write_file(
     _validate_file_path(file_path)
     actor = _authenticated_actor(user)
 
-    await check_project_access(slug, user, db)
-
+    # The file predicate is path-aware; a project-list visibility check would
+    # reject a legitimate file-scoped edit before reaching it.
     logical_path = f"{slug}/{file_path}"
     if not await access_grants.file_writable(db, actor, logical_path):
         raise HTTPException(status_code=404, detail="Not found")

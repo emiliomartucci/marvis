@@ -41,6 +41,7 @@ class LLMClassification(BaseModel):
     tags: list[str] = Field(default_factory=list, max_length=20)
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = Field(max_length=500)
+    secret_safety: Literal["not_checked", "clear", "requires_redaction", "unverified"] = "not_checked"
 
 
 class LLMClassifier(Protocol):

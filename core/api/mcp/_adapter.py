@@ -44,6 +44,11 @@ from core.api.use_cases._roles import map_sso_role
 logger = logging.getLogger(__name__)
 _TOOL_ERROR_RUNTIME: Literal["mcp", "fastmcp"] = "mcp"
 
+
+def _oauth_provider_label(env: Mapping[str, str] | None = None) -> str:
+    source = os.environ if env is None else env
+    return "oidc" if source.get("OIDC_ISSUER", "").strip() else "workos"
+
 # The DB context managers above are intentionally re-exported so tools import DB
 # access from this adapter, not from deep in the API package. ``acquire_db`` is
 # the read pool; ``acquire_write_db`` is the writer plus lock.
@@ -211,6 +216,62 @@ def _db_system_role(user_id: str, workspace_id: str) -> str | None:
     return identity[1] if identity is not None else None
 
 
+def _enterprise_oidc_identity(object_id: str, workspace_id: str) -> tuple[str, str]:
+    """Resolve an active customer-managed OIDC binding without a revocation cache."""
+    import sqlite3
+
+    db_path = os.environ.get("MARVIS_DB_PATH", "").strip()
+    if not object_id or not workspace_id or not db_path:
+        raise RuntimeError("Enterprise OIDC identity is not active")
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        try:
+            rows = db.execute(
+                "SELECT id, system_role FROM users WHERE workspace_id = ? "
+                "AND external_id = ? AND auth_provider = 'oidc' AND type = 'human' "
+                "AND deleted_at IS NULL LIMIT 2",
+                (workspace_id, "oidc:" + object_id.lower()),
+            ).fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        raise RuntimeError("Enterprise OIDC identity lookup unavailable") from exc
+    if len(rows) != 1 or not rows[0][0] or not rows[0][1]:
+        raise RuntimeError("Enterprise OIDC identity is not active")
+    return str(rows[0][0]), str(rows[0][1])
+
+
+def _enterprise_oidc_agent_identity(object_id: str, workspace_id: str) -> tuple[str, str]:
+    """Resolve a currently active, explicitly bound service principal.
+
+    Customer Entra application tokens carry the service principal's stable
+    ``oid``. It is bound to a local agent row, never a human account or a role
+    claim. Agents cannot hold an organization admin role, even if the database
+    row was misconfigured.
+    """
+    import sqlite3
+
+    db_path = os.environ.get("MARVIS_DB_PATH", "").strip()
+    if not object_id or not workspace_id or not db_path:
+        raise RuntimeError("Enterprise application identity is not active")
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        try:
+            rows = db.execute(
+                "SELECT id, system_role FROM users WHERE workspace_id = ? "
+                "AND external_id = ? AND auth_provider = 'oidc_app' AND type = 'agent' "
+                "AND deleted_at IS NULL LIMIT 2",
+                (workspace_id, "oidc-app:" + object_id.lower()),
+            ).fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        raise RuntimeError("Enterprise application identity lookup unavailable") from exc
+    if len(rows) != 1 or not rows[0][0] or rows[0][1] not in {"viewer", "operator"}:
+        raise RuntimeError("Enterprise application identity is not active")
+    return str(rows[0][0]), str(rows[0][1])
+
+
 def _invalidate_db_role_cache(user_id: str, workspace_id: str) -> None:
     """Drop a cached role so the next request re-reads a freshly-synced row."""
     for key, cached in tuple(_DB_ROLE_CACHE.items()):
@@ -229,7 +290,7 @@ def _is_verified_workos_person(
     """Allow legacy aliases only for a provider-proven WorkOS person token.
 
     Direct tenant servers prove the provider through their mutually-exclusive
-    WorkOS configuration. The private Emilio backend receives only short-lived
+    WorkOS configuration. A private tenant backend receives only short-lived
     assertions minted by its WorkOS-only root gateway. Enterprise OIDC/Entra
     claims never gain WorkOS alias semantics merely by carrying ``org_id``.
     """
@@ -267,6 +328,25 @@ def _authenticated_mcp_workspace(claims: Mapping[str, Any]) -> str:
     return workspace_id
 
 
+def _is_app_only_token(claims: Mapping[str, Any]) -> bool:
+    """Recognize Entra client credentials without relying on optional idtyp.
+
+    Delegated tokens carry ``scp``. An app-only token instead carries an app
+    identifier and no interactive person claim; the strict adapter still binds
+    its ``oid`` to a live local oidc_app row before granting access.
+    """
+    if claims.get("idtyp") == "app":
+        return True
+    return bool(
+        claims.get("oid")
+        and (claims.get("azp") or claims.get("appid"))
+        and not claims.get("scp")
+        and not any(claims.get(name) for name in (
+            "preferred_username", "upn", "email", "unique_name",
+        ))
+    )
+
+
 def current_mcp_context() -> CallerContext:
     """Resolve the current MCP caller when the transport exposes auth context.
 
@@ -288,10 +368,16 @@ def current_mcp_context() -> CallerContext:
     scopes = tuple(getattr(access_token, "scopes", None) or claims.get("scopes") or ())
     tenant_id = os.environ.get("TENANT_ID", "").strip()
     workspace_id = _authenticated_mcp_workspace(claims)
+    enterprise_strict = os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1"
+    app_token = claims.get("idtyp") == "app" or (
+        enterprise_strict and _is_app_only_token(claims)
+    )
 
     # StaticTokenVerifier in server.py sets client_id to TENANT_ID and has no
     # person claim. That token is the tenant admin break-glass/admin path.
-    if client_id and tenant_id and client_id == tenant_id and not claims.get("sub"):
+    if (client_id and tenant_id and client_id == tenant_id
+            and not claims.get("sub") and not claims.get("oid")
+            and not app_token):
         return CallerContext(
             username=f"{tenant_id}:static-bearer",
             system_role="admin",
@@ -299,6 +385,45 @@ def current_mcp_context() -> CallerContext:
             workspace_id=workspace_id,
             scopes=scopes,
             user_id=f"tenant:{tenant_id}",
+            auth_mechanism="mcp_static",
+        )
+
+    if enterprise_strict:
+        if app_token:
+            object_id = str(claims.get("oid") or "").strip().lower()
+            db_user_id, db_role = _enterprise_oidc_agent_identity(object_id, workspace_id)
+            app_roles = claims.get("roles")
+            # Entra client-credentials tokens carry application roles, not a
+            # delegated scp claim. Only the signed operator app role, capped by
+            # the current bound DB role, maps to task-write capability.
+            agent_scopes = scopes
+            if (
+                db_role == "operator"
+                and isinstance(app_roles, (list, tuple))
+                and "operator" in app_roles
+            ):
+                agent_scopes = tuple(dict.fromkeys((*scopes, "tasks:write")))
+            return CallerContext(
+                username=db_user_id,
+                system_role=db_role,
+                user_type="agent",
+                workspace_id=workspace_id,
+                scopes=agent_scopes,
+                user_id=db_user_id,
+                is_human_session=False,
+                auth_mechanism="mcp_oauth_agent",
+            )
+        object_id = str(claims.get("oid") or "").strip().lower()
+        db_user_id, db_role = _enterprise_oidc_identity(object_id, workspace_id)
+        return CallerContext(
+            username=db_user_id,
+            system_role=db_role,
+            user_type="human",
+            workspace_id=workspace_id,
+            scopes=scopes,
+            user_id=db_user_id,
+            is_human_session=True,
+            auth_mechanism="mcp_oauth_person",
         )
 
     subject = (
@@ -347,8 +472,7 @@ def current_mcp_context() -> CallerContext:
                 "oauth role: restored persisted %s role for an interactive token",
                 db_role,
             )
-    # Entra client-credentials (M2M) tokens declare idtyp=app — that caller is
-    # an agent, not a person (IMPL §A.0c). No-op for WorkOS tokens.
+    # Outside Enterprise strict mode, keep the existing explicit idtyp rule.
     return CallerContext(
         username=str(subject),
         system_role=system_role,
@@ -357,6 +481,7 @@ def current_mcp_context() -> CallerContext:
         scopes=scopes,
         user_id=user_id,
         is_human_session=not is_app_token,
+        auth_mechanism="mcp_app" if is_app_token else "mcp_oauth_person",
     )
 
 
@@ -435,6 +560,9 @@ async def _available_oauth_slug(
 
 async def sync_oauth_user(db, ctx: CallerContext) -> None:
     """Display-only drift sync of the ``users`` row for an OAuth person."""
+    if os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1":
+        # Customer admins provision identities; IdP role claims are never writes.
+        return
     if not ctx.is_human_session or not ctx.user_id or ctx.user_id == "local":
         return
     claims = _oauth_claims()
@@ -487,8 +615,9 @@ async def sync_oauth_user(db, ctx: CallerContext) -> None:
                     "INSERT INTO users"
                     " (id, slug, display_name, email, system_role, type,"
                     " auth_provider, workspace_id)"
-                    " VALUES (?, ?, ?, ?, ?, 'human', 'workos', ?)",
-                    (ctx.user_id, slug, display_name, email, role, workspace_id),
+                    " VALUES (?, ?, ?, ?, ?, 'human', ?, ?)",
+                    (ctx.user_id, slug, display_name, email, role,
+                     _oauth_provider_label(), workspace_id),
                 )
                 cur = await wdb.execute(
                     "SELECT id, workspace_id, slug, system_role FROM users"
@@ -704,17 +833,18 @@ def current_user_info(ctx: CallerContext | None = None):
     ``visible_projects`` set. This is the "ctx -> UserInfo" adapter the brain
     RBAC fix (2026-07-03) needs.
 
-    Admin / super_admin — and the static tenant bearer, which resolves to
-    ``system_role='admin'`` — return ``None``: the brain services treat
-    ``user is None`` as "no visibility restriction", so the admin/bearer path
-    stays byte-identical to today (no new query, unrestricted). Every other
-    caller (operator/viewer, OAuth person or non-admin agent) gets a real
-    ``UserInfo`` so the services filter by their visible projects.
+    Legacy admin / super_admin calls retain their historical ``user=None``
+    path. Enterprise strict mode carries their bound identity as ``UserInfo``
+    too, so Brain reads and audit fields remain workspace-aware. Other callers
+    always carry a real ``UserInfo`` for project filtering.
     """
     from core.api.models import UserInfo
 
     resolved = ctx or current_mcp_context()
-    if resolved.system_role in ("admin", "super_admin"):
+    if (
+        resolved.system_role in ("admin", "super_admin")
+        and os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() != "1"
+    ):
         return None
     return UserInfo(
         username=resolved.username,
@@ -775,12 +905,9 @@ def mcp_schedule_embed(
     async), so we schedule the SHARED fastapi-free embed body
     (``embedding_service.embed_task_document``) fire-and-forget — the exact helper
     the HTTP router runs, just without FastAPI in the path. No-ops gracefully when
-    the embedder is unavailable (mirrors the router's ``is_available()`` guard).
+    the shared helper finds the embedder unavailable asynchronously.
     """
     from core.api.services import embedding_service
-
-    if not embedding_service.is_available():
-        return
 
     async def _embed() -> None:
         try:
@@ -856,9 +983,6 @@ async def mcp_embed_learning(
     No-ops when the embedder is unavailable.
     """
     from core.api.services import embedding_service
-
-    if not embedding_service.is_available():
-        return
 
     async def _embed() -> None:
         try:

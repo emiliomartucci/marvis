@@ -162,7 +162,15 @@ class LocalUpgradeTests(unittest.TestCase):
                         "WHERE workspace_id=? AND project_slug=?",
                         ("ws_default", "sample"),
                     ).fetchone()
-                self.assertEqual(version, 187)
+                self.assertEqual(
+                    version,
+                    max(
+                        db_mod._migration_version(migration)
+                        for migration in db_mod.discover_up_migrations(
+                            ROOT / "migrations"
+                        )
+                    ),
+                )
                 self.assertEqual(lifecycle, ("active",))
             finally:
                 db_mod.MIGRATIONS_DIR = original_migrations

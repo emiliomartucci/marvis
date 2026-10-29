@@ -586,6 +586,14 @@ def _ingest_event_for_status(status: str) -> str:
     return "parsed"
 
 
+def _with_secret_safety(base: dict[str, Any], status: str) -> dict[str, Any]:
+    merged = dict(base)
+    merged["secret_safety"] = status
+    if status in {"requires_redaction", "unverified"}:
+        merged = _block_llm_auto_approve(merged, reason=f"secret_safety_{status}")
+    return merged
+
+
 async def _maybe_llm_enrich(
     *,
     workspace_id: str,
@@ -604,6 +612,10 @@ async def _maybe_llm_enrich(
 
     Reads context OUTSIDE the writer lock (M-D7).
     """
+    from core.api.services.jev.outbound import contains_credentials
+
+    if contains_credentials(extracted_text):
+        return _with_secret_safety(base_classification, "requires_redaction")
     enabled = _llm_classifier_enabled()
     shadow = _llm_classifier_shadow()
     # BYOK (U4): a DB-configured provider for the 'classify' function also enables
@@ -648,6 +660,10 @@ async def _maybe_llm_enrich(
     if ingest_id:
         ctx["_idempotency_scope"] = f"ingest:{ingest_id}"
     ctx["_workspace_id"] = workspace_id
+    ctx["_source_text_truncated"] = len(extracted_text) > 6000
+    ctx["_document_title"] = str(
+        base_classification.get("title") or extracted_text.split("\n", 1)[0]
+    )[:300]
 
     classifier = None
     if byok:
@@ -677,11 +693,21 @@ async def _maybe_llm_enrich(
         llm_result = await classifier.classify(classifier_content, ctx)
     except Exception:  # noqa: BLE001 - defensive: classify() should never raise
         logger.warning("llm classify raised", exc_info=True)
+        secret_safety = getattr(classifier, "secret_safety", "not_checked")
+        if secret_safety in {"requires_redaction", "unverified"}:
+            return _with_secret_safety(base_classification, secret_safety)
         return _with_llm_no_result(
             base_classification,
             status="exception",
             reason="llm_classifier_exception",
         )
+
+    secret_safety = getattr(classifier, "secret_safety", "not_checked")
+    if llm_result is not None:
+        secret_safety = getattr(llm_result, "secret_safety", secret_safety)
+    if secret_safety in {"requires_redaction", "unverified"}:
+        return _with_secret_safety(base_classification, secret_safety)
+    base_classification = _with_secret_safety(base_classification, secret_safety)
 
     if llm_result is None:
         diagnostics = getattr(classifier, "last_error", None)
@@ -819,6 +845,7 @@ async def _maybe_llm_enrich(
         # Keep deterministic decision but surface the LLM hint so the human
         # triage UI can show it.
         merged = dict(base_classification)
+        merged["auto_approve"] = False
         merged["llm_metadata"] = {**metadata, "auto_approved": False}
         return merged
 

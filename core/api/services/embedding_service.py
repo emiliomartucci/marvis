@@ -14,6 +14,7 @@ from typing import Literal, cast
 
 import aiosqlite
 
+from core.api.observability import phase_timing
 from core.api.services._fts import fts5_safe_query
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,8 @@ DEFAULT_SEARCH_RRF_K = 60
 DEFAULT_SEARCH_SALIENCE_WEIGHT = 0.3
 DEFAULT_SEARCH_SCORE_THRESHOLD = 0.6
 BM25_FETCH_LIMIT = 50
+# sqlite-vec rejects KNN queries with k above this bound.
+_VEC0_KNN_K_MAX = 4096
 # Canonical, backend-agnostic mode names. "remote" selects the optional remote
 # backend (a deploy-only module); "granite_local" the in-process engine;
 # "granite_remote" the Phase 2 sidecar; "dual" runs the local validator and
@@ -59,12 +62,30 @@ def _local_run_semaphore() -> asyncio.Semaphore:
 # keyword rather than mixing vectors from a different model into the index.
 _embedder_http_client = None  # httpx.AsyncClient | None (lazy singleton)
 _embedder_health_cache: tuple[float, bool] | None = None  # (checked_at_monotonic, ok)
+_embedder_document_health_cache: tuple[float, bool] | None = None
 _EMBEDDER_HEALTH_TTL = 20.0  # seconds
 _EMBEDDER_MAX_TEXTS = 32  # mirror the sidecar query per-request cap
 # The durable hosted reindex contract intentionally uses a much smaller actual
 # document boundary, regardless of the caller's outer collection size.
 _EMBEDDER_MAX_DOCUMENT_TEXTS = 1
 DEFAULT_EMBEDDER_URL = "http://127.0.0.1:8109"
+
+
+class EmbeddingUnavailableError(RuntimeError):
+    """The configured embedding model is unavailable; retain work for retry."""
+
+
+def require_embedding_count(
+    vectors: list[list[float]], expected_count: int,
+) -> list[list[float]]:
+    """Reject incomplete or extra vectors before acknowledging semantic work."""
+    try:
+        actual_count = len(vectors)
+    except TypeError as exc:
+        raise EmbeddingUnavailableError("Embedding response cardinality mismatch") from exc
+    if actual_count != expected_count:
+        raise EmbeddingUnavailableError("Embedding response cardinality mismatch")
+    return vectors
 
 
 class EmbeddingBackpressureError(RuntimeError):
@@ -102,7 +123,7 @@ def _sidecar_error_detail(response: object) -> str | None:
     return detail if isinstance(detail, str) else None
 
 
-def _probe_embedder_health() -> bool:
+def _probe_embedder_health(input_type: str = "query") -> bool:
     import json as _json
     import urllib.request
 
@@ -115,8 +136,6 @@ def _probe_embedder_health() -> bool:
             body = _json.loads(resp.read().decode("utf-8"))
     except Exception:  # noqa: BLE001 - any probe failure = not available
         return False
-    if body.get("status") != "ready":
-        return False
     if body.get("model_id") != DEFAULT_MODEL or body.get("revision") != MODEL_REVISION:
         logger.error(
             "Embedder sidecar model/revision mismatch: got model=%r revision=%r "
@@ -127,18 +146,26 @@ def _probe_embedder_health() -> bool:
             MODEL_REVISION,
         )
         return False
-    return True
+    lanes = body.get("lanes")
+    if isinstance(lanes, dict):
+        lane = lanes.get(input_type, {})
+        return lane.get("status") in {"ready", "busy"} and lane.get("available") is True
+    return body.get("status") == "ready"
 
 
-def _embedder_health_ok() -> bool:
-    global _embedder_health_cache
+def _embedder_health_ok(input_type: str = "query") -> bool:
+    global _embedder_health_cache, _embedder_document_health_cache
     now = time.monotonic()
-    if _embedder_health_cache is not None:
-        checked_at, ok = _embedder_health_cache
+    cache = _embedder_health_cache if input_type == "query" else _embedder_document_health_cache
+    if cache is not None:
+        checked_at, ok = cache
         if now - checked_at < _EMBEDDER_HEALTH_TTL:
             return ok
-    ok = _probe_embedder_health()
-    _embedder_health_cache = (now, ok)
+    ok = _probe_embedder_health(input_type)
+    if input_type == "query":
+        _embedder_health_cache = (now, ok)
+    else:
+        _embedder_document_health_cache = (now, ok)
     return ok
 
 
@@ -154,7 +181,9 @@ async def _embed_granite_remote_texts(
     """
     if not texts:
         return []
-    global _embedder_health_cache
+    from core.api.services.embedding_internal import DEFAULT_MODEL, MODEL_REVISION
+
+    global _embedder_health_cache, _embedder_document_health_cache
     client = _get_embedder_client()
     raw: list[list[float]] = []
     request_batch_size = (
@@ -169,21 +198,31 @@ async def _embed_granite_remote_texts(
                 "/embed", json={"texts": chunk, "input_type": input_type}
             )
             if (
-                input_type == "document"
-                and resp.status_code == 503
-                and _sidecar_error_detail(resp) == "doc_lane_saturated"
+                resp.status_code == 503
+                and _sidecar_error_detail(resp) == (
+                    "query_lane_saturated" if input_type == "query" else "doc_lane_saturated"
+                )
             ):
-                raise EmbeddingBackpressureError("Embedding document lane is saturated")
+                raise EmbeddingBackpressureError("Embedding lane is saturated")
             if input_type == "document" and resp.status_code == 413:
                 raise EmbeddingInputTooLargeError("Embedding document exceeds sidecar limit")
             resp.raise_for_status()
-            raw.extend(resp.json()["vectors"])
+            payload = resp.json()
+            if (
+                payload.get("model_id") != DEFAULT_MODEL
+                or payload.get("revision") != MODEL_REVISION
+            ):
+                raise EmbeddingUnavailableError("Embedding response identity mismatch")
+            raw.extend(require_embedding_count(payload["vectors"], len(chunk)))
     except (EmbeddingBackpressureError, EmbeddingInputTooLargeError):
         raise
     except Exception as exc:  # noqa: BLE001 - unknown failure -> fail-soft keyword
-        _embedder_health_cache = (time.monotonic(), False)
-        logger.warning("Embedder sidecar request failed: %s", exc)
-        raise RuntimeError("Embedding sidecar unavailable") from exc
+        if input_type == "query":
+            _embedder_health_cache = (time.monotonic(), False)
+        else:
+            _embedder_document_health_cache = (time.monotonic(), False)
+        logger.warning("Embedder sidecar request failed in %s lane", input_type)
+        raise EmbeddingUnavailableError("Embedding sidecar unavailable") from exc
     return [_coerce_dimensions_for_vec_documents(v) for v in raw]
 
 
@@ -247,8 +286,6 @@ def is_available() -> bool:
         backend = _remote_backend()
         if backend is not None and backend.client_ready():
             return True
-        if mode == "remote" and _remote_auto_fallback_enabled():
-            return _get_granite_client().is_available()
         return False
     if mode == "granite_local":
         # F1: honest readiness. The client's is_available() actually attempts the
@@ -259,6 +296,13 @@ def is_available() -> bool:
     if mode == "granite_remote":
         return _embedder_health_ok()
     return False
+
+
+async def is_available_async(*, input_type: str = "query") -> bool:
+    """Check readiness without blocking the event loop; inspect lanes separately."""
+    if _embedding_mode() == "granite_remote":
+        return await asyncio.to_thread(_embedder_health_ok, input_type)
+    return await asyncio.to_thread(is_available)
 
 
 # F2/U6: a background or opportunistic index build must never OOM a self-hoster's
@@ -318,40 +362,26 @@ async def embed_texts(
     """
     mode = _embedding_mode()
     if mode == "remote":
-        if _remote_auto_fallback_enabled():
-            try:
-                backend = _remote_backend()
-                if backend is not None and backend.client_ready():
-                    return await _embed_remote_texts(texts, input_type=input_type)
-                logger.warning("Remote embedding backend unavailable; falling back to Granite local")
-            except Exception:
-                logger.exception("Remote embedding backend failed; falling back to Granite local")
-            return await _embed_granite_texts(
-                texts,
-                input_type=input_type,
-                batch_size=batch_size,
-            )
-        return await _embed_remote_texts(texts, input_type=input_type)
-    if mode == "granite_local":
-        return await _embed_granite_texts(
-            texts,
-            input_type=input_type,
-            batch_size=batch_size,
+        embeddings = await _embed_remote_texts(texts, input_type=input_type)
+    elif mode == "granite_local":
+        embeddings = await _embed_granite_texts(
+            texts, input_type=input_type, batch_size=batch_size,
         )
-    if mode == "dual":
-        remote_embeddings = await _embed_remote_texts(texts, input_type=input_type)
+    elif mode == "dual":
+        embeddings = require_embedding_count(
+            await _embed_remote_texts(texts, input_type=input_type), len(texts),
+        )
         try:
             await _embed_granite_texts(
-                texts,
-                input_type=input_type,
-                batch_size=batch_size,
+                texts, input_type=input_type, batch_size=batch_size,
             )
         except Exception:
             logger.exception("Granite dual-mode validation embedding failed")
-        return remote_embeddings
-    if mode == "granite_remote":
-        return await _embed_granite_remote_texts(texts, input_type=input_type)
-    raise NotImplementedError(f"Unhandled embedding mode: {mode!r}")
+    elif mode == "granite_remote":
+        embeddings = await _embed_granite_remote_texts(texts, input_type=input_type)
+    else:
+        raise NotImplementedError(f"Unhandled embedding mode: {mode!r}")
+    return require_embedding_count(embeddings, len(texts))
 
 
 async def _embed_remote_texts(
@@ -360,9 +390,14 @@ async def _embed_remote_texts(
 ) -> list[list[float]]:
     """Embed texts via the optional remote backend (deploy-only module)."""
     backend = _remote_backend()
-    if backend is None:
-        raise RuntimeError("Remote embedding backend not installed")
-    return await backend.embed(texts, input_type=input_type)
+    if backend is None or not backend.client_ready():
+        raise EmbeddingUnavailableError("Remote embedding backend not installed")
+    try:
+        return await backend.embed(texts, input_type=input_type)
+    except (EmbeddingBackpressureError, EmbeddingInputTooLargeError):
+        raise
+    except Exception as exc:
+        raise EmbeddingUnavailableError("Configured embedding backend unavailable") from exc
 
 
 async def _embed_granite_texts(
@@ -372,13 +407,18 @@ async def _embed_granite_texts(
 ) -> list[list[float]]:
     client = _get_granite_client()
     # F2: one model run at a time across the process (see _local_run_semaphore).
-    async with _local_run_semaphore():
-        embeddings = await asyncio.to_thread(
-            client.embed_texts,
-            texts,
-            input_type=input_type,
-            batch_size=batch_size,
-        )
+    try:
+        async with _local_run_semaphore():
+            embeddings = await asyncio.to_thread(
+                client.embed_texts,
+                texts,
+                input_type=input_type,
+                batch_size=batch_size,
+            )
+    except (EmbeddingBackpressureError, EmbeddingInputTooLargeError):
+        raise
+    except Exception as exc:
+        raise EmbeddingUnavailableError("Configured embedding backend unavailable") from exc
     return [_coerce_dimensions_for_vec_documents(embedding) for embedding in embeddings]
 
 
@@ -411,18 +451,9 @@ def _embedding_mode() -> EmbeddingMode:
     return cast(EmbeddingMode, mode)
 
 
-def _remote_auto_fallback_enabled() -> bool:
-    """Allow auto-resolved remote deployments to degrade to local Granite.
-
-    An explicit ``EMBEDDING_MODE=remote`` remains strict. With no explicit mode,
-    deploys that carry a remote backend use it when healthy, but search/reindex
-    can still work through the local OSS engine when the remote client is down.
-    """
-    raw_mode = os.environ.get("EMBEDDING_MODE")
-    if raw_mode and raw_mode.strip():
-        return False
-    raw = os.environ.get("EMBEDDING_REMOTE_FALLBACK_LOCAL", "true").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+def uses_external_embedding() -> bool:
+    """Whether the configured inference path can send text to a vendor."""
+    return _embedding_mode() in {"remote", "dual"}
 
 
 def _search_rrf_k() -> int:
@@ -711,12 +742,64 @@ def _pack_chunk_vector(vec: Sequence[float]) -> bytes:
     return struct.pack(f"<{len(vec)}f", *(float(x) for x in vec))
 
 
+async def persist_lexical_file(
+    db: aiosqlite.Connection,
+    vec_db: aiosqlite.Connection,
+    *,
+    workspace_id: str,
+    project: str,
+    file_path: str,
+    title: str,
+    doc_type: str,
+    content: str,
+) -> int:
+    """Persist searchable text with an incomplete semantic hash before inference.
+
+    The caller commits this phase separately. Old vectors and chunks cannot be
+    paired with the new body, and a retry cannot mistake this row for completion.
+    """
+    row = await (await db.execute(
+        "SELECT id, workspace_id, project FROM documents WHERE file_path = ?", [file_path]
+    )).fetchone()
+    if row is not None:
+        if row["workspace_id"] != workspace_id or row["project"] != project:
+            raise ValueError("Document belongs to another workspace or project")
+        await db.execute(
+            "UPDATE documents SET content_hash = '', doc_type = ?, doc_title = ? WHERE id = ?",
+            [doc_type, title, row["id"]],
+        )
+    else:
+        cursor = await db.execute(
+            """INSERT INTO documents(file_path, project, workspace_id, doc_type, doc_title, content_hash)
+               VALUES (?, ?, ?, ?, ?, '')""",
+            [file_path, project, workspace_id, doc_type, title],
+        )
+        row = {"id": cursor.lastrowid}
+    doc_id = row["id"]
+    for table, key, values in [
+        ("vec_documents", "doc_id", [doc_id]),
+        ("vec_chunks", "chunk_rowid", [r[0] for r in await (await db.execute(
+            "SELECT rowid FROM chunks WHERE doc_id = ?", [str(doc_id)]
+        )).fetchall()]),
+    ]:
+        exists = await (await vec_db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = ?", [table]
+        )).fetchone()
+        if exists:
+            for value in values:
+                await vec_db.execute(f"DELETE FROM {table} WHERE {key} = ?", [value])
+    await db.execute("DELETE FROM chunks WHERE doc_id = ?", [str(doc_id)])
+    await refresh_documents_fts_row(db, doc_id=doc_id, title=title, content=content, force=True)
+    return doc_id
+
+
 async def persist_prose_chunks(
     *,
     doc_id: str,
     content: str,
     db: aiosqlite.Connection,
     vec_db: aiosqlite.Connection | None = None,
+    redact_for_embedding: bool = False,
 ) -> int:
     """Chunk a PROSE doc, embed the chunks, and upsert them into ``chunks``.
 
@@ -730,8 +813,10 @@ async def persist_prose_chunks(
     the write (the caller already holds the doc write lock pattern; this runs the
     embed via ``embed_texts`` which offloads off-lock).
     """
-    if not chunking_enabled() or not is_available():
+    if not chunking_enabled():
         return 0
+    if not await is_available_async(input_type="document"):
+        raise EmbeddingUnavailableError("Chunk embedding unavailable")
 
     from core.api.services.chunking import chunk_prose
 
@@ -792,8 +877,15 @@ async def persist_prose_chunks(
 
     raw = content.encode("utf-8")
     texts = [raw[c.span_start : c.span_end].decode("utf-8", "replace") for _, _, c in pending]
+    if redact_for_embedding:
+        from core.api.services.pii_redactor import redact
+
+        texts = [redact(text) for text in texts]
     try:
-        embedded = list(zip(pending, await embed_texts(texts, input_type="document")))
+        vectors = require_embedding_count(
+            await embed_texts(texts, input_type="document"), len(pending),
+        )
+        embedded = list(zip(pending, vectors))
     except EmbeddingInputTooLargeError:
         # One oversized chunk must not kill the document — nor, upstream, the
         # whole reindex job (2026-08-05: one such input killed every full
@@ -803,7 +895,9 @@ async def persist_prose_chunks(
         embedded = []
         for entry, text in zip(pending, texts):
             try:
-                vec = (await embed_texts([text], input_type="document"))[0]
+                vec = require_embedding_count(
+                    await embed_texts([text], input_type="document"), 1,
+                )[0]
             except EmbeddingInputTooLargeError:
                 _, idx, c = entry
                 logger.warning(
@@ -1200,10 +1294,10 @@ async def embed_task_document(
 
     Writes go through ``write_db`` (the writer pool); the read pool is
     ``query_only=ON`` and would fail any INSERT (learning 6130bc49). No-ops if the
-    embedder is unavailable — the caller is expected to gate on ``is_available()``
-    too, but this guard keeps the helper safe to call directly.
+    embedder is unavailable; this helper checks document readiness asynchronously
+    so callers can schedule it without a blocking readiness preflight.
     """
-    if not await asyncio.to_thread(is_available):
+    if not await is_available_async(input_type="document"):
         return
 
     content = f"{title}\nStatus: {status}\nProject: {project}"
@@ -1282,7 +1376,7 @@ async def embed_learning_document(
     learning. Writes go through ``write_db`` (the writer pool); the read pool is
     ``query_only=ON`` (learning 6130bc49). No-ops if the embedder is unavailable.
     """
-    if not await asyncio.to_thread(is_available):
+    if not await is_available_async(input_type="document"):
         return
 
     content = "\n".join(
@@ -1370,7 +1464,7 @@ async def embed_project_document(
     pool); the read pool is ``query_only=ON`` (learning 6130bc49). No-ops if the
     embedder is unavailable.
     """
-    if not is_available():
+    if not await is_available_async(input_type="document"):
         return
 
     content = f"{slug}\n{name}\n{description}"
@@ -1448,7 +1542,7 @@ async def embed_inbox_document(
     (the writer pool); the read pool is ``query_only=ON`` (learning 6130bc49). No-ops if
     the embedder is unavailable.
     """
-    if not is_available():
+    if not await is_available_async(input_type="document"):
         return
 
     snippet = (content or "")[:500]
@@ -1537,7 +1631,7 @@ async def embed_doc_document(
     ``write_db`` (the writer pool); the read pool is ``query_only=ON`` (learning
     6130bc49). No-ops if the embedder is unavailable.
     """
-    if not is_available():
+    if not await is_available_async(input_type="document"):
         return
 
     h = content_hash(content)
@@ -1915,10 +2009,11 @@ async def search_by_type(
     using Reciprocal Rank Fusion, then applies the salience boost. Set
     SEARCH_BM25_ENABLED=false to use the legacy embedding-only scorer.
     """
-    if not is_available():
+    if not await is_available_async():
         raise RuntimeError("Embedding client not initialized")
 
-    embeddings = await embed_texts([query], input_type="query")
+    async with phase_timing.aphase("embed"):
+        embeddings = await embed_texts([query], input_type="query")
     vec_bytes = serialize_f32(embeddings[0])
 
     # Open dedicated connections — never share request-scoped connections
@@ -1943,7 +2038,7 @@ async def search_by_type(
         # Single KNN with large k, then group by doc_type. Previous approach
         # ran the same KNN 4x with k=20, so files/handoffs were drowned out by
         # task-heavy top-20 results.
-        fetch_k = max(BM25_FETCH_LIMIT, top_k * 20)
+        fetch_k = min(_VEC0_KNN_K_MAX, max(BM25_FETCH_LIMIT, top_k * 20))
         embedding_hits = await _embedding_knn_search(vec_db, vec_bytes, fetch_k)
         if not embedding_hits:
             return _empty_grouped_results()
@@ -2048,91 +2143,23 @@ async def search_by_type(
         await vec_db.close()
 
 
-async def reindex_project(project: str, db: aiosqlite.Connection) -> dict:
-    """Reindex all handoff files for a project. Single connection for atomicity."""
-    if not is_available():
-        raise RuntimeError("Embedding client not initialized")
+async def reindex_project(
+    project: str, db: aiosqlite.Connection, *, workspace_id: str = "ws_default",
+) -> dict:
+    """Reindex project handoffs with the shared privacy and recovery contract."""
+    from core.api.routers.projects import _find_project_path
+    from core.api.use_cases.search import _reindex_file_paths
 
-    # Find handoff directory
-    import core.api.routers.projects as _projects_mod
-    project_path = _projects_mod._find_project_path(project)
+    project_path = _find_project_path(project)
     if not project_path:
         return {"error": "Project not found", "indexed": 0}
-
     memory_dir = project_path / "memory"
     if not memory_dir.is_dir():
         return {"error": "No memory directory", "indexed": 0}
-
-    # Cleanup orphans
-    await db.execute("DELETE FROM vec_documents WHERE doc_id NOT IN (SELECT id FROM documents)")
-
-    # Load existing hashes
-    cursor = await db.execute(
-        "SELECT file_path, content_hash FROM documents WHERE project = ?",
-        [project],
+    result = await _reindex_file_paths(
+        workspace_id, db, db, sorted(memory_dir.glob("handoff-*.md"))
     )
-    existing = {row["file_path"]: row["content_hash"] for row in await cursor.fetchall()}
-
-    # Scan files and find changed ones
-    to_embed: list[tuple[str, str]] = []  # (file_path, content)
-    for f in sorted(memory_dir.glob("handoff-*.md")):
-        if f.is_symlink():
-            continue
-        try:
-            text = f.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        fpath = str(f)
-        h = content_hash(text)
-        if existing.get(fpath) == h:
-            continue
-        to_embed.append((fpath, text))
-
-    if not to_embed:
-        return {"indexed": 0, "skipped": len(existing), "message": "All up to date"}
-
-    # Batch embed (remote backend max 128 per call)
-    indexed = 0
-    batch_size = 64
-    for i in range(0, len(to_embed), batch_size):
-        batch = to_embed[i:i + batch_size]
-        texts = [content for _, content in batch]
-        embeddings = await embed_texts(texts, input_type="document")
-
-        for (fpath, text), embedding in zip(batch, embeddings):
-            h = content_hash(text)
-            # Upsert document
-            await db.execute(
-                "INSERT INTO documents (file_path, project, content_hash) VALUES (?, ?, ?) "
-                "ON CONFLICT(file_path) DO UPDATE SET content_hash = excluded.content_hash",
-                [fpath, project, h],
-            )
-            # Get doc_id
-            cur = await db.execute("SELECT id FROM documents WHERE file_path = ?", [fpath])
-            doc_row = await cur.fetchone()
-            doc_id = doc_row["id"]
-
-            # vec0 virtual table does not support ON CONFLICT — DELETE + INSERT
-            await db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
-            await db.execute(
-                "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
-                [doc_id, serialize_f32(embedding)],
-            )
-            # B-fix (MARVIS_FTS_BODIES): no doc_title in this legacy path — the
-            # file_path-as-title mirrors the migration backfill fallback.
-            await refresh_documents_fts_row(db, doc_id=doc_id, title=fpath, content=text)
-            # A-span (Phase 2, gap S2): keep the chunks sidecar in sync on the
-            # reindex path too. No-op unless MARVIS_CHUNKING is ON.
-            if chunking_enabled() and fpath.startswith("/"):
-                await persist_prose_chunks(
-                    doc_id=str(doc_id), content=text, db=db
-                )
-            indexed += 1
-
-        await db.commit()
-
-        # Rate limit: 1s between batches
-        if i + batch_size < len(to_embed):
-            await asyncio.sleep(1)
-
-    return {"indexed": indexed, "skipped": len(existing) - indexed, "total_files": len(to_embed) + len(existing)}
+    result["total_files"] = result["total"]
+    if result["indexed"] == 0 and not result.get("skipped_entries") and not result.get("error"):
+        result["message"] = "All up to date"
+    return result

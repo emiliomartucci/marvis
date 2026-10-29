@@ -71,6 +71,7 @@ import os
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -85,6 +86,7 @@ from core.api.models import (
     StatusUpdateFeedItem,
     StatusUpdateFeedResponse,
 )
+from core.api.services.project_lifecycle import metadata_program
 from core.api.use_cases._context import (
     CallerContext,
     require_role_ctx,
@@ -103,8 +105,42 @@ logger = logging.getLogger(__name__)
 # Default data dir for new work projects on the MANAGED deploy.
 _SERVER_DATA_PROJECT_DIR = Path("/data/projects")
 
+_PROJECT_ENTITLEMENT_MODE_ENV = "MARVIS_PROJECT_ENTITLEMENT_MODE"
+_HOSTED_PROJECT_ENTITLEMENT_MODE = "hosted"
+_UNMETERED_SELF_HOSTED_PROJECT_ENTITLEMENT_MODE = "unmetered-self-hosted"
+
+
+def _project_entitlement_mode() -> str:
+    """Resolve the explicit project-entitlement boundary.
+
+    Hosted remains the fail-closed default whenever a tenant identity is
+    configured.  A self-hosted distribution that deliberately has no Hosted
+    commercial entitlement runtime must opt out explicitly; ``TENANT_ID`` is
+    still free to identify that customer's isolated workspace.
+    """
+    raw = (
+        os.environ.get(
+            _PROJECT_ENTITLEMENT_MODE_ENV,
+            _HOSTED_PROJECT_ENTITLEMENT_MODE,
+        )
+        .strip()
+        .lower()
+    )
+    mode = raw or _HOSTED_PROJECT_ENTITLEMENT_MODE
+    if mode not in {
+        _HOSTED_PROJECT_ENTITLEMENT_MODE,
+        _UNMETERED_SELF_HOSTED_PROJECT_ENTITLEMENT_MODE,
+    }:
+        raise ServiceUnavailableError(
+            code="project_entitlement_mode_invalid",
+            message="Project entitlement mode is invalid",
+        )
+    return mode
+
 
 def load_signed_project_entitlement():
+    if _project_entitlement_mode() == _UNMETERED_SELF_HOSTED_PROJECT_ENTITLEMENT_MODE:
+        return None
     tenant_id = (
         os.environ.get("TENANT_ID")
         or os.environ.get("MARVIS_TENANT_ID")
@@ -327,6 +363,23 @@ async def _project_color(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_program(slug: str, path: Path) -> str | None:
+    """Program of one project, resolved exactly as ``list_programs`` groups it.
+
+    project.yaml ``program`` (normalized by ``metadata_program``) wins; otherwise
+    the programs.yaml membership. The context.md fallback is never canonical.
+    """
+    from core.api.routers.projects import _get_programs, _read_project_yaml
+
+    program = metadata_program(_read_project_yaml(path) or {})
+    if program:
+        return program
+    for prog_name, prog_data in _get_programs().items():
+        if isinstance(prog_data, dict) and slug in prog_data.get("projects", []):
+            return prog_name
+    return None
+
+
 async def list_programs(
     ctx: CallerContext,
     db: aiosqlite.Connection,
@@ -350,7 +403,13 @@ async def list_programs(
         _get_latest_status_updates,
         _get_programs,
         _get_project_metadata,
+        _read_project_yaml,
     )
+
+    def _canonical_program(entry: Any) -> str | None:
+        # Only project.yaml is canonical; the context.md fallback of
+        # _get_project_metadata never overrides programs.yaml membership.
+        return metadata_program(_read_project_yaml(entry.metadata_path) or {}) if entry else None
 
     programs = _get_programs()
     if not _projects_mod._project_index or (
@@ -394,60 +453,63 @@ async def list_programs(
         workspace_id=ctx.workspace_id or "ws_default",
     )
 
-    result: list[ProgramInfo] = []
+    def _project_info(
+        slug: str,
+        entry: Any,
+        meta: dict,
+        program: str | None,
+    ) -> ProjectInfo:
+        counts = task_counts.get(slug, {})
+        sc = StatusCounts(**{k: v for k, v in counts.items() if k in StatusCounts.model_fields})
+        su = status_updates.get(slug)
+        metadata_path = str(entry.metadata_path.resolve()) if entry else None
+        return ProjectInfo(
+            slug=slug,
+            name=slug,
+            program=program,
+            language=meta.get("language"),
+            lifecycle=meta.get("lifecycle"),
+            phase=meta.get("phase"),
+            scope=meta.get("scope"),
+            description=meta.get("description"),
+            type=entry.project_type if entry else None,
+            repo_path=str(entry.repo_path) if entry and entry.repo_path else None,
+            metadata_path=metadata_path,
+            status=su[0] if su else None,
+            color=colors.get(slug),
+            task_counts=sc,
+            last_status_update=su[1] if su else None,
+            on_server=entry is not None,
+            path=metadata_path,
+        )
+
+    # project.yaml ``program`` is the per-project source (set through the
+    # governed ``set_project_program`` lifecycle API); programs.yaml membership
+    # is only the fallback for projects whose metadata declares none.
+    groups: dict[str, list[ProjectInfo]] = {}
+    descriptions: dict[str, str] = {}
     seen_slugs: set[str] = set()
+
+    def _place(program: str, info: ProjectInfo) -> None:
+        groups.setdefault(program, []).append(info)
+        descriptions.setdefault(program, "")
 
     for prog_name, prog_data in programs.items():
         if not isinstance(prog_data, dict):
             continue
-        description = prog_data.get("description", "")
-        project_slugs = prog_data.get("projects", [])
-        projects: list[ProjectInfo] = []
-        for slug in project_slugs:
+        groups.setdefault(prog_name, [])
+        descriptions[prog_name] = prog_data.get("description", "")
+        for slug in prog_data.get("projects", []):
             seen_slugs.add(slug)
             if visible_slugs is not None and slug not in visible_slugs:
                 continue
             entry = project_index.get(slug)
-            on_server = entry is not None
-            meta: dict = {}
-            if on_server and entry:
-                meta = _get_project_metadata(entry.metadata_path)
+            meta: dict = _get_project_metadata(entry.metadata_path) if entry else {}
             if not include_archived and meta.get("lifecycle") == "archived":
                 continue
+            program = _canonical_program(entry) or prog_name
+            _place(program, _project_info(slug, entry, meta, program))
 
-            counts = task_counts.get(slug, {})
-            sc = StatusCounts(**{k: v for k, v in counts.items() if k in StatusCounts.model_fields})
-
-            su = status_updates.get(slug)
-            proj_status = su[0] if su else None
-            last_su_date = su[1] if su else None
-
-            working_path = None
-            if entry:
-                working_path = str(entry.metadata_path.resolve())
-
-            projects.append(ProjectInfo(
-                slug=slug,
-                name=slug,
-                program=prog_name,
-                language=meta.get("language"),
-                lifecycle=meta.get("lifecycle"),
-                phase=meta.get("phase"),
-                scope=meta.get("scope"),
-                description=meta.get("description"),
-                type=entry.project_type if entry else None,
-                repo_path=str(entry.repo_path) if entry and entry.repo_path else None,
-                metadata_path=str(entry.metadata_path.resolve()) if entry else None,
-                status=proj_status,
-                color=colors.get(slug),
-                task_counts=sc,
-                last_status_update=last_su_date,
-                on_server=on_server,
-                path=working_path,
-            ))
-        result.append(ProgramInfo(name=prog_name, description=description, projects=projects))
-
-    # Standalone projects (in index but not in any program)
     standalone: list[ProjectInfo] = []
     for slug, entry in project_index.items():
         if slug in seen_slugs:
@@ -457,29 +519,17 @@ async def list_programs(
         meta = _get_project_metadata(entry.metadata_path)
         if not include_archived and meta.get("lifecycle") == "archived":
             continue
-        counts = task_counts.get(slug, {})
-        sc = StatusCounts(**{k: v for k, v in counts.items() if k in StatusCounts.model_fields})
-        su = status_updates.get(slug)
-        working_path = str(entry.metadata_path.resolve())
-        standalone.append(ProjectInfo(
-            slug=slug,
-            name=slug,
-            program=None,
-            language=meta.get("language"),
-            lifecycle=meta.get("lifecycle"),
-            phase=meta.get("phase"),
-            scope=meta.get("scope"),
-            description=meta.get("description"),
-            type=entry.project_type,
-            repo_path=str(entry.repo_path) if entry.repo_path else None,
-            metadata_path=str(entry.metadata_path.resolve()),
-            status=su[0] if su else None,
-            color=colors.get(slug),
-            task_counts=sc,
-            last_status_update=su[1] if su else None,
-            on_server=True,
-            path=working_path,
-        ))
+        program = _canonical_program(entry)
+        info = _project_info(slug, entry, meta, program)
+        if program is None:
+            standalone.append(info)
+        else:
+            _place(program, info)
+
+    result = [
+        ProgramInfo(name=name, description=descriptions[name], projects=projects)
+        for name, projects in groups.items()
+    ]
     if standalone:
         result.append(ProgramInfo(name="standalone", description="Standalone projects", projects=standalone))
 
@@ -737,7 +787,6 @@ async def get_project(
 
     from core.api.routers.projects import (
         _find_project_entry,
-        _get_programs,
         _get_project_metadata,
         _parse_context_config,
         _parse_docs,
@@ -754,13 +803,7 @@ async def get_project(
     meta = _get_project_metadata(path)
     config = _parse_context_config(context_md) if context_md else {}
 
-    program = meta.get("program")
-    if not program:
-        programs = _get_programs()
-        for prog_name, prog_data in programs.items():
-            if isinstance(prog_data, dict) and slug in prog_data.get("projects", []):
-                program = prog_name
-                break
+    program = _resolve_program(slug, path)
 
     deploy = meta.get("deploy") if isinstance(meta.get("deploy"), dict) else None
 
@@ -878,8 +921,8 @@ async def get_session_brief(
     from core.api.config import settings
     from core.api.routers.projects import (
         _find_project_entry,
-        _get_programs,
         _get_project_metadata,
+        _handoff_date_cached,
         _handoff_date_from_content,
         _handoff_sort_key,
         _safe_read_file,
@@ -899,13 +942,7 @@ async def get_session_brief(
         "Personalita: opinioni forti, umorismo naturale, garbo nel segnalare scelte sbagliate."
     )
 
-    program = meta.get("program")
-    if not program:
-        programs = _get_programs()
-        for prog_name, prog_data in programs.items():
-            if isinstance(prog_data, dict) and slug in prog_data.get("projects", []):
-                program = prog_name
-                break
+    program = _resolve_program(slug, path)
 
     project_info = {
         "slug": slug,
@@ -958,24 +995,28 @@ async def get_session_brief(
     latest_handoff = None
     memory_dir = path / "memory"
     if memory_dir.is_dir():
-        candidates: list[tuple[Path, str, str]] = []
+        # Rank by the stat-keyed cached date, then read only the winner in full.
+        candidates: list[tuple[Path, str]] = []
         for f in memory_dir.glob("handoff-*.md"):
             if f.is_symlink():
                 continue
+            ho_date = _handoff_date_cached(path, f)
+            if ho_date is not None:
+                candidates.append((f, ho_date))
+        for f, ho_date in sorted(
+            candidates,
+            key=lambda item: _handoff_sort_key(item[0], item[1]),
+            reverse=True,
+        ):
             content = _safe_read_file(path, f"memory/{f.name}")
-            if content:
-                candidates.append((f, content, _handoff_date_from_content(content, f.name)))
-        if candidates:
-            f, content, ho_date = sorted(
-                candidates,
-                key=lambda item: _handoff_sort_key(item[0], item[2]),
-                reverse=True,
-            )[0]
+            if not content:
+                continue  # vanished or replaced since ranking: try the next one
             latest_handoff = {
                 "title": f.stem.replace("-", " ").strip(),
-                "date": ho_date,
+                "date": _handoff_date_from_content(content, f.name),
                 "summary_first_500_chars": content[:500],
             }
+            break
 
     # Bi-temporal hygiene (#14): exclude superseded learnings from the cold-start
     # bundle when MARVIS_TEMPORAL_MEMORY is on, via the SAME canonical helper the

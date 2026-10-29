@@ -26,6 +26,7 @@ from core.api.models.brain import (
     SignalType,
 )
 from core.api.visibility import get_visible_projects
+from core.api.services.brain.visibility_policy import enterprise_strict, scope_sql, scope_visible
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +104,9 @@ async def _resolve_run(
     if run_id:
         row = await (
             await db.execute(
-                "SELECT run_id, cycle_key FROM brain_runs WHERE run_id = ?",
-                (run_id,),
+                "SELECT run_id, cycle_key FROM brain_runs "
+                "WHERE run_id = ? AND workspace_id = ?",
+                (run_id, workspace_id),
             )
         ).fetchone()
         if row is None:
@@ -181,12 +183,10 @@ def _redact(sig: DriftSignal) -> DriftSignalRedacted:
     )
 
 
-def _is_visible(visible: set[str] | None, involved_projects: list[str]) -> bool:
-    if visible is None:
-        return True
-    if not involved_projects:
-        return True
-    return set(involved_projects).issubset(visible)
+def _is_visible(
+    visible: set[str] | None, involved_projects: list[str], scope_type: str, scope_key: str
+) -> bool:
+    return scope_visible(visible, involved_projects, scope_type, scope_key)
 
 
 async def list_drift_signals(
@@ -258,6 +258,11 @@ async def list_drift_signals(
         where.append("s.confidence >= ?")
         params.append(confidence_min)
 
+        visibility_sql, visibility_params = scope_sql("s", visible)
+        if visibility_sql is not None:
+            where.append(visibility_sql)
+            params.extend(visibility_params)
+
         if cursor:
             decoded = _decode_cursor(cursor)
             if decoded:
@@ -293,7 +298,9 @@ async def list_drift_signals(
         )
     for row in page_rows:
         sig = _row_to_signal(row)
-        if not _is_visible(visible, sig.involved_projects):
+        if not _is_visible(visible, sig.involved_projects, sig.scope_type, sig.scope_key):
+            if enterprise_strict():
+                continue
             redacted_count += 1
             items.append(_redact(sig))
             continue
@@ -319,15 +326,17 @@ async def fetch_single_drift_signal(
         db.row_factory = aiosqlite.Row
         row = await (
             await db.execute(
-                "SELECT * FROM brain_drift_signals WHERE signal_id = ?",
-                (signal_id,),
+                "SELECT s.* FROM brain_drift_signals s "
+                "JOIN brain_runs r ON r.run_id = s.run_id "
+                "WHERE s.signal_id = ? AND r.workspace_id = ?",
+                (signal_id, workspace_id),
             )
         ).fetchone()
         if row is None:
             return None
         visible = await get_visible_projects(db, user, workspace_id) if user else None
     sig = _row_to_signal(row)
-    if not _is_visible(visible, sig.involved_projects):
+    if not _is_visible(visible, sig.involved_projects, sig.scope_type, sig.scope_key):
         # 404 — never reveal existence to redacted callers.
         return None
     return sig
@@ -338,7 +347,7 @@ async def apply_drift_patch(
     signal_id: str,
     action: DriftPatchAction,
     reason: str | None,
-    user: UserInfo,
+    user: UserInfo | None,
     workspace_id: str = "ws_default",
     now: datetime,
 ) -> DriftSignal | None:
@@ -359,7 +368,7 @@ async def apply_drift_patch(
     if action == "dismiss":
         new_state = "dismissed"
         dismissed_at = iso_now
-        dismissed_by = user.user_id
+        dismissed_by = user.user_id if user is not None else None
         dismiss_reason = reason
     elif action == "acknowledge":
         # Acknowledge keeps state=open but stores reason as dismiss_reason

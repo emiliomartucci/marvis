@@ -8,7 +8,15 @@ from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from core.api.retired_ui_contract import is_ui_request_path, retired_ui_decision
+
+try:
+    from core.hosted_control.retired_ui import RETIRED_PERSONAL_UI_HOST
+except ImportError:  # Hosted-only coordinate, absent in public projection
+    RETIRED_PERSONAL_UI_HOST = None
+
 UI_DIR = Path(__file__).parent / "console_dist"
+CANONICAL_CONSOLE_ORIGIN = "https://app.justaskmarvis.com"
 
 UI_MISSING_MESSAGE = (
     "Marvis Console assets are not installed. Expected static export at "
@@ -80,8 +88,25 @@ def mount_ui(app: FastAPI, ui_dir: Path = UI_DIR) -> None:
     )
 
 
-def is_ui_request_path(path: str) -> bool:
-    return path == "/ui" or path.startswith("/ui/")
+def retired_ui_redirect(request: Request) -> Response | None:
+    """Retire only the legacy personal browser entry point."""
+    host = request.headers.get("host", "").lower().rstrip(".")
+    if RETIRED_PERSONAL_UI_HOST is None or host != RETIRED_PERSONAL_UI_HOST:
+        return None
+
+    decision = retired_ui_decision(
+        request.scope,
+        target=f"{CANONICAL_CONSOLE_ORIGIN}/ui",
+    )
+    if decision is None:
+        return None
+    status, location = decision
+    headers = {"Cache-Control": "no-store"}
+    if status == 308 and location is not None:
+        headers["Location"] = location
+    elif status == 405:
+        headers["Allow"] = "GET, HEAD"
+    return Response(content=b"", status_code=status, headers=headers)
 
 
 def apply_ui_response_headers(request: Request, response: Response) -> None:

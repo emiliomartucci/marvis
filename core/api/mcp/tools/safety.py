@@ -10,11 +10,11 @@ port imports the bridge's ``evaluate_action`` (the exact function ``_run_check``
 calls) DIRECTLY: no subprocess, no ``python3`` re-exec, no HTTP. The returned
 ``Decision`` is mapped to the SAME ``{allowed, reason, rule}`` dict shape the Node
 ``checkSafety`` returns (``safety_bridge._run_check``'s output), so the behaviour is
-byte-identical — minus the subprocess fork.
+unchanged for enforcement, with a separate optional Jev advisory receipt.
 
-There is no DB and no use_case for this tool (the safety bridge is a Constitution
+There is no use_case for this tool (the safety bridge is a Constitution
 preflight, not a domain entity), so the tool body neither acquires a connection nor
-calls ``use_cases`` — it computes the decision in-process. ``evaluate_action`` is
+calls ``use_cases`` — it computes enforcement in-process. ``evaluate_action`` is
 fail-CLOSED by contract: ``_run_check`` catches any exception and denies with
 ``rule='bridge-error'``; that envelope is reproduced here so a config/parse failure
 returns ``{allowed: False, ...}`` rather than raising.
@@ -83,7 +83,7 @@ def register(mcp) -> None:
 
         QUANDO USARLO: su provider senza native PreToolUse hook (Codex, Gemini, OpenClaw container) — mirror dell'enforcement che Claude Code ha gratis via hook.
         QUANDO NON USARLO: NOT su Claude Code con hook attivi — e' ridondante. NOT come sostituto della Constitution (e' un preflight, non un substitute).
-        RESTITUISCE: {allowed:bool, reason, rule}."""
+        RESTITUISCE: {allowed:bool, reason, rule, jev_advisory}; Jev does not change enforcement."""
         # In-process port of `safety_bridge check`: import the stdlib bridge and call
         # the SAME `evaluate_action` the Node subprocess invokes. Map the Decision to
         # the {allowed, reason, rule} dict shape Node's checkSafety returns. Fail
@@ -96,14 +96,25 @@ def register(mcp) -> None:
                 command=command,
                 cwd=cwd,
             )
-            return {
+            result = {
                 "allowed": decision.allowed,
                 "reason": decision.reason,
                 "rule": decision.rule,
             }
         except Exception as exc:  # noqa: BLE001 — fail-closed, mirror _run_check
-            return {
+            result = {
                 "allowed": False,
                 "reason": f"Safety bridge failure: {exc}",
                 "rule": "bridge-error",
             }
+        # Advisory only: the deterministic bridge owns enforcement.
+        from core.api.services.jev.guardrail import evaluate_action, GuardrailVerdict
+        try:
+            advice = await evaluate_action(
+                command or file_path or action_type,
+                context=f"action_type={action_type}; cwd={cwd or ''}",
+            )
+        except Exception:
+            advice = GuardrailVerdict("ask_human", .5, None, "error", "advisory check unavailable")
+        result["jev_advisory"] = advice.to_dict()
+        return result
