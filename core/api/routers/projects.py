@@ -31,6 +31,7 @@ import re
 import shutil
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -79,7 +80,7 @@ from core.api.services.kg.audit import check_deep_rate_limit, log_kg_deep_access
 from core.api.services.kg.lens import build_kg_context_for_project, require_kg_visibility
 from core.api.use_cases import projects as uc
 from core.api.use_cases._context import CallerContext
-from core.api.use_cases._errors import ServiceError
+from core.api.use_cases._errors import NotFoundError, ServiceError
 
 logger = logging.getLogger(__name__)
 
@@ -106,9 +107,6 @@ def _schedule_embed_project(
     is ``description or slug`` and the embedded ``description`` is ``description or ""``.
     """
     from core.api.services import embedding_service
-
-    if not embedding_service.is_available():
-        return
 
     desc = description or ""
     name = desc or slug
@@ -482,6 +480,54 @@ def _handoff_date_from_content(content: str, filename: str) -> str:
     return date_match.group(1) if date_match else ""
 
 
+# Parsed metadata of project files, keyed on (kind, path, st_mtime_ns, st_size).
+# Listing a project (session_brief, get_project, list_handoffs) then costs one
+# stat() per file instead of a full read + YAML parse of every handoff and doc
+# on every call (~0.15-0.2 ms/file; live projects carry ~800 handoffs). An edit
+# changes mtime or size, so a stale entry is never served.
+_PARSED_FILE_CACHE: dict[tuple[str, str, int, int], object] = {}
+_PARSED_FILE_CACHE_MAX = 50_000
+_UNPARSED = object()
+
+
+def _stat_memo(kind: str, path: Path, parse: Callable[[], object]) -> object:
+    """Return ``parse()`` for ``path``, reusing it while the file is unchanged.
+
+    ``_UNPARSED`` when the file cannot be stat'ed or ``parse`` returns
+    ``_UNPARSED`` (unreadable content), which is never cached.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return _UNPARSED
+    key = (kind, str(path), st.st_mtime_ns, st.st_size)
+    cached = _PARSED_FILE_CACHE.get(key, _UNPARSED)
+    if cached is not _UNPARSED:
+        return cached
+    value = parse()
+    if value is not _UNPARSED:
+        if len(_PARSED_FILE_CACHE) >= _PARSED_FILE_CACHE_MAX:
+            _PARSED_FILE_CACHE.clear()
+        _PARSED_FILE_CACHE[key] = value
+    return value
+
+
+def _handoff_date_cached(project_path: Path, path: Path) -> str | None:
+    """Handoff date as ``_handoff_date_from_content`` would return it.
+
+    ``None`` when the file is unreadable (same skip rule as a full read).
+    """
+
+    def parse() -> object:
+        content = _safe_read_file(project_path, f"memory/{path.name}")
+        if not content:
+            return _UNPARSED
+        return _handoff_date_from_content(content, path.name)
+
+    date = _stat_memo("handoff_date", path, parse)
+    return None if date is _UNPARSED else date
+
+
 def _handoff_sort_key(path: Path, date: str) -> tuple[int, str, float, str]:
     """Prefer dated handoffs; for same-date files, newest mtime wins."""
     try:
@@ -491,72 +537,84 @@ def _handoff_sort_key(path: Path, date: str) -> tuple[int, str, float, str]:
     return (1 if date else 0, date, mtime, path.name)
 
 
+def _parse_handoff_file(project_path: Path, f: Path) -> object:
+    """``(sort_date, HandoffEntry)`` for one handoff, or ``_UNPARSED``."""
+    content = _safe_read_file(project_path, f"memory/{f.name}")
+    if not content:
+        return _UNPARSED
+    sort_date = _handoff_date_from_content(content, f.name)
+    handoff_date = sort_date
+    session = None
+    branch = None
+    tags: list[str] = []
+
+    # Try YAML frontmatter first
+    if content.startswith("---"):
+        end = content.find("---", 3)
+        if end > 0:
+            try:
+                fm = yaml.safe_load(content[3:end])
+                if isinstance(fm, dict):
+                    handoff_date = str(fm["date"]) if "date" in fm else ""
+                    raw_session = fm.get("session")
+                    if raw_session not in (None, ""):
+                        session = str(raw_session)
+                    branch = fm.get("branch")
+                    tags = fm.get("tags", [])
+                    if isinstance(tags, str):
+                        tags = [tags]
+            except Exception:
+                pass
+
+    # Extract summary from ## Summary section (always, regardless of frontmatter)
+    summary = ""
+    in_summary = False
+    for line in content.splitlines():
+        if line.strip().startswith("## Summary"):
+            in_summary = True
+            continue
+        if in_summary and line.strip().startswith("## "):
+            break
+        if in_summary and line.strip():
+            summary += line.strip() + " "
+            if len(summary) > 200:
+                break
+
+    return sort_date, HandoffEntry(
+        filename=f"memory/{f.name}",
+        date=handoff_date,
+        summary=summary.strip()[:200],
+        session=session,
+        branch=branch,
+        tags=tags,
+    )
+
+
 def _parse_handoffs(project_path: Path) -> list[HandoffEntry]:
     """Parse memory/handoff-*.md files. Reads YAML frontmatter if present, fallback to filename."""
     memory_dir = project_path / "memory"
     if not memory_dir.is_dir():
         return []
-    entries: list[HandoffEntry] = []
-    candidates: list[tuple[Path, str, str]] = []
+    candidates: list[tuple[Path, str, HandoffEntry]] = []
     for f in memory_dir.glob("handoff-*.md"):
         if f.is_symlink():
             continue
-        content = _safe_read_file(project_path, f"memory/{f.name}")
-        if not content:
+        parsed = _stat_memo(
+            "handoff", f, lambda f=f: _parse_handoff_file(project_path, f)
+        )
+        if parsed is _UNPARSED:
             continue
-        candidates.append((f, content, _handoff_date_from_content(content, f.name)))
+        sort_date, entry = parsed
+        candidates.append((f, sort_date, entry))
 
-    for f, content, handoff_date in sorted(
-        candidates,
-        key=lambda item: _handoff_sort_key(item[0], item[2]),
-        reverse=True,
-    ):
-
-        session = None
-        branch = None
-        tags: list[str] = []
-
-        # Try YAML frontmatter first
-        if content.startswith("---"):
-            end = content.find("---", 3)
-            if end > 0:
-                try:
-                    fm = yaml.safe_load(content[3:end])
-                    if isinstance(fm, dict):
-                        handoff_date = str(fm["date"]) if "date" in fm else ""
-                        raw_session = fm.get("session")
-                        if raw_session not in (None, ""):
-                            session = str(raw_session)
-                        branch = fm.get("branch")
-                        tags = fm.get("tags", [])
-                        if isinstance(tags, str):
-                            tags = [tags]
-                except Exception:
-                    pass
-
-        # Extract summary from ## Summary section (always, regardless of frontmatter)
-        summary = ""
-        in_summary = False
-        for line in content.splitlines():
-            if line.strip().startswith("## Summary"):
-                in_summary = True
-                continue
-            if in_summary and line.strip().startswith("## "):
-                break
-            if in_summary and line.strip():
-                summary += line.strip() + " "
-                if len(summary) > 200:
-                    break
-
-        entries.append(HandoffEntry(
-            filename=f"memory/{f.name}",
-            date=handoff_date,
-            summary=summary.strip()[:200],
-            session=session,
-            branch=branch,
-            tags=tags,
-        ))
-    return entries
+    return [
+        entry.model_copy(deep=True)
+        for _f, _date, entry in sorted(
+            candidates,
+            key=lambda item: _handoff_sort_key(item[0], item[1]),
+            reverse=True,
+        )
+    ]
 
 
 def _parse_docs(project_path: Path, subdir: str) -> list[DocEntry]:
@@ -568,30 +626,49 @@ def _parse_docs(project_path: Path, subdir: str) -> list[DocEntry]:
     for f in sorted(docs_dir.glob("*.md"), reverse=True):
         if f.is_symlink():
             continue
-        content = _safe_read_file(project_path, f"docs/{subdir}/{f.name}")
-        title = None
-        date = None
-        category = None
-        if content:
-            # Parse YAML frontmatter
-            if content.startswith("---"):
-                end = content.find("---", 3)
-                if end > 0:
-                    try:
-                        fm = yaml.safe_load(content[3:end])
-                        if isinstance(fm, dict):
-                            title = fm.get("title")
-                            date = str(fm["date"]) if "date" in fm else None
-                            category = fm.get("category") or fm.get("type")
-                    except Exception:
-                        pass
-        if not date:
-            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", f.name)
-            date = date_match.group(1) if date_match else None
-        if not title:
-            title = f.stem
-        entries.append(DocEntry(filename=f"docs/{subdir}/{f.name}", date=date, title=title, category=category))
+        parsed = _stat_memo(
+            "doc", f, lambda f=f: _parse_doc_file(project_path, subdir, f)
+        )
+        entry = (
+            _parse_doc_file(project_path, subdir, f, content_missing=True)
+            if parsed is _UNPARSED
+            else parsed
+        )
+        entries.append(entry.model_copy(deep=True))
     return entries
+
+
+def _parse_doc_file(
+    project_path: Path, subdir: str, f: Path, *, content_missing: bool = False
+) -> object:
+    """``DocEntry`` for one doc; ``_UNPARSED`` when unreadable (not cached)."""
+    content = None if content_missing else _safe_read_file(
+        project_path, f"docs/{subdir}/{f.name}"
+    )
+    if content is None and not content_missing:
+        return _UNPARSED
+    title = None
+    date = None
+    category = None
+    if content:
+        # Parse YAML frontmatter
+        if content.startswith("---"):
+            end = content.find("---", 3)
+            if end > 0:
+                try:
+                    fm = yaml.safe_load(content[3:end])
+                    if isinstance(fm, dict):
+                        title = fm.get("title")
+                        date = str(fm["date"]) if "date" in fm else None
+                        category = fm.get("category") or fm.get("type")
+                except Exception:
+                    pass
+    if not date:
+        date_match = re.search(r"(\d{4}-\d{2}-\d{2})", f.name)
+        date = date_match.group(1) if date_match else None
+    if not title:
+        title = f.stem
+    return DocEntry(filename=f"docs/{subdir}/{f.name}", date=date, title=title, category=category)
 
 
 # --- Git operations ---
@@ -980,6 +1057,12 @@ async def register_project_lifecycle(
             db,
             slug,
             visible_projects,
+        )
+        from core.api.services.access_grants import require_enterprise_project_edit
+
+        await require_enterprise_project_edit(
+            db, ctx, slug,
+            error=NotFoundError(code="project_not_found", message="Not found"),
         )
         async with lifecycle_service.async_project_mutation_guard():
             snapshot = await lifecycle_service.ensure_project_lifecycle(

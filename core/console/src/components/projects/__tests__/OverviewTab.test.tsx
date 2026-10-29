@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 vi.mock("@/lib/api", () => ({
   getMe: vi.fn(),
@@ -10,6 +10,7 @@ vi.mock("@/lib/api", () => ({
   getProjectCosts: vi.fn(),
   listTasks: vi.fn(),
   getProjectRaci: vi.fn(),
+  getEffectiveProjectAccess: vi.fn(),
   createStatusUpdate: vi.fn(),
   getComments: vi.fn(),
   createComment: vi.fn(),
@@ -28,6 +29,7 @@ import {
   listTasks,
   getProjectRaci,
   getComments,
+  getEffectiveProjectAccess,
 } from "@/lib/api";
 import OverviewTab from "../OverviewTab";
 import type { ProjectDetail } from "@/lib/types";
@@ -88,6 +90,7 @@ const mockCommits = [
 ];
 
 describe("OverviewTab", () => {
+  afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getMe).mockResolvedValue({ username: "emilio" });
@@ -102,6 +105,37 @@ describe("OverviewTab", () => {
     vi.mocked(listTasks).mockResolvedValue([]);
     vi.mocked(getProjectRaci).mockResolvedValue([]);
     vi.mocked(getComments).mockResolvedValue([]);
+    vi.mocked(getEffectiveProjectAccess).mockResolvedValue({
+      project: mockProject.slug, can_view: true, can_edit: false, sources: [],
+    });
+  });
+
+  it("keeps Enterprise project comments readable without edit controls for a viewer", async () => {
+    vi.stubEnv("NEXT_PUBLIC_ENTERPRISE_MODE", "1");
+    render(<OverviewTab project={mockProject} />);
+    await waitFor(() => expect(getEffectiveProjectAccess).toHaveBeenCalledWith(mockProject.slug));
+    expect(screen.queryByText("Status Update")).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Write a comment... (markdown supported)")).not.toBeInTheDocument();
+    expect(screen.getByText("Comments")).toBeInTheDocument();
+  });
+
+  it("shows Enterprise edit controls after an effective edit grant", async () => {
+    vi.stubEnv("NEXT_PUBLIC_ENTERPRISE_MODE", "1");
+    vi.mocked(getEffectiveProjectAccess).mockResolvedValue({
+      project: mockProject.slug, can_view: true, can_edit: true, sources: [],
+    });
+    render(<OverviewTab project={mockProject} />);
+    await waitFor(() => expect(screen.getByText("Status Update")).toBeInTheDocument());
+    expect(await screen.findByPlaceholderText("Write a comment... (markdown supported)")).toBeInTheDocument();
+  });
+
+  it("omits Git panels when the Enterprise image does not include Git", async () => {
+    vi.stubEnv("NEXT_PUBLIC_ENTERPRISE_MODE", "1");
+    render(<OverviewTab project={mockProject} />);
+    await waitFor(() => expect(getEffectiveProjectAccess).toHaveBeenCalledWith(mockProject.slug));
+    expect(getProjectGitGraph).not.toHaveBeenCalled();
+    expect(screen.queryByText("Git")).not.toBeInTheDocument();
+    expect(screen.queryByText("Recent Activity")).not.toBeInTheDocument();
   });
 
   it("renders metric card titles: Lifecycle, Tasks, Git", () => {

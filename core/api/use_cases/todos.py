@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
@@ -126,6 +127,27 @@ async def _fetch_todo(
     if row is None:
         raise _todo_not_found(todo_id)
     return row
+
+
+async def _require_todo_project_write(
+    db: aiosqlite.Connection,
+    ctx: CallerContext,
+    project: str | None,
+    todo_id: str | None = None,
+) -> None:
+    from core.api.services.access_grants import (
+        can_write_project,
+        require_workspace_project_bound,
+    )
+
+    if project:
+        await require_workspace_project_bound(db, ctx, project)
+    if os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() != "1":
+        return
+    if not await can_write_project(db, ctx, project):
+        if todo_id:
+            raise _todo_not_found(todo_id)
+        raise NotFoundError(code="project_not_found", message="Not found")
 
 
 def _virtual_todo(
@@ -312,6 +334,16 @@ async def list_todos(
     """List persisted todos plus read-only virtual approval projections."""
     require_role_ctx(ctx, "viewer", "operator", "admin", "super_admin")
     workspace_id = require_workspace_ctx(ctx)
+    from core.api.services.access_grants import visible_projects_for_actor
+
+    visible_projects = (
+        await visible_projects_for_actor(db, ctx)
+        if os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1"
+        else None
+    )
+    # Strict installations have no owner field for unscoped todos. They cannot
+    # safely expose workspace-wide entries to project-scoped callers.
+    include_workspace_todos = visible_projects is None
     db.row_factory = aiosqlite.Row
     conditions: list[str] = ["workspace_id = ?"]
     params: list[Any] = [workspace_id]
@@ -327,8 +359,23 @@ async def list_todos(
         conditions.append(f"type IN ({placeholders})")
         params.extend(types)
     if project:
+        if visible_projects is not None and project not in visible_projects:
+            return []
         conditions.append("project = ?")
         params.append(project)
+
+    if visible_projects is not None:
+        if visible_projects:
+            placeholders = ",".join("?" for _ in visible_projects)
+            clause = f"project IN ({placeholders})"
+            params.extend(sorted(visible_projects))
+            if include_workspace_todos:
+                clause = f"({clause} OR project IS NULL)"
+            conditions.append(clause)
+        elif include_workspace_todos:
+            conditions.append("project IS NULL")
+        else:
+            return []
 
     where = " AND ".join(conditions) if conditions else "1=1"
     rows = await (
@@ -349,6 +396,12 @@ async def list_todos(
                 project=project,
             )
         )
+    if visible_projects is not None:
+        items = [
+            item for item in items
+            if item.project in visible_projects
+            or (item.project is None and include_workspace_todos)
+        ]
     items.sort(key=lambda item: (item.fu, item.created_at))
     return items[offset : offset + limit]
 
@@ -510,10 +563,7 @@ async def create_todo(
     require_role_ctx(ctx, "operator", "admin", "super_admin")
     workspace_id = require_workspace_ctx(ctx)
     from core.api.services.audit import log_audit
-    from core.api.services.access_grants import require_workspace_project_bound
-
-    if body.project:
-        await require_workspace_project_bound(db, ctx, body.project)
+    await _require_todo_project_write(db, ctx, body.project)
 
     todo_type = body.type or "promemoria"
     if todo_type == "approva":
@@ -677,6 +727,7 @@ async def delegate_todo(
     from core.api.services.audit import log_audit
 
     row = await _fetch_todo(db, todo_id, workspace_id=workspace_id)
+    await _require_todo_project_write(db, ctx, row["project"], todo_id)
     if row["type"] not in {"azione", "rivedi"}:
         raise ValidationError(
             code="todo_not_delegable",
@@ -701,6 +752,7 @@ async def delegate_todo(
             code="todo_project_required",
             message="Delegating a todo requires a project.",
         )
+    await _require_todo_project_write(db, ctx, project, todo_id)
     task_id = await _create_task_from_todo(
         ctx,
         db,
@@ -758,6 +810,9 @@ async def _promote_idea(
             code="todo_project_required",
             message="Promoting an idea requires a project.",
         )
+    await _require_todo_project_write(
+        db, ctx, target_project, row["id"] if target_project == row["project"] else None
+    )
     task_id = await _create_task_from_todo(
         ctx,
         db,
@@ -807,6 +862,10 @@ async def update_todo(
     from core.api.services.audit import log_audit
 
     row = await _fetch_todo(db, todo_id, workspace_id=workspace_id)
+    await _require_todo_project_write(db, ctx, row["project"], todo_id)
+    if "project" in body.model_fields_set and body.project != row["project"]:
+        # A hidden target must answer like an unknown project, not like the todo.
+        await _require_todo_project_write(db, ctx, body.project)
     if body.status == "delegato":
         return await delegate_todo(
             ctx,

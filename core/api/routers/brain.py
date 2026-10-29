@@ -534,7 +534,7 @@ async def get_brain_runs(
     user=Depends(require_role("viewer", "operator", "admin", "super_admin")),
 ) -> RunsListResponse:
     """Stable sort `(cycle_key DESC, run_id ASC)`. `latest` resolves to the
-    most recent succeeded, non-superseded cycle (sub-01 §6.D4)."""
+    most recent readable succeeded/partial, non-superseded cycle."""
     try:
         return await uc.list_brain_runs(
             _ctx(user),

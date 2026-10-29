@@ -193,6 +193,9 @@ domains:
       - id: marvis.comments.remove_reaction
         callable: remove_reaction
         mutating: true
+    internal:
+      - prepare_create_body
+      - prepare_update_body
   costs:
     module: core/api/use_cases/costs.py
     actions:

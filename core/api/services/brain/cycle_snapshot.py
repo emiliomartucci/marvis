@@ -110,7 +110,10 @@ async def _fetch_events(
             "SELECT event_id, event_type, source_system, source_project, "
             "       target_project, program_key, source_ref, title, summary, "
             "       observed_at, evidence_json "
-            "FROM brain_digest_events WHERE run_id = ?",
+            "FROM brain_digest_events WHERE run_id IN ("
+            "SELECT r.run_id FROM brain_runs r JOIN brain_runs selected "
+            "ON selected.workspace_id=r.workspace_id AND selected.cycle_key=r.cycle_key "
+            "WHERE selected.run_id=?)",
             (run_id,),
         )
     ).fetchall()

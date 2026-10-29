@@ -55,6 +55,7 @@ SKIPPED (no clean fastapi-free use_case):
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -69,6 +70,7 @@ from core.api.mcp._adapter import (
     dump,
     raise_mcp_error,
 )
+from core.api.services import access_grants
 from core.api.use_cases import ingest_triage as ingest_uc
 from core.api.use_cases._errors import NotFoundError, ServiceError, ValidationError
 
@@ -223,6 +225,20 @@ def register(mcp) -> None:
                     ),
                 )
                 payload = dump(result)
+                if os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1":
+                    # Project visibility alone does not authorize the source
+                    # file. Pending rows can contain extracted text, previews,
+                    # classification, and an absolute source path.
+                    readable = []
+                    for item in payload:
+                        logical_path = access_grants._search_project_path(
+                            item.get("project_slug"), item.get("file_path") or ""
+                        )
+                        if logical_path and await access_grants.file_readable(
+                            db, ctx, logical_path, direct_read=True
+                        ):
+                            readable.append(item)
+                    payload = readable
                 if include_content:
                     return payload
                 return [_minimize_ingest_item(item) for item in payload]

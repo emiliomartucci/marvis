@@ -58,9 +58,9 @@ TeamProjectClearance = Literal["public", "internal"]
 
 class TeamProjectAssignRequest(BaseModel):
     project: str = Field(..., min_length=1, max_length=100)
-    is_public: bool = False
-    role: TeamProjectRole = "member"
-    clearance: TeamProjectClearance = "internal"
+    is_public: bool | None = None
+    role: TeamProjectRole | None = None
+    clearance: TeamProjectClearance | None = None
 
 
 class TeamProjectResponse(BaseModel):

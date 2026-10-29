@@ -28,6 +28,7 @@ import aiosqlite
 from pydantic import ValidationError
 
 from core.api.db import acquire_db, write_db
+from core.api.services.brain.run_selection import latest_readable_run
 from core.api.models import UserInfo
 from core.api.models.brain import (
     ArtifactSelector,
@@ -46,6 +47,7 @@ from core.api.models.brain import (
     OwnerHint,
 )
 from core.api.visibility import get_visible_projects
+from core.api.services.brain.visibility_policy import enterprise_strict, scope_sql, scope_visible
 
 logger = logging.getLogger(__name__)
 
@@ -287,12 +289,13 @@ def _redact(f: Finding) -> FindingRedacted:
     )
 
 
-def _is_visible(visible: set[str] | None, involved_projects: list[str]) -> bool:
-    if visible is None:
-        return True
-    if not involved_projects:
-        return True
-    return set(involved_projects).issubset(visible)
+def _is_visible(
+    visible: set[str] | None,
+    involved_projects: list[str],
+    scope_type: str,
+    scope_key: str,
+) -> bool:
+    return scope_visible(visible, involved_projects, scope_type, scope_key)
 
 
 def _evidence_prefix(kind: str) -> str:
@@ -355,18 +358,8 @@ async def _resolve_run(
             return None
         return {"run_id": row[0], "cycle_key": row[1]}
     if not cycle_key or cycle_key == "latest":
-        row = await (
-            await db.execute(
-                "SELECT run_id, cycle_key FROM brain_runs"
-                " WHERE workspace_id = ? AND status IN ('succeeded','partial')"
-                "  AND superseded_by_run_id IS NULL"
-                " ORDER BY cycle_key DESC, started_at DESC LIMIT 1",
-                (workspace_id,),
-            )
-        ).fetchone()
-        if row is None:
-            return None
-        return {"run_id": row[0], "cycle_key": row[1]}
+        return await latest_readable_run(db, workspace_id=workspace_id)
+
     row = await (
         await db.execute(
             "SELECT run_id, cycle_key FROM brain_runs"
@@ -533,8 +526,8 @@ async def list_findings(
             ]
             params = [workspace_id]
         else:
-            where = ["r.workspace_id = ?", "f.run_id = ?"]
-            params = [workspace_id, run["run_id"]]
+            where = ["r.workspace_id = ?", "f.run_id = ?" if run_id else "f.cycle_key = ?"]
+            params = [workspace_id, run["run_id"] if run_id else run["cycle_key"]]
         if scope_type:
             where.append("f.scope_type = ?")
             params.append(scope_type)
@@ -564,6 +557,13 @@ async def list_findings(
         if owner_user_id:
             where.append("json_extract(f.owner_hint_json, '$.user_id') = ?")
             params.append(owner_user_id)
+        enterprise_scoped = enterprise_strict() and visible is not None
+        visibility_sql, visibility_params = scope_sql("f", visible)
+        if visibility_sql is not None:
+            # Filter before the SQL page limit: hidden rows must neither leak
+            # IDs/counts nor crowd all visible findings out of a full page.
+            where.append(visibility_sql)
+            params.extend(visibility_params)
         # severity/confidence min applied in-Python (rank order not in SQL).
 
         # Over-fetch a window and sort in Python so the recency_factor
@@ -677,7 +677,11 @@ async def list_findings(
             rf = _recency_factor(detected_for_factor, now, half_life_days)
             if decay_enabled:
                 finding = finding.model_copy(update={"recency_factor": rf})
-            if not _is_visible(visible, finding.involved_projects):
+            if not _is_visible(
+                visible, finding.involved_projects, finding.scope_type, finding.scope_key
+            ):
+                if enterprise_scoped:
+                    continue
                 redacted_count += 1
                 page.append(_redact(finding))
             else:
@@ -750,7 +754,9 @@ async def fetch_single_finding(
             _validation_error_locs(exc),
         )
         return None
-    if not _is_visible(visible, finding.involved_projects):
+    if not _is_visible(
+        visible, finding.involved_projects, finding.scope_type, finding.scope_key
+    ):
         return None
     if decay_enabled:
         now = now or datetime.now(timezone.utc)

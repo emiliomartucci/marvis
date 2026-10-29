@@ -13376,6 +13376,77 @@
         "title": "ScanWorkdirResponse",
         "type": "object"
       },
+      "SearchCuration": {
+        "description": "Jev re-rank receipt attached to the search response (plan R16/R17).\n\n``status`` uses the closed outcome vocabulary (ok | disabled_tenant |\ntimeout_fallback | breaker_open | ceiling_hit | provider_error | error):\nthe agent sees exactly why the curation ran or degraded, and can challenge\nany demotion listed in ``demoted`` (context parity).",
+        "properties": {
+          "demoted": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/SearchCurationDemotion"
+            },
+            "title": "Demoted",
+            "type": "array"
+          },
+          "scored": {
+            "default": 0,
+            "title": "Scored",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "surface": {
+            "default": "search_rerank",
+            "title": "Surface",
+            "type": "string"
+          },
+          "truncated": {
+            "default": 0,
+            "title": "Truncated",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "SearchCuration",
+        "type": "object"
+      },
+      "SearchCurationDemotion": {
+        "description": "One demoted hit in the search curation receipt (plan R16).",
+        "properties": {
+          "confidence": {
+            "title": "Confidence",
+            "type": "number"
+          },
+          "doc_id": {
+            "title": "Doc Id",
+            "type": "string"
+          },
+          "doc_type": {
+            "title": "Doc Type",
+            "type": "string"
+          },
+          "relevance": {
+            "title": "Relevance",
+            "type": "number"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "doc_type",
+          "doc_id",
+          "relevance",
+          "confidence"
+        ],
+        "title": "SearchCurationDemotion",
+        "type": "object"
+      },
       "SearchHit": {
         "properties": {
           "authority_notice": {
@@ -13545,6 +13616,16 @@
             },
             "title": "Audits",
             "type": "array"
+          },
+          "curation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SearchCuration"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "files": {
             "default": [],
@@ -16680,18 +16761,30 @@
       "TeamProjectAssignRequest": {
         "properties": {
           "clearance": {
-            "default": "internal",
-            "enum": [
-              "public",
-              "internal"
+            "anyOf": [
+              {
+                "enum": [
+                  "public",
+                  "internal"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Clearance",
-            "type": "string"
+            "title": "Clearance"
           },
           "is_public": {
-            "default": false,
-            "title": "Is Public",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Public"
           },
           "project": {
             "maxLength": 100,
@@ -16700,13 +16793,19 @@
             "type": "string"
           },
           "role": {
-            "default": "member",
-            "enum": [
-              "member",
-              "viewer"
+            "anyOf": [
+              {
+                "enum": [
+                  "member",
+                  "viewer"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Role",
-            "type": "string"
+            "title": "Role"
           }
         },
         "required": [
@@ -22531,7 +22630,7 @@
     },
     "/api/v1/brain/runs": {
       "get": {
-        "description": "Stable sort `(cycle_key DESC, run_id ASC)`. `latest` resolves to the\nmost recent succeeded, non-superseded cycle (sub-01 §6.D4).",
+        "description": "Stable sort `(cycle_key DESC, run_id ASC)`. `latest` resolves to the\nmost recent readable succeeded/partial, non-superseded cycle.",
         "operationId": "get_brain_runs_api_v1_brain_runs_get",
         "parameters": [
           {
@@ -28478,6 +28577,92 @@
         "summary": "Ingest Signed Webhook",
         "tags": [
           "ingest"
+        ]
+      }
+    },
+    "/api/v1/internal/consumer/document": {
+      "get": {
+        "description": "Open a current project document through the same direct-read file predicate.",
+        "operationId": "consumer_document_api_v1_internal_consumer_document_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Consumer Document",
+        "tags": [
+          "consumer"
+        ]
+      }
+    },
+    "/api/v1/internal/consumer/search": {
+      "get": {
+        "description": "Search using the current reader's workspace and grants, with safe file links.",
+        "operationId": "consumer_search_api_v1_internal_consumer_search_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 500,
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Consumer Search",
+        "tags": [
+          "consumer"
         ]
       }
     },

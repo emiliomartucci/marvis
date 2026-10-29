@@ -356,6 +356,114 @@ class Settings(BaseSettings):
     newsletter_llm_gateway_agent_name: str = Field(
         default="newsletter-digest", alias="NEWSLETTER_LLM_GATEWAY_AGENT_NAME"
     )
+    # Jev (TypeSafe System One) decision provider — plan 2026-09-21 U1/KTD1-3.
+    # The API key is boot-time (EnvironmentFile); the ENABLEMENT flags are NOT
+    # here: they are flag files read live by core/api/services/jev/flags.py
+    # (plan KTD3: rollback = flip a file, never a restart).
+    typesafe_api_key: SecretStr | None = Field(default=None, alias="TYPESAFE_API_KEY")
+    # Local Laya scoring (MARVIS_SCORING_PROVIDER=laya). The pinned checkpoint
+    # name must be served by the local laya-serve (LAYA_MODELS) and pass the
+    # client's response validation; "marvis-v1" is the fleet-tuned checkpoint.
+    marvis_laya_model: str = Field(default="multilingual", alias="MARVIS_LAYA_MODEL")
+    typesafe_base_url: str = Field(
+        default="https://api.typesafe.ai", alias="TYPESAFE_BASE_URL"
+    )
+    typesafe_model: str = Field(default="jev-1.13.0", alias="TYPESAFE_MODEL")
+    typesafe_timeout_seconds: float = Field(default=3.0, alias="TYPESAFE_TIMEOUT_SECONDS")
+    typesafe_surface_timeout_seconds: dict[str, float] = Field(
+        default_factory=lambda: {"search_rerank": 1.0, "gather_context": 2.0},
+        alias="TYPESAFE_SURFACE_TIMEOUT_SECONDS",
+    )
+    typesafe_tenant_flags_root: str = Field(
+        default="/etc/marvis/tenants", alias="TYPESAFE_TENANT_FLAGS_ROOT"
+    )
+    typesafe_global_kill_file: str = Field(
+        default="/etc/marvis/typesafe-kill", alias="TYPESAFE_GLOBAL_KILL_FILE"
+    )
+    typesafe_flag_cache_seconds: float = Field(
+        default=60.0, alias="TYPESAFE_FLAG_CACHE_SECONDS"
+    )
+    typesafe_breaker_failures: int = Field(default=5, alias="TYPESAFE_BREAKER_FAILURES")
+    typesafe_breaker_cooldown_seconds: float = Field(
+        default=300.0, alias="TYPESAFE_BREAKER_COOLDOWN_SECONDS"
+    )
+    typesafe_daily_call_ceiling: int = Field(
+        default=5000, alias="TYPESAFE_DAILY_CALL_CEILING"
+    )
+    typesafe_max_concurrent_per_tenant: int = Field(
+        default=4, alias="TYPESAFE_MAX_CONCURRENT_PER_TENANT"
+    )
+    typesafe_max_concurrent_global: int = Field(
+        default=16, ge=1, alias="TYPESAFE_MAX_CONCURRENT_GLOBAL"
+    )
+    typesafe_price_per_m_input_usd: float = Field(
+        default=0.042, alias="TYPESAFE_PRICE_PER_M_INPUT_USD"
+    )
+    # U2 — search re-rank slice (plan R1/R2). Surface default ON since the
+    # 2026-09-23 owner calibration (96.7% agreement): the re-rank runs whenever
+    # the adapter tenant flag allows it; the per-call `rerank=false` opts out
+    # and TYPESAFE_RERANK_ENABLED=false is the operator kill-switch. The
+    # adapter flags stay the hard gate (flag OFF → output identical to today).
+    typesafe_rerank_enabled: bool = Field(default=True, alias="TYPESAFE_RERANK_ENABLED")
+    # Task 7af2b38c (Laya round-2 U1): opt-in capture of sanitized scoring
+    # payloads (state/questions/answers) into per-tenant daily JSONL files on
+    # the tenant's OWN server — training data for the local model, zero egress.
+    scoring_capture_enabled: bool = Field(default=False, alias="MARVIS_SCORING_CAPTURE")
+    typesafe_rerank_demote_below: float = Field(
+        default=0.5, alias="TYPESAFE_RERANK_DEMOTE_BELOW"
+    )
+    typesafe_rerank_confidence_min: float = Field(
+        default=0.8, alias="TYPESAFE_RERANK_CONFIDENCE_MIN"
+    )
+    typesafe_rerank_max_candidates: int = Field(
+        default=20, alias="TYPESAFE_RERANK_MAX_CANDIDATES"
+    )
+    # U5 — redaction identifier gate (plan R18/KTD9). Double confirmation to
+    # KEEP a token unredacted: deterministic ID pattern AND provider choice
+    # "internal_reference" with this confidence. Default keeps today's
+    # behaviour unless the provider doubly confirms.
+    typesafe_redaction_confidence_min: float = Field(
+        default=0.9, alias="TYPESAFE_REDACTION_CONFIDENCE_MIN"
+    )
+    typesafe_redaction_max_tokens: int = Field(
+        default=32, alias="TYPESAFE_REDACTION_MAX_TOKENS"
+    )
+    # U3 — gather_context selection (plan R10/R14/R16): omission from the
+    # brief ONLY when clearly off-goal with high confidence, always receipted.
+    typesafe_gather_cut_below: float = Field(default=0.5, alias="TYPESAFE_GATHER_CUT_BELOW")
+    typesafe_gather_confidence_min: float = Field(
+        default=0.8, alias="TYPESAFE_GATHER_CONFIDENCE_MIN"
+    )
+    typesafe_gather_max_items: int = Field(default=20, alias="TYPESAFE_GATHER_MAX_ITEMS")
+    # SP-A U2 — M8 semantic contradiction rule: proposals only (pending human
+    # approval), noul threshold on the probability (no confidence on nouls).
+    typesafe_contradiction_threshold: float = Field(
+        default=0.75, alias="TYPESAFE_CONTRADICTION_THRESHOLD"
+    )
+    typesafe_contradiction_max_pairs: int = Field(
+        default=16, alias="TYPESAFE_CONTRADICTION_MAX_PAIRS"
+    )
+    # SP-A U3 — M9 similar_to semantic rule (plan R12): consolidate proposals.
+    typesafe_similar_threshold: float = Field(
+        default=0.75, alias="TYPESAFE_SIMILAR_THRESHOLD"
+    )
+    typesafe_similar_max_pairs: int = Field(
+        default=16, alias="TYPESAFE_SIMILAR_MAX_PAIRS"
+    )
+    # SP-D — journal notability filter (plan R-D1): events scoring below 0.5
+    # on the notability rubric are filtered from the journal body (receipt).
+    typesafe_journal_headline_min: float = Field(
+        default=1.2, alias="TYPESAFE_JOURNAL_HEADLINE_MIN"
+    )
+    # SP-C — guardrail confidence floor (plan R6): below this the verdict
+    # degrades to ask_human regardless of the model's pick.
+    typesafe_guardrail_confidence_min: float = Field(
+        default=0.5, alias="TYPESAFE_GUARDRAIL_CONFIDENCE_MIN"
+    )
+    # SP-B — ingest classification via Jev (plan R3/R4). The flag selects the
+    # provider: set INGEST_LLM_PROVIDER=jev to route ingest classification
+    # through the System One batch (Choice type + Choice project + Noul secret
+    # + Score quality in ONE call ~0.8s ~$0.00002/doc). Default unchanged.
     # Inbox TLDR migration flags. Both default false → behaviour unchanged
     # (Sonnet only). Setting shadow_mode=true logs cloud + local in parallel
     # without affecting the user response. Setting use_local=true serves the
@@ -463,7 +571,7 @@ class Settings(BaseSettings):
     ingest_llm_classifier_model: Literal["tier-fast"] = Field(
         default="tier-fast", alias="INGEST_LLM_CLASSIFIER_MODEL"
     )
-    ingest_llm_provider: Literal["local", "gateway", "mac", "tier-fast"] = Field(
+    ingest_llm_provider: Literal["local", "gateway", "mac", "tier-fast", "jev"] = Field(
         default="local", alias="INGEST_LLM_PROVIDER"
     )
     todos_llm_provider: Literal[

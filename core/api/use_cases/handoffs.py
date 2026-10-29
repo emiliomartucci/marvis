@@ -300,6 +300,11 @@ async def create_handoff(
         raise ServiceError(code="invalid_project_slug", message="Invalid project slug")
     if visible_projects is not None and project_slug not in visible_projects:
         raise NotFoundError(code="not_found", message="Not found")
+    from core.api.services.access_grants import require_enterprise_project_edit
+
+    await require_enterprise_project_edit(
+        db, ctx, project_slug, error=NotFoundError(code="not_found", message="Not found"),
+    )
 
     body_clean = body.strip()
     if not body_clean:
@@ -459,7 +464,10 @@ async def search_handoffs(
         return []
 
     # --- Semantic search (if vec0 available, query present, no tag/date filters) ---
-    if q and q.strip() and not tags and not date_start and not date_end and embedding_service.is_available():
+    if (
+        q and q.strip() and not tags and not date_start and not date_end
+        and await embedding_service.is_available_async(input_type="query")
+    ):
         try:
             sem_results = await _search_semantic(q.strip(), vec_db, visible_slugs, project, limit)
             if sem_results:
@@ -693,9 +701,9 @@ async def reindex_handoffs(
     """
     from core.api.services import embedding_service
 
-    if not embedding_service.is_available():
+    if not await embedding_service.is_available_async(input_type="document"):
         raise ServiceUnavailableError(
             code="embeddings_unavailable",
             message="Embedding backend not configured",
         )
-    return await embedding_service.reindex_project(project, vec_db)
+    return await embedding_service.reindex_project(project, vec_db, workspace_id=ctx.workspace_id)

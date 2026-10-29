@@ -49,11 +49,11 @@ def register(mcp) -> None:
         note: str | None = None,
         agent_name: Annotated[str, Field(max_length=80)] | None = None,
     ) -> dict[str, Any]:
-        """Registra l'esito REALE dell'uso di un documento recuperato: rinforza (helped) o penalizza (misled) la sua salience futura.
+        """Record whether a retrieved document helped or misled you; adjusts its future salience.
 
-        QUANDO USARLO: chiamalo SOLO se il contenuto del doc ha CAMBIATO la tua azione in questa sessione — outcome='helped' se ti ha guidato alla mossa giusta, outcome='misled' se ti ha fuorviato. doc_id è quello restituito da search/check_learnings/get_learning. note (opzionale, max 300) = in una riga COSA ha cambiato; agent_name (opzionale) = solo telemetria auto-dichiarata, non influenza nulla.
-        QUANDO NON USARLO: se il contenuto non l'hai usato, NON chiamare — nessuna chiamata È il segnale corretto. NOT per cortesia, NOT in loop su ogni risultato: i cap anti-gaming contano i rigetti. NOT per contenuti mai recuperati dai tool di recall.
-        RESTITUISCE: {ok, mode, applied, reason?} — applied:false con reason:'cap' significa feedback contato ma oltre i limiti (non è un errore: NON ritentare). Con MARVIS_REINFORCEMENT=off il tool è inerte ({ok, mode:'off', applied:false})."""
+        QUANDO USARLO: solo se il doc ha CAMBIATO la tua azione: outcome='helped' o 'misled'. doc_id viene da search/check_learnings/get_learning; note opzionale (max 300) = cosa ha cambiato.
+        QUANDO NON USARLO: se non l'hai usato non chiamarlo: il silenzio e' il segnale corretto. Mai in loop o per cortesia (i cap contano i rigetti).
+        RESTITUISCE: {ok, mode, applied, reason?}; applied:false con reason:'cap' non e' un errore, non ritentare."""
         # R4: mode off = inert tool, zero DB work — answer BEFORE taking the
         # writer lock so the off-path cost is exactly zero.
         if settings.reinforcement_mode == "off":

@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from pydantic import Field
 
 from core.api.mcp._adapter import acquire_db, acquire_write_db, current_mcp_context, raise_mcp_error
-from core.api.services import access_grants
+from core.api.services import access_grants, project_ownership_recovery
 from core.api.use_cases._errors import ServiceError
 
 Role = Literal["admin", "member", "viewer"]
@@ -15,6 +15,8 @@ Clearance = Literal["public", "internal", "confidential"]
 Identity = Annotated[str, Field(min_length=1, max_length=255)]
 ProjectSlug = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_&-]{0,127}$")]
 Scope = Annotated[str, Field(min_length=1, max_length=500)]
+RecoverySlug = Annotated[str, Field(min_length=1, max_length=63, pattern=r"^[a-z0-9][a-z0-9&+_.\-]{0,62}$")]
+RecoveryProjects = Annotated[list[RecoverySlug], Field(min_length=1, max_length=50)]
 
 
 def _dump_grant(grant: access_grants.AccessGrant) -> dict:
@@ -23,6 +25,24 @@ def _dump_grant(grant: access_grants.AccessGrant) -> dict:
 
 def register(mcp) -> None:
     """Register tenant access administration tools."""
+
+    @mcp.tool()
+    async def reconcile_project_ownership(
+        projects: RecoveryProjects, workspace_id: Identity, apply: bool = False,
+    ) -> dict:
+        """Recover explicit legacy project ownership in a single-workspace tenant.
+
+        QUANDO USARLO: authenticated human admin declares these exact projects belong to their workspace; preview first with apply=false, then apply=true for that declaration.
+        QUANDO NON USARLO: never infer ownership from files/tasks; NOT for multi-workspace tenants, archived/ambiguous projects, grants or moving an existing owner.
+        RESTITUISCE: {workspace_id, applied, projects:[{project,status}], repaired}; an ineligible selection applies nothing. No project content or foreign owner is returned."""
+        try:
+            async with acquire_write_db(label="mcp.reconcile_project_ownership") as db:
+                return await project_ownership_recovery.reconcile_project_ownership(
+                    db, current_mcp_context(), projects=projects,
+                    workspace_id=workspace_id, apply=apply,
+                )
+        except ServiceError as e:
+            raise_mcp_error(e)
 
     @mcp.tool()
     async def grant_access(
@@ -56,7 +76,7 @@ def register(mcp) -> None:
     async def revoke_access(identity: Identity, project: ProjectSlug) -> dict:
         """Revoke tenant-scoped access for a person/project.
 
-        QUANDO USARLO: admin tenant vuole togliere subito visibilita' e write access a una persona su un progetto.
+        QUANDO USARLO: admin tenant vuole togliere subito visibilita' e write access a una persona su un progetto. In Enterprise la revoca blocca anche l'eredita' da team e la lettura pubblica finche' non viene salvato un nuovo grant.
         QUANDO NON USARLO: NOT per cancellare l'utente WorkOS o revocare accessi in altri tenant.
         RESTITUISCE: {identity, project_slug, revoked}; revoca inesistente torna revoked=false senza leak extra."""
         try:

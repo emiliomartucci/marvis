@@ -90,6 +90,7 @@ from core.api.use_cases._context import (
     CallerContext,
     require_role_ctx,
     require_workspace_ctx,
+    require_task_write_capability,
     resolve_approval_authority,
 )
 from core.api.use_cases._errors import (
@@ -636,6 +637,7 @@ async def create_task(
     fastapi-free.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    require_task_write_capability(ctx)
 
     from core.api.services.audit import log_audit
     from core.api.services.auto_approval import DEFAULT_POLICY, ApprovalDecision
@@ -645,9 +647,11 @@ async def create_task(
     now = datetime.now(timezone.utc).isoformat()
     tags_json = json.dumps(body.tags)
     ws = require_workspace_ctx(ctx)
-    from core.api.services.access_grants import require_workspace_project_bound
+    from core.api.services.access_grants import can_write_project, require_workspace_project_bound
 
     await require_workspace_project_bound(db, ctx, body.project)
+    if not await can_write_project(db, ctx, body.project):
+        raise NotFoundError(code="project_not_found", message="Not found")
 
     created_by_value = created_by
 
@@ -878,6 +882,7 @@ async def update_task(
     (pinned by test_task_sync_to_graph).
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    require_task_write_capability(ctx)
 
     from core.api.config import settings
     from core.api.services import cost_service
@@ -891,6 +896,11 @@ async def update_task(
     )
     row = await cursor.fetchone()
     if not row:
+        raise _task_not_found(task_id)
+
+    from core.api.services.access_grants import can_write_project
+
+    if not await can_write_project(db, ctx, row["project"]):
         raise _task_not_found(task_id)
 
     expected_updated_at = getattr(body, "expected_updated_at", None)
@@ -1262,7 +1272,9 @@ async def create_human_cost_entry(
     body,
 ) -> TaskCostSummary:
     """Manually record human time for a task (cookie-auth caller; adapter-enforced)."""
+    require_task_write_capability(ctx)
     from core.api.services import cost_service
+    from core.api.services.access_grants import can_write_project
 
     ws = require_workspace_ctx(ctx)
     cursor = await db.execute(
@@ -1271,6 +1283,8 @@ async def create_human_cost_entry(
     )
     row = await cursor.fetchone()
     if not row:
+        raise _task_not_found(task_id)
+    if not await can_write_project(db, ctx, row["project"]):
         raise _task_not_found(task_id)
 
     result = await cost_service.create_human_entry(
@@ -1298,8 +1312,10 @@ async def delete_task(
 ) -> None:
     """Soft delete a task (admin+). Cannot delete in_progress tasks."""
     require_role_ctx(ctx, "admin", "super_admin")
+    require_task_write_capability(ctx)
 
     from core.api.services.audit import log_audit
+    from core.api.services.access_grants import can_write_project
 
     ws = require_workspace_ctx(ctx)
     cursor = await db.execute(
@@ -1308,6 +1324,8 @@ async def delete_task(
     )
     row = await cursor.fetchone()
     if not row:
+        raise _task_not_found(task_id)
+    if not await can_write_project(db, ctx, row["project"]):
         raise _task_not_found(task_id)
 
     if row["status"] == "in_progress":
@@ -1390,13 +1408,15 @@ async def reset_stale_tasks(
     Called by REM in its HYGIENE step.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    require_task_write_capability(ctx)
 
     from core.api.services.audit import log_audit
+    from core.api.services.access_grants import can_write_project
 
     ws = require_workspace_ctx(ctx)
     now = datetime.now(timezone.utc).isoformat()
     stale_cursor = await db.execute(
-        "SELECT id, tags, updated_at FROM tasks "
+        "SELECT id, project, tags, updated_at FROM tasks "
         "WHERE status = 'in_progress' "
         "AND deleted_at IS NULL "
         "AND updated_at < datetime('now', ?) "
@@ -1408,7 +1428,13 @@ async def reset_stale_tasks(
     reset_count = 0
     reset_ids: list[str] = []
     conflict_ids: list[str] = []
+    project_access: dict[str | None, bool] = {}
     for stale_row in stale_rows:
+        project = stale_row["project"]
+        if project not in project_access:
+            project_access[project] = await can_write_project(db, ctx, project)
+        if not project_access[project]:
+            continue
         sid = stale_row["id"]
         # Parse existing tags and add stale_reset
         try:
@@ -1473,8 +1499,11 @@ async def zombie_scan(
     dry_run=true returns the report without writing notifications.
     """
     require_role_ctx(ctx, "operator", "admin", "super_admin")
+    if not dry_run:
+        require_task_write_capability(ctx)
 
     from core.api.services.audit import log_audit
+    from core.api.services.access_grants import can_read_project, can_write_project
 
     ws = require_workspace_ctx(ctx)
     cutoff = (
@@ -1498,7 +1527,14 @@ async def zombie_scan(
 
     by_project: dict[str, list[dict]] = defaultdict(list)
     now_utc = datetime.now(timezone.utc)
+    project_access: dict[str | None, bool] = {}
+    project_permitted = can_read_project if dry_run else can_write_project
     for row in rows:
+        project = row["project"]
+        if project not in project_access:
+            project_access[project] = await project_permitted(db, ctx, project)
+        if not project_access[project]:
+            continue
         # Skip if opted out via dormant-ok tag
         try:
             tags = json.loads(row["tags"] or "[]") if row["tags"] else []
@@ -1617,8 +1653,10 @@ async def bulk_reject_tasks(
     audit entry for the batch. Partial failures are reported, not raised.
     """
     require_role_ctx(ctx, "admin", "super_admin")
+    require_task_write_capability(ctx)
 
     from core.api.services.audit import log_audit
+    from core.api.services.access_grants import can_write_project
 
     rejected: list[str] = []
     failed: list[dict] = []
@@ -1629,6 +1667,7 @@ async def bulk_reject_tasks(
         await db.execute("BEGIN IMMEDIATE")
 
     db.row_factory = aiosqlite.Row
+    project_access: dict[str | None, bool] = {}
     for index, task_id in enumerate(task_ids):
         cursor = await db.execute(
             "SELECT id, status, project, title, tags FROM tasks "
@@ -1638,6 +1677,12 @@ async def bulk_reject_tasks(
         )
         row = await cursor.fetchone()
         if not row:
+            failed.append({"task_id": task_id, "error": "not_found"})
+            continue
+        project = row["project"]
+        if project not in project_access:
+            project_access[project] = await can_write_project(db, ctx, project)
+        if not project_access[project]:
             failed.append({"task_id": task_id, "error": "not_found"})
             continue
 

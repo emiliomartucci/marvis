@@ -45,6 +45,7 @@ from core.api.mcp._adapter import (
     require_unambiguous_visible_project,
     raise_mcp_error,
 )
+from core.api.observability import phase_timing
 from core.api.use_cases import search as search_uc
 from core.api.use_cases._errors import AuthorizationError, NotFoundError, ServiceError
 
@@ -86,6 +87,20 @@ def register(mcp) -> None:
     @mcp.tool()
     async def search(
         q: Annotated[str, Field(min_length=1, max_length=500)],
+        rerank: Annotated[
+            bool | None,
+            Field(
+                description=(
+                    "Jev re-rank of the returned hits (plan U2): clearly "
+                    "irrelevant results with high model confidence sink to the "
+                    "end of their bucket and the response gains a `curation` "
+                    "receipt (status + demoted list + confidence). Default "
+                    "(null): runs whenever the tenant Jev flag allows. Pass "
+                    "false to skip (fastest), true to force. Fail-closed: on "
+                    "any provider problem the order is unchanged."
+                ),
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         """MEANING-first discovery across tasks, projects, files, handoffs, learnings, inbox and audits.
 
@@ -93,15 +108,15 @@ def register(mcp) -> None:
         QUANDO NON USARLO: ID/slug noto -> get_task/get_project/get_handoff; filtri esatti -> list_tasks/list_handoffs.
         PROVA: buckets ranked con span evidence, non stato completo.
         NEXT: apri l'artefatto esatto con get_*/read_file dopo aver scelto il match.
-        RESTITUISCE: buckets ranked (tasks/projects/files/handoffs/learnings/inbox_items/audits), ogni hit con doc_id (usato da memory_feedback) + span evidence; usa span_text prima di aprire file. Con reinforcement mode shadow/on e risultati non vuoti, il payload include il campo suggested_next_tool (nudge memory_feedback)."""
+        RESTITUISCE: buckets ranked (tasks/projects/files/handoffs/learnings/inbox_items/audits), ogni hit con doc_id (usato da memory_feedback) + span evidence; usa span_text prima di aprire file. Con reinforcement mode shadow/on e risultati non vuoti, il payload include il campo suggested_next_tool (nudge memory_feedback). Quando il re-rank Jev gira (default se il tenant lo ha attivo, o rerank=true) il payload include anche il blocco `curation` (ricevuta: status, demoted con confidence)."""
         # The use_case takes only `ctx`: it opens its own connections from
         # settings (db_path / vec0_path) and pulls hybrid_search / embedding_service
         # function-locally — so the MCP path stays fastapi-free at import.
         try:
             ctx = current_mcp_context()
-            async with acquire_db() as db:
+            async with phase_timing.aphase("visibility"), acquire_db() as db:
                 visible_projects = await current_visible_projects(db, ctx)
-            result = await search_uc.search(ctx, q=q)
+            result = await search_uc.search(ctx, q=q, rerank=rerank)
             payload = dump(result)
             notice = no_grants_notice(visible_projects)
             if notice:

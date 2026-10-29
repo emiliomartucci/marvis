@@ -11,8 +11,8 @@ from verify_compatibility_contract import CompatibilityError, provider_breaks, v
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_REF = "8dfd16e4e275b69435e0348258daf86f67898997"
-PAYLOAD_SHA256 = "d41411373ecaf584ee4406a23c9ba7fedc1915a9564f8734983d9a826cd70ae7"
+SOURCE_REF = "f113a0454836603731fbe630fc16c34fb9e5af23"
+PAYLOAD_SHA256 = "60d1248b86d5e87b31729d8955927d86e786bfff228438d0b143fbd5cac52dbe"
 
 
 class CompatibilityContractTests(unittest.TestCase):
@@ -25,18 +25,24 @@ class CompatibilityContractTests(unittest.TestCase):
             "contracts/engine-pin.yaml",
             "core/api/db.py",
             "core/api/mcp/stdio.py",
+            "core/api/mcp/tools/admin_access.py",
             "core/api/mcp/tools/agent_tokens.py",
+            "core/api/mcp/tools/context.py",
             "core/api/mcp/tools/projects.py",
             "core/api/models/auth.py",
             "core/api/models/search.py",
             "core/api/models/tasks.py",
+            "core/api/models/teams.py",
             "core/api/routers/agent_tokens.py",
             "core/api/routers/auth.py",
             "core/api/routers/graph_ingest.py",
             "core/api/routers/projects.py",
+            "core/api/routers/search.py",
             "core/api/routers/tasks.py",
+            "core/api/routers/teams.py",
             "core/api/services/schema_upgrade.py",
             "core/api/use_cases/search.py",
+            "core/api/use_cases/teams.py",
             "core/api/tests/test_require_scope_empty_deny.py",
             "core/api/tests/test_schema_compatibility.py",
             "core/cli/marvis_hooks.py",
@@ -75,8 +81,9 @@ class CompatibilityContractTests(unittest.TestCase):
         self.assertEqual(result["source_ref"], SOURCE_REF)
         self.assertEqual(result["projection_payload_sha256"], PAYLOAD_SHA256)
         self.assertGreater(result["n_operations"], result["n_minus_1_operations"])
-        self.assertEqual(result["declared_n_minus_1_schema_breaks"], 4)
+        self.assertEqual(result["declared_n_minus_1_schema_breaks"], 7)
         self.assertEqual(result["declared_n_minus_1_response_sanitizers"], 1)
+        self.assertEqual(result["declared_n_minus_1_request_widenings"], 3)
 
     def test_runtime_search_reason_sanitizer_maps_timeout_to_n_minus_one_value(self) -> None:
         from core.api.models.search import SearchResponse
@@ -122,6 +129,45 @@ class CompatibilityContractTests(unittest.TestCase):
         path.write_text(json.dumps(matrix, sort_keys=True, indent=2) + "\n")
 
         with self.assertRaisesRegex(CompatibilityError, "evidence symbol missing"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_undeclared_request_widening_fails_closed(self) -> None:
+        root = self._copy()
+        path = root / "contracts/compatibility/consumer-matrix-v1.json"
+        matrix = json.loads(path.read_text())
+        matrix["n_minus_1_provider_request_widenings"].pop()
+        path.write_text(json.dumps(matrix, sort_keys=True, indent=2) + "\n")
+
+        with self.assertRaisesRegex(CompatibilityError, "inventory drift"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_request_widening_cannot_certify_a_response_schema(self) -> None:
+        root = self._copy()
+        path = root / "contracts/compatibility/consumer-matrix-v1.json"
+        matrix = json.loads(path.read_text())
+        sanitizer = matrix["n_minus_1_provider_response_sanitizers"].pop()
+        matrix["n_minus_1_provider_request_widenings"].append(
+            {
+                "failure": sanitizer["failure"],
+                "schema": sanitizer["schema"],
+                "property": sanitizer["property"],
+                "surfaces": ["http"],
+                "evidence": sanitizer["evidence"],
+            }
+        )
+        path.write_text(json.dumps(matrix, sort_keys=True, indent=2) + "\n")
+
+        with self.assertRaisesRegex(CompatibilityError, "appears in a response"):
+            verify(root, expected_source_ref=SOURCE_REF)
+
+    def test_request_widening_cannot_certify_a_non_passing_row(self) -> None:
+        root = self._copy()
+        path = root / "contracts/compatibility/consumer-matrix-v1.json"
+        matrix = json.loads(path.read_text())
+        matrix["n_minus_1_provider_request_widenings"][0]["surfaces"] = ["local_mcp"]
+        path.write_text(json.dumps(matrix, sort_keys=True, indent=2) + "\n")
+
+        with self.assertRaisesRegex(CompatibilityError, "non-passing N-1 row"):
             verify(root, expected_source_ref=SOURCE_REF)
 
     def test_manifest_tamper_fails_closed(self) -> None:

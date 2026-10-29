@@ -4,7 +4,7 @@ from __future__ import annotations
 import aiosqlite
 from fastapi import APIRouter, Depends, Query
 
-from core.api.db import get_db, get_write_db
+from core.api.db import acquire_db, acquire_write_db, get_db, get_write_db
 from core.api.models import (
     CommentCreateRequest,
     CommentResponse,
@@ -25,20 +25,21 @@ router = APIRouter(prefix="/api/v1/comments", tags=["comments"])
 async def create_comment(
     body: CommentCreateRequest,
     user: UserInfo = Depends(get_current_user_or_agent),
-    db: aiosqlite.Connection = Depends(get_write_db),
 ) -> CommentResponse:
     """Create a new comment (RBAC + redaction + notify via the shared use_case)."""
     ctx = CallerContext.from_user_info(user, is_human_session=user.user_type == "human")
     try:
-        return await comments_uc.create_comment(
-            ctx,
-            db,
-            target_type=body.target_type,
-            target_id=body.target_id,
-            body=body.body,
-            status=body.status,
-            parent_id=body.parent_id,
-        )
+        async with acquire_db() as read_db:
+            prepared = await comments_uc.prepare_create_body(
+                ctx, read_db, target_type=body.target_type,
+                target_id=body.target_id, body=body.body,
+            )
+        async with acquire_write_db(label="http.comments.create") as db:
+            return await comments_uc.create_comment(
+                ctx, db, target_type=body.target_type,
+                target_id=body.target_id, body=body.body, status=body.status,
+                parent_id=body.parent_id, prepared_body=prepared,
+            )
     except ServiceError as e:
         raise to_http(e)
 
@@ -76,18 +77,21 @@ async def update_comment(
     comment_id: int,
     body: CommentUpdateRequest,
     user: UserInfo = Depends(get_current_user_or_agent),
-    db: aiosqlite.Connection = Depends(get_write_db),
 ) -> CommentResponse:
     """Edit comment body/status after workspace-owned target authorization."""
     ctx = CallerContext.from_user_info(user, is_human_session=user.user_type == "human")
     try:
-        return await comments_uc.update_comment(
-            ctx,
-            db,
-            comment_id=comment_id,
-            body=body.body,
-            status=body.status,
-        )
+        prepared = None
+        if body.body is not None:
+            async with acquire_db() as read_db:
+                prepared = await comments_uc.prepare_update_body(
+                    ctx, read_db, comment_id=comment_id, body=body.body,
+                )
+        async with acquire_write_db(label="http.comments.update") as db:
+            return await comments_uc.update_comment(
+                ctx, db, comment_id=comment_id, body=body.body,
+                status=body.status, prepared_body=prepared,
+            )
     except ServiceError as e:
         raise to_http(e)
 

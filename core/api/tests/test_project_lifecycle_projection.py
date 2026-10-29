@@ -84,7 +84,7 @@ def test_migration_187_installs_and_seals_lifecycle_contract(
             "FROM project_lifecycle_bootstrap WHERE id=1"
         ).fetchone()
 
-    assert version == 187
+    assert version >= 187
     assert {
         "project_lifecycle_state",
         "project_write_events",

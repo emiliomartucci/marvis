@@ -26,8 +26,9 @@ unrestricted — DECISION 1).
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 import logging
+from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 import aiosqlite
@@ -44,11 +45,12 @@ from core.api.mcp._adapter import (
     require_any_grant,
     require_unambiguous_visible_project,
 )
-from core.api.services import project_lifecycle as lifecycle_service
+from core.api.services import access_grants
 from core.api.services import governed_decisions as decision_service
+from core.api.services import project_lifecycle as lifecycle_service
 from core.api.use_cases import projects as projects_uc
 from core.api.use_cases._context import CallerContext, require_role_ctx
-from core.api.use_cases._errors import ServiceError
+from core.api.use_cases._errors import NotFoundError, ServiceError
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +77,6 @@ def _schedule_embed_project_mcp(
     unavailable.
     """
     from core.api.services import embedding_service
-
-    if not embedding_service.is_available():
-        return
 
     desc = description or ""
     name = desc or slug
@@ -134,6 +133,22 @@ async def create_project_impl(
         owner=owner,
     )
     return dump(result)
+
+
+def _indexed_projects_root(slug: str) -> Path | None:
+    """Root that holds the indexed project (multi-root self-hosted installs)."""
+    from core.api.routers.projects import _find_project_entry
+
+    entry = _find_project_entry(slug)
+    return entry.metadata_path.parent if entry else None
+
+
+def _forget_project_yaml_cache(slug: str) -> None:
+    """Drop the router's mtime-keyed project.yaml cache after a governed write."""
+    import core.api.routers.projects as projects_router
+
+    projects_router._project_yaml_cache.pop(slug, None)
+    projects_router._project_yaml_mtime.pop(slug, None)
 
 
 def _lean_project_rows(
@@ -318,6 +333,10 @@ def register(mcp) -> None:
                 await require_unambiguous_visible_project(
                     db, ctx, slug, visible_projects
                 )
+                await access_grants.require_enterprise_project_edit(
+                    db, ctx, slug,
+                    error=NotFoundError(code="project_not_found", message="Not found"),
+                )
                 async with lifecycle_service.async_project_mutation_guard():
                     snapshot = await lifecycle_service.ensure_project_lifecycle(
                         db,
@@ -326,6 +345,38 @@ def register(mcp) -> None:
                     )
                     await db.commit()
                 return lifecycle_service.snapshot_dict(snapshot)
+        except ServiceError as e:
+            raise_mcp_error(e)
+
+    @mcp.tool()
+    async def set_project_program(
+        slug: Annotated[str, Field(min_length=1, max_length=63)],
+        program: Annotated[str, Field(max_length=63)] | None = None,
+    ) -> dict[str, Any]:
+        """Set project.yaml program, read by list_projects(program=); empty clears. Governed, audited.
+
+        QUANDO NON USARLO: edit/write_file su project.yaml (rifiutati)."""
+        try:
+            async with acquire_write_db(label="mcp.set_project_program") as db:
+                ctx = current_mcp_context()
+                require_role_ctx(ctx, "operator", "admin", "super_admin")
+                visible_projects = await current_visible_projects(db, ctx)
+                await require_unambiguous_visible_project(
+                    db, ctx, slug, visible_projects
+                )
+                await access_grants.require_enterprise_project_edit(
+                    db, ctx, slug,
+                    error=NotFoundError(code="project_not_found", message="Not found"),
+                )
+                result = await lifecycle_service.set_project_program(
+                    ctx,
+                    db,
+                    project_slug=slug,
+                    program=program,
+                    projects_root=_indexed_projects_root(slug),
+                )
+            _forget_project_yaml_cache(slug)
+            return result
         except ServiceError as e:
             raise_mcp_error(e)
 

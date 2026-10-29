@@ -74,7 +74,7 @@ from core.api.services import access_grants
 from core.api.use_cases import feedback as feedback_uc
 from core.api.use_cases import graph as graph_uc
 from core.api.use_cases._context import require_role_ctx, require_workspace_ctx
-from core.api.use_cases._errors import ServiceError
+from core.api.use_cases._errors import NotFoundError, ServiceError
 
 # Zod enums -> Literals (mirror the Node tool signatures).
 NeighborRelation = Literal["calls", "imports", "defines"]
@@ -109,6 +109,13 @@ _GRAPH_SCOPE_PATTERN = r"^([a-z0-9][a-z0-9&\-]+|(project|module):artifact:.+)$"
 _PROJECT_SCOPE_RE = re.compile(_PROJECT_PATTERN)
 _CANONICAL_SCOPE_RE = re.compile(_CANONICAL_SCOPE_PATTERN)
 _KG_REINDEX_PATHS_MAX = 25
+
+
+async def _require_readable_project_filter(db: Any, ctx: Any, project: str | None) -> None:
+    """Reject hidden project selectors before graph retrieval or freshness lookup."""
+    if project is not None and not ctx.is_local_os_account:
+        if not await access_grants.can_read_project(db, ctx, project):
+            raise NotFoundError(code="project_not_found", message="Not found")
 
 
 async def _local_no_op_edge_filter(
@@ -355,6 +362,7 @@ def register(mcp) -> None:
         try:
             async with acquire_db() as db:
                 ctx = current_mcp_context()
+                await _require_readable_project_filter(db, ctx, project)
                 # Node proxy hardcodes limit=200 (the surface exposes no limit param).
                 result = await graph_uc.graph_neighbors(
                     ctx,
@@ -415,6 +423,7 @@ def register(mcp) -> None:
         try:
             async with acquire_db() as db:
                 ctx = current_mcp_context()
+                await _require_readable_project_filter(db, ctx, project)
                 result = await graph_uc.graph_impact(
                     ctx,
                     db,
@@ -469,6 +478,7 @@ def register(mcp) -> None:
         try:
             async with acquire_db() as db:
                 ctx = current_mcp_context()
+                await _require_readable_project_filter(db, ctx, project)
                 result = await graph_uc.graph_context(
                     ctx,
                     db,
@@ -530,12 +540,11 @@ def register(mcp) -> None:
         skip_hash_gate: bool = False,
         aggregate_project_edges: bool = True,
     ) -> dict[str, Any]:
-        """Re-index N paths in the Knowledge Graph synchronously (artifact + cross_project edges).
+        """Re-index a few paths in the Knowledge Graph synchronously (artifact + cross_project edges).
 
-        QUANDO USARLO: un .md sotto projects_root e' stato modificato esternamente (rsync, sed batch) e vuoi refresh senza aspettare il watcher. Operator+, batch piccolo.
-        QUANDO NON USARLO: NOT per semantic embeddings reindex -> usa reindex/reindex_paths (non graph nodes/edges). NOT per il rebuild completo notturno: NON e' esposto su questa superficie (control plane router/systemd), qui puoi solo reindicizzare i path che passi. NOT per path fuori projects_root.
-        ATTENZIONE: handle_delete=true dichiara che OGNI path passato e' stato cancellato e rimuove il relativo stato KG anche se il file esiste ancora. Per reindicizzare file esistenti lascialo false.
-        FORZA: skip_hash_gate=true forza la rilettura ma registra comunque il nuovo hash.
+        QUANDO USARLO: un .md sotto projects_root e' cambiato fuori dal watcher e vuoi il grafo aggiornato subito. Operator+, batch piccolo.
+        QUANDO NON USARLO: per gli embedding semantici -> reindex/reindex_paths. Path fuori projects_root non ammessi.
+        ATTENZIONE: handle_delete=true rimuove lo stato KG di OGNI path passato anche se il file esiste. skip_hash_gate=true forza la rilettura.
         RESTITUISCE: {nodes_written, edges_written, files_processed, files_skipped_hash_unchanged, skipped, project_nodes_written, project_edges_aggregation_rc, latency_ms}."""
         try:
             ctx = current_mcp_context()

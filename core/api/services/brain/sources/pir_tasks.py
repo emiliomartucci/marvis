@@ -16,6 +16,7 @@ from collections.abc import AsyncIterator
 from core.api.db import acquire_db
 from core.api.services.brain.digest_collector import SourceCollector
 from core.api.services.brain.models import EventDraft, SourceCollectorContext
+from core.api.services.brain.semantic_context import capture_source_context
 from core.api.services.brain.sources.base import (
     normalize_iso,
     resolve_source_project,
@@ -67,13 +68,14 @@ async def _collect_tasks(
     while True:
         async with acquire_db() as db:
             cur = await db.execute(
-                "SELECT id, title, status, priority, project, tags, updated_at "
+                "SELECT id, title, status, priority, project, tags, updated_at, description "
                 "FROM tasks "
                 "WHERE deleted_at IS NULL "
                 "  AND updated_at > ? AND updated_at <= ? "
+                "  AND COALESCE(workspace_id,'ws_default') = ? "
                 "ORDER BY updated_at ASC "
                 "LIMIT ? OFFSET ?",
-                (lower_iso, upper_iso, _PAGE_SIZE, offset),
+                (lower_iso, upper_iso, ctx.workspace_id, _PAGE_SIZE, offset),
             )
             rows = await cur.fetchall()
         if not rows:
@@ -87,6 +89,7 @@ async def _collect_tasks(
             project = row[4] if not hasattr(row, "keys") else row["project"]
             tags_raw = row[5] if not hasattr(row, "keys") else row["tags"]
             updated_at_raw = row[6] if not hasattr(row, "keys") else row["updated_at"]
+            description = row[7] if not hasattr(row, "keys") else row["description"]
 
             observed_at = normalize_iso(updated_at_raw)
             if observed_at is None:
@@ -102,6 +105,8 @@ async def _collect_tasks(
                 "project": project,
                 "tags_hash": _tags_hash(tags_raw),
                 "updated_at": observed_at.isoformat(),
+                **capture_source_context(title=title, description=description,
+                                         updated_at=observed_at.isoformat()),
             }
             yield EventDraft(
                 event_type="task_changed",

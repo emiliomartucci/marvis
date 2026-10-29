@@ -1885,12 +1885,28 @@ export async function getTeamProjects(
 
 export async function assignTeamProject(
   teamId: string,
-  data: { project: string; is_public?: boolean }
-): Promise<{ status: string; project: string; team_id: string }> {
+  data: { project: string; is_public?: boolean; role?: "viewer" | "member"; clearance?: "public" | "internal" }
+): Promise<{ status: string; project: string; team_id: string; role: "viewer" | "member"; clearance: "public" | "internal"; is_public: boolean }> {
   return fetchAPI(`/api/v1/teams/${encodeURIComponent(teamId)}/projects`, {
     method: "POST",
     body: JSON.stringify(data),
   });
+}
+
+export interface EffectiveProjectAccess {
+  project: string;
+  can_view: boolean;
+  can_edit: boolean;
+  sources: Array<{
+    role: "viewer" | "member" | "admin" | "denied";
+    clearance: "public" | "internal" | "confidential";
+    scope: string;
+    via_team?: string | null;
+  }>;
+}
+
+export async function getEffectiveProjectAccess(project: string): Promise<EffectiveProjectAccess> {
+  return fetchAPI<EffectiveProjectAccess>(`/api/v1/access/effective/${encodeURIComponent(project)}`);
 }
 
 export async function removeTeamProject(teamId: string, slug: string): Promise<void> {

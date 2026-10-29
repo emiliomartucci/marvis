@@ -16,6 +16,11 @@ from typing import Any, Literal
 from core.api.db import acquire_write_db
 from core.api.paths import repo_root
 from core.api.services.ingest.embedding_router import embed_and_index
+from core.api.services.embedding_service import (
+    EmbeddingBackpressureError,
+    EmbeddingInputTooLargeError,
+    EmbeddingUnavailableError,
+)
 from core.api.services.ingest.events import broadcast_ingest_changed
 from core.api.services.ingest.xlsx_privacy import (
     PROPRIETARY_DETECTOR,
@@ -825,6 +830,28 @@ def _should_skip_xlsx_embedding(row, target_path: Path) -> bool:
     return sheet_count != 1 or structure.get("proprietary") is True
 
 
+def _require_secret_safety(row, classification: dict[str, Any]) -> None:
+    from core.api.services import bug_reports_core
+    from core.api.services.jev.outbound import contains_credentials
+
+    raw_text = row["extracted_text"] or ""
+    status = classification.get("secret_safety", "not_checked")
+    legacy_block = "needs-redaction" in (classification.get("tags") or [])
+    basis = row["triage_decision_id"] if "triage_decision_id" in row.keys() else None
+    reviewed = bool(basis and basis.startswith("approve:secret-reviewed:"))
+    # The bug-report sweep redacts on ambiguity; as an ingest *block* it would
+    # stop ordinary documents over letter-only identifiers such as
+    # "LegacyExtractedMarker". Generated secrets mix letters and digits.
+    secret_like = [
+        token for token in bug_reports_core.high_entropy_tokens(raw_text)
+        if any(char.isdigit() for char in token)
+    ]
+    if (contains_credentials(raw_text)
+            or secret_like
+            or (not reviewed and (status not in {"not_checked", "clear"} or legacy_block))):
+        raise ValueError("ingest_secret_safety_requires_redaction_or_verification")
+
+
 async def _embed_inserted_row(
     *,
     row,
@@ -832,27 +859,36 @@ async def _embed_inserted_row(
     classification: dict[str, Any],
     project_type: ProjectType,
 ) -> str:
+    _require_secret_safety(row, classification)
     if _should_skip_xlsx_embedding(row, target_path):
         logger.info(
             "embedding backend: skipped ingest_id=%s reason=xlsx-structural-privacy",
             row["id"],
         )
         return "skipped"
-    return await embed_and_index(
-        ingest_id=row["id"],
-        workspace_id=row["workspace_id"],
-        slug=row["project_slug"],
-        target_path=target_path,
-        extracted_text=row["extracted_text"],
-        document_type=str(classification.get("type") or "file"),
-        title=str(classification.get("title") or target_path.stem),
-        project_type=project_type,
-    )
+    try:
+        return await embed_and_index(
+            ingest_id=row["id"],
+            workspace_id=row["workspace_id"],
+            slug=row["project_slug"],
+            target_path=target_path,
+            extracted_text=row["extracted_text"],
+            document_type=str(classification.get("type") or "file"),
+            title=str(classification.get("title") or target_path.stem),
+            project_type=project_type,
+        )
+    except EmbeddingInputTooLargeError:
+        # The file has already been materialized and its lexical text indexed.
+        # Retrying the same oversized payload cannot produce a vector, and a
+        # semantic limitation must not turn successful insertion into parse_error.
+        logger.warning("semantic index skipped for oversized ingest_id=%s", row["id"])
+        return "skipped"
 
 
 async def _finish_inserted_row(row, workspace_id: str) -> None:
     if row["workspace_id"] != workspace_id:
         raise ValueError("ingest row workspace mismatch")
+    _require_secret_safety(row, json.loads(row["classification_json"] or "{}"))
     project_slug = row["project_slug"]
     target_path = _target_path_from_inserted_row(row)
     if not target_path.exists():
@@ -1031,6 +1067,7 @@ async def execute_saga(ingest_id: str, workspace_id: str) -> None:
 
     project_slug = row["project_slug"]
     try:
+        _require_secret_safety(row, json.loads(row["classification_json"] or "{}"))
         project_root = _project_root(project_slug)
         project_type, repo_path = _load_project_entry(project_slug)
         logger.info(
@@ -1211,6 +1248,15 @@ async def execute_saga(ingest_id: str, workspace_id: str) -> None:
             )
             _PENDING_ENRICHMENT_TASKS.add(task)
             task.add_done_callback(_PENDING_ENRICHMENT_TASKS.discard)
+    except (EmbeddingUnavailableError, EmbeddingBackpressureError):
+        async with acquire_write_db() as db:
+            await db.execute(
+                """UPDATE ingest_pending SET error_message = 'semantic_index_deferred',
+                   updated_at = datetime('now') WHERE id = ? AND workspace_id = ?
+                   AND status = 'inserted'""", (ingest_id, workspace_id),
+            )
+            await db.commit()
+        raise
     except Exception as exc:
         logger.exception("ingest saga failed: id=%s", ingest_id)
         async with acquire_write_db() as db:

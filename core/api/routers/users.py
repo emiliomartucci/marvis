@@ -290,6 +290,21 @@ async def update_user(
     if not row or row["deleted_at"]:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # A user administrator may change only lower-ranked accounts or their own
+    # profile. In particular an admin cannot demote, rebind email for, or
+    # otherwise take over a super_admin or peer admin account.
+    target_level = ROLE_HIERARCHY.get(row["system_role"], -1)
+    caller_level = ROLE_HIERARCHY.get(caller.system_role, -1)
+    if target_level > caller_level or (target_level == caller_level and row["id"] != caller.user_id):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    if row["system_role"] == "super_admin" and body.system_role not in {None, "super_admin"}:
+        remaining = await (await db.execute(
+            "SELECT count(*) FROM users WHERE workspace_id = ? AND system_role = 'super_admin' "
+            "AND deleted_at IS NULL", (ws,),
+        )).fetchone()
+        if remaining[0] <= 1:
+            raise HTTPException(status_code=409, detail="Cannot demote the last super admin")
+
     provided = body.model_fields_set
     updates: dict = {}
     if "display_name" in provided and body.display_name is not None:

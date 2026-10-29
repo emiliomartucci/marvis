@@ -3,7 +3,6 @@
 # No LLM, no business state mutation, no auto-task creation.
 from __future__ import annotations
 
-import dataclasses
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -65,74 +64,19 @@ async def empty_collector(_ctx: SourceCollectorContext) -> AsyncIterator[EventDr
 async def collect_from_source(
     collector: SourceCollector, ctx: SourceCollectorContext
 ) -> list[EventDraft]:
-    """Materialize a collector with orchestrator-side pagination (Wave 3.1 gap 5).
+    """Drain one iterator; never infer a cursor from unordered timestamps.
 
-    Pattern:
-      * Pull up to `ctx.per_source_event_cap` drafts in one pass.
-      * If the batch hits the cap, advance `ctx.since` to the max observed_at
-        seen so far and re-call the collector. Repeat until a partial batch
-        comes back or the bound `MAX_COLLECT_ITERATIONS` is reached.
-      * No synthetic `external_update_seen` overflow event — the orchestrator
-        now drains the source completely and the cycle reports `succeeded`
-        instead of `partial`.
-
-    Guards:
-      * Bail when no watermark progress (last_observed_at <= ctx.since).
-      * Bail at MAX_COLLECT_ITERATIONS with a WARNING — keeps a pathological
-        source from blocking the cycle.
+    The total cap bounds memory and work. Reading one extra item distinguishes
+    an exactly-full, exhausted source from an incomplete source. Incomplete
+    batches raise before persistence, leaving the durable watermark unchanged.
     """
-    all_drafts: list[EventDraft] = []
-    current_ctx = ctx
-    iterations = 0
-
-    while True:
-        batch: list[EventDraft] = []
-        cap = current_ctx.per_source_event_cap
-        async for draft in collector.collect(current_ctx):
-            if len(batch) >= cap:
-                # Stop reading from this batch — the collector should not
-                # return more than cap, but we defend regardless.
-                break
-            batch.append(draft)
-        all_drafts.extend(batch)
-        iterations += 1
-
-        if len(batch) < cap:
-            # Batch is below cap → source is fully drained for this window.
-            break
-
-        if iterations >= MAX_COLLECT_ITERATIONS:
-            logger.warning(
-                "collect_from_source: max %d iterations reached for %s "
-                "(cycle=%s) — stopping pagination",
-                MAX_COLLECT_ITERATIONS,
-                collector.source_system,
-                current_ctx.cycle_key,
-            )
-            break
-
-        # Advance the watermark on the iteration ctx so the next call returns
-        # the subsequent slice. We use the max observed_at to keep ordering
-        # robust even when collectors yield slightly out-of-order events.
-        try:
-            last_observed = max(d.observed_at for d in batch)
-        except ValueError:
-            break
-
-        if last_observed <= current_ctx.since_watermark:
-            logger.warning(
-                "collect_from_source: no watermark advance for %s (cycle=%s, "
-                "since=%s, last_observed=%s) — stopping to avoid infinite loop",
-                collector.source_system,
-                current_ctx.cycle_key,
-                current_ctx.since_watermark.isoformat() if current_ctx.since_watermark else "",
-                last_observed.isoformat() if last_observed else "",
-            )
-            break
-
-        current_ctx = dataclasses.replace(current_ctx, since_watermark=last_observed)
-
-    return all_drafts
+    drafts: list[EventDraft] = []
+    total_cap = ctx.per_source_event_cap * MAX_COLLECT_ITERATIONS
+    async for draft in collector.collect(ctx):
+        if len(drafts) >= total_cap:
+            raise RuntimeError(f"source_incomplete: total event cap {total_cap} exceeded")
+        drafts.append(draft)
+    return drafts
 
 
 __all__ = [

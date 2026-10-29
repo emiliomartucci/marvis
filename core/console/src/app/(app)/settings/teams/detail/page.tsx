@@ -217,6 +217,7 @@ function TeamDetailContent() {
   // Add project form
   const [addingProject, setAddingProject] = useState(false);
   const [projectSlug, setProjectSlug] = useState("");
+  const [projectRole, setProjectRole] = useState<"viewer" | "member">("viewer");
   const [addProjectLoading, setAddProjectLoading] = useState(false);
   const [addProjectError, setAddProjectError] = useState<string | null>(null);
 
@@ -304,8 +305,9 @@ function TeamDetailContent() {
     setAddProjectLoading(true);
     setAddProjectError(null);
     try {
-      await assignTeamProject(teamId, { project: projectSlug.trim() });
+      await assignTeamProject(teamId, { project: projectSlug.trim(), role: projectRole, clearance: "internal" });
       setProjectSlug("");
+      setProjectRole("viewer");
       setAddingProject(false);
       loadData();
     } catch (err) {
@@ -339,6 +341,17 @@ function TeamDetailContent() {
       );
     } catch (err) {
       alert(err instanceof Error ? err.message : "Failed to update visibility");
+    }
+  }
+
+  async function handleChangeProjectRole(project: TeamProject, role: "viewer" | "member") {
+    try {
+      const updated = await assignTeamProject(teamId, { project: project.project, role });
+      setProjects((prev) => prev.map((item) => item.project === project.project
+        ? { ...item, role: updated.role, clearance: updated.clearance, is_public: updated.is_public }
+        : item));
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to update project access");
     }
   }
 
@@ -570,6 +583,17 @@ function TeamDetailContent() {
                 onChange={(e) => setProjectSlug(e.target.value)}
                 required
               />
+              <label className="text-label text-pir-text-secondary block">
+                Project access
+                <select
+                  className="mt-1 w-full bg-pir-surface-2 border border-pir rounded px-3 py-2 text-body text-pir-text-primary"
+                  value={projectRole}
+                  onChange={(e) => setProjectRole(e.target.value as "viewer" | "member")}
+                >
+                  <option value="viewer">View</option>
+                  <option value="member">Edit</option>
+                </select>
+              </label>
               <div className="flex gap-2">
                 <button
                   type="button"
@@ -605,9 +629,12 @@ function TeamDetailContent() {
                       <th className="text-left text-label text-pir-text-muted px-4 py-3">
                         Project
                       </th>
-                      <th className="text-left text-label text-pir-text-muted px-4 py-3 w-28">
-                        Visibility
-                      </th>
+                    <th className="text-left text-label text-pir-text-muted px-4 py-3 w-28">
+                      Visibility
+                    </th>
+                    <th className="text-left text-label text-pir-text-muted px-4 py-3 w-28">
+                      Access
+                    </th>
                       <th className="px-4 py-3 w-16" />
                     </tr>
                   </thead>
@@ -639,6 +666,17 @@ function TeamDetailContent() {
                           >
                             {p.is_public ? "public" : "private"}
                           </button>
+                        </td>
+                        <td className="px-4 py-3">
+                          <select
+                            aria-label={`Access for ${p.project}`}
+                            value={p.role}
+                            onChange={(e) => handleChangeProjectRole(p, e.target.value as "viewer" | "member")}
+                            className="bg-pir-surface-2 border border-pir rounded px-2 py-1 text-caption text-pir-text-primary"
+                          >
+                            <option value="viewer">View</option>
+                            <option value="member">Edit</option>
+                          </select>
                         </td>
                         <td className="px-4 py-3 text-right">
                           <button

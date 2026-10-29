@@ -56,15 +56,18 @@ _REDACTORS: list[tuple[str, re.Pattern[str]]] = [
     ("API_KEY", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     ("API_KEY", re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b")),
     ("AWS_KEY", re.compile(r"\b(?:AKIA|ASIA|AGPA|AROA|AIDA)[A-Z0-9]{12,}\b")),
+    # Authorization schemes may contain whitespace (e.g. Basic plus payload).
+    ("AUTHORIZATION", re.compile(r"(?im)\bauthorization\b['\"]?\s*[:=][^\r\n]+")),
     # bearer/authorization inline
-    ("BEARER", re.compile(r"\b[Bb]earer\s+[A-Za-z0-9._~+/=-]{12,}")),
+    ("BEARER", re.compile(r"\b[Bb]earer\s+[^\s,;\"'<>]+")),
     # emails
     ("EMAIL", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
-    # generic key=value / key: value where value looks secret-ish
+    # Explicit credential context wins regardless of length or punctuation.
     (
         "SECRET",
         re.compile(
-            r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|pwd|authorization|auth[_-]?token|access[_-]?token|private[_-]?key)\b\s*[:=]\s*['\"]?([A-Za-z0-9._~+/=-]{8,})['\"]?"
+            r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|pwd|authorization|auth[_-]?token|access[_-]?token|private[_-]?key|client[_-]?secret|refresh[_-]?token|secret[_-]?key|signing[_-]?key)\b['\"]?\s*[:=]\s*"
+            r"(?:\"(?:\\.|[^\"\\])+\"|'(?:\\.|[^'\\])+'|[^\s\"'<>]+)"
         ),
     ),
 ]
@@ -104,29 +107,45 @@ def _looks_high_entropy(token: str) -> bool:
     return entropy >= 3.0
 
 
-def redact(text: str) -> tuple[str, int]:
+def redact_explicit(text: str, *, include_email: bool = True) -> tuple[str, int]:
+    """Remove typed credentials before any optional identifier classification."""
+    count = 0
+    for label, pattern in _REDACTORS:
+        if label == "EMAIL" and not include_email:
+            continue
+        text, matches = pattern.subn(f"[REDACTED_{label}]", text or "")
+        count += matches
+    return text, count
+
+
+def redact(
+    text: str, *, keep_tokens: set[str] | None = None
+) -> tuple[str, int]:
     """Return ``(redacted_text, redaction_count)``.
 
     Applies typed shape redactors, then a generic high-entropy sweep. The count
     is a signal surfaced to the operator (a report with many redactions is
-    likely a paste of a config/secret, worth a closer look)."""
+    likely a paste of a config/secret, worth a closer look).
+
+    ``keep_tokens`` (plan 2026-09-21 U5/R18) lets an ASYNC caller de-redact
+    known-internal identifiers: tokens in the set skip ONLY the entropy sweep —
+    the typed shape redactors (SECRET/BEARER/…) still run on them. The caller
+    (core/api/services/jev/redaction_gate.py) builds the set with the
+    double-confirmation gate (deterministic ID pattern AND provider judgment);
+    sync callers keep today's behaviour by passing nothing."""
     if not text:
         return "", 0
-    count = 0
-
-    def _sub(m: re.Match[str]) -> str:
-        nonlocal count
-        count += 1
-        return f"[REDACTED_{label}]"
-
-    for label, pattern in _REDACTORS:
-        text, n = pattern.subn(_sub, text)
+    text, count = redact_explicit(text)
     # generic high-entropy pass (skip already-redacted placeholders)
+    keep = keep_tokens or frozenset()
+
     def _entropy_sub(m: re.Match[str]) -> str:
         nonlocal count
         tok = m.group(0)
         if tok.startswith("REDACTED_") or "REDACTED_" in tok:
             return tok
+        if tok in keep:
+            return tok  # doubly-confirmed internal identifier (U5 gate)
         if _looks_high_entropy(tok):
             count += 1
             return "[REDACTED_HIGH_ENTROPY]"
@@ -134,6 +153,24 @@ def redact(text: str) -> tuple[str, int]:
 
     text = _HIGH_ENTROPY.sub(_entropy_sub, text)
     return text, count
+
+
+def high_entropy_tokens(text: str) -> list[str]:
+    """Tokens the entropy sweep WOULD redact, in order (U5 gate input).
+
+    Mirrors the sweep exactly (same regex, same heuristic, same placeholder
+    skip) so the gate decides on precisely the tokens ``redact`` would touch.
+    """
+    if not text:
+        return []
+    out: list[str] = []
+    for m in _HIGH_ENTROPY.finditer(text):
+        tok = m.group(0)
+        if "REDACTED_" in tok:
+            continue
+        if _looks_high_entropy(tok):
+            out.append(tok)
+    return out
 
 
 def redact_fields(**fields: str | None) -> tuple[dict[str, str], int]:

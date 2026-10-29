@@ -70,10 +70,12 @@ from core.api.services.project_lifecycle import (
 )
 from core.api.use_cases._context import (
     CallerContext,
+    has_approval_authority,
     require_role_ctx,
     require_workspace_ctx,
 )
 from core.api.use_cases._errors import (
+    AuthorizationError,
     ConflictError,
     NotFoundError,
     ServiceError,
@@ -863,6 +865,31 @@ async def approve(
             message="Item has no target classification",
         )
 
+    from core.api.services.jev.outbound import contains_credentials
+
+    # Check the complete original before committing an approval or scheduling
+    # indexing. A semantic uncertainty can be reviewed; a known secret cannot.
+    if contains_credentials(row["extracted_text"] or ""):
+        raise ConflictError(
+            code="ingest_contains_credentials",
+            message="Upload a sanitized copy before approving this document",
+        )
+    classification = json.loads(row["classification_json"] or "{}")
+    review_required = (
+        classification.get("secret_safety", "not_checked") not in {"not_checked", "clear"}
+        or "needs-redaction" in (classification.get("tags") or [])
+    )
+    basis = f"approve:{ctx.user_id}"
+    if review_required:
+        if not await has_approval_authority(ctx, db):
+            raise AuthorizationError(
+                code="secret_review_requires_approval_authority",
+                message="A verified human session or active approval delegation must review this document",
+            )
+        # Separate from legacy approvals, which did not validate this authority.
+        # Preserve the original classifier verdict for audit and review.
+        basis = f"approve:secret-reviewed:{ctx.user_id}"
+
     cursor = await db.execute(
         """
         UPDATE ingest_pending
@@ -873,7 +900,7 @@ async def approve(
            AND workspace_id = ?
            AND status = 'awaiting_triage'
         """,
-        (f"approve:{ctx.user_id}", ingest_id, workspace_id),
+        (basis, ingest_id, workspace_id),
     )
     if cursor.rowcount != 1:
         raise ConflictError(

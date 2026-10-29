@@ -8,6 +8,7 @@ import TriageSidebar from "@/components/triage/TriageSidebar";
 import TriageKanban from "@/components/triage/TriageKanban";
 import TaskDetailModal from "@/components/projects/TaskDetailModal";
 import { filterTriageTasks, loadTriageTasks } from "@/lib/triage";
+import { getEffectiveProjectAccess } from "@/lib/api";
 import { useDesignV2 } from "@/lib/useDesignV2";
 import type { TaskResponse, TriageFilters } from "@/lib/types";
 
@@ -25,6 +26,8 @@ function TriageBoard() {
   const preSelectTaskId = searchParams.get("task");
 
   const [allTasks, setAllTasks] = useState<TaskResponse[]>([]);
+  const [editableProjects, setEditableProjects] = useState<Set<string>>(new Set());
+  const enterpriseMode = process.env.NEXT_PUBLIC_ENTERPRISE_MODE === "1";
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState<TriageFilters>(DEFAULT_FILTERS);
   const [selectedTask, setSelectedTask] = useState<TaskResponse | null>(null);
@@ -34,12 +37,26 @@ function TriageBoard() {
     async ({ showLoading = false }: { showLoading?: boolean } = {}) => {
       const requestId = ++refreshRequestIdRef.current;
       if (showLoading) setLoading(true);
+      if (enterpriseMode) setEditableProjects(new Set());
 
       try {
         const data = await loadTriageTasks();
         if (refreshRequestIdRef.current !== requestId) return;
 
         setAllTasks(data);
+        if (enterpriseMode) {
+          const projects = [...new Set(data.map((task) => task.project))];
+          const access = await Promise.all(projects.map(async (project) => {
+            try {
+              const result = await getEffectiveProjectAccess(project);
+              return result.can_edit ? project : null;
+            } catch {
+              return null;
+            }
+          }));
+          if (refreshRequestIdRef.current !== requestId) return;
+          setEditableProjects(new Set(access.filter((project): project is string => project !== null)));
+        }
         if (preSelectTaskId) {
           const found = data.find((t) => t.id === preSelectTaskId);
           if (found) setSelectedTask(found);
@@ -52,7 +69,7 @@ function TriageBoard() {
         }
       }
     },
-    [preSelectTaskId]
+    [preSelectTaskId, enterpriseMode]
   );
 
   // Fetch all triage-relevant tasks and refresh when the tab becomes active again.
@@ -237,6 +254,7 @@ function TriageBoard() {
               tasks={filteredTasks}
               onTasksChange={setAllTasks}
               onTaskClick={handleTaskClick}
+              canEditTask={(task) => !enterpriseMode || editableProjects.has(task.project)}
             />
           </div>
         </div>
@@ -246,6 +264,7 @@ function TriageBoard() {
           <TaskDetailModal
             task={selectedTask}
             slug={selectedTask.project}
+            canWrite={!enterpriseMode || editableProjects.has(selectedTask.project)}
             onClose={() => setSelectedTask(null)}
             onStatusChange={(taskId, newStatus) => {
               setAllTasks((prev) =>

@@ -120,7 +120,7 @@ def register(mcp) -> None:
     async def assign_team_project(
         team_id: TeamArg,
         project: ProjectArg,
-        role: TeamProjectRole = "member",
+        role: TeamProjectRole = "viewer",
         clearance: TeamProjectClearance = "internal",
     ) -> dict[str, Any]:
         """Assegna o aggiorna un progetto per un team del workspace.

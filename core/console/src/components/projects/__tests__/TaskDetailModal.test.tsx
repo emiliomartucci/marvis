@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Mock the api module
 vi.mock("@/lib/api", () => ({
@@ -46,7 +46,7 @@ vi.mock("@/lib/auth", () => ({
 }));
 
 import TaskDetailModal from "../TaskDetailModal";
-import { getTask, getPullRequest, getTaskCostEntries, getProjectRaci } from "@/lib/api";
+import { getTask, getPullRequest, getTaskCostEntries, getProjectRaci, listUsers } from "@/lib/api";
 
 const mockTask = {
   id: "task-123",
@@ -80,6 +80,8 @@ const defaultProps = {
 };
 
 describe("TaskDetailModal", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getTask).mockResolvedValue(mockTask);
@@ -173,5 +175,28 @@ describe("TaskDetailModal", () => {
     const statusSelect = screen.getByRole("combobox", { name: /task status/i });
     expect(statusSelect).toBeInTheDocument();
     expect(statusSelect).toHaveValue("in_progress");
+  });
+
+  it("shows Enterprise task comments in read-only mode for a project viewer", async () => {
+    vi.stubEnv("NEXT_PUBLIC_ENTERPRISE_MODE", "1");
+    render(<TaskDetailModal {...defaultProps} canWrite={false} />);
+    expect(await screen.findByText("Comments")).toBeInTheDocument();
+    expect(await screen.findByText("No comments yet.")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Write a comment... (markdown supported)")).not.toBeInTheDocument();
+  });
+
+  it("shows the Enterprise comment editor for a project editor", async () => {
+    vi.stubEnv("NEXT_PUBLIC_ENTERPRISE_MODE", "1");
+    render(<TaskDetailModal {...defaultProps} canWrite />);
+    expect(await screen.findByPlaceholderText("Write a comment... (markdown supported)")).toBeInTheDocument();
+  });
+
+  it("keeps the owner picker out of a non-admin Enterprise task edit", async () => {
+    vi.stubEnv("NEXT_PUBLIC_ENTERPRISE_MODE", "1");
+    const user = userEvent.setup();
+    render(<TaskDetailModal {...defaultProps} canWrite />);
+    await user.click(screen.getByRole("button", { name: /edit task/i }));
+    expect(screen.queryByRole("combobox", { name: /task owner/i })).not.toBeInTheDocument();
+    expect(listUsers).not.toHaveBeenCalled();
   });
 });

@@ -28,6 +28,7 @@ and ``edge_path_summary``.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 from pathlib import Path
@@ -39,10 +40,34 @@ from typing import Any
 import aiosqlite
 
 from core.api.config import settings
+from core.api.observability import phase_timing
 from core.api.services._fts import fts5_safe_query
 from core.api.services.kg.rrf import normalize_key, reciprocal_rank_fusion
 
 logger = logging.getLogger(__name__)
+
+
+# One connection shared by every lexical lane of a single hybrid_search call.
+# Each fresh connection re-parses the tenant schema (~700 objects); opened
+# concurrently, 5-6 of them contend on SQLite's allocator mutex and cost
+# ~12 ms each on the runtime host (task 170213a5). aiosqlite serializes the
+# lanes' statements on the shared connection's thread, which is cheaper.
+# MARVIS_SEARCH_SHARED_FTS_CONNECTION=0 restores one connection per lane.
+_SHARED_LANE_CONN: contextvars.ContextVar[tuple[str, aiosqlite.Connection] | None] = (
+    contextvars.ContextVar("hybrid_shared_lane_conn", default=None)
+)
+
+
+def _shared_lane_connection_enabled() -> bool:
+    return os.environ.get("MARVIS_SEARCH_SHARED_FTS_CONNECTION", "1").strip() != "0"
+
+
+async def _open_lane_conn(db_path: str) -> tuple[aiosqlite.Connection, bool]:
+    """(connection, owned). Reuses the call's shared connection when present."""
+    shared = _SHARED_LANE_CONN.get()
+    if shared is not None and shared[0] == db_path:
+        return shared[1], False
+    return await aiosqlite.connect(db_path), True
 
 
 async def _filter_learnings_temporal(
@@ -92,7 +117,7 @@ async def _filter_learnings_temporal(
         f"{temporal_sql}"
     )
     try:
-        conn = await aiosqlite.connect(db_path)
+        conn, owned = await _open_lane_conn(db_path)
     except Exception:  # noqa: BLE001 — cannot probe → leave result unchanged
         logger.warning("temporal learning filter: cannot open %s", db_path)
         return
@@ -110,7 +135,8 @@ async def _filter_learnings_temporal(
             return
         live_ids = {r["id"] for r in rows}
     finally:
-        await conn.close()
+        if owned:
+            await conn.close()
 
     grouped["learning"] = [h for h in hits if h.get("doc_id") in live_ids]
 
@@ -331,7 +357,7 @@ async def kg_full_text_search(
     if not q_fts:
         return []
     try:
-        conn = await aiosqlite.connect(db_path)
+        conn, owned = await _open_lane_conn(db_path)
     except Exception:  # pragma: no cover — DB not openable
         logger.warning("kg_full_text_search: cannot open %s", db_path)
         return []
@@ -366,7 +392,8 @@ async def kg_full_text_search(
             for r in rows
         ]
     finally:
-        await conn.close()
+        if owned:
+            await conn.close()
 
 
 async def _row_fts_search(
@@ -393,7 +420,7 @@ async def _row_fts_search(
     if not q.strip():
         return []
     try:
-        conn = await aiosqlite.connect(db_path)
+        conn, owned = await _open_lane_conn(db_path)
     except Exception:  # pragma: no cover — DB not openable
         logger.warning("_row_fts_search(%s): cannot open %s", fts_table, db_path)
         return []
@@ -455,7 +482,8 @@ async def _row_fts_search(
             for r in rows
         ]
     finally:
-        await conn.close()
+        if owned:
+            await conn.close()
 
 
 async def tasks_fts_search(
@@ -522,7 +550,7 @@ async def documents_fts_search(
 ) -> list[DocumentFtsHit]:
     """MATCH over documents_fts without requiring the embedding backend."""
     try:
-        conn = await aiosqlite.connect(db_path)
+        conn, owned = await _open_lane_conn(db_path)
     except Exception:  # pragma: no cover — DB not openable
         logger.warning("documents_fts_search: cannot open %s", db_path)
         return []
@@ -565,7 +593,8 @@ async def documents_fts_search(
             )
         return hits
     finally:
-        await conn.close()
+        if owned:
+            await conn.close()
 
 
 async def _batch_edge_paths(
@@ -579,7 +608,7 @@ async def _batch_edge_paths(
     """
     if not node_ids:
         return {}
-    conn = await aiosqlite.connect(db_path)
+    conn, owned = await _open_lane_conn(db_path)
     try:
         conn.row_factory = aiosqlite.Row
         placeholders = ",".join("?" * len(node_ids))
@@ -602,7 +631,8 @@ async def _batch_edge_paths(
             out.setdefault(r["source_id"], []).append(r["target_id"])
         return out
     finally:
-        await conn.close()
+        if owned:
+            await conn.close()
 
 
 def _summary_from_path(path: list[str]) -> str:
@@ -637,15 +667,16 @@ async def _run_semantic_branch(
     try:
         from core.api.services import embedding_service
 
-        if not embedding_service.is_available():
+        if not await embedding_service.is_available_async():
             return None, RuntimeError("semantic-embedding-unavailable")
-        grouped = await embedding_service.search_by_type(
-            query=q,
-            workspace_id=workspace_id,
-            db_path=db_path,
-            vec0_path=vec0_path,
-            top_k=top_k,
-        )
+        async with phase_timing.aphase("semantic"):
+            grouped = await embedding_service.search_by_type(
+                query=q,
+                workspace_id=workspace_id,
+                db_path=db_path,
+                vec0_path=vec0_path,
+                top_k=top_k,
+            )
         return grouped, None
     except asyncio.CancelledError:
         # ``asyncio.wait_for`` uses cancellation to enforce the semantic
@@ -706,7 +737,8 @@ async def _run_kg_branch(
     limit: int,
 ) -> tuple[list[KgFtsHit] | None, BaseException | None]:
     try:
-        return await kg_full_text_search(q, db_path, limit=limit), None
+        async with phase_timing.aphase("fts_kg"):
+            return await kg_full_text_search(q, db_path, limit=limit), None
     except BaseException as exc:  # noqa: BLE001
         logger.warning("hybrid.kg_branch failed: %s", exc)
         return None, exc
@@ -722,7 +754,8 @@ async def _run_row_fts_branch(
 ) -> tuple[list[RowFtsHit] | None, BaseException | None]:
     """Generic (result, error) wrapper for the three Phase 6.6 row-FTS branches."""
     try:
-        return await fn(q, db_path, workspace_id, limit=limit), None
+        async with phase_timing.aphase(f"fts_{name}"):
+            return await fn(q, db_path, workspace_id, limit=limit), None
     except BaseException as exc:  # noqa: BLE001
         logger.warning("hybrid.%s_branch failed: %s", name, exc)
         return None, exc
@@ -735,13 +768,58 @@ async def _run_documents_fts_branch(
     limit: int,
 ) -> tuple[list[DocumentFtsHit] | None, BaseException | None]:
     try:
-        return await documents_fts_search(q, db_path, workspace_id, limit=limit), None
+        async with phase_timing.aphase("fts_documents"):
+            return await documents_fts_search(q, db_path, workspace_id, limit=limit), None
     except BaseException as exc:  # noqa: BLE001
         logger.warning("hybrid.documents_branch failed: %s", exc)
         return None, exc
 
 
 async def hybrid_search(
+    q: str,
+    workspace_id: str,
+    db_path: str,
+    vec0_path: str,
+    limit: int = 20,
+    rrf_k: int = DEFAULT_RRF_K,
+    weights: dict[str, float] | None = None,
+    *,
+    graph_lane: bool = False,
+    graph_lane_weight: float = 0.12,
+    graph_lane_seeds: int = 10,
+    graph_lane_fanout: int = 25,
+    as_of: str | None = None,
+) -> tuple[dict[str, list[dict]], dict[str, object]]:
+    """See ``_hybrid_search``; this wrapper only scopes the shared lane connection."""
+    kwargs: dict[str, Any] = {
+        "q": q,
+        "workspace_id": workspace_id,
+        "db_path": db_path,
+        "vec0_path": vec0_path,
+        "limit": limit,
+        "rrf_k": rrf_k,
+        "weights": weights,
+        "graph_lane": graph_lane,
+        "graph_lane_weight": graph_lane_weight,
+        "graph_lane_seeds": graph_lane_seeds,
+        "graph_lane_fanout": graph_lane_fanout,
+        "as_of": as_of,
+    }
+    if not _shared_lane_connection_enabled() or _SHARED_LANE_CONN.get() is not None:
+        return await _hybrid_search(**kwargs)
+    try:
+        conn = await aiosqlite.connect(db_path)
+    except Exception:  # noqa: BLE001 - lanes open their own and degrade as before
+        return await _hybrid_search(**kwargs)
+    token = _SHARED_LANE_CONN.set((db_path, conn))
+    try:
+        return await _hybrid_search(**kwargs)
+    finally:
+        _SHARED_LANE_CONN.reset(token)
+        await conn.close()
+
+
+async def _hybrid_search(
     q: str,
     workspace_id: str,
     db_path: str,
@@ -1170,6 +1248,15 @@ async def hybrid_search(
 
     total_hits = _total()
     meta: dict[str, object] = {
+        # The use case can expand the candidate window after ACL filtering.
+        # A lane returning the full fetch window may have more matches even
+        # when cross-source dedupe reduced the current fused result count.
+        "retrievers_may_have_more": len(fused) > limit or any(
+            len(lane) >= fetch_n for lane in (
+                semantic_ranking, kg_ranking, docs_ranking, tasks_ranking,
+                inbox_ranking, learn_ranking,
+            )
+        ),
         "semantic_available": sem_err is None,
         "semantic_reason": _semantic_reason(sem_err),
         "kg_available": kg_err is None,

@@ -184,9 +184,10 @@ function AddHumanForm({ taskId, onSaved, onCancel }: AddHumanFormProps) {
 
 interface Props {
   taskId: string;
+  canWrite?: boolean;
 }
 
-export default function TaskCostSection({ taskId }: Props) {
+export default function TaskCostSection({ taskId, canWrite = true }: Props) {
   const [summary, setSummary] = useState<TaskCostSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -238,13 +239,13 @@ export default function TaskCostSection({ taskId }: Props) {
     <div>
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-xs font-medium text-pir-text-primary">Cost</h3>
-        <button
+        {canWrite && <button
           type="button"
           onClick={() => setShowAddForm((v) => !v)}
           className="text-[10px] text-pir-text-muted hover:text-pir-accent transition-colors"
         >
           + Log time
-        </button>
+        </button>}
       </div>
 
       {hasCosts ? (
@@ -299,7 +300,7 @@ export default function TaskCostSection({ taskId }: Props) {
         <div className="text-xs text-pir-text-muted italic">No cost entries yet.</div>
       )}
 
-      {showAddForm && (
+      {canWrite && showAddForm && (
         <AddHumanForm
           taskId={taskId}
           onSaved={handleSaved}

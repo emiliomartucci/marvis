@@ -76,12 +76,19 @@ class OpenAICompatibleClassifier:
             return None
 
 
+# Default for tenants that choose Anthropic for BYOK classify. Claude Haiku 5.5
+# thinks adaptively and its thinking counts toward max_tokens, so the budget is
+# well above the JSON answer; it rejects temperature/top_p/top_k with a 400.
+ANTHROPIC_DEFAULT_MODEL = "claude-haiku-5-5"
+ANTHROPIC_MAX_TOKENS = 4000
+
+
 class AnthropicClassifier:
     """Classifier for the Anthropic Messages API. Fail-soft."""
 
     def __init__(self, *, api_key: str | None, model: str | None) -> None:
         self._api_key = api_key
-        self._model = model or "claude-haiku-4-5-20251001"
+        self._model = model or ANTHROPIC_DEFAULT_MODEL
         self.last_error: dict[str, Any] | None = None
 
     async def classify(self, content_excerpt: str, context: dict) -> LLMClassification | None:
@@ -92,8 +99,7 @@ class AnthropicClassifier:
             client = AsyncAnthropic(api_key=self._api_key or "")
             message = await client.messages.create(
                 model=self._model,
-                max_tokens=CLASSIFICATION_OUTPUT_TOKENS,
-                temperature=0,
+                max_tokens=max(CLASSIFICATION_OUTPUT_TOKENS, ANTHROPIC_MAX_TOKENS),
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )

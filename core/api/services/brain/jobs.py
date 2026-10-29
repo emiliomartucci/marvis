@@ -15,6 +15,7 @@ from core.api.db import acquire_db, write_db
 from core.api.services.brain.cycle import (
     current_brain_cycle_key,
     cycle_cutoff_at,
+    evidence_hash as event_evidence_hash,
     persist_event,
     polish_run_journals,
     publish_run_journals,
@@ -33,7 +34,7 @@ from core.api.services.brain.models import (
     SourceCollectorContext,
     SourceFailure,
 )
-from core.api.services.brain.watermarks import advance_watermark, get_watermark
+from core.api.services.brain.watermarks import get_watermark
 from core.api.services.brain.ws_emitter import emit_phase_complete
 
 try:
@@ -387,9 +388,26 @@ async def _execute_cycle(
 
     try:
         for collector in collectors:
-            since = await get_watermark(
-                source_system=collector.source_system, workspace_id=workspace_id
-            )
+            source_window_start = cycle_window_start
+            if trigger == "manual":
+                since = cycle_window_start - timedelta(microseconds=1)
+            else:
+                since = await get_watermark(
+                    source_system=collector.source_system, workspace_id=workspace_id
+                )
+                async with acquire_db() as db:
+                    pending = await (await db.execute(
+                        "SELECT MIN(r.cycle_window_start_utc) FROM brain_runs r "
+                        "WHERE r.workspace_id=? AND r.status IN ('partial','failed') "
+                        "AND r.superseded_by_run_id IS NULL "
+                        "AND julianday(r.started_at) > COALESCE((SELECT julianday(updated_at) FROM brain_source_watermarks "
+                        "WHERE workspace_id=? AND source_system=?), 0) "
+                        "AND EXISTS (SELECT 1 FROM json_each(r.partial_failures_json) f "
+                        "WHERE json_extract(f.value, '$.source_system')=?)",
+                        (workspace_id, workspace_id, collector.source_system, collector.source_system),
+                    )).fetchone()
+                if pending and pending[0]:
+                    source_window_start = min(cycle_window_start, _parse_dt(pending[0]))
             ctx = SourceCollectorContext(
                 cycle_key=cycle_key,
                 cutoff_at=cutoff_at,
@@ -398,7 +416,7 @@ async def _execute_cycle(
                 run_id=run_id,
                 workspace_id=workspace_id,
                 per_source_event_cap=settings.per_source_event_cap,
-                cycle_window_start=cycle_window_start,
+                cycle_window_start=source_window_start,
                 cycle_window_end=cycle_window_end,
             )
             try:
@@ -416,50 +434,55 @@ async def _execute_cycle(
                 )
                 continue
 
-            latest_observed = since
-            last_event_id: str | None = None
-            async with write_db() as db:
-                for draft in drafts:
-                    try:
-                        event_id = await persist_event(
+            # One source commits events and progress together. A failing event
+            # rolls back its siblings, so a later cycle cannot duplicate a prefix.
+            try:
+                async with write_db() as db:
+                    latest_observed = since
+                    last_event_id = None
+                    for draft in drafts:
+                        existing = None
+                        if source_window_start < cycle_window_start and draft.observed_at < cycle_window_start:
+                            # A manual replay may already have recovered a later
+                            # interval inside this source's outstanding range.
+                            existing = await (await db.execute(
+                                "SELECT e.event_id FROM brain_digest_events e "
+                                "JOIN brain_runs r ON r.run_id=e.run_id "
+                                "WHERE e.source_ref=? AND e.event_type=? AND e.source_system=? "
+                                "AND e.evidence_hash=? AND julianday(e.observed_at)=julianday(?) "
+                                "AND r.workspace_id=? LIMIT 1",
+                                (draft.source_ref, draft.event_type, draft.source_system,
+                                 event_evidence_hash(dict(draft.evidence or {})),
+                                 draft.observed_at.isoformat(), workspace_id),
+                            )).fetchone()
+                        event_id = existing[0] if existing else await persist_event(
                             db, run_id=run_id, cycle_key=cycle_key, draft=draft
                         )
-                    except Exception as exc:  # noqa: BLE001 — per-event isolation
-                        logger.exception(
-                            "brain.jobs: persist_event failed for %s/%s",
-                            collector.source_system,
-                            draft.source_ref,
+                        if draft.observed_at > latest_observed:
+                            latest_observed = draft.observed_at
+                            last_event_id = event_id
+                    if trigger != "manual":
+                        await db.execute(
+                            "INSERT INTO brain_source_watermarks "
+                            "(source_system,workspace_id,last_observed_at,last_event_id,last_cycle_key,updated_at) "
+                            "VALUES (?,?,?,?,?,?) ON CONFLICT(source_system,workspace_id) DO UPDATE SET "
+                            "last_observed_at=MAX(last_observed_at,excluded.last_observed_at), "
+                            "last_event_id=COALESCE(excluded.last_event_id,last_event_id), "
+                            "last_cycle_key=excluded.last_cycle_key,updated_at=excluded.updated_at",
+                            (collector.source_system,workspace_id,min(latest_observed,cycle_window_end).isoformat(),
+                             last_event_id,cycle_key,now.isoformat()),
                         )
-                        failures.append(
-                            SourceFailure(
-                                source_system=collector.source_system,
-                                error=f"persist_event: {exc}",
-                                traceback=traceback.format_exc(),
-                            )
-                        )
-                        continue
-                    event_count += 1
-                    if draft.observed_at > latest_observed:
-                        latest_observed = draft.observed_at
-                        last_event_id = event_id
+            except Exception as exc:  # noqa: BLE001 — independent sources still complete
+                logger.exception("brain.jobs: source %s persistence failed", collector.source_system)
+                failures.append(SourceFailure(source_system=collector.source_system,
+                    error=f"persist_event: {exc}", traceback=traceback.format_exc()))
 
-            if latest_observed > since:
-                # Clamp watermark advance to cycle_window_end so backfilling
-                # an OLD cycle doesn't push the watermark past its window
-                # (which would silently skip future cycles' substrate slices).
-                clamped_observed = (
-                    cycle_window_end
-                    if latest_observed > cycle_window_end
-                    else latest_observed
-                )
-                await advance_watermark(
-                    source_system=collector.source_system,
-                    workspace_id=workspace_id,
-                    observed_at=clamped_observed,
-                    last_event_id=last_event_id,
-                    cycle_key=cycle_key,
-                    now=now,
-                )
+        async with acquire_db() as db:
+            row = await (await db.execute(
+                "SELECT COUNT(*) FROM brain_digest_events e JOIN brain_runs r ON r.run_id=e.run_id "
+                "WHERE e.cycle_key=? AND r.workspace_id=?", (cycle_key, workspace_id),
+            )).fetchone()
+            event_count = row[0]
 
         async with write_db() as db:
             journal_count = await publish_run_journals(
@@ -683,34 +706,6 @@ async def _execute_cycle(
                 )
         except Exception:  # noqa: BLE001 — side-channel, never crashes the cycle
             logger.exception("brain.jobs: notify producer failed")
-
-        # Phase 7 — Salience decay (P4 F1 PR-b, re-enabled after mig 166). Ebbinghaus
-        # decay of document salience so stale docs sink in ranking over time. UNLIKE
-        # the notify side-channel above, a failure here appends to `failures` -> the
-        # run is marked partial. DECAY ONLY — boost stays out of the cycle. Safe for
-        # FTS since mig 166 scoped documents_fts_update to `OF file_path, doc_title`,
-        # so this bulk salience UPDATE no longer rebuilds (clobbers) the FTS content.
-        try:
-            from core.api.services.brain.salience_decay import (
-                run_salience_decay_phase,
-            )
-
-            decay_report = await run_salience_decay_phase(
-                run_id=run_id,
-                now=now,
-                workspace_id=workspace_id,
-            )
-            logger.info(
-                "brain.jobs: salience decay run_id=%s scanned=%d updated=%d",
-                run_id,
-                decay_report.scanned,
-                decay_report.updated,
-            )
-        except Exception as exc:  # noqa: BLE001 — phase-level isolation, marks run partial
-            logger.exception("brain.jobs: salience decay phase failed")
-            failures.append(
-                SourceFailure(source_system="salience_decay", error=str(exc))
-            )
 
         duration_ms = int((time.monotonic() - started) * 1000)
         status = "succeeded" if not failures else "partial"

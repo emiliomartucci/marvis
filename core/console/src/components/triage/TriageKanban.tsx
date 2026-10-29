@@ -207,7 +207,7 @@ const TriageCard = memo(function TriageCard({
   const isReview = task.status === "review";
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: task.id,
-    disabled: isInflight || isReview,
+    disabled: isInflight || isReview || !showActions,
   });
 
   const style = {
@@ -321,7 +321,7 @@ const TriageCard = memo(function TriageCard({
       )}
 
       {/* Review card actions — always visible */}
-      {isReview && (
+      {isReview && showActions && (
         <div className="mt-2 pt-1.5 border-t border-purple-500/20">
           {/* PR title */}
           {prTitle && (
@@ -986,7 +986,7 @@ const TriageCardV2 = memo(function TriageCardV2({
   const isReview = task.status === "review";
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: task.id,
-    disabled: isInflight || isReview,
+    disabled: isInflight || isReview || !showActions,
   });
 
   const borderLeftColor = task.delegation
@@ -1160,7 +1160,7 @@ const TriageCardV2 = memo(function TriageCardV2({
       )}
 
       {/* Review actions (Merge/Close/View) */}
-      {isReview && (
+      {isReview && showActions && (
         <ReviewActionsV2
           task={task}
           isInflight={isInflight}
@@ -1271,10 +1271,12 @@ interface Props {
   tasks: TaskResponse[];
   onTasksChange: (updater: (prev: TaskResponse[]) => TaskResponse[]) => void;
   onTaskClick: (task: TaskResponse) => void;
+  canEditTask?: (task: TaskResponse) => boolean;
 }
 
-export default function TriageKanban({ tasks, onTasksChange, onTaskClick }: Props) {
+export default function TriageKanban({ tasks, onTasksChange, onTaskClick, canEditTask = () => true }: Props) {
   const v2 = useDesignV2();
+  const enterpriseMode = process.env.NEXT_PUBLIC_ENTERPRISE_MODE === "1";
   const [draggedTask, setDraggedTask] = useState<TaskResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [columnPages, setColumnPages] = useState<Record<string, number>>({});
@@ -1381,9 +1383,10 @@ export default function TriageKanban({ tasks, onTasksChange, onTaskClick }: Prop
   const handleDragStart = useCallback(
     (event: DragStartEvent) => {
       const task = tasks.find((t) => t.id === event.active.id);
+      if (task && !canEditTask(task)) return;
       setDraggedTask(task || null);
     },
-    [tasks]
+    [tasks, canEditTask]
   );
 
   const handleDragEnd = useCallback(
@@ -1402,19 +1405,21 @@ export default function TriageKanban({ tasks, onTasksChange, onTaskClick }: Prop
       }
 
       const task = tasks.find((t) => t.id === taskId);
-      if (!task || task.status === newStatus) return;
+      if (!task || !canEditTask(task) || task.status === newStatus) return;
 
       // Block manual drag into review — only PR submit can set this status
       if (newStatus === "review") return;
 
       await doStatusChange(taskId, newStatus);
     },
-    [tasks, onTasksChange]
+    [tasks, onTasksChange, canEditTask]
   );
 
   // Shared status change logic for drag-drop and quick actions
   const doStatusChange = useCallback(
     async (taskId: string, newStatus: string) => {
+      const task = tasks.find((item) => item.id === taskId);
+      if (!task || !canEditTask(task)) return;
       if (inflightTasks.current.has(taskId)) return;
 
       inflightTasks.current.add(taskId);
@@ -1434,7 +1439,7 @@ export default function TriageKanban({ tasks, onTasksChange, onTaskClick }: Prop
         inflightTasks.current.delete(taskId);
       }
     },
-    [tasks, onTasksChange]
+    [tasks, onTasksChange, canEditTask]
   );
 
   const handleQuickAction = useCallback(
@@ -1589,9 +1594,9 @@ export default function TriageKanban({ tasks, onTasksChange, onTaskClick }: Prop
                       isInflight={inflightTasks.current.has(task.id)}
                       onClick={onTaskClick}
                       onQuickAction={handleQuickAction}
-                      onMerge={handleMerge}
-                      onClose={handleClose}
-                      showActions
+                      onMerge={enterpriseMode ? undefined : handleMerge}
+                      onClose={enterpriseMode ? undefined : handleClose}
+                      showActions={canEditTask(task) && (!enterpriseMode || task.status !== "review")}
                       prDiff={task.status === "review" ? (prDiffMap[task.id] ?? null) : null}
                       mergeOrder={task.status === "review" ? (mergeOrderMap.get(task.id) ?? null) : null}
                       prTitle={task.status === "review" ? (prMetaMap[task.id]?.title ?? null) : null}
@@ -1621,7 +1626,8 @@ export default function TriageKanban({ tasks, onTasksChange, onTaskClick }: Prop
             onToggle={() => setCompletedCollapsed((v) => !v)}
           >
             {completedTasks.slice(0, (columnPages["completed"] || 1) * PAGE_SIZE).map((task) => (
-              <StaticCardComp key={task.id} task={task} onClick={onTaskClick} onRevert={handleRevert} />
+              <StaticCardComp key={task.id} task={task} onClick={onTaskClick}
+                onRevert={enterpriseMode || !canEditTask(task) ? undefined : handleRevert} />
             ))}
             {completedTasks.length > (columnPages["completed"] || 1) * PAGE_SIZE && (
               <button

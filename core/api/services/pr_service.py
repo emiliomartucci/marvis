@@ -1042,7 +1042,7 @@ async def merge_pr(
             merge_result = await git_ops.merge_branch_async(
                 repo_path, branch_head_sha, pr["target"]
             )
-        except git_ops.MergeConflictError as exc:
+        except git_ops.MergeConflictError:
             # Rollback lock
             await db.execute(
                 "UPDATE pull_requests SET status = 'open' "

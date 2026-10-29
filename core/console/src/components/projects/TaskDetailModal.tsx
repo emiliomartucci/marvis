@@ -149,6 +149,7 @@ interface Props {
   onStatusChange?: (taskId: string, newStatus: string) => void;
   onTaskUpdated?: (task: Task) => void;
   onTaskDeleted?: (taskId: string) => void;
+  canWrite?: boolean;
 }
 
 export default function TaskDetailModal({
@@ -158,10 +159,14 @@ export default function TaskDetailModal({
   onStatusChange,
   onTaskUpdated,
   onTaskDeleted,
+  canWrite: canWriteOverride,
 }: Props) {
   void slug;
 
-  const { permissions } = useAuth();
+  const { permissions, role } = useAuth();
+  const canWrite = canWriteOverride ?? permissions.canWrite;
+  const enterpriseMode = process.env.NEXT_PUBLIC_ENTERPRISE_MODE === "1";
+  const canPickOwner = !enterpriseMode || role === "admin" || role === "super_admin";
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [localTask, setLocalTask] = useState<Task>(task);
   const [responsible, setResponsible] = useState<RaciEntry | null>(null);
@@ -220,7 +225,7 @@ export default function TaskDetailModal({
 
   // Save scores on close if dirty
   const handleClose = useCallback(async () => {
-    if (scoreDirty.current) {
+    if (canWrite && scoreDirty.current) {
       try {
         const updated = await apiUpdateTask(localTask.id, {
           impact: scoreImpact,
@@ -234,7 +239,7 @@ export default function TaskDetailModal({
       }
     }
     onClose();
-  }, [localTask.id, scoreImpact, scoreConfidence, scoreEase, scoreDelegation, onClose, onTaskUpdated]);
+  }, [canWrite, localTask.id, scoreImpact, scoreConfidence, scoreEase, scoreDelegation, onClose, onTaskUpdated]);
 
   useEffect(() => {
     getMe()
@@ -261,7 +266,7 @@ export default function TaskDetailModal({
     setEditOwnerId(localTask.owner_id ?? null);
     setIsEditing(true);
     // Load users for owner picker
-    listUsers().then(setEditUsers).catch(() => {});
+    if (canPickOwner) listUsers().then(setEditUsers).catch(() => {});
   }
 
   function handleCancelEdit() {
@@ -285,7 +290,7 @@ export default function TaskDetailModal({
           description: editDescription,
           priority: editPriority,
           tags: parsedTags,
-          owner_id: editOwnerId,
+          ...(canPickOwner ? { owner_id: editOwnerId } : {}),
         }),
       });
 
@@ -382,7 +387,7 @@ export default function TaskDetailModal({
                   <select
                     className={`text-[10px] px-2 py-0.5 rounded-full border-0 cursor-pointer ${statusColorClass} bg-transparent`}
                     value={localTask.status}
-                    disabled={isStatusSaving || reachable.length === 0 || !permissions.canWrite}
+                    disabled={isStatusSaving || reachable.length === 0 || !canWrite}
                     onChange={(e) => handleStatusChange(e.target.value)}
                     aria-label="Task status"
                   >
@@ -396,7 +401,7 @@ export default function TaskDetailModal({
               })()}
 
               {/* Quick Approve button for pending tasks — operator+ only */}
-              {localTask.status === "pending" && !isEditing && permissions.canWrite && (
+              {localTask.status === "pending" && !isEditing && canWrite && (
                 <button
                   onClick={() => handleStatusChange("approved")}
                   disabled={isStatusSaving}
@@ -431,7 +436,7 @@ export default function TaskDetailModal({
           </div>
 
           <div className="flex items-center gap-2 ml-3 shrink-0">
-            {!isEditing && permissions.canWrite && (
+            {!isEditing && canWrite && (
               <button
                 onClick={handleEditClick}
                 className="text-xs text-pir-text-muted hover:text-pir-text-secondary px-2 py-1 border border-pir rounded"
@@ -527,7 +532,7 @@ export default function TaskDetailModal({
           {/* Tags */}
           {isEditing ? (
             <div className="space-y-3">
-              <div>
+              {canPickOwner && <div>
                 <label className="text-label text-pir-text-tertiary block mb-1">
                   Owner
                 </label>
@@ -544,7 +549,7 @@ export default function TaskDetailModal({
                     </option>
                   ))}
                 </select>
-              </div>
+              </div>}
               <div>
                 <label className="text-label text-pir-text-tertiary block mb-1">
                   Tags (comma-separated)
@@ -575,30 +580,30 @@ export default function TaskDetailModal({
 
           {/* Scoring */}
           <div className="border border-pir rounded p-3 bg-pir-surface-0">
-            <ScoreInput
+            {canWrite ? <ScoreInput
               impact={scoreImpact}
               confidence={scoreConfidence}
               ease={scoreEase}
               delegation={scoreDelegation}
               iceScore={computedIceScore}
               onChange={handleScoreChange}
-            />
+            /> : <div className="text-caption text-pir-text-secondary">ICE-D {computedIceScore ?? "—"} · Impact {scoreImpact ?? "—"} · Confidence {scoreConfidence ?? "—"} · Ease {scoreEase ?? "—"}</div>}
           </div>
 
           {/* Pull Request */}
-          <PullRequestSection
+          {!enterpriseMode && <PullRequestSection
             taskId={localTask.id}
             onTaskCompleted={() => {
               setLocalTask((prev) => ({ ...prev, status: "completed" }));
               onStatusChange?.(localTask.id, "completed");
             }}
-          />
+          />}
 
           {/* CI Status */}
-          <CIChecksList taskId={localTask.id} hasPr={!!localTask.pr_status} />
+          {!enterpriseMode && <CIChecksList taskId={localTask.id} hasPr={!!localTask.pr_status} />}
 
           {/* Cost */}
-          <TaskCostSection taskId={localTask.id} />
+          <TaskCostSection taskId={localTask.id} canWrite={canWrite} />
 
           {/* Comments */}
           <div>
@@ -608,6 +613,7 @@ export default function TaskDetailModal({
                 targetType="task"
                 targetId={localTask.id}
                 currentUser={currentUser}
+                canWrite={canWrite}
               />
             ) : (
               <div className="text-xs text-pir-text-muted">Loading...</div>
@@ -616,7 +622,7 @@ export default function TaskDetailModal({
         </div>
 
         {/* Delete section — operator+ only */}
-        {permissions.canWrite && (
+        {canWrite && (
           <div className="border-t border-pir px-5 py-3 shrink-0">
             {showDeleteConfirm ? (
               <div className="flex items-center gap-3">

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.api.db import acquire_db, acquire_write_db
+from core.api.services.brain.run_selection import latest_readable_run
 from core.api.models.brain import JournalBody, JournalEntry, ScopeType
 try:
     from core.api.services.first_value import (
@@ -195,7 +196,7 @@ async def list_entries_for_cycle(
 ) -> list[JournalEntry]:
     """Surface listing for sub-05 §2 `/api/v1/brain/journal`.
 
-    Resolves `cycle_key='latest'` to the most recent succeeded cycle. Filters
+    Resolves `cycle_key='latest'` to the most recent readable succeeded/partial cycle. Filters
     by scope_type/scope_key/program_key when provided. Stable sort:
     `(cycle_key DESC, scope_type ASC, scope_key ASC)`.
     """
@@ -210,14 +211,7 @@ async def list_entries_for_cycle(
     if cycle_key == "latest":
         async with acquire_db() as db:
             db.row_factory = __import__("aiosqlite").Row
-            async with db.execute(
-                "SELECT cycle_key FROM brain_runs "
-                "WHERE workspace_id = ? AND status = 'succeeded' "
-                "AND superseded_by_run_id IS NULL "
-                "ORDER BY cycle_key DESC LIMIT 1",
-                (workspace_id,),
-            ) as cur:
-                row = await cur.fetchone()
+            row = await latest_readable_run(db, workspace_id=workspace_id)
         if row:
             resolved_cycle = row["cycle_key"]
         else:

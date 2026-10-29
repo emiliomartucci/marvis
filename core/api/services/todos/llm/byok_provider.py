@@ -73,12 +73,18 @@ class OpenAICompatibleTodoClassifier:
             return None
 
 
+# Same defaults as the ingest BYOK classifier (ingest/llm/byok_provider.py):
+# Claude Haiku 5.5 with room for adaptive thinking, no sampling parameters.
+_ANTHROPIC_DEFAULT_MODEL = "claude-haiku-5-5"
+_ANTHROPIC_MAX_TOKENS = 4000
+
+
 class AnthropicTodoClassifier:
     """Todos classifier for the Anthropic Messages API. Fail-soft."""
 
     def __init__(self, *, api_key: str | None, model: str | None) -> None:
         self._api_key = api_key
-        self._model = model or "claude-haiku-4-5-20251001"
+        self._model = model or _ANTHROPIC_DEFAULT_MODEL
 
     async def classify(self, text: str, context: dict) -> TodoClassification | None:
         try:
@@ -87,8 +93,7 @@ class AnthropicTodoClassifier:
             client = AsyncAnthropic(api_key=self._api_key or "")
             message = await client.messages.create(
                 model=self._model,
-                max_tokens=_MAX_TOKENS,
-                temperature=0,
+                max_tokens=max(_MAX_TOKENS, _ANTHROPIC_MAX_TOKENS),
                 system=_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": _user_prompt(text, context)}],
             )

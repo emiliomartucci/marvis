@@ -52,7 +52,8 @@ from pathlib import Path
 import aiosqlite
 
 from core.api.config import settings
-from core.api.models.search import SearchHit, SearchResponse
+from core.api.models.search import SearchCuration, SearchHit, SearchResponse
+from core.api.observability import phase_timing
 from core.api.services import access_grants
 from core.api.services.repository_authority import historical_repository_notice
 from core.api.use_cases._context import (
@@ -173,7 +174,7 @@ async def _maybe_kick_lazy_build(workspace_id: str) -> bool:
             return False
         from core.api.services import embedding_service
 
-        if not embedding_service.is_available():
+        if not await embedding_service.is_available_async():
             return False
         ram_ok, reason = embedding_service.background_index_ram_ok()
         if not ram_ok:
@@ -208,6 +209,7 @@ def _build_response(
     grouped: dict[str, list[dict]],
     q: str,
     meta: dict[str, object] | None,
+    curation: dict[str, object] | None = None,
 ) -> SearchResponse:
     def to_hits(doc_type: str, items: list[dict]) -> list[SearchHit]:
         return [
@@ -292,6 +294,7 @@ def _build_response(
         suggested_next_tool=suggested,
         semantic_available=semantic_available,
         semantic_reason=semantic_reason,
+        curation=SearchCuration(**curation) if curation else None,
     )
 
 
@@ -307,6 +310,9 @@ async def search(
     hybrid: bool = True,
     limit: int = 20,
     as_of: str | None = None,
+    rerank: bool | None = None,
+    allow_rerank: bool = True,
+    project: str | None = None,
 ) -> SearchResponse:
     """Hybrid (default) or semantic search across the KG and embedding index.
 
@@ -328,21 +334,58 @@ async def search(
     """
     workspace_id = require_workspace_ctx(ctx)
 
+    def selected(grouped: dict[str, list[dict]]) -> dict[str, list[dict]]:
+        if project is None:
+            return grouped
+        return {
+            kind: [hit for hit in hits if hit.get("project") == project]
+            for kind, hits in grouped.items()
+        }
+
+    def first_hits(grouped: dict[str, list[dict]]) -> dict[str, list[dict]]:
+        ranked = sorted(
+            ((kind, index, hit) for kind, hits in grouped.items()
+             for index, hit in enumerate(hits)),
+            key=lambda entry: entry[2].get("rrf_score", entry[2].get("score", 0)),
+            reverse=True,
+        )[:limit]
+        keep = {(kind, index) for kind, index, _hit in ranked}
+        return {
+            kind: [hit for index, hit in enumerate(hits) if (kind, index) in keep]
+            for kind, hits in grouped.items()
+        }
+
     if hybrid:
         from core.api.services.kg.hybrid_search import hybrid_search as _hybrid_search
 
-        grouped, meta = await _hybrid_search(
-            q=q,
-            workspace_id=workspace_id,
-            db_path=settings.db_path,
-            vec0_path=settings.vec0_path,
-            limit=limit,
-            graph_lane=settings.graph_lane_enabled,
-            graph_lane_weight=settings.graph_lane_weight,
-            graph_lane_seeds=settings.graph_lane_seeds,
-            graph_lane_fanout=settings.graph_lane_fanout,
-            as_of=as_of,
-        )
+        retrieval_limit = max(1, limit)
+        while True:
+            async with phase_timing.aphase("hybrid"):
+                grouped, meta = await _hybrid_search(
+                    q=q,
+                    workspace_id=workspace_id,
+                    db_path=settings.db_path,
+                    vec0_path=settings.vec0_path,
+                    limit=retrieval_limit,
+                    graph_lane=settings.graph_lane_enabled,
+                    graph_lane_weight=settings.graph_lane_weight,
+                    graph_lane_seeds=settings.graph_lane_seeds,
+                    graph_lane_fanout=settings.graph_lane_fanout,
+                    as_of=as_of,
+                )
+            async with phase_timing.aphase("acl_filter"):
+                visible = selected(await access_grants.filter_search_grouped(ctx, grouped))
+            if (
+                sum(len(hits) for hits in visible.values()) >= limit
+                or not meta.get("retrievers_may_have_more", False)
+            ):
+                grouped = first_hits(visible)
+                break
+            # The retrievers limit ranked candidates before ACL evaluation.
+            # Keep expanding until visible hits fill the caller's requested
+            # page or every lane is exhausted. A fixed overfetch cap would
+            # still starve authorized hits behind a large denied corpus.
+            retrieval_limit *= 2
         # gh#37: a zero-result hybrid search over an EMPTY corpus is a ready
         # (empty) index, NOT "index-building". The old code kicked a build
         # whenever `documents` was empty and flipped semantic_available →
@@ -356,20 +399,44 @@ async def search(
         if not any(grouped.values()):
             from core.api.services import embedding_service
 
-            if await _documents_empty(workspace_id) and embedding_service.is_available():
+            if await _documents_empty(workspace_id) and await embedding_service.is_available_async():
                 await _maybe_kick_lazy_build(workspace_id)
                 meta = {
                     **(meta or {}),
                     "semantic_available": True,
                     "semantic_reason": None,
                 }
-        grouped = await access_grants.filter_search_grouped(ctx, grouped)
-        return _build_response(grouped, q, meta=meta)
+        if not ctx.is_local_os_account and not any(grouped.values()):
+            # A retriever may have found only unauthorized hits. Its empty-
+            # corpus suggestion would then distinguish that case from a truly
+            # empty corpus after the ACL filter. Scoped callers receive one
+            # indistinguishable zero-hit response.
+            meta = {**meta, "suggested_next_tool": None}
+        # Plan 2026-09-21 U2: Jev re-rank of the VISIBLE results (post-ACL by
+        # construction — review F3: nothing the caller cannot see ever reaches
+        # the provider or the receipt). Default (rerank=None) follows the
+        # surface flag, ON since the 2026-09-23 owner calibration; the adapter
+        # tenant flags stay the hard gate. Explicit per-call true/false wins;
+        # fail-closed: unchanged order on any unavailability, receipt carries
+        # the outcome (R16).
+        curation = None
+        want_rerank = settings.typesafe_rerank_enabled if rerank is None else rerank
+        if allow_rerank and want_rerank:
+            from core.api.services.jev.rerank import rerank_grouped
+
+            async with phase_timing.aphase("rerank"):
+                grouped, receipt = await rerank_grouped(grouped, q)
+            # A disabled tenant (no Jev flag / no provider) gets NO receipt:
+            # byte-identical responses for non-Jev callers. R16 receipts
+            # document real attempts (ok, timeout, breaker, provider error).
+            if receipt.status != "disabled_tenant":
+                curation = receipt.to_dict()
+        return _build_response(grouped, q, meta=meta, curation=curation)
 
     # Legacy semantic-only branch (backward compat).
     from core.api.services import embedding_service
 
-    if not embedding_service.is_available():
+    if not await embedding_service.is_available_async():
         raise ServiceUnavailableError(
             code="embedding_unavailable",
             message="Semantic search is temporarily unavailable",
@@ -386,7 +453,7 @@ async def search(
     except RuntimeError as e:
         raise ServiceUnavailableError(code="embedding_unavailable", message=str(e))
 
-    grouped = await access_grants.filter_search_grouped(ctx, grouped)
+    grouped = selected(await access_grants.filter_search_grouped(ctx, grouped))
     return _build_response(grouped, q, meta=None)
 
 
@@ -625,7 +692,7 @@ async def _reindex_type_bg(doc_type: str, workspace_id: str) -> None:
         logger.exception("Reindex %s failed", doc_type)
 
 
-async def _reindex_all_bg(db_path: str) -> None:
+async def _reindex_all_bg(db_path: str, *, workspace_id: str = "ws_default") -> None:
     """Background task: reindex all doc types.
 
     Uses a SINGLE connection with vec extension loaded as both db and vec_db.
@@ -634,6 +701,7 @@ async def _reindex_all_bg(db_path: str) -> None:
     from core.api.db import _configure_connection, resolve_vec0_loadable
 
     logger.info("Reindex all: starting background job")
+    db = None
     try:
         db = await aiosqlite.connect(db_path)
         await _configure_connection(db)
@@ -652,8 +720,8 @@ async def _reindex_all_bg(db_path: str) -> None:
                 )
             """)
 
-        workspace_id = "ws_default"
         # Pass same connection as both db and vec_db — single writer, no locking
+        failed_types: list[str] = []
         for doc_type, fn in [
             ("handoffs", _reindex_handoffs),
             ("tasks", _reindex_tasks),
@@ -665,14 +733,19 @@ async def _reindex_all_bg(db_path: str) -> None:
         ]:
             try:
                 result = await fn(workspace_id, db, db)
-                logger.info("Reindex %s: %s", doc_type, result)
             except Exception:
-                logger.exception("Reindex %s failed", doc_type)
-
-        await db.close()
+                logger.exception("Reindex %s failed; continuing other document types", doc_type)
+                failed_types.append(doc_type)
+                await db.rollback()
+                continue
+            logger.info("Reindex %s: %s", doc_type, result)
+        if failed_types:
+            raise RuntimeError("Reindex failed for: " + ", ".join(failed_types))
         logger.info("Reindex all: background job complete")
-    except Exception:
-        logger.exception("Reindex all: background job failed")
+    finally:
+        if db is not None:
+            await db.rollback()
+            await db.close()
 
 
 async def _unchanged_and_embedded(
@@ -1117,9 +1190,16 @@ async def _reindex_file_paths(
         content_hash,
         embed_texts,
         persist_prose_chunks,
+        persist_lexical_file,
+        require_embedding_count,
         serialize_f32,
     )
 
+    from core.api.services.ingest.embedding_router import load_file_embedding_policies
+    from core.api.services.pii_redactor import redact
+
+    policies_by_project: dict[str, dict[Path, bool]] = {}
+    redacted_paths: set[str] = set()
     seen: set[Path] = set()
     items: list[tuple[str, str, str, str, str, str, str]] = []
     skipped_entries: list[dict[str, str]] = []
@@ -1148,6 +1228,7 @@ async def _reindex_file_paths(
     # never the frontmatter — a stripped marker must not re-index the file)
     from core.api.services.confidential_files import file_path_confidential
 
+    total = len(items) + len(skipped_entries)
     to_embed: list[tuple[str, str, str, str, str, str, str, str]] = []
     for slug, fpath, title, text, embed_text, doc_type, source_sha256 in items:
         if await file_path_confidential(
@@ -1155,23 +1236,65 @@ async def _reindex_file_paths(
         ):
             skipped_entries.append({"file": fpath, "reason": "confidential"})
             continue
+        project_root = next(base / slug for base in PROJECT_DIRS if Path(fpath).is_relative_to(base / slug))
+        if slug not in policies_by_project:
+            policies_by_project[slug] = await load_file_embedding_policies(
+                db, workspace_id=workspace_id, slug=slug, project_root=project_root,
+            )
+        policy = policies_by_project[slug].get(Path(fpath).resolve())
+
+        async def _persist_lexical_or_skip(
+            slug: str = slug, fpath: str = fpath, title: str = title,
+            doc_type: str = doc_type, text: str = text,
+        ) -> bool:
+            # One row already owned by another project/workspace (e.g. a `.task`
+            # layout whose directory name differs from the slug) must not abort
+            # the whole batch; never re-own it silently either.
+            try:
+                await persist_lexical_file(
+                    db, vec_db, workspace_id=workspace_id, project=slug, file_path=fpath,
+                    title=title, doc_type=doc_type, content=text,
+                )
+            except ValueError:
+                logger.warning(
+                    "reindex: documents row for %s belongs to another project/workspace; skipped",
+                    fpath,
+                )
+                skipped_entries.append({"file": fpath, "reason": "document_owner_mismatch"})
+                return False
+            return True
+
+        if policy is False:
+            if not await _persist_lexical_or_skip():
+                continue
+            await _forget_semantic_file_state(db, path=fpath)
+            skipped_entries.append({"file": fpath, "reason": "embedding_privacy_opt_out"})
+            continue
+        if policy is True:
+            embed_text = redact(embed_text)
+            redacted_paths.add(fpath)
         h = content_hash(text)
         if await _unchanged_and_embedded(db, vec_db, fpath, h):
             await _record_semantic_file_state(
                 db, path=fpath, sha256=source_sha256
             )
             continue
+        if not await _persist_lexical_or_skip():
+            continue
+        await _forget_semantic_file_state(db, path=fpath)
         to_embed.append(
             (slug, fpath, title, text, embed_text, doc_type, h, source_sha256)
         )
 
-    await db.commit()  # Release read locks before embedding work
+    await db.commit()  # Lexical phase survives semantic failure.
+    if db is not vec_db:
+        await vec_db.commit()
 
     if not to_embed:
         result = {
             "indexed": 0,
-            "skipped": len(items) + len(skipped_entries),
-            "total": len(items) + len(skipped_entries),
+            "skipped": total,
+            "total": total,
         }
         if skipped_entries:
             result["skipped_entries"] = skipped_entries
@@ -1184,7 +1307,9 @@ async def _reindex_file_paths(
         batch = to_embed[start : start + FILE_REINDEX_EMBED_BATCH_SIZE]
         batch_texts = [embed_text for _, _, _, _, embed_text, _, _, _ in batch]
         try:
-            embeddings = await embed_texts(batch_texts, input_type="document")
+            embeddings = require_embedding_count(
+                await embed_texts(batch_texts, input_type="document"), len(batch),
+            )
             embedded_items = list(zip(batch, embeddings))
         except EmbeddingInputTooLargeError:
             # The sidecar rejects a whole request, so isolate the offending item
@@ -1202,8 +1327,8 @@ async def _reindex_file_paths(
                     source_sha256,
                 ) = item
                 try:
-                    embedding = (
-                        await embed_texts([embed_text], input_type="document")
+                    embedding = require_embedding_count(
+                        await embed_texts([embed_text], input_type="document"), 1,
                     )[0]
                 except EmbeddingInputTooLargeError:
                     # Name the culprit in the journal, not only in the result
@@ -1249,26 +1374,11 @@ async def _reindex_file_paths(
             h,
             source_sha256,
         ), embedding in embedded_items:
-            await db.execute(
-                """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(file_path) DO UPDATE SET
-                     content_hash = excluded.content_hash,
-                     project = excluded.project,
-                     workspace_id = excluded.workspace_id,
-                     doc_type = excluded.doc_type,
-                     doc_title = excluded.doc_title""",
-                [fpath, slug, workspace_id, doc_type, title, h],
-            )
             cur2 = await db.execute(
                 "SELECT id FROM documents WHERE file_path = ?", [fpath]
             )
             doc_row = await cur2.fetchone()
             doc_id = doc_row["id"]
-            await _refresh_delta_documents_fts_row(
-                db, doc_id=doc_id, title=title, content=text
-            )
-
             await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
             await vec_db.execute(
                 "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
@@ -1277,8 +1387,11 @@ async def _reindex_file_paths(
             # A-span (Phase 2, gap S2): chunks sidecar stays in sync on reindex.
             if chunking_enabled():
                 await persist_prose_chunks(
-                    doc_id=str(doc_id), content=text, db=db, vec_db=vec_db
+                    doc_id=str(doc_id), content=text, db=db, vec_db=vec_db,
+                    redact_for_embedding=fpath in redacted_paths,
                 )
+            await db.execute("UPDATE documents SET content_hash = ? WHERE id = ?", [h, doc_id])
+            await _refresh_delta_documents_fts_row(db, doc_id=doc_id, title=title, content=text)
             await _record_semantic_file_state(
                 db, path=fpath, sha256=source_sha256
             )
@@ -1288,11 +1401,10 @@ async def _reindex_file_paths(
     if db is not vec_db:
         await vec_db.commit()
 
-    unchanged = len(items) - indexed
     result = {
         "indexed": indexed,
-        "skipped": unchanged + len(skipped_entries),
-        "total": len(items) + len(skipped_entries),
+        "skipped": total - indexed,
+        "total": total,
     }
     all_skipped_entries = skipped_entries + terminal_skipped_entries
     if all_skipped_entries:
@@ -1350,100 +1462,17 @@ async def _reindex_files(
 async def _reindex_handoffs(
     workspace_id: str, db: aiosqlite.Connection, vec_db: aiosqlite.Connection
 ) -> dict:
-    """Batch-embed handoff files from filesystem (memory/handoff-*.md)."""
+    """Index handoffs through the same privacy and recovery path as other files."""
     from core.api.routers.projects import PROJECT_DIRS
-    from core.api.services.embedding_service import (
-        chunking_enabled,
-        content_hash,
-        embed_texts,
-        persist_prose_chunks,
-        refresh_documents_fts_row,
-        serialize_f32,
-    )
 
-    # Scan all projects for handoffs
-    items: list[tuple[str, str, str, str]] = []  # (slug, file_path, title, content)
+    paths = []
     for base in PROJECT_DIRS:
         if not base.exists():
             continue
         for project_dir in sorted(base.iterdir()):
-            if not project_dir.is_dir() or project_dir.is_symlink():
-                continue
-            slug = project_dir.name
-            memory_dir = project_dir / "memory"
-            if not memory_dir.is_dir():
-                continue
-            for f in sorted(memory_dir.glob("handoff-*.md")):
-                if f.is_symlink() or f.stat().st_size > 500_000:
-                    continue
-                try:
-                    text = f.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                title = f.stem.replace("-", " ").strip()
-                items.append((slug, str(f), title, text))
-
-    # Filter unchanged
-    to_embed: list[tuple[str, str, str, str, str]] = []
-    for slug, fpath, title, text in items:
-        h = content_hash(text)
-        if await _unchanged_and_embedded(db, vec_db, fpath, h):
-            continue
-        to_embed.append((slug, fpath, title, text, h))
-
-    await db.commit()  # Release read locks before API call
-
-    if not to_embed:
-        return {"indexed": 0, "skipped": len(items), "total": len(items)}
-
-    # Batch embed
-    indexed = 0
-    batch_size = 64
-    for i in range(0, len(to_embed), batch_size):
-        batch = to_embed[i : i + batch_size]
-        texts = [text for _, _, _, text, _ in batch]
-        embeddings = await embed_texts(texts, input_type="document")
-
-        for (slug, fpath, title, text, h), embedding in zip(batch, embeddings):
-            await db.execute(
-                """INSERT INTO documents (file_path, project, workspace_id, doc_type, doc_title, content_hash)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(file_path) DO UPDATE SET
-                     content_hash = excluded.content_hash,
-                     project = excluded.project,
-                     workspace_id = excluded.workspace_id,
-                     doc_type = excluded.doc_type,
-                     doc_title = excluded.doc_title""",
-                [fpath, slug, workspace_id, "handoff", title, h],
-            )
-            cur2 = await db.execute(
-                "SELECT id FROM documents WHERE file_path = ?", [fpath]
-            )
-            doc_row = await cur2.fetchone()
-            doc_id = doc_row["id"]
-            # B-fix (MARVIS_FTS_BODIES): repair the trigger-degraded FTS row.
-            await refresh_documents_fts_row(db, doc_id=doc_id, title=title, content=text)
-
-            await vec_db.execute("DELETE FROM vec_documents WHERE doc_id = ?", [doc_id])
-            await vec_db.execute(
-                "INSERT INTO vec_documents (doc_id, embedding) VALUES (?, ?)",
-                [doc_id, serialize_f32(embedding)],
-            )
-            # A-span (Phase 2, gap S2): chunks sidecar stays in sync on reindex.
-            if chunking_enabled():
-                await persist_prose_chunks(
-                    doc_id=str(doc_id), content=text, db=db, vec_db=vec_db
-                )
-            indexed += 1
-
-        await db.commit()
-        if db is not vec_db:
-            await vec_db.commit()
-
-        if i + batch_size < len(to_embed):
-            await asyncio.sleep(20)
-
-    return {"indexed": indexed, "total": len(items)}
+            if project_dir.is_dir() and not project_dir.is_symlink():
+                paths.extend(sorted((project_dir / "memory").glob("handoff-*.md")))
+    return await _reindex_file_paths(workspace_id, db, vec_db, paths)
 
 
 async def _reindex_learnings(

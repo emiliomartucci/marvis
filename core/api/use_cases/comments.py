@@ -17,7 +17,10 @@ The security + hygiene rules live HERE so neither surface can drift:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import aiosqlite
@@ -39,6 +42,48 @@ from core.api.use_cases._errors import (
 logger = logging.getLogger(__name__)
 
 COMMENT_BODY_CAP = 5000
+
+
+@dataclass(frozen=True)
+class PreparedCommentBody:
+    """Server-side redaction completed after a read check, before the writer lock."""
+
+    body: str
+    raw_sha256: str
+    actor_id: str
+    target_type: str
+    target_id: str
+
+
+def _body_digest(body: str) -> str:
+    return hashlib.sha256(bug_reports_core.cap(body, COMMENT_BODY_CAP).encode()).hexdigest()
+
+
+async def _redact_body(body: str) -> str:
+    from core.api.services.jev.redaction_gate import redact_with_identifier_gate
+
+    redacted, _ = await redact_with_identifier_gate(
+        bug_reports_core.cap(body, COMMENT_BODY_CAP)
+    )
+    if not redacted.strip():
+        raise ValidationError(
+            code="empty_comment", message="Comment body is empty after redaction."
+        )
+    return redacted
+
+
+def _prepared_body(
+    ctx: CallerContext, body: str, prepared: PreparedCommentBody,
+    *, target_type: str, target_id: str,
+) -> str:
+    if (
+        prepared.actor_id != (ctx.user_id or ctx.username)
+        or prepared.target_type != target_type
+        or prepared.target_id != target_id
+        or prepared.raw_sha256 != _body_digest(body)
+    ):
+        raise ValidationError(code="invalid_prepared_comment", message="Prepared comment does not match request")
+    return prepared.body
 
 _TASK_NOT_FOUND = "target_not_found"
 _TASK_NOT_FOUND_MSG = "Target not found or not visible to you."
@@ -103,7 +148,8 @@ async def _governing_project(
 
 
 async def _authorize(
-    db: aiosqlite.Connection, ctx: CallerContext, target_type: str, target_id: str
+    db: aiosqlite.Connection, ctx: CallerContext, target_type: str, target_id: str,
+    *, write: bool = False,
 ) -> tuple[str | None, str | None, str]:
     """Return (project, owner_id, workspace_id) or a non-enumerating 404."""
     exists, project, owner_id, workspace_id = await _governing_project(
@@ -112,6 +158,9 @@ async def _authorize(
     visible = await access_grants.visible_projects_for_actor(db, ctx)  # None = admin
     if not exists:
         raise NotFoundError(code=_TASK_NOT_FOUND, message=_TASK_NOT_FOUND_MSG)
+    if write and os.environ.get("MARVIS_ENTERPRISE_OIDC_STRICT", "").strip() == "1":
+        if not project or not await access_grants.can_write_project(db, ctx, project):
+            raise NotFoundError(code=_TASK_NOT_FOUND, message=_TASK_NOT_FOUND_MSG)
     if visible is None:
         return project, owner_id, workspace_id
     # non-admin: program-scope (project None) is not theirs, and a project not in
@@ -119,6 +168,22 @@ async def _authorize(
     if project is None or project not in visible:
         raise NotFoundError(code=_TASK_NOT_FOUND, message=_TASK_NOT_FOUND_MSG)
     return project, owner_id, workspace_id
+
+
+async def prepare_create_body(
+    ctx: CallerContext, db: aiosqlite.Connection, *,
+    target_type: str, target_id: str, body: str,
+) -> PreparedCommentBody:
+    """Authorize on a read connection before any optional model call."""
+    require_role_ctx(ctx, "operator", "admin", "super_admin")
+    await _authorize(db, ctx, target_type, target_id, write=True)
+    return PreparedCommentBody(
+        body=await _redact_body(body),
+        raw_sha256=_body_digest(body),
+        actor_id=ctx.user_id or ctx.username,
+        target_type=target_type,
+        target_id=target_id,
+    )
 
 
 def _parse_reactions(raw: str | None) -> list[CommentReaction]:
@@ -218,18 +283,18 @@ async def create_comment(
     body: str,
     status: str = "info",
     parent_id: int | None = None,
+    prepared_body: PreparedCommentBody | None = None,
 ) -> CommentResponse:
     """Create a comment (RBAC + redaction + notify inside). Commits."""
     require_role_ctx(ctx, "operator", "admin", "super_admin")
     project, owner_id, workspace_id = await _authorize(
-        db, ctx, target_type, target_id
+        db, ctx, target_type, target_id, write=True
     )
 
-    red_body, _ = bug_reports_core.redact(bug_reports_core.cap(body, COMMENT_BODY_CAP))
-    if not red_body.strip():
-        raise ValidationError(
-            code="empty_comment", message="Comment body is empty after redaction."
-        )
+    red_body = (
+        _prepared_body(ctx, body, prepared_body, target_type=target_type, target_id=target_id)
+        if prepared_body is not None else await _redact_body(body)
+    )
 
     now = _now()
     if parent_id is not None:
@@ -362,8 +427,25 @@ async def _comment_row_for_actor(
     ).fetchone()
     if row is None:
         raise NotFoundError(code="comment_not_found", message="Comment not found")
-    await _authorize(db, ctx, row["target_type"], row["target_id"])
+    await _authorize(db, ctx, row["target_type"], row["target_id"], write=True)
     return row
+
+
+async def prepare_update_body(
+    ctx: CallerContext, db: aiosqlite.Connection, *, comment_id: int, body: str,
+) -> PreparedCommentBody:
+    """Check author and edit grant before scoring, then recheck on the writer."""
+    require_role_ctx(ctx, "viewer", "operator", "admin", "super_admin")
+    row = await _comment_row_for_actor(ctx, db, comment_id)
+    if row["created_by"] != ctx.username:
+        raise AuthorizationError(code="not_comment_author", message="Not the comment author")
+    return PreparedCommentBody(
+        body=await _redact_body(body),
+        raw_sha256=_body_digest(body),
+        actor_id=ctx.user_id or ctx.username,
+        target_type="comment",
+        target_id=str(comment_id),
+    )
 
 
 async def _comment_response(
@@ -403,6 +485,7 @@ async def update_comment(
     comment_id: int,
     body: str | None,
     status: str | None,
+    prepared_body: PreparedCommentBody | None = None,
 ) -> CommentResponse:
     """Update an own comment only after resolving its workspace-owned target."""
     require_role_ctx(ctx, "viewer", "operator", "admin", "super_admin")
@@ -413,14 +496,10 @@ async def update_comment(
         )
     updates: dict[str, str] = {}
     if body is not None:
-        red_body, _ = bug_reports_core.redact(
-            bug_reports_core.cap(body, COMMENT_BODY_CAP)
+        red_body = (
+            _prepared_body(ctx, body, prepared_body, target_type="comment", target_id=str(comment_id))
+            if prepared_body is not None else await _redact_body(body)
         )
-        if not red_body.strip():
-            raise ValidationError(
-                code="empty_comment",
-                message="Comment body is empty after redaction.",
-            )
         updates["body"] = red_body
     if status is not None:
         updates["status"] = status

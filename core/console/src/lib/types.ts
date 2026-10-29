@@ -120,6 +120,8 @@ export interface TeamProject {
   project: string;
   is_public: boolean;
   assigned_at: string;
+  role: "viewer" | "member";
+  clearance: "public" | "internal";
 }
 
 export interface AppCapabilities {

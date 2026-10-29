@@ -27,6 +27,15 @@ ROUTING_GUIDE: tuple[dict[str, str], ...] = (
         "why": "Lean list of slug, program, lifecycle, language and task counts.",
     },
     {
+        "intent": "register a new project / first project on an empty tenant",
+        "tool": "create_project(slug=..., name=..., description=...)",
+        "why": (
+            "The only canonical registration path: DB rows + workspace scaffold "
+            "(project.yaml, context.md, .task) + embed. Hand-writing those files "
+            "with write_file leaves unregistered shadow state."
+        ),
+    },
+    {
         "intent": "cold-start one project",
         "tool": "session_brief(slug)",
         "why": "One bundle with project state, open tasks, latest handoff, learnings and salience docs.",
@@ -300,6 +309,7 @@ TOOL_TIERS: dict[str, dict[str, Any]] = {
             "onboarding_status",
             "onboarding_answer",
             "session_brief",
+            "gather_context",
             "search",
             "check_learnings",
             "read_file",
@@ -403,8 +413,6 @@ TOOL_TIERS: dict[str, dict[str, Any]] = {
             "upload_attachment",
             "share_file",
             # workflows
-            "brainstorm",
-            "plan",
             "compound",
             "save_brainstorm",
             "save_plan",
@@ -431,6 +439,7 @@ TOOL_TIERS: dict[str, dict[str, Any]] = {
             "brain_staleness",
             # governed project / Cloud-F control writes
             "register_project_lifecycle",
+            "set_project_program",
             "acquire_cloud_f_change",
             "complete_cloud_f_change",
             "update_project_selector_watermark",
@@ -453,6 +462,7 @@ TOOL_TIERS: dict[str, dict[str, Any]] = {
             "reject_task",
             # access / user-role admin
             "grant_access",
+            "reconcile_project_ownership",
             "revoke_access",
             "set_user_role",
             # bug-report triage (operator, cross-tenant read)
@@ -496,6 +506,45 @@ TOOL_TIERS: dict[str, dict[str, Any]] = {
 TIER_MIN_ROLE: dict[str, str] = {
     name: tier["min_role"] for name, tier in TOOL_TIERS.items()
 }
+
+# P4 tool diet — the data-driven core surface for agent-heavy tenants.
+# Source: 13 days of real per-tool usage on a production tenant backend
+# (2026-09-16..29, 8,649 calls reconstructed from journald + the durable
+# counter, task b52e3b09): 142 tools are exposed, agents consistently use a
+# small core (the top 12 tools alone carry 80% of traffic). These 48 tools
+# (every tool with >= 8 calls) cover 99.5% of observed usage; the remaining
+# ~94 were used once or never in the window.
+# Applied SOFT by ToolProfilesMiddleware when MARVIS_TOOL_DIET is truthy:
+# tools/list hides non-core tools (context tax), tools/call still serves
+# them, so rare flows that name a tool explicitly never break.
+TOOL_DIET_CORE: frozenset[str] = frozenset(
+    {
+        # --- top 33 (>= 30 calls, 96.5% of traffic) ---
+        "get_task", "comment_task", "read_file", "update_task",
+        "check_learnings", "session_brief", "list_comments", "list_tasks",
+        "edit", "create_task", "search", "grep", "write_file",
+        "list_projects", "create_learning", "approve_task", "get_learning",
+        "search_handoffs", "graph_pattern", "get_handoff", "create_handoff",
+        "graph_resolve", "guide", "reindex_paths", "brain_write_journal",
+        "brain_findings", "list_handoffs", "tasks_summary", "brain_drift",
+        "list_learnings", "list_notifications", "get_project",
+        "brain_journal",
+        # --- working set (8..29 calls, ~3% of traffic) ---
+        "save_plan", "brain_findings_get", "brain_runs", "update_learning",
+        "graph_impact", "ack_notification", "brain_events", "gather_context",
+        "save_brainstorm", "brain_staleness", "kg_reindex_path",
+        "brain_memory_operations", "check_safety", "reject_task",
+        "directory_tree",
+        # --- governance exception (incident 2026-10-08: an agent, not finding
+        # create_project in tools/list, improvised a write_file scaffold that
+        # registers nothing; the empty-tenant Console onboarding itself tells
+        # users to ask their agent to create the first project) ---
+        "create_project",
+        # --- same exception: project.yaml is refused to edit/write_file, so an
+        # agent that cannot see the governed program setter is stuck ---
+        "set_project_program",
+    }
+)
 
 
 def _normalize_client(client: str | None) -> str:
@@ -710,7 +759,7 @@ def build_instructions() -> str:
         "Marvis is a company-brain MCP for cross-project orchestration and institutional memory.",
         "Route by task type; prefer structured tools over raw files:",
     ]
-    for item in ROUTING_GUIDE[:13]:
+    for item in ROUTING_GUIDE[:14]:
         lines.append(f"- {item['intent']}: {item['tool']} - {item['why']}")
     lines.extend(
         [

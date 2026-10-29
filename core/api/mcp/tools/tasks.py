@@ -207,7 +207,14 @@ def register(mcp) -> None:
                 )
             for job in embed_jobs:
                 mcp_schedule_embed(**job)
-            return dump(result)
+            response = dump(result)
+            from core.api.services.jev.guardrail import suggest_delegation, DelegationSuggestion
+            try:
+                advice = await suggest_delegation(title, description or "")
+            except Exception:
+                advice = DelegationSuggestion("hybrid", .5, None, "error")
+            response["delegation_suggestion"] = advice.to_dict()
+            return response
         except ServiceError as e:
             raise_mcp_error(e)
 

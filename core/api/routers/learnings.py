@@ -87,9 +87,6 @@ def _schedule_embed_learning(
     """
     from core.api.services import embedding_service
 
-    if not embedding_service.is_available():
-        return
-
     async def _embed() -> None:
         try:
             await embedding_service.embed_learning_document(
